@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-05-02
+- Bug fixes: guide recall query shape.
+
 ### 2026-05-01
 - Bug fixes: include Hermes plugin in signetai package; harden connector install and diagnostics.
 - Docs: correct stale documentation claims; add nyashkn contributor.
@@ -31,10 +34,16 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: bundle install-graphiq.sh so graphiq install/update works; bound prompt-submit embedding latency; detect default install path; emit structured hook JSON.
 - Refactoring: replace brew/cargo install with shell script; add session auto-connect.
 
-### 2026-04-23
-- Features: add GraphIQ plugin management UI and daemon API; index native harness memories; unify LLM provider plumbing.
-
 ## Release Ledger
+
+## [0.109.19] - 2026-05-02
+
+Release summary: 1 bug fix.
+Tag range: `v0.109.18..v0.109.19`.
+
+### Bug Fixes
+
+- **memory**: guide recall query shape (#617)
 
 ## [0.109.18] - 2026-05-01
 
