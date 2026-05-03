@@ -8,6 +8,7 @@ Surface summary of the most recent release dates. See the release ledger below f
 
 ### 2026-05-03
 - Features: add read-only Obsidian knowledge sources.
+- Performance: enable threadedExtraction by default and fix build.
 - Docs: correct stale documentation claims.
 
 ### 2026-05-02
@@ -35,6 +36,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Refactoring: make logger injectable in startWorker via LogSink interface.
 
 ## Release Ledger
+
+## [0.110.1] - 2026-05-03
+
+Release summary: 1 performance improvement.
+Tag range: `v0.110.0..v0.110.1`.
+
+### Performance
+
+- **daemon**: enable threadedExtraction by default and fix build (#609)
 
 ## [0.110.0] - 2026-05-03
 
