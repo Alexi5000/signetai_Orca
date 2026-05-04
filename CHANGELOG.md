@@ -7,6 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-04
+- Features: dual-mode daemon — attach if running, bundled fallback.
 - Bug fixes: keep bundled sdk out of publish deps; surface Obsidian indexing status; resolve session-end timeout under concurrent load.
 
 ### 2026-05-03
@@ -35,6 +36,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Refactoring: reorganize monorepo layout.
 
 ## Release Ledger
+
+## [0.111.0] - 2026-05-04
+
+Release summary: 1 feature.
+Tag range: `v0.110.4..v0.111.0`.
+
+### Features
+
+- **desktop**: dual-mode daemon — attach if running, bundled fallback (#615)
 
 ## [0.110.4] - 2026-05-04
 
