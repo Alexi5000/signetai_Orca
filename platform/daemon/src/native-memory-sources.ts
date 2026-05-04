@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { loadSourcesConfig } from "@signet/core";
+import { DEFAULT_OBSIDIAN_EXCLUDE_GLOBS, loadSourcesConfig, markSourceIndexed } from "@signet/core";
 import { resolveDaemonAgentId } from "./agent-id";
 import { yieldEvery } from "./async-yield";
 import { getDbAccessor } from "./db-accessor";
@@ -103,6 +103,7 @@ export function obsidianNativeMemorySource(
 	root: string,
 	displayName = "Obsidian",
 	sourceId = sourceIdForObsidianRoot(root),
+	excludeGlobs: readonly string[] = DEFAULT_OBSIDIAN_EXCLUDE_GLOBS,
 ): NativeMemorySource {
 	return {
 		harness: "obsidian",
@@ -113,8 +114,7 @@ export function obsidianNativeMemorySource(
 			{
 				glob: "**/*.md",
 				kind: "source_obsidian_markdown",
-				include: (_path, rel) =>
-					!rel.split("/").some((part) => part === ".obsidian" || part === ".trash" || part === ".hermes"),
+				include: (_path, rel) => !isExcludedByGlobs(rel, excludeGlobs),
 			},
 		],
 	};
@@ -123,7 +123,7 @@ export function obsidianNativeMemorySource(
 export function configuredNativeMemorySources(agentsDir?: string): NativeMemorySource[] {
 	const configured = loadSourcesConfig(agentsDir)
 		.sources.filter((source) => source.enabled && source.kind === "obsidian")
-		.map((source) => obsidianNativeMemorySource(source.root, source.name, source.id));
+		.map((source) => obsidianNativeMemorySource(source.root, source.name, source.id, source.excludeGlobs));
 	return [codexNativeMemorySource(), claudeCodeNativeMemorySource(), ...configured];
 }
 
@@ -153,6 +153,15 @@ function matchesPattern(source: NativeMemorySource, filePath: string): NativeMem
 
 function matchesGlob(glob: string, rel: string): boolean {
 	return matchGlobParts(glob.split("/"), rel.split("/"));
+}
+
+function isExcludedByGlobs(rel: string, excludeGlobs: readonly string[]): boolean {
+	const normalized = rel.replace(/\\/g, "/").replace(/^\.\//, "");
+	return excludeGlobs.some((glob) => {
+		const normalizedGlob = glob.replace(/\\/g, "/").replace(/^\.\//, "");
+		const vaultWideGlob = normalizedGlob.includes("/") ? normalizedGlob : `**/${normalizedGlob}`;
+		return matchesGlob(vaultWideGlob, normalized);
+	});
 }
 
 function matchGlobParts(globParts: readonly string[], relParts: readonly string[]): boolean {
@@ -185,7 +194,7 @@ function activeBridgeSources(
 	if (!options.includeConfiguredSources) return [...baseSources];
 	const configured = loadSourcesConfig(options.agentsDir)
 		.sources.filter((source) => source.enabled && source.kind === "obsidian")
-		.map((source) => obsidianNativeMemorySource(source.root, source.name, source.id));
+		.map((source) => obsidianNativeMemorySource(source.root, source.name, source.id, source.excludeGlobs));
 	const byKey = new Map<string, NativeMemorySource>();
 	for (const source of [...baseSources, ...configured]) {
 		byKey.set(source.sourceId ?? `${source.harness}:${source.root}`, source);
@@ -218,6 +227,42 @@ function nativeArtifactRowExists(filePath: string, agentId: string): boolean {
 		});
 	} catch {
 		return false;
+	}
+}
+
+function activeNativeArtifactPaths(source: NativeMemorySource, agentId: string): string[] {
+	const normalizedRoot = resolve(source.root).replace(/\\/g, "/").replace(/\/$/, "");
+	const rootPrefix = `${normalizedRoot}/`;
+	try {
+		return getDbAccessor().withReadDb((db) => {
+			const rows = db
+				.prepare(
+					`SELECT source_path FROM memory_artifacts
+					 WHERE agent_id = ?
+					   AND harness = ?
+					   AND source_path >= ?
+					   AND source_path < ?
+					   AND source_kind IN (${source.files.map(() => "?").join(", ")})
+					   AND COALESCE(is_deleted, 0) = 0`,
+				)
+				.all(
+					agentId,
+					source.harness,
+					rootPrefix,
+					prefixUpperBound(rootPrefix),
+					...source.files.map((file) => file.kind),
+				) as Array<{
+				source_path: string;
+			}>;
+			return rows.map((row) => row.source_path);
+		});
+	} catch (err) {
+		logger.warn("watcher", "Failed listing active native memory artifacts", {
+			harness: source.harness,
+			root: source.root,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return [];
 	}
 }
 
@@ -399,12 +444,17 @@ export function startNativeMemoryBridge(
 		for (const source of activeBridgeSources(sources, options)) {
 			const key = sourceStateKey(source, agentId);
 			const current = new Set<string>();
-			if (existsSync(source.root)) {
+			const rootExists = existsSync(source.root);
+			if (rootExists) {
 				for await (const file of walkMarkdownFiles(source.root)) {
 					if (!matchesPattern(source, file)) continue;
 					current.add(file);
 					if (await indexNativeMemoryFile(source, file, agentId, options)) count++;
 					await yielder();
+				}
+				const currentPaths = new Set([...current].map((file) => file.replace(/\\/g, "/")));
+				for (const file of activeNativeArtifactPaths(source, agentId)) {
+					if (!currentPaths.has(file.replace(/\\/g, "/"))) removeNativeMemoryFile(source, file, agentId);
 				}
 			}
 			const previous = known.get(key);
@@ -414,6 +464,7 @@ export function startNativeMemoryBridge(
 				}
 			}
 			known.set(key, current);
+			if (rootExists && source.sourceId) markSourceIndexed(source.sourceId, undefined, options.agentsDir);
 		}
 		return count;
 	};
