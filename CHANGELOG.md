@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-04
-- Bug fixes: surface Obsidian indexing status; resolve session-end timeout under concurrent load.
+- Bug fixes: keep bundled sdk out of publish deps; surface Obsidian indexing status; resolve session-end timeout under concurrent load.
 
 ### 2026-05-03
 - Features: add read-only Obsidian knowledge sources.
@@ -35,6 +35,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Refactoring: reorganize monorepo layout.
 
 ## Release Ledger
+
+## [0.110.4] - 2026-05-04
+
+Release summary: 1 bug fix.
+Tag range: `v0.110.3..v0.110.4`.
+
+### Bug Fixes
+
+- **openclaw**: keep bundled sdk out of publish deps (#625)
 
 ## [0.110.3] - 2026-05-04
 
