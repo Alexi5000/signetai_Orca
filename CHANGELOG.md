@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-09
-- Bug fixes: isolate background acpx summaries; use claude connector for Claude Code.
+- Bug fixes: add batch memory forget route parity; isolate background acpx summaries; use claude connector for Claude Code.
 
 ### 2026-05-08
 - Features: capture ACPX JSON events; add proposal maintenance loop; split stable and nightly channels.
@@ -37,6 +37,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: align exposed memory tools with harness guidance; sanitize generated hints; pass remember hints through; guide recall query shape.
 
 ## Release Ledger
+
+## [0.115.10] - 2026-05-09
+
+Release summary: 1 bug fix.
+Tag range: `v0.115.9..v0.115.10`.
+
+### Bug Fixes
+
+- **daemon-rs**: add batch memory forget route parity (#666)
 
 ## [0.115.9] - 2026-05-09
 
