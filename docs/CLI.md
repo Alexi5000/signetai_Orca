@@ -109,12 +109,17 @@ Use explicit commands for interactive flows:
 ---
 
 Builds the official Electron desktop app from an existing Signet source
-checkout. The command never clones over local work; run it from the repo root,
-set `SIGNET_SOURCE_DIR`, or pass `--repo <path>`.
+checkout. Without `--repo` or `SIGNET_SOURCE_DIR`, the command first syncs the
+managed workspace checkout at `<workspace>/signetai`, ignoring generated desktop
+build artifacts such as `surfaces/desktop/release/` so stale local artifacts do
+not block fast-forward pulls. Explicit source paths are left under user
+control; set `SIGNET_SOURCE_DIR` or pass `--repo <path>`. To build the checkout
+you are currently in, run `signet desktop install --repo .`.
 
 ```bash
 signet desktop build
 signet desktop install
+signet desktop install --repo .
 signet desktop install --repo ~/signet/signetai
 signet desktop install --skip-build
 ```
