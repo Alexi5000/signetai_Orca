@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-05-11
+- Bug fixes: disable electron-builder auto publish.
+
 ### 2026-05-10
 - Bug fixes: sync source before install; add embeddings status parity route; add packaged app updates; match feature flag response shape.
 
@@ -31,12 +34,16 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: harden startup ownership and background git defaults; keep bundled sdk out of publish deps; surface Obsidian indexing status; resolve session-end timeout under concurrent load.
 - Performance: speed up memory recall.
 
-### 2026-05-03
-- Features: add read-only Obsidian knowledge sources.
-- Performance: enable threadedExtraction by default and fix build.
-- Docs: correct stale documentation claims.
-
 ## Release Ledger
+
+## [0.115.18] - 2026-05-11
+
+Release summary: 1 bug fix.
+Tag range: `v0.115.17..v0.115.18`.
+
+### Bug Fixes
+
+- **desktop**: disable electron-builder auto publish (#676)
 
 ## [0.115.17] - 2026-05-10
 
