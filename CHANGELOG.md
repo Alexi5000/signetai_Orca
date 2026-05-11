@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-11
-- Bug fixes: disable electron-builder auto publish.
+- Bug fixes: prebuild tray before typecheck; disable electron-builder auto publish.
 
 ### 2026-05-10
 - Bug fixes: sync source before install; add embeddings status parity route; add packaged app updates; match feature flag response shape.
@@ -35,6 +35,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Performance: speed up memory recall.
 
 ## Release Ledger
+
+## [0.115.19] - 2026-05-11
+
+Release summary: 1 bug fix.
+Tag range: `v0.115.18..v0.115.19`.
+
+### Bug Fixes
+
+- **desktop**: prebuild tray before typecheck (#677)
 
 ## [0.115.18] - 2026-05-11
 
