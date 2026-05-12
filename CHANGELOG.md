@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-05-12
+- Bug fixes: verify public ghcr pulls after publish; add most-used memories parity route.
+
 ### 2026-05-11
 - Features: add header images for three new essays; add three new essays on memory architecture and sovereignty.
 - Bug fixes: enforce concrete semantic objects; refresh stale web content index; replace placeholder images with original vault artwork; prebuild tray before typecheck; disable electron-builder auto publish.
@@ -30,12 +33,17 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: wrap launchd plist runtime in /bin/bash to avoid macOS AMFI exec failure; install ClawHub skills from dashboard; respect active harnesses during sync; classify body-read timeouts correctly in daemon clients.
 - Docs: correct stale documentation claims.
 
-### 2026-05-04
-- Features: dual-mode daemon — attach if running, bundled fallback.
-- Bug fixes: harden startup ownership and background git defaults; keep bundled sdk out of publish deps; surface Obsidian indexing status; resolve session-end timeout under concurrent load.
-- Performance: speed up memory recall.
-
 ## Release Ledger
+
+## [0.116.1] - 2026-05-12
+
+Release summary: 2 bug fixes.
+Tag range: `v0.116.0..v0.116.1`.
+
+### Bug Fixes
+
+- **docker**: verify public ghcr pulls after publish (#683)
+- **daemon-rs**: add most-used memories parity route (#682)
 
 ## [0.116.0] - 2026-05-11
 
