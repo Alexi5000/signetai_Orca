@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-12
-- Bug fixes: degrade bounded git workspace operations; persist global bin paths; verify public ghcr pulls after publish; add most-used memories parity route.
+- Bug fixes: add ACPX quick setup; degrade bounded git workspace operations; persist global bin paths; verify public ghcr pulls after publish; add most-used memories parity route.
 
 ### 2026-05-11
 - Features: add header images for three new essays; add three new essays on memory architecture and sovereignty.
@@ -34,6 +34,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Docs: correct stale documentation claims.
 
 ## Release Ledger
+
+## [0.116.4] - 2026-05-12
+
+Release summary: 1 bug fix.
+Tag range: `v0.116.3..v0.116.4`.
+
+### Bug Fixes
+
+- **dashboard**: add ACPX quick setup (#688)
 
 ## [0.116.3] - 2026-05-12
 
