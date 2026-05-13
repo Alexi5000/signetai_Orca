@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-05-13
+- Bug fixes: isolate ollama setup validation tests.
+
 ### 2026-05-12
 - Features: add Bitwarden provider.
 - Bug fixes: add HOME to launchd daemon plist env; register secret exec status in tool inventory; bound and queue secret exec; normalize acpx claude setup alias; add ACPX quick setup; degrade bounded git workspace operations; persist global bin paths; verify public ghcr pulls after publish; add most-used memories parity route.
@@ -32,11 +35,16 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: gate npm publish on daemon release assets; dedupe resumed session-start hooks; stabilize Obsidian source sync; index Obsidian sources asynchronously; harden recall authorization.
 - Docs: refine ontology artifact model; add north star ontology.
 
-### 2026-05-06
-- Bug fixes: wrap launchd plist runtime in /bin/bash to avoid macOS AMFI exec failure; install ClawHub skills from dashboard; respect active harnesses during sync; classify body-read timeouts correctly in daemon clients.
-- Docs: correct stale documentation claims.
-
 ## Release Ledger
+
+## [0.117.2] - 2026-05-13
+
+Release summary: 1 bug fix.
+Tag range: `v0.117.1..v0.117.2`.
+
+### Bug Fixes
+
+- **cli**: isolate ollama setup validation tests (#701)
 
 ## [0.117.1] - 2026-05-12
 
