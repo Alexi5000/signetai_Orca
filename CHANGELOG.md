@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-13
-- Bug fixes: isolate ollama setup validation tests.
+- Bug fixes: keep dependency descriptions in sync; isolate ollama setup validation tests.
 
 ### 2026-05-12
 - Features: add Bitwarden provider.
@@ -36,6 +36,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Docs: refine ontology artifact model; add north star ontology.
 
 ## Release Ledger
+
+## [0.117.3] - 2026-05-13
+
+Release summary: 1 bug fix.
+Tag range: `v0.117.2..v0.117.3`.
+
+### Bug Fixes
+
+- **pipeline**: keep dependency descriptions in sync (#702)
 
 ## [0.117.2] - 2026-05-13
 
