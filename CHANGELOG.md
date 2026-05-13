@@ -7,6 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-13
+- Features: daily reflections with dashboard card.
 - Bug fixes: keep dependency descriptions in sync; isolate ollama setup validation tests.
 
 ### 2026-05-12
@@ -36,6 +37,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Docs: refine ontology artifact model; add north star ontology.
 
 ## Release Ledger
+
+## [0.118.0] - 2026-05-13
+
+Release summary: 1 feature.
+Tag range: `v0.117.3..v0.118.0`.
+
+### Features
+
+- **daemon**: daily reflections with dashboard card (#699)
 
 ## [0.117.3] - 2026-05-13
 
