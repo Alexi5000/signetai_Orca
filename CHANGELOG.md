@@ -8,6 +8,7 @@ Surface summary of the most recent release dates. See the release ledger below f
 
 ### 2026-05-15
 - Features: make constellation graph usable.
+- Bug fixes: surface unhealthy diagnostics domains.
 
 ### 2026-05-14
 - Bug fixes: surface daemon start journal diagnostics; clean up detached codex acp processes; reap acpx process trees.
@@ -33,6 +34,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: hide deleted rows from list endpoint; add auth whoami parity route; disable embeddings in mutation api route tests; add batch memory forget route parity; isolate background acpx summaries; use claude connector for Claude Code.
 
 ## Release Ledger
+
+## [0.119.1] - 2026-05-15
+
+Release summary: 1 bug fix.
+Tag range: `v0.119.0..v0.119.1`.
+
+### Bug Fixes
+
+- **daemon**: surface unhealthy diagnostics domains (#711)
 
 ## [0.119.0] - 2026-05-15
 
