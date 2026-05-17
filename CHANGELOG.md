@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-05-17
+- Features: add epistemic assertions; add safe entity merge planning.
+
 ### 2026-05-16
 - Features: add audited control plane.
 
@@ -30,10 +33,17 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Features: add header images for three new essays; add three new essays on memory architecture and sovereignty.
 - Bug fixes: enforce concrete semantic objects; refresh stale web content index; replace placeholder images with original vault artwork; prebuild tray before typecheck; disable electron-builder auto publish.
 
-### 2026-05-10
-- Bug fixes: sync source before install; add embeddings status parity route; add packaged app updates; match feature flag response shape.
-
 ## Release Ledger
+
+## [0.121.0] - 2026-05-17
+
+Release summary: 2 features.
+Tag range: `v0.120.0..v0.121.0`.
+
+### Features
+
+- **ontology**: add epistemic assertions (#717)
+- **ontology**: add safe entity merge planning (#719)
 
 ## [0.120.0] - 2026-05-16
 
