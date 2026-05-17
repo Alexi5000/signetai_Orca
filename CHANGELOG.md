@@ -35,6 +35,13 @@ Surface summary of the most recent release dates. See the release ledger below f
 
 ## Release Ledger
 
+## [0.121.1] - 2026-05-17
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.121.0..v0.121.1`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
 ## [0.121.0] - 2026-05-17
 
 Release summary: 2 features.
