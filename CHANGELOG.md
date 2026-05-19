@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-19
-- Bug fixes: install bun in bundle release job.
+- Bug fixes: minimize bundle release smoke workspace; install bun in bundle release job.
 
 ### 2026-05-18
 - Bug fixes: load updater through cjs interop.
@@ -31,6 +31,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: prune migration backups for disk headroom; use checked LLM model catalog; support latest memory provider lifecycle; generate Daily Brief on dashboard open; keep dependency descriptions in sync; isolate ollama setup validation tests.
 
 ## Release Ledger
+
+## [0.123.5] - 2026-05-19
+
+Release summary: 1 bug fix.
+Tag range: `v0.123.4..v0.123.5`.
+
+### Bug Fixes
+
+- **ci**: minimize bundle release smoke workspace (#730)
 
 ## [0.123.4] - 2026-05-19
 
