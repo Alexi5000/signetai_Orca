@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-05-19
+- Bug fixes: install bun in bundle release job.
+
 ### 2026-05-18
 - Bug fixes: load updater through cjs interop.
 
@@ -27,13 +30,16 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Features: daily reflections with dashboard card.
 - Bug fixes: prune migration backups for disk headroom; use checked LLM model catalog; support latest memory provider lifecycle; generate Daily Brief on dashboard open; keep dependency descriptions in sync; isolate ollama setup validation tests.
 
-### 2026-05-12
-- Features: add Bitwarden provider.
-- Bug fixes: add HOME to launchd daemon plist env; register secret exec status in tool inventory; bound and queue secret exec; normalize acpx claude setup alias; add ACPX quick setup; degrade bounded git workspace operations; persist global bin paths; verify public ghcr pulls after publish; add most-used memories parity route.
-- Refactoring: add configurable identity presets.
-- Docs: correct stale documentation claims.
-
 ## Release Ledger
+
+## [0.123.4] - 2026-05-19
+
+Release summary: 1 bug fix.
+Tag range: `v0.123.3..v0.123.4`.
+
+### Bug Fixes
+
+- **ci**: install bun in bundle release job (#729)
 
 ## [0.123.3] - 2026-05-18
 
