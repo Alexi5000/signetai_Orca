@@ -1,0 +1,674 @@
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { RouteRequest, RouterResult } from "@signet/core";
+import { type AggregateInferenceRouter, InvalidAggregateRecallBudgetError, aggregateRecall } from "./aggregate-recall";
+import { normalizeAndHashContent } from "./content-normalization";
+import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
+import { loadMemoryConfig } from "./memory-config";
+import type { RecallParams, RecallResponse, RecallResult } from "./memory-search";
+import { txIngestEnvelope } from "./transactions";
+
+function row(
+	id: string,
+	content: string,
+	opts: { readonly visibility?: string | null; readonly scope?: string | null } = {},
+): RecallResult {
+	const now = "2026-05-20T12:00:00.000Z";
+	return {
+		id,
+		content,
+		content_length: content.length,
+		truncated: false,
+		score: 0.9,
+		source: "hybrid",
+		type: "semantic",
+		tags: null,
+		pinned: false,
+		importance: 0.7,
+		who: "test",
+		project: null,
+		created_at: now,
+		visibility: "global",
+		scope: null,
+		...opts,
+	};
+}
+
+function response(query: string, results: readonly RecallResult[]): RecallResponse {
+	return {
+		results: [...results],
+		query,
+		method: "hybrid",
+		meta: {
+			totalReturned: results.length,
+			hasSupplementary: false,
+			noHits: results.length === 0,
+			timings: { totalMs: 0, stages: [] },
+		},
+	};
+}
+
+function aggregateKeyForTest(input: {
+	readonly agentId: string;
+	readonly project: string | null;
+	readonly query: string;
+	readonly budget: "small" | "medium" | "large";
+	readonly sourceMemoryIds: readonly string[];
+}): string {
+	const hash = createHash("sha256")
+		.update(input.agentId)
+		.update("\0")
+		.update(input.project ?? "")
+		.update("\0")
+		.update(input.query.trim().replace(/\s+/g, " ").toLowerCase())
+		.update("\0")
+		.update(input.budget)
+		.update("\0")
+		.update([...input.sourceMemoryIds].sort().join("\0"))
+		.digest("hex");
+	return `aggregate-recall:${hash}`;
+}
+
+class StaticRouter implements AggregateInferenceRouter {
+	calls: RouteRequest[] = [];
+
+	async execute(request: RouteRequest): Promise<RouterResult<{ readonly text: string }>> {
+		this.calls.push(request);
+		return {
+			ok: true,
+			value: {
+				text:
+					this.calls.length === 1
+						? JSON.stringify({ queries: ["follow up one", "follow up two"] })
+						: "Aggregate answer from memory evidence.",
+			},
+		};
+	}
+}
+
+function quietLogger(): { readonly warn: ReturnType<typeof mock> } {
+	return {
+		warn: mock((_category: string, _message: string, _data?: Record<string, unknown>) => {}),
+	};
+}
+
+describe("aggregateRecall", () => {
+	let dir = "";
+	let prevSignetPath: string | undefined;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "signet-aggregate-recall-"));
+		mkdirSync(join(dir, "memory"), { recursive: true });
+		writeFileSync(join(dir, "agent.yaml"), "name: AggregateRecallTest\n");
+		prevSignetPath = process.env.SIGNET_PATH;
+		process.env.SIGNET_PATH = dir;
+		initDbAccessor(join(dir, "memory", "memories.db"));
+	});
+
+	afterEach(() => {
+		closeDbAccessor();
+		if (prevSignetPath === undefined) {
+			Reflect.deleteProperty(process.env as Record<string, string | undefined>, "SIGNET_PATH");
+		} else {
+			process.env.SIGNET_PATH = prevSignetPath;
+		}
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("rejects invalid aggregate budgets instead of falling back to small", async () => {
+		await expect(
+			aggregateRecall(
+				{
+					query: "what happened",
+					aggregate: true,
+					aggregateBudget: "maximum",
+				} as unknown as RecallParams,
+				loadMemoryConfig(dir),
+				{
+					router: new StaticRouter(),
+					embedFn: async () => null,
+					logger: quietLogger(),
+					hybridRecall: async () => response("what happened", []),
+				},
+			),
+		).rejects.toBeInstanceOf(InvalidAggregateRecallBudgetError);
+	});
+
+	it("synthesizes, saves one normal memory, and links evidence sources", async () => {
+		const router = new StaticRouter();
+		const calls: string[] = [];
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				aggregateBudget: "small",
+				agentId: "agent-a",
+				readPolicy: "isolated",
+			},
+			loadMemoryConfig(dir),
+			{
+				router,
+				embedFn: async () => null,
+				logger: quietLogger(),
+				now: () => new Date("2026-05-20T12:00:00.000Z"),
+				idFactory: () => "aggregate-1",
+				hybridRecall: async (params: RecallParams) => {
+					calls.push(params.query);
+					if (params.query === "follow up one") return response(params.query, [row("mem-2", "Second evidence")]);
+					if (params.query === "follow up two") return response(params.query, [row("mem-3", "Third evidence")]);
+					return response(params.query, [row("mem-1", "First evidence")]);
+				},
+			},
+		);
+
+		expect(calls).toEqual(["what happened", "follow up one", "follow up two"]);
+		expect(router.calls.map((call) => call.operation)).toEqual(["tool_planning", "tool_planning"]);
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0].id).toBe("aggregate-1");
+		expect(result.results[0].source).toBe("aggregate-recall");
+		expect(result.aggregate).toMatchObject({
+			savedMemoryId: "aggregate-1",
+			saved: true,
+			deduped: false,
+			sourceMemoryIds: ["mem-1", "mem-2", "mem-3"],
+			stoppedReason: "complete",
+		});
+
+		const saved = getDbAccessor().withReadDb((db) =>
+			db.prepare("SELECT source_type, idempotency_key, tags, who, type FROM memories WHERE id = ?").get("aggregate-1"),
+		) as Record<string, unknown>;
+		expect(saved.source_type).toBe("aggregate-recall");
+		expect(saved.idempotency_key).toStartWith("aggregate-recall:");
+		expect(saved.tags).toBe("aggregate,recall");
+		expect(saved.who).toBe("signet");
+		expect(saved.type).toBe("semantic");
+
+		const links = getDbAccessor().withReadDb((db) =>
+			db
+				.prepare(
+					"SELECT source_memory_id FROM aggregate_memory_sources WHERE aggregate_memory_id = ? ORDER BY source_memory_id",
+				)
+				.all("aggregate-1"),
+		) as Array<{ source_memory_id: string }>;
+		expect(links.map((link) => link.source_memory_id)).toEqual(["mem-1", "mem-2", "mem-3"]);
+	});
+
+	it("dedupes repeated aggregate runs for the same evidence set", async () => {
+		const params: RecallParams = {
+			query: "what happened",
+			aggregate: true,
+			agentId: "agent-a",
+			readPolicy: "isolated",
+		};
+		const deps = {
+			router: new StaticRouter(),
+			embedFn: async () => null,
+			logger: quietLogger(),
+			now: () => new Date("2026-05-20T12:00:00.000Z"),
+			idFactory: () => "aggregate-1",
+			hybridRecall: async (input: RecallParams) => response(input.query, [row("mem-1", "First evidence")]),
+		};
+
+		const first = await aggregateRecall(params, loadMemoryConfig(dir), deps);
+		const second = await aggregateRecall(params, loadMemoryConfig(dir), {
+			...deps,
+			router: new StaticRouter(),
+			idFactory: () => "aggregate-2",
+		});
+
+		expect(first.results[0].id).toBe("aggregate-1");
+		expect(second.results[0].id).toBe("aggregate-1");
+		expect(second.aggregate?.deduped).toBe(true);
+	});
+
+	it("logs when a saved aggregate memory cannot be embedded", async () => {
+		const log = quietLogger();
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				logger: log,
+				embedFn: async () => {
+					throw new Error("embedding provider unavailable");
+				},
+				now: () => new Date("2026-05-20T12:00:00.000Z"),
+				idFactory: () => "aggregate-embed-fail",
+				hybridRecall: async (input: RecallParams) => response(input.query, [row("mem-1", "First evidence")]),
+			},
+		);
+
+		expect(result.aggregate).toMatchObject({
+			savedMemoryId: "aggregate-embed-fail",
+			saved: true,
+			stoppedReason: "complete",
+		});
+		expect(log.warn).toHaveBeenCalledTimes(1);
+		expect(log.warn).toHaveBeenCalledWith(
+			"memory",
+			"Aggregate recall memory saved without embedding",
+			expect.objectContaining({
+				memoryId: "aggregate-embed-fail",
+				agentId: "agent-a",
+				reason: "embedding_exception",
+				errorMessage: "embedding provider unavailable",
+			}),
+		);
+	});
+
+	it("returns an unsaved aggregate answer when saving is disabled", async () => {
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				saveAggregate: false,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				embedFn: async () => null,
+				hybridRecall: async (input: RecallParams) => response(input.query, [row("mem-1", "First evidence")]),
+			},
+		);
+
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0].content).toBe("Aggregate answer from memory evidence.");
+		expect(result.aggregate?.saved).toBe(false);
+		expect(result.aggregate?.savedMemoryId).toBeNull();
+		const count = getDbAccessor().withReadDb((db) => db.prepare("SELECT COUNT(*) AS n FROM memories").get()) as {
+			n: number;
+		};
+		expect(count.n).toBe(0);
+	});
+
+	it("does not save global aggregate memories from private evidence", async () => {
+		const result = await aggregateRecall(
+			{
+				query: "private history",
+				aggregate: true,
+				agentId: "agent-private",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				embedFn: async () => null,
+				logger: quietLogger(),
+				idFactory: () => "aggregate-private",
+				hybridRecall: async (params: RecallParams) =>
+					response(params.query, [row("mem-private", "Private evidence", { visibility: "private" })]),
+			},
+		);
+
+		expect(result.results[0].id).toStartWith("aggregate-recall:");
+		expect(result.aggregate).toMatchObject({
+			savedMemoryId: null,
+			saved: false,
+			deduped: false,
+			stoppedReason: "complete",
+		});
+		const count = getDbAccessor().withReadDb(
+			(db) => db.prepare("SELECT COUNT(*) AS n FROM memories WHERE id = ?").get("aggregate-private") as { n: number },
+		);
+		expect(count.n).toBe(0);
+	});
+
+	it("does not save aggregate memories when evidence lacks explicit global scope metadata", async () => {
+		const result = await aggregateRecall(
+			{
+				query: "legacy history",
+				aggregate: true,
+				agentId: "agent-legacy",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				embedFn: async () => null,
+				logger: quietLogger(),
+				idFactory: () => "aggregate-legacy",
+				hybridRecall: async (params: RecallParams) =>
+					response(params.query, [
+						row("mem-legacy", "Legacy evidence without scope metadata", {
+							visibility: undefined,
+							scope: undefined,
+						}),
+					]),
+			},
+		);
+
+		expect(result.results[0].id).toStartWith("aggregate-recall:");
+		expect(result.aggregate).toMatchObject({
+			savedMemoryId: null,
+			saved: false,
+			deduped: false,
+			stoppedReason: "complete",
+		});
+		const count = getDbAccessor().withReadDb(
+			(db) => db.prepare("SELECT COUNT(*) AS n FROM memories WHERE id = ?").get("aggregate-legacy") as { n: number },
+		);
+		expect(count.n).toBe(0);
+	});
+
+	it("does not link synthesized recall rows as aggregate memory sources", async () => {
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				agentId: "agent-a",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				embedFn: async () => null,
+				logger: quietLogger(),
+				now: () => new Date("2026-05-20T12:00:00.000Z"),
+				idFactory: () => "aggregate-sources",
+				hybridRecall: async (params: RecallParams) =>
+					response(params.query, [
+						{
+							...row("summary:abc", "Synthetic summary should not be provenance"),
+							source: "llm_summary",
+							supplementary: true,
+						},
+						row("mem-1", "Real evidence"),
+					]),
+			},
+		);
+
+		expect(result.aggregate?.sourceMemoryIds).toEqual(["mem-1"]);
+		const links = getDbAccessor().withReadDb(
+			(db) =>
+				db
+					.prepare(
+						"SELECT source_memory_id FROM aggregate_memory_sources WHERE aggregate_memory_id = ? ORDER BY source_memory_id",
+					)
+					.all("aggregate-sources") as Array<{ source_memory_id: string }>,
+		);
+		expect(links.map((link) => link.source_memory_id)).toEqual(["mem-1"]);
+	});
+
+	it("returns unsaved aggregate when content hash conflicts with an inaccessible memory", async () => {
+		const answer = "Aggregate answer from memory evidence.";
+		const normalized = normalizeAndHashContent(answer);
+		const now = "2026-05-20T12:00:00.000Z";
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memories (
+					id, content, normalized_content, content_hash, who, project, type,
+					agent_id, visibility, created_at, updated_at, updated_by
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"private-duplicate",
+				answer,
+				normalized.normalizedContent || normalized.hashBasis,
+				normalized.contentHash,
+				"test",
+				"other-project",
+				"semantic",
+				"agent-a",
+				"private",
+				now,
+				now,
+				"test",
+			);
+		});
+
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				project: "current-project",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				embedFn: async () => null,
+				idFactory: () => "aggregate-conflict",
+				hybridRecall: async (input: RecallParams) => response(input.query, [row("mem-1", "First evidence")]),
+			},
+		);
+
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0].id).toStartWith("aggregate-recall:");
+		expect(result.aggregate).toMatchObject({
+			savedMemoryId: null,
+			saved: false,
+			deduped: true,
+			stoppedReason: "complete",
+		});
+		const aggregateRows = getDbAccessor().withReadDb((db) =>
+			db.prepare("SELECT COUNT(*) AS n FROM memories WHERE id = ?").get("aggregate-conflict"),
+		) as { n: number };
+		expect(aggregateRows.n).toBe(0);
+	});
+
+	it("does not reuse visible ordinary memories as saved aggregate dedupes", async () => {
+		const answer = "Aggregate answer from memory evidence.";
+		const normalized = normalizeAndHashContent(answer);
+		const now = "2026-05-20T12:00:00.000Z";
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memories (
+					id, content, normalized_content, content_hash, who, project, type,
+					agent_id, visibility, source_type, created_at, updated_at, updated_by
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"ordinary-duplicate",
+				answer,
+				normalized.normalizedContent || normalized.hashBasis,
+				normalized.contentHash,
+				"test",
+				"current-project",
+				"semantic",
+				"agent-a",
+				"global",
+				"manual",
+				now,
+				now,
+				"test",
+			);
+		});
+
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				project: "current-project",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				embedFn: async () => null,
+				idFactory: () => "aggregate-visible-conflict",
+				hybridRecall: async (input: RecallParams) => response(input.query, [row("mem-1", "First evidence")]),
+			},
+		);
+
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0].id).toStartWith("aggregate-recall:");
+		expect(result.results[0].id).not.toBe("ordinary-duplicate");
+		expect(result.aggregate).toMatchObject({
+			savedMemoryId: null,
+			saved: false,
+			deduped: true,
+			stoppedReason: "complete",
+		});
+		const rows = getDbAccessor().withReadDb((db) =>
+			db
+				.prepare(
+					`SELECT
+						(SELECT COUNT(*) FROM memories WHERE id = 'aggregate-visible-conflict') AS aggregate_count,
+						(SELECT COUNT(*) FROM aggregate_memory_sources WHERE aggregate_memory_id = 'ordinary-duplicate') AS link_count`,
+				)
+				.get(),
+		) as { aggregate_count: number; link_count: number };
+		expect(rows.aggregate_count).toBe(0);
+		expect(rows.link_count).toBe(0);
+	});
+
+	it("does not reuse ordinary memories with matching aggregate idempotency keys", async () => {
+		const content = "Ordinary memory with caller-provided idempotency.";
+		const normalized = normalizeAndHashContent(content);
+		const now = "2026-05-20T12:00:00.000Z";
+		const key = aggregateKeyForTest({
+			agentId: "agent-a",
+			project: "current-project",
+			query: "what happened",
+			budget: "small",
+			sourceMemoryIds: ["mem-1"],
+		});
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memories (
+					id, content, normalized_content, content_hash, idempotency_key,
+					who, project, type, agent_id, visibility, source_type,
+					created_at, updated_at, updated_by
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			).run(
+				"ordinary-idempotency-match",
+				content,
+				normalized.normalizedContent || normalized.hashBasis,
+				normalized.contentHash,
+				key,
+				"test",
+				"current-project",
+				"semantic",
+				"agent-a",
+				"global",
+				"manual",
+				now,
+				now,
+				"test",
+			);
+		});
+
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				project: "current-project",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				embedFn: async () => null,
+				idFactory: () => "aggregate-idempotency-safe",
+				hybridRecall: async (input: RecallParams) => response(input.query, [row("mem-1", "First evidence")]),
+			},
+		);
+
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0].id).toStartWith("aggregate-recall:");
+		expect(result.results[0].id).not.toBe("ordinary-idempotency-match");
+		expect(result.aggregate).toMatchObject({
+			savedMemoryId: null,
+			saved: false,
+			deduped: true,
+			stoppedReason: "complete",
+		});
+		const rows = getDbAccessor().withReadDb((db) =>
+			db
+				.prepare(
+					`SELECT
+						(SELECT COUNT(*) FROM aggregate_memory_sources WHERE aggregate_memory_id = 'ordinary-idempotency-match') AS ordinary_link_count,
+						(SELECT COUNT(*) FROM memories WHERE id = 'aggregate-idempotency-safe') AS aggregate_count,
+						(SELECT COUNT(*) FROM aggregate_memory_sources WHERE aggregate_memory_id = 'aggregate-idempotency-safe') AS aggregate_link_count`,
+				)
+				.get(),
+		) as { ordinary_link_count: number; aggregate_count: number; aggregate_link_count: number };
+		expect(rows.ordinary_link_count).toBe(0);
+		expect(rows.aggregate_count).toBe(0);
+		expect(rows.aggregate_link_count).toBe(0);
+	});
+
+	it("dedupes when a concurrent aggregate insert wins the content-hash race", async () => {
+		let raced = false;
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				project: "current-project",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: new StaticRouter(),
+				embedFn: async () => null,
+				idFactory: () => "aggregate-loser",
+				hybridRecall: async (input: RecallParams) => response(input.query, [row("mem-1", "First evidence")]),
+				ingestEnvelope: (db, mem) => {
+					if (!raced) {
+						raced = true;
+						txIngestEnvelope(db, {
+							...mem,
+							id: "aggregate-race-winner",
+						});
+					}
+					return txIngestEnvelope(db, mem);
+				},
+			},
+		);
+
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0].id).toBe("aggregate-race-winner");
+		expect(result.aggregate).toMatchObject({
+			savedMemoryId: "aggregate-race-winner",
+			saved: true,
+			deduped: true,
+			stoppedReason: "complete",
+		});
+		const rows = getDbAccessor().withReadDb((db) =>
+			db
+				.prepare(
+					`SELECT
+						(SELECT COUNT(*) FROM memories WHERE id = 'aggregate-loser') AS loser_count,
+						(SELECT COUNT(*) FROM aggregate_memory_sources WHERE aggregate_memory_id = 'aggregate-race-winner') AS link_count`,
+				)
+				.get(),
+		) as { loser_count: number; link_count: number };
+		expect(rows.loser_count).toBe(0);
+		expect(rows.link_count).toBe(1);
+	});
+
+	it("returns structured no-hit metadata when synthesis is unavailable", async () => {
+		const result = await aggregateRecall(
+			{
+				query: "what happened",
+				aggregate: true,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+			},
+			loadMemoryConfig(dir),
+			{
+				router: null,
+				embedFn: async () => null,
+				hybridRecall: async (input: RecallParams) => response(input.query, [row("mem-1", "First evidence")]),
+			},
+		);
+
+		expect(result.results).toEqual([]);
+		expect(result.meta.noHits).toBe(true);
+		expect(result.aggregate).toMatchObject({
+			saved: false,
+			savedMemoryId: null,
+			stoppedReason: "router_unavailable",
+			sourceMemoryIds: ["mem-1"],
+		});
+	});
+});

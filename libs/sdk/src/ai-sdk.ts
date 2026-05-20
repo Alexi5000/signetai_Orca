@@ -24,6 +24,9 @@ export async function memoryTools(client: SignetClient) {
 				query: z.string().describe("Search query"),
 				limit: z.number().optional().describe("Max results"),
 				type: z.string().optional().describe("Memory type filter"),
+				aggregate: z.boolean().optional().describe("Synthesize an aggregate answer from recall evidence"),
+				aggregateBudget: z.enum(["small", "medium", "large"]).optional().describe("Aggregate recall budget"),
+				saveAggregate: z.boolean().optional().describe("Save aggregate answers as memories"),
 				sessionKey: z.string().optional().describe("Session key for context dedupe"),
 				agentId: z.string().optional().describe("Agent ID for scoped recall"),
 				includeRecalled: z.boolean().optional().describe("Include rows already recalled in this context"),
@@ -32,6 +35,9 @@ export async function memoryTools(client: SignetClient) {
 				query,
 				limit,
 				type,
+				aggregate,
+				aggregateBudget,
+				saveAggregate,
 				sessionKey,
 				agentId,
 				includeRecalled,
@@ -39,11 +45,23 @@ export async function memoryTools(client: SignetClient) {
 				query: string;
 				limit?: number;
 				type?: string;
+				aggregate?: boolean;
+				aggregateBudget?: "small" | "medium" | "large";
+				saveAggregate?: boolean;
 				sessionKey?: string;
 				agentId?: string;
 				includeRecalled?: boolean;
 			}) => {
-				return client.recall(query, { limit, type, sessionKey, agentId, includeRecalled });
+				return client.recall(query, {
+					limit,
+					type,
+					aggregate,
+					aggregateBudget,
+					saveAggregate,
+					sessionKey,
+					agentId,
+					includeRecalled,
+				});
 			},
 		},
 

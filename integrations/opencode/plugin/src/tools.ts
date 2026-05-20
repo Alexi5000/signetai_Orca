@@ -25,16 +25,26 @@ async function searchMemory(
 		readonly limit?: number;
 		readonly type?: string;
 		readonly min_score?: number;
+		readonly aggregate?: boolean;
+		readonly aggregate_budget?: string;
+		readonly save_aggregate?: boolean;
 		readonly session_key?: string;
 		readonly agent_id?: string;
 		readonly include_recalled?: boolean;
 	},
 ): Promise<string> {
+	const aggregateBudget =
+		args.aggregate_budget === "medium" || args.aggregate_budget === "large" || args.aggregate_budget === "small"
+			? args.aggregate_budget
+			: undefined;
 	const result = await client.post<unknown>(
 		"/api/memory/recall",
 		buildRecallRequestBody(args.query, {
 			limit: args.limit ?? 10,
 			type: args.type,
+			aggregate: args.aggregate,
+			aggregate_budget: aggregateBudget,
+			save_aggregate: args.save_aggregate,
 			sessionKey: args.session_key,
 			agentId: args.agent_id,
 			includeRecalled: args.include_recalled,
@@ -112,6 +122,9 @@ export function createTools(client: DaemonClient): Record<string, ReturnType<typ
 				limit: tool.schema.number().optional().describe("Max results to return (default 10)"),
 				type: tool.schema.string().optional().describe("Filter by memory type"),
 				min_score: tool.schema.number().optional().describe("Minimum relevance score threshold"),
+				aggregate: tool.schema.boolean().optional().describe("Synthesize an aggregate answer from recall evidence"),
+				aggregate_budget: tool.schema.string().optional().describe("Aggregate recall budget: small, medium, or large"),
+				save_aggregate: tool.schema.boolean().optional().describe("Save aggregate answers as memories"),
 				session_key: tool.schema.string().optional().describe("Session key for per-context recall dedupe"),
 				agent_id: tool.schema.string().optional().describe("Agent ID for scoped recall"),
 				include_recalled: tool.schema.boolean().optional().describe("Include rows already recalled in this context"),

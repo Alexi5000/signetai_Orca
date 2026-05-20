@@ -650,6 +650,9 @@ export async function memoryRecall(
 		limit?: number;
 		type?: string;
 		minScore?: number;
+		aggregate?: boolean;
+		aggregateBudget?: "small" | "medium" | "large";
+		saveAggregate?: boolean;
 		sessionKey?: string;
 		agentId?: string;
 		includeRecalled?: boolean;
@@ -661,6 +664,9 @@ export async function memoryRecall(
 		body: buildRecallRequestBody(query, {
 			limit: options.limit ?? 10,
 			type: options.type,
+			aggregate: options.aggregate,
+			aggregateBudget: options.aggregateBudget,
+			saveAggregate: options.saveAggregate,
 			sessionKey: options.sessionKey,
 			agentId: options.agentId,
 			includeRecalled: options.includeRecalled,
@@ -1583,6 +1589,19 @@ const signetPlugin = {
 								description: "Minimum relevance score threshold",
 							}),
 						),
+						aggregate: Type.Optional(
+							Type.Boolean({
+								description: "Synthesize an aggregate answer from recall evidence",
+							}),
+						),
+						aggregate_budget: Type.Optional(
+							Type.Union([Type.Literal("small"), Type.Literal("medium"), Type.Literal("large")]),
+						),
+						save_aggregate: Type.Optional(
+							Type.Boolean({
+								description: "Save aggregate answers as memories",
+							}),
+						),
 						session_key: Type.Optional(
 							Type.String({
 								description: "Session key for per-context recall dedupe",
@@ -1600,11 +1619,25 @@ const signetPlugin = {
 						),
 					}),
 					async execute(_toolCallId, params) {
-						const { query, limit, type, min_score, session_key, agent_id, include_recalled } = params as {
+						const {
+							query,
+							limit,
+							type,
+							min_score,
+							aggregate,
+							aggregate_budget,
+							save_aggregate,
+							session_key,
+							agent_id,
+							include_recalled,
+						} = params as {
 							query: string;
 							limit?: number;
 							type?: string;
 							min_score?: number;
+							aggregate?: boolean;
+							aggregate_budget?: "small" | "medium" | "large";
+							save_aggregate?: boolean;
 							session_key?: string;
 							agent_id?: string;
 							include_recalled?: boolean;
@@ -1615,6 +1648,9 @@ const signetPlugin = {
 								limit,
 								type,
 								minScore: min_score,
+								aggregate,
+								aggregateBudget: aggregate_budget,
+								saveAggregate: save_aggregate,
 								sessionKey: session_key,
 								agentId: agent_id,
 								includeRecalled: include_recalled,

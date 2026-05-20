@@ -79,6 +79,7 @@ import { up as ontologyControlPlaneState } from "./070-ontology-control-plane-st
 import { up as epistemicAssertions } from "./071-epistemic-assertions";
 import { up as agentScopedIdempotencyKey } from "./072-agent-scoped-idempotency-key";
 import { up as recallContextDedupe } from "./073-recall-context-dedupe";
+import { up as aggregateMemoryLinks } from "./074-aggregate-memory-links";
 
 // -- Public interface consumed by Database.init() --
 
@@ -691,6 +692,14 @@ export const MIGRATIONS: readonly Migration[] = [
 		up: recallContextDedupe,
 		artifacts: {
 			tables: ["session_context_epochs", "session_recall_events"],
+		},
+	},
+	{
+		version: 74,
+		name: "aggregate-memory-links",
+		up: aggregateMemoryLinks,
+		artifacts: {
+			tables: ["aggregate_memory_sources"],
 		},
 	},
 ];

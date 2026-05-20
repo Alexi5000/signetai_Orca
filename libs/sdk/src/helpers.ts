@@ -159,6 +159,9 @@ export class SignetClientHelpers {
 			readonly expand?: boolean;
 			readonly minScore?: number;
 			readonly agentId?: string;
+			readonly aggregate?: boolean;
+			readonly aggregateBudget?: "small" | "medium" | "large";
+			readonly saveAggregate?: boolean;
 			readonly sessionKey?: string;
 			readonly includeRecalled?: boolean;
 		},

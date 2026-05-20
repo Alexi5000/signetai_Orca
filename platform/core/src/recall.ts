@@ -34,11 +34,24 @@ export interface RecallMeta {
 	};
 }
 
+export type AggregateRecallBudget = "small" | "medium" | "large";
+
+export interface AggregateRecallMeta {
+	readonly savedMemoryId: string | null;
+	readonly saved: boolean;
+	readonly deduped: boolean;
+	readonly budget: AggregateRecallBudget;
+	readonly queries: readonly string[];
+	readonly sourceMemoryIds: readonly string[];
+	readonly stoppedReason: "complete" | "no_evidence" | "router_unavailable" | "synthesis_failed";
+}
+
 export interface RecallPayload {
 	readonly query?: string;
 	readonly method?: string;
 	readonly results?: ReadonlyArray<RecallRow>;
 	readonly meta?: Partial<RecallMeta>;
+	readonly aggregate?: AggregateRecallMeta;
 	readonly memories?: ReadonlyArray<RecallRow>;
 	readonly count?: number;
 	readonly message?: string;
@@ -66,6 +79,11 @@ export interface RecallRequestOptions {
 	readonly sessionKey?: string;
 	readonly includeRecalled?: boolean;
 	readonly scope?: "global" | "agent" | "session";
+	readonly aggregate?: boolean;
+	readonly aggregateBudget?: AggregateRecallBudget;
+	readonly aggregate_budget?: AggregateRecallBudget;
+	readonly saveAggregate?: boolean;
+	readonly save_aggregate?: boolean;
 }
 
 export interface RememberRequestOptions {
@@ -265,6 +283,14 @@ export function buildRecallRequestBody(query: string, options: RecallRequestOpti
 		sessionKey: options.sessionKey,
 		includeRecalled: options.includeRecalled === true ? true : undefined,
 		scope: options.scope,
+		aggregate: options.aggregate === true ? true : undefined,
+		aggregateBudget: options.aggregateBudget ?? options.aggregate_budget,
+		saveAggregate:
+			options.saveAggregate === false || options.save_aggregate === false
+				? false
+				: options.saveAggregate === true || options.save_aggregate === true
+					? true
+					: undefined,
 	});
 }
 

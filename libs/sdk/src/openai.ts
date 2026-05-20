@@ -30,6 +30,13 @@ export function memoryToolDefinitions(): readonly OpenAIToolDefinition[] {
 						query: { type: "string", description: "Search query" },
 						limit: { type: "number", description: "Max results" },
 						type: { type: "string", description: "Memory type filter" },
+						aggregate: { type: "boolean", description: "Synthesize an aggregate answer from recall evidence" },
+						aggregateBudget: {
+							type: "string",
+							enum: ["small", "medium", "large"],
+							description: "Aggregate recall budget",
+						},
+						saveAggregate: { type: "boolean", description: "Save aggregate answers as memories" },
 						sessionKey: { type: "string", description: "Session key for context dedupe" },
 						agentId: { type: "string", description: "Agent ID for scoped recall" },
 						includeRecalled: { type: "boolean", description: "Include rows already recalled in this context" },
@@ -124,6 +131,22 @@ function optionalNumber(args: Record<string, unknown>, key: string): number | un
 	return value;
 }
 
+function optionalBoolean(args: Record<string, unknown>, key: string): boolean | undefined {
+	const value = args[key];
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "boolean") {
+		throw new SignetError(`Expected boolean for "${key}", got ${typeof value}`, "invalid_args");
+	}
+	return value;
+}
+
+function optionalAggregateBudget(args: Record<string, unknown>): "small" | "medium" | "large" | undefined {
+	const value = optionalString(args, "aggregateBudget");
+	if (value === undefined) return undefined;
+	if (value === "small" || value === "medium" || value === "large") return value;
+	throw new SignetError("Expected aggregateBudget to be small, medium, or large", "invalid_args");
+}
+
 export async function executeMemoryTool(
 	client: SignetClient,
 	toolName: string,
@@ -134,6 +157,9 @@ export async function executeMemoryTool(
 			return client.recall(requireString(args, "query"), {
 				limit: optionalNumber(args, "limit"),
 				type: optionalString(args, "type"),
+				aggregate: optionalBoolean(args, "aggregate"),
+				aggregateBudget: optionalAggregateBudget(args),
+				saveAggregate: optionalBoolean(args, "saveAggregate"),
 				...(optionalString(args, "sessionKey") ? { sessionKey: optionalString(args, "sessionKey") } : {}),
 				...(optionalString(args, "agentId") ? { agentId: optionalString(args, "agentId") } : {}),
 				...(args.includeRecalled === true ? { includeRecalled: true } : {}),

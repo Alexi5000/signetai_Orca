@@ -124,7 +124,10 @@ mock.module("./db-accessor", () => ({
 
 mock.module("./logger", () => ({
 	logger: {
+		debug: () => undefined,
+		info: () => undefined,
 		warn: () => undefined,
+		error: () => undefined,
 	},
 }));
 

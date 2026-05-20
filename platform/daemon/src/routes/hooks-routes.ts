@@ -4,6 +4,7 @@ import { emptyHookRecallResponse, withHookRecallCompat } from "@signet/core";
 import type { Context } from "hono";
 import type { Hono } from "hono";
 import { getAgentScope, resolveAgentId } from "../agent-id";
+import { aggregateRecall, parseAggregateRecallBudget, readAggregateRecallBudgetInput } from "../aggregate-recall";
 import { requirePermission, requireRateLimit } from "../auth";
 import {
 	type AgentMessage,
@@ -38,6 +39,7 @@ import {
 	resetSessionStartDedupe,
 	writeMemoryMd,
 } from "../hooks.js";
+import { getInferenceRouterOrNull } from "../inference-router";
 import { logger } from "../logger";
 import { loadMemoryConfig } from "../memory-config";
 import { writeCompactionArtifact } from "../memory-lineage.js";
@@ -66,6 +68,7 @@ import {
 	PORT,
 	authConfig,
 	authCrossAgentMessageLimiter,
+	authRecallLlmLimiter,
 	getCurrentMemoryDbPath,
 	harnessLastSeen,
 } from "./state";
@@ -506,6 +509,11 @@ function registerRecall(app: Hono): void {
 			if (!body.harness || !body.query) {
 				return c.json({ error: "harness and query are required" }, 400);
 			}
+			const aggregateBudgetInput = readAggregateRecallBudgetInput(body);
+			const aggregateBudget = parseAggregateRecallBudget(aggregateBudgetInput);
+			if (aggregateBudgetInput !== undefined && aggregateBudget === null) {
+				return c.json({ error: "Invalid aggregateBudget. Expected one of: small, medium, large." }, 400);
+			}
 
 			const runtimePath = resolveRuntimePath(c, body);
 			if (runtimePath) body.runtimePath = runtimePath;
@@ -517,35 +525,59 @@ function registerRecall(app: Hono): void {
 				return c.json(emptyHookRecallResponse(body.query, { bypassed: true }));
 			}
 
+			const aggregateSaveRequested =
+				body.aggregate === true && body.saveAggregate !== false && body.save_aggregate !== false;
+			if (aggregateSaveRequested) {
+				const denied = await requirePermission("remember", authConfig)(c, () => Promise.resolve());
+				if (denied) return denied;
+			}
+
 			const agentId = resolveAgentId({
 				agentId: body.agentId ?? c.req.header("x-signet-agent-id"),
 				sessionKey: body.sessionKey,
 			});
 			const agentScope = getAgentScope(agentId);
 			const cfg = loadMemoryConfig(AGENTS_DIR);
-			const result = await hybridRecall(
-				{
-					query: body.query,
-					keywordQuery: body.keywordQuery,
-					limit: body.limit,
-					project: body.project,
-					type: body.type,
-					tags: body.tags,
-					who: body.who,
-					since: body.since,
-					until: body.until,
-					expand: body.expand,
-					agentId,
-					readPolicy: agentScope.readPolicy,
-					policyGroup: agentScope.policyGroup,
-					sessionKey: body.sessionKey,
-					includeRecalled: body.includeRecalled === true,
-					recallSurface: "api.hooks.recall",
-					recallMode: "hook",
-				},
-				cfg,
-				fetchEmbedding,
-			);
+			if (body.aggregate === true && authConfig.mode !== "local") {
+				const actor = c.get("auth")?.claims?.sub ?? "anonymous";
+				const check = authRecallLlmLimiter.check(actor);
+				if (!check.allowed) {
+					c.header("Retry-After", String(Math.ceil((check.resetAt - Date.now()) / 1000)));
+					return c.json({ error: "rate limit exceeded", retryAfter: check.resetAt }, 429);
+				}
+				authRecallLlmLimiter.record(actor);
+			}
+			const params = {
+				query: body.query,
+				keywordQuery: body.keywordQuery,
+				limit: body.limit,
+				project: body.project,
+				aggregate: body.aggregate,
+				aggregateBudget,
+				aggregate_budget: aggregateBudget,
+				saveAggregate: body.saveAggregate ?? body.save_aggregate,
+				save_aggregate: body.save_aggregate ?? body.saveAggregate,
+				type: body.type,
+				tags: body.tags,
+				who: body.who,
+				since: body.since,
+				until: body.until,
+				expand: body.expand,
+				agentId,
+				readPolicy: agentScope.readPolicy,
+				policyGroup: agentScope.policyGroup,
+				sessionKey: body.sessionKey,
+				includeRecalled: body.includeRecalled === true,
+				recallSurface: "api.hooks.recall",
+				recallMode: "hook",
+			};
+			const result =
+				body.aggregate === true
+					? await aggregateRecall(params, cfg, {
+							router: getInferenceRouterOrNull(),
+							embedFn: fetchEmbedding,
+						})
+					: await hybridRecall(params, cfg, fetchEmbedding);
 			return c.json(withHookRecallCompat(result));
 		} catch (e) {
 			logger.error("hooks", "Recall hook failed", e as Error);
