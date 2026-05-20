@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-05-20
+- Bug fixes: avoid heredoc in bundle smoke config.
+
 ### 2026-05-19
 - Bug fixes: minimize bundle release smoke workspace; install bun in bundle release job.
 
@@ -26,11 +29,16 @@ Surface summary of the most recent release dates. See the release ledger below f
 ### 2026-05-14
 - Bug fixes: surface daemon start journal diagnostics; clean up detached codex acp processes; reap acpx process trees.
 
-### 2026-05-13
-- Features: daily reflections with dashboard card.
-- Bug fixes: prune migration backups for disk headroom; use checked LLM model catalog; support latest memory provider lifecycle; generate Daily Brief on dashboard open; keep dependency descriptions in sync; isolate ollama setup validation tests.
-
 ## Release Ledger
+
+## [0.123.6] - 2026-05-20
+
+Release summary: 1 bug fix.
+Tag range: `v0.123.5..v0.123.6`.
+
+### Bug Fixes
+
+- **ci**: avoid heredoc in bundle smoke config (#731)
 
 ## [0.123.5] - 2026-05-19
 
