@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-05-21
+- Bug fixes: harden aggregate recall dogfood paths.
+
 ### 2026-05-20
 - Bug fixes: harden aggregate recall; dedupe recalled context by session epoch; preserve constellation pointer input; expose row provenance on read; persist remember row provenance; repair bundled node daemon startup; avoid heredoc in bundle smoke config.
 - Refactoring: separate transcript search surfaces.
@@ -27,10 +30,16 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Features: make constellation graph usable.
 - Bug fixes: surface unhealthy diagnostics domains.
 
-### 2026-05-14
-- Bug fixes: surface daemon start journal diagnostics; clean up detached codex acp processes; reap acpx process trees.
-
 ## Release Ledger
+
+## [0.123.17] - 2026-05-21
+
+Release summary: 1 bug fix.
+Tag range: `bundle-0.123.16-0c490d06ed3d0219d4e11876a09be2402728338e..v0.123.17`.
+
+### Bug Fixes
+
+- **memory**: harden aggregate recall dogfood paths (#741)
 
 ## [0.123.16] - 2026-05-20
 
