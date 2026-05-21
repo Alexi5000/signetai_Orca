@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-05-21
-- Bug fixes: harden aggregate recall dogfood paths.
+- Bug fixes: expose recall timing metadata; harden aggregate recall dogfood paths.
 - Performance: speed up aggregate recall.
 
 ### 2026-05-20
@@ -32,6 +32,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: surface unhealthy diagnostics domains.
 
 ## Release Ledger
+
+## [0.123.19] - 2026-05-21
+
+Release summary: 1 bug fix.
+Tag range: `bundle-0.123.17-77b75b4c0ef3954a8a5bfe41c181e22d9fbad360..v0.123.19`.
+
+### Bug Fixes
+
+- **sdk**: expose recall timing metadata (#743)
 
 ## [0.123.18] - 2026-05-21
 
