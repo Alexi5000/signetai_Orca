@@ -9,6 +9,7 @@ Surface summary of the most recent release dates. See the release ledger below f
 ### 2026-05-21
 - Bug fixes: expose recall timing metadata; harden aggregate recall dogfood paths.
 - Performance: speed up aggregate recall.
+- Docs: overhaul repo guidance.
 
 ### 2026-05-20
 - Bug fixes: harden aggregate recall; dedupe recalled context by session epoch; preserve constellation pointer input; expose row provenance on read; persist remember row provenance; repair bundled node daemon startup; avoid heredoc in bundle smoke config.
@@ -32,6 +33,15 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: surface unhealthy diagnostics domains.
 
 ## Release Ledger
+
+## [0.123.21] - 2026-05-21
+
+Release summary: 1 docs update.
+Tag range: `bundle-0.123.19-4a0796a977fa82930a0af92220911b3f0698685c..v0.123.21`.
+
+### Docs
+
+- **agents**: overhaul repo guidance
 
 ## [0.123.20] - 2026-05-21
 
