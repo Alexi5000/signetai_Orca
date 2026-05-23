@@ -39,6 +39,7 @@ function normalizeManualNotes(content: string): string {
 export function parseMemory(markdown: string): ParsedMemory {
 	const sections: Record<string, string> = {};
 	let currentSection: string | null = null;
+	let inManualBlock = false;
 	const sectionLines: string[] = [];
 
 	const flushSection = (): void => {
@@ -52,8 +53,16 @@ export function parseMemory(markdown: string): ParsedMemory {
 	for (const line of lines) {
 		if (/^<!--\s*MANUAL:START\s*-->$/.test(line)) {
 			flushSection();
+			inManualBlock = true;
 			currentSection = null;
 			sectionLines.length = 0;
+			continue;
+		}
+		if (/^<!--\s*MANUAL:END\s*-->$/.test(line)) {
+			inManualBlock = false;
+			continue;
+		}
+		if (inManualBlock) {
 			continue;
 		}
 

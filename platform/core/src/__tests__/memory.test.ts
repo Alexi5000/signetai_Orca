@@ -43,6 +43,41 @@ Keep this hand-written note.
 		});
 	});
 
+	test("ignores markdown headings inside manual notes when parsing structured sections", () => {
+		const markdown = `# Memory
+
+## User Profile
+
+Real profile.
+
+## Key Facts
+
+Real fact.
+
+## Ongoing Context
+
+Real context.
+
+<!-- MANUAL:START -->
+## User Profile
+
+Manual note profile heading.
+
+## Key Facts
+
+Manual note fact heading.
+<!-- MANUAL:END -->
+`;
+
+		expect(parseMemory(markdown)).toEqual({
+			userProfile: "Real profile.",
+			keyFacts: "Real fact.",
+			ongoingContext: "Real context.",
+			manualNotes: "## User Profile\n\nManual note profile heading.\n\n## Key Facts\n\nManual note fact heading.",
+			raw: markdown,
+		});
+	});
+
 	test("preserves raw markdown for round trips", () => {
 		const markdown = "# Memory\n\n## Key Facts\n\n- one\n";
 
