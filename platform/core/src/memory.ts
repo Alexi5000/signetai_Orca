@@ -11,6 +11,23 @@ export interface ParsedMemory {
 	raw: string;
 }
 
+const TEMPLATE_PLACEHOLDERS: Readonly<Record<string, string>> = {
+	"User Profile": "*No user profile configured yet.*",
+	"Key Facts": "*No facts stored yet.*",
+	"Ongoing Context": "*No ongoing context.*",
+};
+const MANUAL_NOTES_PLACEHOLDER = "<!-- Add your own notes here - they will be preserved -->";
+
+function normalizeSection(sectionName: string, content: string): string {
+	const trimmed = content.trim();
+	return trimmed === TEMPLATE_PLACEHOLDERS[sectionName] ? "" : trimmed;
+}
+
+function normalizeManualNotes(content: string): string {
+	const trimmed = content.trim();
+	return trimmed === MANUAL_NOTES_PLACEHOLDER ? "" : trimmed;
+}
+
 /**
  * Parse a Signet memory markdown file into structured sections.
  *
@@ -24,30 +41,35 @@ export function parseMemory(markdown: string): ParsedMemory {
 	let currentSection: string | null = null;
 	const sectionLines: string[] = [];
 
+	const flushSection = (): void => {
+		if (currentSection === null) {
+			return;
+		}
+		sections[currentSection] = normalizeSection(currentSection, sectionLines.join("\n"));
+	};
+
 	const lines = markdown.split("\n");
 	for (const line of lines) {
+		if (/^<!--\s*MANUAL:START\s*-->$/.test(line)) {
+			flushSection();
+			currentSection = null;
+			sectionLines.length = 0;
+			continue;
+		}
+
 		const headingMatch = line.match(/^##\s+(.+)/);
 		if (headingMatch) {
-			// Flush previous section
-			if (currentSection !== null) {
-				sections[currentSection] = sectionLines.join("\n").trim();
-			}
+			flushSection();
 			currentSection = headingMatch[1].trim();
 			sectionLines.length = 0;
 		} else if (currentSection !== null) {
 			sectionLines.push(line);
 		}
 	}
-	// Flush last section
-	if (currentSection !== null) {
-		sections[currentSection] = sectionLines.join("\n").trim();
-	}
+	flushSection();
 
-	// Extract manual notes block
-	const manualMatch = markdown.match(
-		/<!--\s*MANUAL:START\s*-->([\s\S]*?)<!--\s*MANUAL:END\s*-->/,
-	);
-	const manualNotes = manualMatch ? manualMatch[1].trim() : "";
+	const manualMatch = markdown.match(/<!--\s*MANUAL:START\s*-->([\s\S]*?)<!--\s*MANUAL:END\s*-->/);
+	const manualNotes = manualMatch ? normalizeManualNotes(manualMatch[1]) : "";
 
 	return {
 		userProfile: sections["User Profile"] ?? "",
