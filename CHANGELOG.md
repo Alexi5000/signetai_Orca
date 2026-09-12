@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-09-12
+- Features: polish landing page experience; refresh Signet landing page.
+
 ### 2026-09-10
 - Features: add dynamic connector health dashboard; add daemon JS bundle path flag; add selectable Bun JS runtime.
 - Bug fixes: enforce connector deadlines across native I/O; bound connector inspection and avoid unverified healthy status; harden Bun daemon runtime and installer.
@@ -33,12 +36,17 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Refactoring: make source cloning explicit; keep one head publication tool; simplify transcript imports; unify runtime config parsing.
 - Docs: document durable transcript endpoints.
 
-### 2026-09-04
-- Bug fixes: stop retaining backlog text; make backlog probes threshold-aware.
-- Refactoring: simplify backlog probes.
-- Docs: add missing contributors.
-
 ## Release Ledger
+
+## [0.226.0] - 2026-09-12
+
+Release summary: 2 features.
+Tag range: `v0.225.0..v0.226.0`.
+
+### Features
+
+- **marketing**: polish landing page experience
+- **marketing**: refresh Signet landing page
 
 ## [0.225.0] - 2026-09-10
 
