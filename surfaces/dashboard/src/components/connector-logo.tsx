@@ -8,7 +8,8 @@ import { useState } from "react";
  * generic fallback.
  */
 export function ConnectorLogo({ icon, className }: { icon: string | null; className?: string }) {
-	const src = icon ? `/logos/${icon}` : null;
+	const baseUrl = import.meta.env.BASE_URL || "/";
+	const src = icon ? `${baseUrl}logos/${icon}` : null;
 	const [failedSrc, setFailedSrc] = useState<string | null>(null);
 
 	if (!src || failedSrc === src) return <Link2 className={className} aria-hidden="true" />;

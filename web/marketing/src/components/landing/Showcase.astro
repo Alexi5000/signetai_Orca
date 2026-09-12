@@ -45,6 +45,7 @@
 <style>
   .showcase {
     position: relative;
+    overflow-x: hidden;
     padding: clamp(88px, 8vw, 112px) 0 clamp(64px, 7vw, 96px);
   }
 
@@ -132,9 +133,18 @@
     height: auto;
   }
 
+  @media (max-width: 900px) {
+    .showcase-glow {
+      inset: -40px 0;
+    }
+  }
+
   @media (max-width: 700px) {
     .showcase {
       padding: var(--space-2xl) 0 var(--space-xl);
+    }
+    .showcase-glow {
+      inset: -40px 0;
     }
     .showcase-frame {
       border-radius: 10px;

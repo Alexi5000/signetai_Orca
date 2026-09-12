@@ -14,7 +14,6 @@ export async function GET(context: APIContext): Promise<Response> {
 		"## Pages",
 		"",
 		`- [Home](${site}/)`,
-		`- [How Signet works](${site}/how-it-works/)`,
 		`- [Benchmarks](${site}/benchmarks/)`,
 		"- [Documentation](https://docs.signetai.sh/)",
 		"- [Full documentation for LLMs](https://docs.signetai.sh/llms-full.txt)",

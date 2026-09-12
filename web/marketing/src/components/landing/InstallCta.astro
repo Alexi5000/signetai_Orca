@@ -1,38 +1,5 @@
 ---
 import OsInstallSelector from "./OsInstallSelector.astro";
-
-const tabs = [
-	{
-		id: "install",
-		label: "01 · Install",
-		lines: [
-			{ type: "cmd", text: "curl -fsSL https://signetai.sh/install.sh | bash" },
-			{ type: "out", text: "✓ binary linked · workspace initialized · daemon started" },
-			{ type: "cmd", text: "signet status" },
-			{ type: "out", text: "● daemon running · memory pipeline healthy" },
-		],
-	},
-	{
-		id: "setup",
-		label: "02 · Setup",
-		lines: [
-			{ type: "cmd", text: "signet setup" },
-			{ type: "out", text: "agent name [atlas]: signet setup --identity-mode off" },
-			{ type: "out", text: "✓ harness detected: claude-code · hooks installed" },
-			{ type: "out", text: "✓ embedding provider: built-in (on-device)" },
-		],
-	},
-	{
-		id: "work",
-		label: "03 · Work",
-		lines: [
-			{ type: "cmd", text: 'signet remember "prefers bun over npm"' },
-			{ type: "out", text: "✓ memory saved · source-backed" },
-			{ type: "cmd", text: 'signet recall "package manager preference"' },
-			{ type: "out", text: "→ prefers bun over npm (source: transcript 2026-08-07)" },
-		],
-	},
-];
 ---
 
 <section id="install" class="container install-final-section" style="border-top: 1px solid var(--color-border)">
@@ -43,41 +10,50 @@ const tabs = [
   </div>
 
   <div class="install-final reveal">
-    <h2 class="install-final-title">Persistent memory in five minutes.</h2>
-    <p class="install-final-sub">Install the binary, run the wizard, start working. No cloud account, no migration.</p>
-
-    <OsInstallSelector placement="install_cta" />
-
-    <div class="install-terminal">
-      <div class="install-terminal-tabs" role="tablist" aria-label="Getting started steps">
-        {tabs.map((tab, i) => (
-          <button
-            type="button"
-            class:list={["install-terminal-tab", { active: i === 0 }]}
-            role="tab"
-            aria-selected={i === 0 ? "true" : "false"}
-            data-tab={tab.id}
-            data-analytics-install-surface="install_cta"
-            data-analytics-install-option={tab.id}
-          >
-            {tab.label}
-          </button>
-        ))}
+    <div class="install-final-lead">
+      <div class="install-final-copy">
+        <h2 class="install-final-title">Persistent memory<br /><em>in five minutes.</em></h2>
+        <p class="install-final-sub">Install the binary, run the wizard, start working. No cloud account, no migration.</p>
       </div>
-      <div class="install-terminal-body">
-        {tabs.map((tab, i) => (
-          <div class:list={["install-terminal-panel", { active: i === 0 }]} data-panel={tab.id} role="tabpanel">
-            {tab.lines.map((line) => (
-              line.type === "cmd" ? (
-                <div class="install-term-cmd">
-                  <span class="install-term-p">$</span> {line.text}
-                </div>
-              ) : (
-                <div class="install-term-out">{line.text}</div>
-              )
-            ))}
-          </div>
-        ))}
+      <aside class="install-final-aside">
+        <span class="install-final-time">05:00</span>
+        <span class="install-final-time-label">TO FIRST MEMORY</span>
+        <span class="install-final-aside-rule" aria-hidden="true"></span>
+        <p>One command. A local workspace. The next session starts with context already in place.</p>
+      </aside>
+	    </div>
+
+	    <div class="install-final-console">
+	      <OsInstallSelector placement="install_cta" />
+
+      <div class="install-path" aria-label="First session steps">
+        <div class="install-path-head">
+          <span>AFTER THE FIRST COMMAND</span>
+          <span>THREE SMALL STEPS</span>
+        </div>
+        <ol class="install-path-list">
+          <li>
+            <span>01</span>
+            <div>
+              <strong>Install</strong>
+              <p>Run the command above. Your local daemon starts with it.</p>
+            </div>
+          </li>
+          <li>
+            <span>02</span>
+            <div>
+              <strong>Connect</strong>
+              <p>Bring the harnesses you already use into the same workspace.</p>
+            </div>
+          </li>
+          <li>
+            <span>03</span>
+            <div>
+              <strong>Remember</strong>
+              <p>Save one preference. Recall it when the next session begins.</p>
+            </div>
+          </li>
+        </ol>
       </div>
     </div>
 
@@ -90,27 +66,10 @@ const tabs = [
         <span>Local-first</span>
       </div>
       <div class="install-final-links">
-        <a href="/join" class="btn btn-primary" data-analytics-cta="join_community" data-analytics-placement="install_cta">Join Community</a>
+        <a href="https://discord.gg/pHa5scah9C" target="_blank" rel="noopener noreferrer" class="btn btn-primary" data-analytics-cta="join_discord" data-analytics-placement="install_cta">Join Discord</a>
         <a href="https://docs.signetai.sh/quickstart/" class="btn btn-ghost" data-analytics-guide="quickstart">Quickstart docs</a>
         <a href="https://github.com/Signet-AI/signetai" class="btn btn-ghost">GitHub</a>
       </div>
     </div>
   </div>
 </section>
-
-<script>
-  document.querySelectorAll('.install-terminal-tabs').forEach((tabGroup) => {
-    const tabs = tabGroup.querySelectorAll('.install-terminal-tab');
-    const panels = tabGroup.parentElement.querySelectorAll('.install-terminal-panel');
-
-    tabs.forEach((tab) => {
-      tab.addEventListener('click', () => {
-        tabs.forEach((t) => {
-          t.classList.toggle('active', t === tab);
-          t.setAttribute('aria-selected', t === tab ? 'true' : 'false');
-        });
-        panels.forEach((p) => p.classList.toggle('active', p.dataset.panel === tab.dataset.tab));
-      });
-    });
-  });
-</script>

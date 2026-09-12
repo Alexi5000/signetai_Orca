@@ -3,18 +3,17 @@ const stats = [
 	{
 		value: "97.6%",
 		label: "LongMemEval Answer Accuracy",
-		context:
-			"MemoryBench LongMemEval under the rules profile — averaged across the tracked local and canary score set.",
+		context: "Rules profile · tracked local + canary score set.",
 	},
 	{
 		value: "LOCAL",
 		label: "No LLM at Search Time",
-		context: "Retrieval and ranking run entirely on-device; search never calls a model.",
+		context: "Search and ranking stay on-device.",
 	},
 	{
 		value: "RECEIPT",
 		label: "Verified on a Shared Harness",
-		context: "Scores come from the MemoryBench eval harness with methodology attached — not self-invented numbers.",
+		context: "Shared harness. Methodology attached.",
 	},
 ];
 ---
@@ -27,7 +26,7 @@ const stats = [
   </div>
 
   <p class="benchmark-intro reveal">
-    Signet's latest tracked MemoryBench run averages 97.6% LongMemEval answer accuracy under the rules profile — one of the only local-first memory systems with SOTA recall on a shared, verifiable eval harness.
+		One tracked run. 97.6% LongMemEval answer accuracy.
   </p>
 
   <div class="benchmark-proof reveal">
@@ -56,7 +55,7 @@ const stats = [
 
   <div class="benchmark-foot reveal">
     <p class="benchmark-caveat">
-      The rules profile keeps the contract strict: memories are ingested through /api/memory/remember, recalled through /api/memory/recall, and answered from bounded daemon recall results.
+		Rules profile · bounded daemon recall · no model at search time.
     </p>
     <a href="https://docs.signetai.sh/benchmarking/" class="benchmark-link" data-analytics-guide="benchmarking">Methodology and full results &rarr;</a>
   </div>

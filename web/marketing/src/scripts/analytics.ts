@@ -32,8 +32,6 @@ function pageCategory(pathname: string): string {
 	if (pathname === "/") return "home";
 	if (pathname.startsWith("/blog/")) return "blog_article";
 	if (pathname === "/blog" || pathname === "/blog/") return "blog_index";
-	if (pathname === "/how-it-works" || pathname === "/how-it-works/") return "architecture";
-	if (pathname === "/join" || pathname === "/join/") return "join";
 	if (pathname === "/404" || pathname === "/404/") return "not_found";
 	return "site";
 }

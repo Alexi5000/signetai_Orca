@@ -20,10 +20,14 @@
  */
 
 import type {
+	AgentsResponse,
+	DashboardIdentity,
 	DaemonStatus,
 	DailyReflection,
 	DreamStatus,
 	EmbeddingHealthReport,
+	HarnessConnector,
+	HarnessesResponse,
 	KnowledgeConstellation,
 	KnowledgeStats,
 	LogEntry,
@@ -215,6 +219,97 @@ const demoSources: SourcesResponse = {
 				latestArtifactAt: "2026-08-07T01:45:00.000Z",
 				failures: { total: 0, recoverable: 0 },
 			},
+		},
+	],
+};
+
+// The embedded dashboard is a product tour, so its System panel should show
+// the same kinds of configured integrations as the rest of the marketing
+// page. Keep these records synthetic, compact, and tied to real bundled logo
+// assets so the connector and agent panels never fall back to 404 states.
+const demoConnectorCheckedAt = new Date(Date.now() - 8 * 60_000).toISOString();
+const demoHarnessConnectors: HarnessConnector[] = [
+	{
+		id: "demo-claude-code",
+		displayName: "Claude Code",
+		kind: "harness",
+		description: "Session hooks",
+		icon: "claude.svg",
+		available: true,
+		configured: true,
+		detected: true,
+		installed: true,
+		relevant: true,
+		configPath: "~/.claude/settings.json",
+		lastSeen: demoConnectorCheckedAt,
+		capabilities: { repair: false, reinitialize: false, reinitializeRequiresConfirmation: false },
+		health: { status: "healthy", message: "Session hooks active.", checkedAt: demoConnectorCheckedAt },
+	},
+	{
+		id: "demo-opencode",
+		displayName: "OpenCode",
+		kind: "harness",
+		description: "Runtime plugin",
+		icon: "opencode.svg",
+		available: true,
+		configured: true,
+		detected: true,
+		installed: true,
+		relevant: true,
+		configPath: "~/.config/opencode/plugins/signet.ts",
+		lastSeen: demoConnectorCheckedAt,
+		capabilities: { repair: false, reinitialize: false, reinitializeRequiresConfirmation: false },
+		health: { status: "healthy", message: "Runtime plugin ready.", checkedAt: demoConnectorCheckedAt },
+	},
+	{
+		id: "demo-codex",
+		displayName: "Codex",
+		kind: "harness",
+		description: "Hooks + MCP",
+		icon: "openai.svg",
+		available: true,
+		configured: true,
+		detected: true,
+		installed: true,
+		relevant: true,
+		configPath: "~/.codex/config.toml",
+		lastSeen: demoConnectorCheckedAt,
+		capabilities: { repair: false, reinitialize: false, reinitializeRequiresConfirmation: false },
+		health: { status: "healthy", message: "Hooks and MCP connected.", checkedAt: demoConnectorCheckedAt },
+	},
+];
+
+const demoHarnesses: HarnessesResponse = {
+	harnesses: demoHarnessConnectors.map((connector) => ({
+		id: connector.id,
+		name: connector.displayName,
+		icon: connector.icon,
+		path: connector.configPath ?? "~/.agents",
+		exists: true,
+		lastSeen: connector.lastSeen,
+	})),
+	connectors: demoHarnessConnectors,
+	configuredHarnesses: demoHarnessConnectors
+		.filter((connector) => connector.configured)
+		.map((connector) => connector.id),
+};
+
+const demoIdentity: DashboardIdentity = {
+	name: "Operator",
+	creature: "fox",
+	vibe: "calm and methodical",
+};
+
+const demoAgents: AgentsResponse = {
+	agents: [
+		{
+			id: "demo-agent-default",
+			name: DEMO_AGENT,
+			read_policy: "isolated",
+			policy_group: null,
+			effective_scope: "agent",
+			created_at: "2026-01-12T09:00:00.000Z",
+			updated_at: demoConnectorCheckedAt,
 		},
 	],
 };
@@ -622,6 +717,9 @@ type ApiClient = typeof import("./api").api;
 export function installDemoApi(target: ApiClient): void {
 	target.getHealth = async () => true;
 	target.getStatus = async () => demoStatus;
+	target.getIdentity = async () => demoIdentity;
+	target.getHarnesses = async () => ({ data: demoHarnesses, error: null });
+	target.getAgents = async () => ({ data: demoAgents, error: null });
 	target.getKnowledgeStats = async () => demoStats;
 	target.getSources = async () => demoSources;
 	target.getSkills = async () => null;

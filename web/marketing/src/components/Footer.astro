@@ -1,7 +1,8 @@
 ---
 ---
 
-<footer class="container site-footer">
+<footer class="site-footer">
+  <div class="container site-footer-inner">
   <div class="footer-left">
     <div class="footer-brand">
       <img src="/Signet-Logo-White.png" alt="" class="footer-logo" width="24" height="24" aria-hidden="true" />
@@ -16,7 +17,6 @@
       <div class="footer-nav-col">
         <span class="footer-nav-label">Product</span>
         <a href="https://docs.signetai.sh/">Docs</a>
-        <a href="/how-it-works">How It Works</a>
         <a href="https://github.com/Signet-AI/signetai/tree/main/spec">Spec</a>
       </div>
       <div class="footer-nav-col">
@@ -40,25 +40,36 @@
       </a>
     </div>
   </div>
+  </div>
 </footer>
 
 <style>
   .site-footer {
     isolation: isolate;
     overflow: hidden;
+    display: block;
+    width: 100%;
+    padding-top: var(--space-3xl);
+    padding-bottom: var(--space-xl);
+    padding-inline: 0;
+    border-top: 1px solid rgba(132, 179, 227, 0.32);
+    background-color: #050c16;
+    background-image:
+      linear-gradient(180deg, rgba(5, 15, 26, 0.58) 0%, rgba(5, 12, 22, 0.86) 100%),
+      url('/footer-bg.jpg');
+    background-position: 0 0, center 56%;
+    background-size: auto, cover;
+    background-repeat: no-repeat;
+    gap: 40px;
+    box-shadow: inset 0 1px 0 rgba(198, 222, 255, 0.07), inset 0 34px 90px rgba(3, 10, 18, 0.32);
+  }
+
+  .site-footer-inner {
     display: flex;
     justify-content: space-between;
     align-items: flex-start;
-    padding-top: var(--space-3xl);
-    padding-bottom: var(--space-xl);
-    padding-inline: clamp(20px, 4vw, var(--space-xl));
-    border-top: 1px solid rgba(132, 179, 227, 0.32);
     gap: 40px;
     flex-wrap: wrap;
-    background:
-      linear-gradient(180deg, rgba(5, 15, 26, 0.58) 0%, rgba(5, 12, 22, 0.86) 100%),
-      url('/footer-bg.jpg') center 56% / cover no-repeat;
-    box-shadow: inset 0 1px 0 rgba(198, 222, 255, 0.07), inset 0 34px 90px rgba(3, 10, 18, 0.32);
   }
 
   .footer-left {
@@ -157,25 +168,43 @@
   }
 
   @media (max-width: 720px) {
-    .site-footer {
+    .site-footer-inner {
       flex-direction: column;
-      align-items: center;
-      text-align: center;
+      align-items: flex-start;
+      gap: 44px;
+      text-align: left;
     }
-    
+
     .footer-left {
-      align-items: center;
+      width: 100%;
+      align-items: flex-start;
     }
 
     .footer-right {
-      align-items: center;
+      width: 100%;
+      align-items: stretch;
+      gap: 36px;
     }
 
     .footer-nav {
+      display: grid;
+      width: 100%;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 32px;
       text-align: left;
     }
-    
+
+    .footer-nav-col a {
+      font-size: 13px;
+    }
+
+    .footer-links {
+      width: 100%;
+      justify-content: flex-start;
+      padding-top: 18px;
+      border-top: 1px solid var(--color-border);
+    }
+
     .footer-nav-col a:hover {
       transform: none;
     }

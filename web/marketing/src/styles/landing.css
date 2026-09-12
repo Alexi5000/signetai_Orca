@@ -1,6 +1,67 @@
 /* ==========================================================================
    HERO
    ========================================================================== */
+.site-nav-wrapper--landing {
+	padding-top: 18px;
+	background: transparent;
+	border-bottom: 0;
+}
+
+.site-nav-wrapper--landing .site-nav {
+	width: min(1120px, calc(100vw - 40px));
+	height: 56px;
+	padding-inline: 4px;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	backdrop-filter: none;
+	-webkit-backdrop-filter: none;
+	box-shadow: none;
+	overflow: visible;
+}
+
+.site-nav-wrapper--landing .nav-brand { padding-inline: 8px; }
+.site-nav-wrapper--landing .nav-links { margin-left: 10px; }
+.site-nav-wrapper--landing .nav-search-trigger { background: rgba(4, 15, 26, .52); }
+.site-nav-wrapper--landing .nav-github { background: rgba(4, 15, 26, .28); }
+
+.site-nav-wrapper--landing .site-nav::before,
+.site-nav-wrapper--landing .nav-divider {
+	display: none;
+}
+
+@media (max-width: 720px) {
+	.site-nav-wrapper--landing {
+		position: fixed;
+		padding: 14px 16px 0;
+		background: transparent;
+		border-bottom: 0;
+	}
+
+	.site-nav-wrapper--landing .site-nav {
+		width: 100%;
+		height: 52px;
+		padding: 0 6px 0 10px;
+		border: 1px solid var(--color-border-strong);
+		border-radius: 16px;
+		background: color-mix(in srgb, var(--color-surface) 84%, transparent);
+		backdrop-filter: blur(18px);
+		-webkit-backdrop-filter: blur(18px);
+		box-shadow: 0 12px 34px rgba(0, 0, 0, .36), inset 0 1px 0 rgba(255, 255, 255, .06);
+	}
+
+	.site-nav-wrapper--landing .nav-search { display: flex; }
+	.site-nav-wrapper--landing .nav-search-trigger { min-width: 40px; width: 40px; height: 34px; padding: 0; gap: 0; justify-content: center; background: rgba(4, 15, 26, .36); }
+	.site-nav-wrapper--landing .nav-search-hint,
+	.site-nav-wrapper--landing .nav-search-kbd { display: none; }
+	.site-nav-wrapper--landing .nav-join { display: none; }
+	.site-nav-wrapper--landing .nav-mobile-toggle { display: inline-flex; }
+}
+
+.feature-sections [id],
+#benchmark,
+#install { scroll-margin-top: 88px; }
+
 .hero {
 	min-height: 100vh;
 	display: flex;
@@ -33,16 +94,6 @@
 	inset: -12px -48px -14px -48px;
 	background: radial-gradient(ellipse at 50% 36%, rgba(4, 15, 26, 0.38) 0%, rgba(4, 15, 26, 0.16) 60%, rgba(4, 15, 26, 0) 90%);
 	filter: blur(4px);
-	pointer-events: none;
-	z-index: -1;
-}
-.hero-grid::after {
-	content: "";
-	position: absolute;
-	inset: 8% 1% 5%;
-	border: 1px solid rgba(169, 184, 244, 0.11);
-	border-radius: 24px;
-	background: linear-gradient(145deg, rgba(9, 26, 42, 0.08), transparent 46%, rgba(6, 18, 31, 0.2));
 	pointer-events: none;
 	z-index: -1;
 }
@@ -194,6 +245,50 @@
 	background: rgba(6, 19, 29, 0.78);
 	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09), 0 18px 48px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(169, 184, 244, 0.08);
 }
+.hero .install-os-selector--compact {
+	display: grid;
+	grid-template-columns: 126px minmax(0, 1fr);
+	align-items: stretch;
+	gap: 0;
+	max-width: 760px;
+	border: 1px solid rgba(169, 184, 244, 0.38);
+	border-radius: 14px;
+	overflow: hidden;
+	background: rgba(6, 19, 29, 0.78);
+	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09), 0 18px 48px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(169, 184, 244, 0.08);
+}
+.hero .install-os-selector--compact .install-os-label { display: none; }
+.hero .install-os-selector--compact .install-os-tabs {
+	grid-column: 1;
+	grid-row: 1;
+	align-self: stretch;
+	align-items: center;
+	gap: 3px;
+	padding: 6px;
+	border: 0;
+	border-right: 1px solid rgba(169, 184, 244, 0.2);
+	border-radius: 0;
+	background: rgba(4, 15, 26, 0.28);
+}
+.hero .install-os-selector--compact .install-os-tab {
+	min-width: 0;
+	flex: 1 1 0;
+	padding-inline: 8px;
+}
+.hero .install-os-selector--compact .install-os-panels {
+	grid-column: 2;
+	grid-row: 1;
+	min-width: 0;
+}
+.hero .install-os-selector--compact .install-os-panel .install-box {
+	width: 100%;
+	min-width: 0;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	box-shadow: none;
+}
+.hero .install-os-selector--compact .install-os-tab:focus-visible { outline-offset: -2px; }
 .hero .hero-discord-btn { border-radius: 999px; padding-inline: 22px; background: rgba(9, 26, 42, 0.58); }
 .hero .hero-discord-btn:hover { background: var(--color-text-bright); }
 
@@ -425,10 +520,16 @@
 
 	.install-cmd {
 		font-size: 0.8125rem;
+		white-space: normal;
+		overflow: visible;
+		text-overflow: clip;
+		overflow-wrap: anywhere;
 	}
 
-	.hero-grid::after { inset: 4% 0 3%; border-radius: 18px; }
 	.hero .install-os-tabs { max-width: 100%; }
+	.hero .install-os-selector--compact { grid-template-columns: 108px minmax(0, 1fr); }
+	.hero .install-os-selector--compact .install-os-tabs { padding: 5px; gap: 2px; }
+	.hero .install-os-selector--compact .install-os-tab { padding-inline: 5px; }
 
 	.hero-meta-grid {
 		grid-template-columns: 1fr;
@@ -772,7 +873,7 @@
 }
 
 /* ==========================================================================
-   PIPELINE (HOW IT WORKS) — used by how-it-works page components
+   PIPELINE — retained for legacy landing components
    ========================================================================== */
 .pipeline {
 	display: flex;
@@ -1412,10 +1513,10 @@
    LANDING FOOTER OVERRIDES
    ========================================================================== */
 .landing-page .site-footer {
-	padding-top: 24px;
-	padding-bottom: 24px;
-	gap: 12px;
+	padding-top: clamp(96px, 11vw, 156px);
+	padding-bottom: clamp(84px, 9vw, 124px);
 }
+.landing-page .site-footer-inner { min-height: 320px; }
 
 .landing-page .footer-tagline,
 .landing-page .footer-meta,
@@ -1530,7 +1631,7 @@
 	color: var(--color-text-bright);
 }
 
-/* Legacy — kept for how-it-works page */
+/* Legacy landing surface */
 .capabilities-primary {
 	display: grid;
 	grid-template-columns: repeat(3, 1fr);
@@ -1855,110 +1956,122 @@
    INSTALL CTA — Final conversion section
    ========================================================================== */
 .install-final-section {
-	padding-block: clamp(72px, 9vw, 120px) !important;
+	position: relative;
+	width: 100%;
+	max-width: none;
+	margin-left: 0;
+	margin-right: 0;
+	padding: clamp(88px, 10vw, 144px) clamp(20px, 4vw, var(--space-xl)) clamp(72px, 8vw, 112px) !important;
+	background: #c4d2e7;
+	color: #0b1725;
+	overflow: hidden;
 }
+.install-final-section::before {
+	content: "";
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+	background: radial-gradient(circle at 70% 35%, rgba(255, 255, 255, .5), transparent 38%), linear-gradient(120deg, rgba(255, 255, 255, .12), transparent 46%);
+}
+.install-final-section > * { position: relative; z-index: 1; }
+.install-final-section > .section-header { border-bottom-color: rgba(20, 43, 69, .24); }
+.install-final-section .section-label { color: #0b1725; }
+.install-final-section .section-index { color: #36547e; }
+.install-final-section .crosshair::before,
+.install-final-section .crosshair::after { background: #36547e; }
 
 .install-final {
 	display: flex;
 	flex-direction: column;
-	gap: 40px;
+	gap: 56px;
+	width: min(1120px, 100%);
+	margin: 0 auto;
+}
+.install-final-lead {
+	display: grid;
+	grid-template-columns: minmax(0, 1.2fr) minmax(240px, .8fr);
+	gap: clamp(44px, 9vw, 140px);
+	align-items: end;
 }
 .install-final-title {
 	font-family: var(--font-body);
-	font-size: clamp(1.9rem, 4vw, 2.6rem);
-	font-weight: 600;
-	letter-spacing: 0;
+	font-size: clamp(3rem, 6.6vw, 6.8rem);
+	font-weight: 500;
+	letter-spacing: -.075em;
 	text-transform: none;
-	color: #ffffff;
-	line-height: 1.12;
-	max-width: 640px;
+	color: #0b1725;
+	line-height: .9;
+	max-width: 760px;
 }
+.install-final-title em { color: #425f90; font-style: normal; }
 .install-final-sub {
+	margin-top: 28px;
 	font-size: 1rem;
-	line-height: 1.7;
-	color: #cbd5e1;
+	line-height: 1.65;
+	color: #304662;
 	max-width: 560px;
 }
-
-.install-terminal {
-	border: 1px solid rgba(255, 255, 255, 0.1);
-	border-radius: 12px;
-	background: #0a0a0e;
-	overflow: hidden;
-	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 16px 48px rgba(0, 0, 0, 0.4);
-}
-
-.install-terminal-tabs {
+.install-final-aside {
 	display: flex;
-	gap: 4px;
-	padding: 10px 12px;
-	border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-	overflow-x: auto;
-}
-
-.install-terminal-tab {
-	background: none;
-	border: 1px solid transparent;
-	border-radius: 8px;
-	padding: 8px 14px;
-	font-family: var(--font-mono);
-	font-size: 0.75rem;
-	letter-spacing: 0.06em;
-	text-transform: uppercase;
-	color: var(--color-text-muted);
-	cursor: pointer;
-	transition: all 0.2s var(--ease);
-	white-space: nowrap;
-}
-
-.install-terminal-tab:hover {
-	color: var(--color-text-bright);
-}
-
-.install-terminal-tab.active {
-	color: #ffffff;
-	background: rgba(255, 255, 255, 0.05);
-	border-color: rgba(255, 255, 255, 0.1);
-}
-
-.install-terminal-body {
-	padding: 20px 22px;
-	min-height: 150px;
-}
-
-.install-terminal-panel {
-	display: none;
 	flex-direction: column;
-	gap: 6px;
+	align-items: flex-start;
+	padding-left: 26px;
+	border-left: 1px solid rgba(20, 43, 69, .3);
 }
+.install-final-time { color: #0b1725; font: 500 clamp(3rem, 6vw, 5.5rem)/.82 var(--font-body); letter-spacing: -.08em; }
+.install-final-time-label { margin-top: 12px; color: #36547e; font: .6rem var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
+.install-final-aside-rule { width: 42px; margin: 24px 0 18px; border-top: 1px solid #425f90; }
+.install-final-aside p { max-width: 250px; color: #304662; font-size: .8rem; line-height: 1.5; }
 
-.install-terminal-panel.active {
+.install-final-console {
+	padding: 24px;
+	background: #0b1725;
+	border: 1px solid rgba(11, 23, 37, .32);
+	box-shadow: 0 24px 60px rgba(18, 47, 77, .18);
+}
+.install-final-console > .install-os-selector { align-items: stretch; max-width: none; }
+.install-final-console .install-os-label { color: #8998aa; }
+.install-final-console .install-os-tabs { justify-content: flex-start; }
+.install-final-console .install-os-tab { background: rgba(255, 255, 255, .02); }
+.install-final-console .install-os-tab:hover,
+.install-final-console .install-os-tab.active { background: #122536; }
+.install-final-console .install-box { background: #07111c; border-color: rgba(169, 184, 244, .34); }
+
+.install-path {
+	margin-top: 26px;
+	border-top: 1px solid rgba(198, 210, 231, .16);
+}
+.install-path-head {
 	display: flex;
+	justify-content: space-between;
+	gap: 20px;
+	padding: 18px 0 14px;
+	color: #8998aa;
+	font: .58rem var(--font-mono);
+	letter-spacing: .1em;
+	text-transform: uppercase;
 }
-
-.install-term-cmd {
-	font-family: var(--font-mono);
-	font-size: 0.9375rem;
-	color: #e2e8f0;
-	white-space: nowrap;
-	overflow: hidden;
-	text-overflow: ellipsis;
+.install-path-head span:first-child { color: #a9b8f4; }
+.install-path-list {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	border-top: 1px solid rgba(198, 210, 231, .12);
 }
-
-.install-term-p {
-	color: var(--color-highlight-text);
-	font-weight: 600;
+.install-path-list li {
+	display: flex;
+	gap: 14px;
+	min-height: 132px;
+	padding: 18px 16px 14px 0;
+	border-right: 1px solid rgba(198, 210, 231, .12);
 }
-
-.install-term-out {
-	font-family: var(--font-mono);
-	font-size: 0.8125rem;
-	color: var(--color-success);
-	white-space: nowrap;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	margin-bottom: 4px;
-}
+.install-path-list li + li { padding-left: 16px; }
+.install-path-list li:last-child { border-right: 0; }
+.install-path-list > li > span { color: #a9b8f4; font: .58rem var(--font-mono); }
+.install-path-list strong { color: #f1f4f8; font: 500 .78rem var(--font-mono); letter-spacing: .07em; text-transform: uppercase; }
+.install-path-list p { margin: 8px 0 0; color: #8998aa; font-size: .75rem; line-height: 1.45; }
 
 .install-final-footer {
 	display: flex;
@@ -1967,7 +2080,7 @@
 	flex-wrap: wrap;
 	gap: 24px;
 	padding-top: 24px;
-	border-top: 1px solid var(--color-border);
+	border-top: 1px solid rgba(20, 43, 69, .28);
 }
 .install-final-meta {
 	display: flex;
@@ -1977,7 +2090,7 @@
 	font-size: 0.75rem;
 	text-transform: uppercase;
 	letter-spacing: 0.15em;
-	color: var(--color-text);
+	color: #304662;
 }
 .install-final-sep {
 	opacity: 0.3;
@@ -1986,18 +2099,39 @@
 	display: flex;
 	gap: 16px;
 }
+.install-final-links .btn-ghost { color: #304662; }
+.install-final-links .btn-ghost:hover { background: rgba(11, 23, 37, .1); color: #0b1725; }
 
 @media (max-width: 1024px) {
-	.install-final-grid {
-		grid-template-columns: 1fr;
-	}
+	.install-final-lead { grid-template-columns: 1fr; gap: 40px; }
+	.install-final-aside { padding-left: 0; padding-top: 24px; border-left: 0; border-top: 1px solid rgba(20, 43, 69, .3); }
 }
 
 @media (max-width: 720px) {
+	.install-final-section { padding-inline: 20px !important; }
+	.install-final { gap: 40px; }
+	.install-final-title { font-size: clamp(2.8rem, 14vw, 5rem); }
+	.install-final-console { padding: 16px; }
+	.install-final-console > .install-os-selector { margin-top: 0; }
+	.install-final-console .install-os-tabs { overflow-x: auto; justify-content: flex-start; }
+	.install-final-console .install-os-tab { padding-inline: 12px; }
+	.install-final-console .install-box { padding-inline: 14px; }
+	.install-final-console .install-cmd { font-size: .72rem; white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+	.install-path-head { flex-direction: column; gap: 8px; }
+	.install-path-list { grid-template-columns: 1fr; }
+	.install-path-list li,
+	.install-path-list li + li {
+		min-height: 0;
+		padding: 14px 0;
+		border-right: 0;
+		border-bottom: 1px solid rgba(198, 210, 231, .12);
+	}
+	.install-path-list li:last-child { border-bottom: 0; }
 	.install-final-footer {
 		flex-direction: column;
-		align-items: flex-start;
+		align-items: stretch;
 	}
+	.install-final-links { flex-wrap: wrap; }
 }
 
 /* ==========================================================================
@@ -2006,6 +2140,10 @@
 @media (max-width: 900px) {
 	.landing-page .hero-ascii {
 		font-size: clamp(0.38rem, 1.5vw, 0.55rem);
+	}
+
+	.landing-page .hero-grid::before {
+		inset: -12px 0 -14px;
 	}
 
 	.landing-page .hero-harnesses {
@@ -2018,6 +2156,10 @@
 @media (max-width: 720px) {
 	.landing-page .hero {
 		padding-top: var(--space-xl);
+	}
+
+	.landing-page .hero-grid::before {
+		inset: -12px 0 -14px;
 	}
 
 	.landing-page .hero-ascii {
@@ -2048,6 +2190,13 @@
 	.landing-page .footer-links {
 		font-size: 0.6875rem;
 	}
+
+	.landing-page .site-footer {
+		padding-top: 92px;
+		padding-bottom: 76px;
+	}
+
+	.landing-page .site-footer-inner { min-height: 360px; }
 
 	.landing-page .section-index {
 		font-size: 0.5625rem;

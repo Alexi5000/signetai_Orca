@@ -15,16 +15,6 @@ const SITE_ITEMS: readonly SearchItem[] = [
 		excerpt: "Install Signet, connect a harness, and give AI agents durable memory, identity, sources, and secrets.",
 	},
 	{
-		title: "How Signet works",
-		description: "The architecture behind durable context selection.",
-		section: "Site",
-		sectionTitle: "Product",
-		slug: "how-it-works",
-		url: "/how-it-works/",
-		excerpt:
-			"Raw-first storage, background distillation, knowledge graphs, hybrid recall, and bounded context selection.",
-	},
-	{
 		title: "Benchmarks",
 		description: "Signet memory and retrieval benchmark results.",
 		section: "Site",
@@ -32,15 +22,6 @@ const SITE_ITEMS: readonly SearchItem[] = [
 		slug: "benchmarks",
 		url: "/benchmarks/",
 		excerpt: "Measured retrieval accuracy, hit rate, methodology, and benchmark reports.",
-	},
-	{
-		title: "Join the community",
-		description: "Join Signet users and contributors.",
-		section: "Site",
-		sectionTitle: "Community",
-		slug: "join",
-		url: "/join/",
-		excerpt: "Discord, GitHub, and community links for Signet users and contributors.",
 	},
 ];
 
