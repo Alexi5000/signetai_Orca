@@ -17,17 +17,17 @@
 
 ---
 
-Signet automatically creates memories from your transcripts, imported files, and other sources. Memories are built and maintained in the background by a process called **dreaming**, which constructs a living semantic ontology—a structured representation of your world—on top of your raw history. This turns an agent's transcripts and data into connected memory with an audit trail back to the source.
+Signet automatically creates memories from your transcripts, imported files, and other sources. Memories are built and maintained in the background by a process called **dreaming**, which constructs a living semantic ontology - a structured representation of your world - on top of your raw history. This turns an agent's transcripts and data into connected memory with an audit trail back to the source.
 
 The result: the agent gets the right context _before_ the next prompt starts, with a path back to the raw source when deeper context is needed.
 
 This is useful for:
 
-- **Company brains**—Connect Signet to all the tools in your existing stack, and watch your agents spend less time learning your business and more time being useful to it.
-- **Developers**—Managing projects across different models and harnesses usually means context gets fragmented across each one. With Signet, ChatGPT, Claude, Hermes, and Pi can all work off the same shared knowledge base. Your agents suddenly know what's going on, and how they fit into the bigger picture.
-- **Individuals**—Research, journaling, daily work: run the same agent across all of it without re-explaining yourself every session. History compounds instead of resetting.
-- **Autonomous agents**—Scheduled agents that run unattended, like a morning-brief or monitoring agent, keep continuity between runs without a human re-priming them each time.
-- **Agent builders**—Ship an agent product without building memory infrastructure from scratch. Signet is the memory layer underneath, with the audit trail doubling as a debugging and trust feature.
+- **Company brains** - Connect Signet to all the tools in your existing stack, and watch your agents spend less time learning your business and more time being useful to it.
+- **Developers** - Managing projects across different models and harnesses usually means context gets fragmented across each one. With Signet, ChatGPT, Claude, Hermes, and Pi can all work off the same shared knowledge base. Your agents suddenly know what's going on, and how they fit into the bigger picture.
+- **Individuals** - Research, journaling, daily work: run the same agent across all of it without re-explaining yourself every session. History compounds instead of resetting.
+- **Autonomous agents** - Scheduled agents that run unattended, like a morning-brief or monitoring agent, keep continuity between runs without a human re-priming them each time.
+- **Agent builders** - Ship an agent product without building memory infrastructure from scratch. Signet is the memory layer underneath, with the audit trail doubling as a debugging and trust feature.
 
 Read more: [Why Signet](https://docs.signetai.sh/quickstart/#why-signet) · [Architecture](https://docs.signetai.sh/architecture/) · [Knowledge Graph](https://docs.signetai.sh/knowledge-graph/) · [Pipeline](https://docs.signetai.sh/pipeline/)
 
@@ -88,7 +88,7 @@ Signet runs underneath the tools you already use. Run `signet setup` to configur
 
 <a href="https://signetai.sh/"><img src="public/sources.png" alt="Sources"></a>
 
-Signet supports a wide variety of sources that can be imported directly into your agent's memory graph — included in dreaming sessions and surfaced as new connections in recall.
+Signet supports a wide variety of sources that can be imported directly into your agent's memory graph - included in dreaming sessions and surfaced as new connections in recall.
 
 |Source|Notes|
 |---|---|

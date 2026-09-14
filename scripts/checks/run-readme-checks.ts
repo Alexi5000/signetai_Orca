@@ -1,5 +1,5 @@
-import { readFileSync, existsSync } from "node:fs";
-import { checkNoEmDash, checkImagesHaveAlt } from "./readme-quality.test.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { checkImagesHaveAlt, checkNoEmDash } from "./readme-quality.ts";
 
 const targets = ["README.md", "docs/ORCA-HERO-STORY.md", "docs/assets/README.md"];
 let failed = false;
