@@ -117,25 +117,27 @@ Supported formats for one-time import:
 |CSV|`.csv`|
 |PDF|`.pdf`|
 
+## How Orca fits together
+
+- Daemon owns core behavior and durable transitions in `platform/daemon`. CLI, dashboard, desktop, SDK, and harness integrations are clients.
+- `surfaces/cli` is the source of truth (`signet setup`, `signet status`, `signet dashboard`).
+- `surfaces/dashboard` shows memory plus retrieval plus audit trail.
+- `surfaces/desktop` plus `surfaces/tray` give always on presence.
+- `surfaces/browser-extension` captures web context.
+- `integrations/` covers claude-code, codex, forge, gemini, hermes-agent, kimi, oh-my-pi, openclaw, opencode, pi, and unreal.
+
 ## Documentation
 
-- [Quickstart](https://docs.signetai.sh/quickstart/)
-- [CLI Reference](https://docs.signetai.sh/cli/)
-- [Configuration](https://docs.signetai.sh/configuration/)
-- Telemetry
-- [Hooks](https://docs.signetai.sh/hooks/)
-- [Harnesses](https://docs.signetai.sh/harnesses/)
-- [Secrets](https://docs.signetai.sh/secrets/)
-- [Skills](https://docs.signetai.sh/skills/)
-- [Auth](https://docs.signetai.sh/auth/)
-- [Dashboard](https://docs.signetai.sh/dashboard/)
-- [SDK](https://docs.signetai.sh/sdk/)
-- [API Reference](https://docs.signetai.sh/api/)
-- [Knowledge Architecture](https://docs.signetai.sh/knowledge-architecture/)
-- [Knowledge Graph](https://docs.signetai.sh/knowledge-graph/)
-- [Benchmarks](https://docs.signetai.sh/benchmarking/)
-- Roadmap
-- Repository Map
+| Goal | Start here |
+| --- | --- |
+| Install in 5 minutes | [Quickstart](https://docs.signetai.sh/quickstart/) |
+| Run the CLI | [CLI Reference](https://docs.signetai.sh/cli/) |
+| Configure identity and workspace | [Configuration](https://docs.signetai.sh/configuration/) |
+| Connect a harness | [Harnesses](https://docs.signetai.sh/harnesses/) |
+| Guard secrets | [Secrets](https://docs.signetai.sh/secrets/) |
+| See memory model | [Knowledge Architecture](https://docs.signetai.sh/knowledge-architecture/) |
+| Check recall quality | [Benchmarks](https://docs.signetai.sh/benchmarking/) |
+| Read the delivery story | [docs/ORCA-HERO-STORY.md](docs/ORCA-HERO-STORY.md) |
 
 ## Benchmarks
 
@@ -175,13 +177,15 @@ New to open source? Start with [Your First PR](https://docs.signetai.sh/first-pr
 
 ## Star History
 
-<a href="https://star-history.com/#Signet-AI/signetai&Date">
+<a href="https://star-history.com/#Alexi5000/signetai_Orca&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Signet-AI/signetai&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Signet-AI/signetai&type=Date" />
-    <img alt="Star history chart for Signet-AI/signetai" src="https://api.star-history.com/svg?repos=Signet-AI/signetai&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Alexi5000/signetai_Orca&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Alexi5000/signetai_Orca&type=Date" />
+    <img alt="Star history chart for Alexi5000 signetai Orca fork" src="https://api.star-history.com/svg?repos=Alexi5000/signetai_Orca&type=Date" />
   </picture>
 </a>
+
+Upstream history: [Signet-AI/signetai](https://star-history.com/#Signet-AI/signetai&Date).
 
 ## Contributors
 
@@ -189,6 +193,14 @@ Made with love by...
 
 <a href="https://github.com/NicholaiVogel"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/217880623?v=4&s=48" width="48" height="48" alt="NicholaiVogel" title="NicholaiVogel" /></a> <a href="https://github.com/aaf2tbz"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/260091788?v=4&s=48" width="48" height="48" alt="aaf2tbz" title="aaf2tbz" /></a> <a href="https://github.com/Ostico"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/8008416?v=4&s=48" width="48" height="48" alt="Ostico" title="Ostico" /></a> <a href="https://github.com/BusyBee3333"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/241850310?v=4&s=48" width="48" height="48" alt="BusyBee3333" title="BusyBee3333" /></a> <a href="https://github.com/stephenwoska2-cpu"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/258141506?v=4&s=48" width="48" height="48" alt="stephenwoska2-cpu" title="stephenwoska2-cpu" /></a> <a href="https://github.com/PatchyToes"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/256889430?v=4&s=48" width="48" height="48" alt="PatchyToes" title="PatchyToes" /></a> <a href="https://github.com/ddasgupta4"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/ddasgupta4?v=4&s=48" width="48" height="48" alt="ddasgupta4" title="ddasgupta4" /></a> <a href="https://github.com/LeuciRemi"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/44776125?v=4&s=48" width="48" height="48" alt="LeuciRemi" title="LeuciRemi" /></a> <a href="https://github.com/nyashkn"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/1158551?v=4&s=48" width="48" height="48" alt="nyashkn" title="nyashkn" /></a> <a href="https://github.com/Alexi5000"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/135995822?v=4&s=48" width="48" height="48" alt="Alexi5000" title="Alexi5000" /></a> <a href="https://github.com/dragontvstaff"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/279829920?v=4&s=48" width="48" height="48" alt="dragontvstaff" title="dragontvstaff" /></a> <a href="https://github.com/maximhar"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/maximhar?v=4&s=48" width="48" height="48" alt="maximhar" title="maximhar" /></a> <a href="https://github.com/alcar2364"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/alcar2364?v=4&s=48" width="48" height="48" alt="alcar2364" title="alcar2364" /></a> <a href="https://github.com/noamsiegel"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/52804845?v=4&s=48" width="48" height="48" alt="noamsiegel" title="noamsiegel" /></a> <a href="https://github.com/lost-orchard"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/lost-orchard?v=4&s=48" width="48" height="48" alt="lost-orchard" title="lost-orchard" /></a> <a href="https://github.com/gpzack"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/271398594?v=4&s=48" width="48" height="48" alt="gpzack" title="gpzack" /></a> <a href="https://github.com/Jarvis-ORC-HPS"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/273477147?v=4&s=48" width="48" height="48" alt="Jarvis-ORC-HPS" title="Jarvis-ORC-HPS" /></a> <a href="https://github.com/nanookclaw"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/258741235?v=4&s=48" width="48" height="48" alt="nanookclaw" title="nanookclaw" /></a> <a href="https://github.com/quannon"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/5967?v=4&s=48" width="48" height="48" alt="quannon" title="quannon" /></a> <a href="https://github.com/arnavgoel17"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/136158339?v=4&s=48" width="48" height="48" alt="arnavgoel17" title="arnavgoel17" /></a> <a href="https://github.com/glen-tl"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/270518453?v=4&s=48" width="48" height="48" alt="glen-tl" title="glen-tl" /></a> <a href="https://github.com/mikemikimike"><img align="left" hspace="4" src="https://avatars.githubusercontent.com/u/186855910?v=4&s=48" width="48" height="48" alt="mikemikimike" title="mikemikimike" /></a>
 <br clear="left" />
+
+## Links
+
+[Hero story](docs/ORCA-HERO-STORY.md) · [Upstream](https://github.com/Signet-AI/signetai) · [Docs](https://docs.signetai.sh) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
+
+[![Star History](https://api.star-history.com/svg?repos=Alexi5000/signetai_Orca&type=Date)](https://star-history.com/#Alexi5000/signetai_Orca&Date)
+
+Built by [Alex Cinovoj](https://alexcinovoj.com) for [TechTide AI](https://techtideai.io).
 
 ## Built from Signet
 
