@@ -175,18 +175,6 @@ Requirements:
 
 New to open source? Start with [Your First PR](https://docs.signetai.sh/first-pr/). For code conventions and project structure, see [CONTRIBUTING.md](https://docs.signetai.sh/contributing/). Open an issue before contributing significant features. Read the AI Policy before submitting AI-assisted work.
 
-## Star History
-
-<a href="https://star-history.com/#Alexi5000/signetai_Orca&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Alexi5000/signetai_Orca&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Alexi5000/signetai_Orca&type=Date" />
-    <img alt="Star history chart for Alexi5000 signetai Orca fork" src="https://api.star-history.com/svg?repos=Alexi5000/signetai_Orca&type=Date" />
-  </picture>
-</a>
-
-Upstream history: [Signet-AI/signetai](https://star-history.com/#Signet-AI/signetai&Date).
-
 ## Contributors
 
 Made with love by...
@@ -197,8 +185,6 @@ Made with love by...
 ## Links
 
 [Hero story](docs/ORCA-HERO-STORY.md) · [Upstream](https://github.com/Signet-AI/signetai) · [Docs](https://docs.signetai.sh) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
-
-[![Star History](https://api.star-history.com/svg?repos=Alexi5000/signetai_Orca&type=Date)](https://star-history.com/#Alexi5000/signetai_Orca&Date)
 
 Built by [Alex Cinovoj](https://alexcinovoj.com) for [TechTide AI](https://techtideai.io).
 
