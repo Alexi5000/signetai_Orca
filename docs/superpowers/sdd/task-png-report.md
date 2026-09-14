@@ -77,6 +77,6 @@ Method: title band text pixel sampling (not corners) plus text region crop count
 
 ## Concerns
 
-- social-preview.svg has a 1200x630 viewBox while the brief requires a 1280x640 PNG. Rendered by exact scaling (aspect 1.905 to 2.0), so the art is very slightly stretched horizontally. Text stays centered, so the 900x480 center safe zone holds, but a pixel perfect reviewer could regenerate the master at 1280x640 viewBox later.
+- social-preview.svg has a 1200x630 viewBox while the brief requires a 1280x640 PNG. Fixed by aspect preserved render at full height 640 (width 1219) centered on a 1280x640 canvas of the same bg, so glyphs are undistorted and the 900x480 center safe zone holds. A pixel perfect reviewer could still regenerate the master at a native 1280x640 viewBox later.
 - logo.svg and favicon.svg use rounded rectangles, so corner pixels are transparent rather than #0F172A. Expected from the masters, not a defect.
 - Banner text uses Inter with Arial fallback through sharp/librsvg, so glyph shapes may differ slightly from a designer machine with Inter installed. Copy strings match the masters exactly.
