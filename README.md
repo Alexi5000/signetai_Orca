@@ -1,35 +1,37 @@
-<div align="center">
+# SignetAI Orca: shared memory for every harness
 
-<a href="https://signetai.sh/"><img src="public/banner-typography.png" alt="Signet AI"></a>
+> TechTide delivery fork of Signet. One memory graph across Claude Code, OpenCode, OpenClaw, Codex, Kimi, Hermes, Pi, and Gemini CLI. Local first with an audit trail back to source.
 
-**Store, sync and share memories, system prompts, transcripts, institutional knowledge, and secrets between all of your favorite harnesses and models.**
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/orca-banner-dark.png" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/orca-banner-light.png" />
+    <img src="docs/assets/orca-banner-dark.png" alt="SignetAI Orca banner showing shared memory across eight harnesses" width="100%" />
+  </picture>
+</p>
 
-<a href="https://github.com/Signet-AI/signetai/releases"><img src="https://img.shields.io/github/v/release/Signet-AI/signetai?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
-<a href="https://www.npmjs.com/package/signetai"><img src="https://img.shields.io/npm/v/signetai?style=for-the-badge" alt="npm"></a>
-<a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="Apache-2.0 License"></a>
-<a href="https://docs.signetai.sh/benchmarking/#current-longmemeval-score"><img src="https://img.shields.io/badge/LongMemEval-97.6%25-black?style=for-the-badge" alt="LongMemEval 97.6% answer accuracy"></a>
+<p align="center">
+  <a href="https://github.com/Alexi5000/signetai_Orca/releases"><img src="https://img.shields.io/github/v/release/Alexi5000/signetai_Orca?style=flat-square" alt="Orca GitHub release badge" /></a>
+  <a href="https://www.npmjs.com/package/signetai"><img src="https://img.shields.io/npm/v/signetai?style=flat-square" alt="npm signetai version badge" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square" alt="Apache 2.0 license badge" /></a>
+  <a href="https://docs.signetai.sh/benchmarking/"><img src="https://img.shields.io/badge/LongMemEval-97.6%25-black?style=flat-square" alt="LongMemEval 97.6 percent accuracy badge" /></a>
+</p>
 
-**97.6% average LongMemEval answer accuracy**
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="docs/ORCA-HERO-STORY.md">Hero story</a> ·
+  <a href="#harness-support">Harnesses</a> ·
+  <a href="#documentation">Docs</a> ·
+  <a href="https://docs.signetai.sh">Upstream docs</a>
+</p>
 
-[Quick start](https://docs.signetai.sh/quickstart/) · [Why Signet](#why-signet) · [Benchmarks](https://docs.signetai.sh/benchmarking/) · [Docs](https://docs.signetai.sh/quickstart/) · [Discord](https://discord.gg/Psdeg7sQm7)
+Built by [Alex Cinovoj](https://alexcinovoj.com) ([X](https://x.com/AlexCinovoj) · [LinkedIn](https://www.linkedin.com/in/alexcinovoj)) for [TechTide AI](https://techtideai.io). Read the delivery story in [docs/ORCA-HERO-STORY.md](docs/ORCA-HERO-STORY.md).
 
-</div>
+Upstream core by Signet AI: [Signet-AI/signetai](https://github.com/Signet-AI/signetai). Product docs at [signetai.sh](https://signetai.sh).
 
----
+## Trust
 
-Signet automatically creates memories from your transcripts, imported files, and other sources. Memories are built and maintained in the background by a process called **dreaming**, which constructs a living semantic ontology - a structured representation of your world - on top of your raw history. This turns an agent's transcripts and data into connected memory with an audit trail back to the source.
-
-The result: the agent gets the right context _before_ the next prompt starts, with a path back to the raw source when deeper context is needed.
-
-This is useful for:
-
-- **Company brains** - Connect Signet to all the tools in your existing stack, and watch your agents spend less time learning your business and more time being useful to it.
-- **Developers** - Managing projects across different models and harnesses usually means context gets fragmented across each one. With Signet, ChatGPT, Claude, Hermes, and Pi can all work off the same shared knowledge base. Your agents suddenly know what's going on, and how they fit into the bigger picture.
-- **Individuals** - Research, journaling, daily work: run the same agent across all of it without re-explaining yourself every session. History compounds instead of resetting.
-- **Autonomous agents** - Scheduled agents that run unattended, like a morning-brief or monitoring agent, keep continuity between runs without a human re-priming them each time.
-- **Agent builders** - Ship an agent product without building memory infrastructure from scratch. Signet is the memory layer underneath, with the audit trail doubling as a debugging and trust feature.
-
-Read more: [Why Signet](https://docs.signetai.sh/quickstart/#why-signet) · [Architecture](https://docs.signetai.sh/architecture/) · [Knowledge Graph](https://docs.signetai.sh/knowledge-graph/) · [Pipeline](https://docs.signetai.sh/pipeline/)
+Local first. Your transcripts and imports stay in your workspace database. Dreaming builds derived memory with a path back to source, so recall stays inspectable and purgeable. No silent second writer. Telemetry is documented in docs/TELEMETRY.md. No paid tier trick in this README.
 
 ## Quick start (about 5 minutes)
 
