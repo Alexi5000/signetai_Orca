@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick start</a> ·
+  <a href="#quick-start-about-5-minutes">Quick start</a> ·
   <a href="docs/ORCA-HERO-STORY.md">Hero story</a> ·
   <a href="#harness-support">Harnesses</a> ·
   <a href="#documentation">Docs</a> ·
