@@ -6,6 +6,11 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-10-13
+- Bug fixes: ignore hygiene passes when marking import nudges seen; consume whitespace-only evidence tails; stop re-arming seen import nudges; keep suppressed passes off stalls; match imported transcript cursors; stop stall attention driving passes; demote stalled continuations; advance evidence by reviewed text; pin bun-types in extension workspaces.
+- Performance: bound import attention drain check.
+- Docs: name migration 169 as latest.
+
 ### 2026-10-08
 - Bug fixes: stop orphaning nightly releases; read failure and pass times as UTC; keep supported carried entries; revalidate carried head entries; bind head fence and carry entries; stop content passes staling their head; count every purged mention; bind memory-head commits to the running pass; keep aliases and assertions on merge; reconcile contradictions on skill uninstall; stop reconciling contradictions on read; bound native embedding input; defer incomplete transcript backfill; stop blocking input on prompt-submit; keep transcript seq monotonic per key; keep identity in portable import; record ontology claim actor; cascade and audit agent removal; stop retention from deleting entities; check pid hints and relative paths; scope daemon stop to its workspace; keep opt-in for existing workspaces; list memory setup under Needs attention; show the pipeline on when unset; wait for a provider instead of pausing.
 - Docs: address review on docs template; add screenshots for docs template PR; add page template and rewrite core pages; refresh for 1.0 and post-1.0 direction; note native updater cap in 1.0 post.
@@ -35,13 +40,32 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: share in-flight connector inspections; let connector rows pass wheel scroll; keep better-sqlite3 external in bun build; stage the real bun binary; verify native updates atomically; clarify retired Windows app; preserve retryable Windows migration; migrate legacy Windows install; preserve installed bundles and restore runtime connectivity; fold ASCII only in evidence search; tighten evidence search and recall cites; let memory chat find saved memories; guard prune resume generation; fence bounded prune scans; bound generic entity pruning scans.
 - Docs: add dashboard screenshot; refresh overview, install, and trust sections; clarify legacy cleanup.
 
-### 2026-10-02
-- Features: add 2D memory graph and persistent Pi chat.
-- Bug fixes: update native Dreaming smoke payload; authorize macOS keychain access for API-key saves; remove false graph attribution; commit memory head with pass finalization; scope model catalog and gate dreaming completion; compare live credentials without password hashing; retry GitHub asset upload timeouts; classify absent default macOS keychain as unavailable; recover macOS OAuth keychain authorization; stop macOS keychain prompt loops; preserve macOS verification copy; use keychain search list; parse signing keychain lists; harden signing probe recovery; add codesign key access; use matched signing identity; support Bash 3.2 signing; harden macOS signing lookup; sign by certificate fingerprint; guard fallback signing identity; report macOS keychain lookup details; match signing team suffix; skip identity policy filter; bypass trust-only identity scan; preflight macOS signing.
-- Refactoring: rebuild guided onboarding.
-- Docs: drop graph attribution entry; remove duplicate license note; clarify opening and use cases.
-
 ## Release Ledger
+
+## [0.237.11] - 2026-10-13
+
+Release summary: 9 bug fixes, 1 performance improvement, and 1 docs update.
+Tag range: `v0.237.10..v0.237.11`.
+
+### Bug Fixes
+
+- **dreaming**: ignore hygiene passes when marking import nudges seen
+- **dreaming**: consume whitespace-only evidence tails
+- **dreaming**: stop re-arming seen import nudges
+- **dreaming**: keep suppressed passes off stalls
+- **dreaming**: match imported transcript cursors
+- **dreaming**: stop stall attention driving passes
+- **dreaming**: demote stalled continuations
+- **dreaming**: advance evidence by reviewed text
+- **ci**: pin bun-types in extension workspaces
+
+### Performance
+
+- **dreaming**: bound import attention drain check
+
+### Docs
+
+- **storage**: name migration 169 as latest
 
 ## [0.237.10] - 2026-10-08
 
