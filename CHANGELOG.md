@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-10-14
-- Bug fixes: require a note's own graph structure before skipping it; look up indexed Obsidian documents by canonical path; skip unchanged native source files in the owner.
+- Bug fixes: guarantee integrity progress past slow probes and shadowed rowids; check large tables in bounded chunks during integrity sweeps; compact no-op dependency history rebuild pairs; say a rejected memory head commit may be retried; enforce the memory head token budget when it is staged; require a note's own graph structure before skipping it; look up indexed Obsidian documents by canonical path; skip unchanged native source files in the owner.
 
 ### 2026-10-13
 - Bug fixes: ignore hygiene passes when marking import nudges seen; consume whitespace-only evidence tails; stop re-arming seen import nudges; keep suppressed passes off stalls; match imported transcript cursors; stop stall attention driving passes; demote stalled continuations; advance evidence by reviewed text; pin bun-types in extension workspaces.
@@ -40,6 +40,19 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Docs: sync the route reference with the daemon.
 
 ## Release Ledger
+
+## [0.237.13] - 2026-10-14
+
+Release summary: 5 bug fixes.
+Tag range: `v0.237.12..v0.237.13`.
+
+### Bug Fixes
+
+- **daemon**: guarantee integrity progress past slow probes and shadowed rowids
+- **daemon**: check large tables in bounded chunks during integrity sweeps
+- **daemon**: compact no-op dependency history rebuild pairs
+- **dreaming**: say a rejected memory head commit may be retried
+- **dreaming**: enforce the memory head token budget when it is staged
 
 ## [0.237.12] - 2026-10-14
 
