@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-10-14
+- Bug fixes: require a note's own graph structure before skipping it; look up indexed Obsidian documents by canonical path; skip unchanged native source files in the owner.
+
 ### 2026-10-13
 - Bug fixes: ignore hygiene passes when marking import nudges seen; consume whitespace-only evidence tails; stop re-arming seen import nudges; keep suppressed passes off stalls; match imported transcript cursors; stop stall attention driving passes; demote stalled continuations; advance evidence by reviewed text; pin bun-types in extension workspaces.
 - Performance: bound import attention drain check.
@@ -36,11 +39,18 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: close search before client navigation; fail closed on keyring probe errors; persist and deliver first-use events in recorded order; release the store lock without exposing an empty lock directory; decode source-chunk fallback vectors from the DB owner; record a clean shutdown when no cleanup error occurred; yield every reindex batch instead of every 2,500 files; stop sharing default pipeline config by reference; allow machine-id encryption only when the host has no keyring; launch git and protection subprocesses through the shared adapter; mark routed targets unavailable on any HTTP auth failure; flush final SSE drop summaries; retain SSE fallback framing; preserve bounded SSE delivery; bound SSE buffering and teardown.
 - Docs: sync the route reference with the daemon.
 
-### 2026-10-03
-- Bug fixes: share in-flight connector inspections; let connector rows pass wheel scroll; keep better-sqlite3 external in bun build; stage the real bun binary; verify native updates atomically; clarify retired Windows app; preserve retryable Windows migration; migrate legacy Windows install; preserve installed bundles and restore runtime connectivity; fold ASCII only in evidence search; tighten evidence search and recall cites; let memory chat find saved memories; guard prune resume generation; fence bounded prune scans; bound generic entity pruning scans.
-- Docs: add dashboard screenshot; refresh overview, install, and trust sections; clarify legacy cleanup.
-
 ## Release Ledger
+
+## [0.237.12] - 2026-10-14
+
+Release summary: 3 bug fixes.
+Tag range: `v0.237.11..v0.237.12`.
+
+### Bug Fixes
+
+- **daemon**: require a note's own graph structure before skipping it
+- **daemon**: look up indexed Obsidian documents by canonical path
+- **daemon**: skip unchanged native source files in the owner
 
 ## [0.237.11] - 2026-10-13
 
