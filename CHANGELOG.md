@@ -6,6 +6,9 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-10-18
+- Bug fixes: register implicit agents as isolated.
+
 ### 2026-10-14
 - Bug fixes: guarantee integrity progress past slow probes and shadowed rowids; check large tables in bounded chunks during integrity sweeps; compact no-op dependency history rebuild pairs; say a rejected memory head commit may be retried; enforce the memory head token budget when it is staged; require a note's own graph structure before skipping it; look up indexed Obsidian documents by canonical path; skip unchanged native source files in the owner.
 
@@ -35,11 +38,16 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Refactoring: remove relocation migration.
 - Docs: sync translations; list Notion as a supported source; add German, Korean, Simplified Chinese, and Japanese translations; narrow the transcript upgrade row; describe v2 paths and memory/ rule.
 
-### 2026-10-04
-- Bug fixes: close search before client navigation; fail closed on keyring probe errors; persist and deliver first-use events in recorded order; release the store lock without exposing an empty lock directory; decode source-chunk fallback vectors from the DB owner; record a clean shutdown when no cleanup error occurred; yield every reindex batch instead of every 2,500 files; stop sharing default pipeline config by reference; allow machine-id encryption only when the host has no keyring; launch git and protection subprocesses through the shared adapter; mark routed targets unavailable on any HTTP auth failure; flush final SSE drop summaries; retain SSE fallback framing; preserve bounded SSE delivery; bound SSE buffering and teardown.
-- Docs: sync the route reference with the daemon.
-
 ## Release Ledger
+
+## [0.237.14] - 2026-10-18
+
+Release summary: 1 bug fix.
+Tag range: `v0.237.13..v0.237.14`.
+
+### Bug Fixes
+
+- **daemon**: register implicit agents as isolated
 
 ## [0.237.13] - 2026-10-14
 
