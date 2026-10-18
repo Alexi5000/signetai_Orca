@@ -235,7 +235,7 @@ export async function verifyExecutableVersion(
 			: `verification exceeded ${timeoutMs}ms before the executable could be started`;
 		const windowsAdvice =
 			platform === "win32"
-				? ` after ${attempts} attempt${attempts === 1 ? "" : "s"}. The replacement may already have succeeded; stop or restart the daemon, then run \"${executablePath}\" --version before retrying the install`
+				? ` after ${attempts} attempt${attempts === 1 ? "" : "s"}. The replacement may already have succeeded; stop or restart the daemon, then run "${executablePath}" --version before retrying the install`
 				: "";
 		return {
 			ok: false,
@@ -596,7 +596,11 @@ export async function installUpdateTarget(
 	settings: { readonly packageName: string; readonly githubRepo: string },
 	deps: UpdateInstallDeps,
 ): Promise<string> {
+	const normalizedVersion = normalizeExactSemver(version);
+	if (!normalizedVersion) {
+		throw new UpdateInstallFailure("invalid_target_version", "Update version must be an exact semantic version");
+	}
 	return target.kind === "native"
-		? await installNativeUpdate(target, version, deadline, settings, deps)
-		: await installPackageManagerUpdate(target, version, deadline, settings, deps);
+		? await installNativeUpdate(target, normalizedVersion, deadline, settings, deps)
+		: await installPackageManagerUpdate(target, normalizedVersion, deadline, settings, deps);
 }

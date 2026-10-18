@@ -5637,63 +5637,63 @@
     },
     {
       "path": "update-system.ts",
-      "line": 629,
+      "line": 631,
       "api": "existsSync",
       "source": "existsSync: (path) => existsSync(path),",
       "category": "hot-path"
     },
     {
       "path": "update-system.ts",
-      "line": 630,
+      "line": 632,
       "api": "readFileSync",
       "source": "readFileSync: (path, encoding) => readFileSync(path, { encoding }),",
       "category": "hot-path"
     },
     {
       "path": "update-system.ts",
-      "line": 635,
+      "line": 637,
       "api": "existsSync",
       "source": "const launcherExists = deps.existsSync(launcherPath);",
       "category": "hot-path"
     },
     {
       "path": "update-system.ts",
-      "line": 636,
+      "line": 638,
       "api": "existsSync",
       "source": "const appImageExists = deps.existsSync(appImagePath);",
       "category": "hot-path"
     },
     {
       "path": "update-system.ts",
-      "line": 659,
+      "line": 661,
       "api": "readFileSync",
       "source": "const launcher = deps.readFileSync(launcherPath, \"utf-8\");",
       "category": "hot-path"
     },
     {
       "path": "update-system.ts",
-      "line": 690,
+      "line": 692,
       "api": "existsSync",
       "source": "existsSync: deps.existsSync ?? ((path: string) => existsSync(path)),",
       "category": "hot-path"
     },
     {
       "path": "update-system.ts",
-      "line": 691,
+      "line": 693,
       "api": "readFileSync",
       "source": "readFileSync: deps.readFileSync ?? ((path: string, encoding: BufferEncoding) => readFileSync(path, { encoding })),",
       "category": "hot-path"
     },
     {
       "path": "update-system.ts",
-      "line": 714,
+      "line": 716,
       "api": "existsSync",
       "source": "if (!fsDeps.existsSync(deps.signetCliPath)) {",
       "category": "hot-path"
     },
     {
       "path": "update-system.ts",
-      "line": 736,
+      "line": 738,
       "api": "existsSync",
       "source": "if (!fsDeps.existsSync(signetBin)) {",
       "category": "hot-path"

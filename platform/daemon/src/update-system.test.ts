@@ -12,12 +12,18 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { pathToFileURL } from "node:url";
-import { parseExecutableVersion, parseNativeReleaseManifest, verifyExecutableVersion } from "./update-install";
+import {
+	installUpdateTarget,
+	parseExecutableVersion,
+	parseNativeReleaseManifest,
+	verifyExecutableVersion,
+} from "./update-install";
 import {
 	MAX_UPDATE_INTERVAL_SECONDS,
 	MIN_UPDATE_INTERVAL_SECONDS,
 	canUpdateDesktopFromSourceSync,
 	categorizeUpdateError,
+	checkForUpdates,
 	detectDesktopInstall,
 	finalizeSuccessfulUpdateInstall,
 	getUpdateState,
@@ -1078,5 +1084,85 @@ describe("config helpers", () => {
 		expect(categorizeUpdateError("EACCES")).toContain("Permission");
 		expect(categorizeUpdateError("timeout")).toContain("timed out");
 		expect(categorizeUpdateError("something else")).toBe("something else");
+	});
+});
+
+describe("release version trust boundary", () => {
+	it("rejects malicious provider metadata before selecting an update", async () => {
+		const originalFetch = globalThis.fetch;
+		const temp = mkdtempSync(join(tmpdir(), "signet-release-security-"));
+		initUpdateSystem("0.78.0", temp);
+		try {
+			for (const value of [
+				"1.2.3; touch /tmp/injected",
+				"--prefix=/tmp/attacker",
+				"https://evil.test/package.tgz",
+				{},
+				null,
+			]) {
+				globalThis.fetch = (async () => Response.json({ tag_name: value, version: value })) as typeof fetch;
+				const result = await checkForUpdates();
+				expect(result.latestVersion).toBeNull();
+				expect(result.updateAvailable).toBe(false);
+			}
+			globalThis.fetch = (async () => Response.json({ tag_name: "v1.2.3", version: "1.2.3" })) as typeof fetch;
+			expect((await checkForUpdates()).latestVersion).toBe("1.2.3");
+			globalThis.fetch = (async (input) =>
+				new URL(String(input)).hostname === "api.github.com"
+					? Response.json({ tag_name: "invalid release" })
+					: Response.json({ version: "1.2.4-rc.1+build.7" })) as typeof fetch;
+			expect((await checkForUpdates()).latestVersion).toBe("1.2.4-rc.1+build.7");
+		} finally {
+			globalThis.fetch = originalFetch;
+			rmSync(temp, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects invalid versions at the installer before commands or downloads", async () => {
+		let sideEffects = 0;
+		const deps = {
+			runCommand: async () => {
+				sideEffects++;
+				return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+			},
+			fetch: (async () => {
+				sideEffects++;
+				return new Response();
+			}) as typeof fetch,
+		};
+		for (const version of ["--help", "1.2.3;echo injected", "file:/tmp/payload", "1.2.3\n--flag"]) {
+			for (const target of [
+				{ kind: "native" as const, executablePath: "/unused" },
+				{ kind: "package-manager" as const, family: "npm" as const, executablePath: "/unused" },
+			]) {
+				await expect(
+					installUpdateTarget(
+						target,
+						version,
+						Date.now() + 10000,
+						{ packageName: "signetai", githubRepo: "Signet-AI/signetai" },
+						deps,
+					),
+				).rejects.toMatchObject({ code: "invalid_target_version" });
+			}
+		}
+		expect(sideEffects).toBe(0);
+	});
+
+	it("retains exact prerelease and build versions in package-manager updates", async () => {
+		const calls: string[][] = [];
+		await installUpdateTarget(
+			{ kind: "package-manager", family: "npm", executablePath: "/unused" },
+			"v1.2.3-rc.1+build.7",
+			Date.now() + 10000,
+			{ packageName: "signetai", githubRepo: "Signet-AI/signetai" },
+			{
+				runCommand: async (_command, args) => {
+					calls.push([...args]);
+					return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+				},
+			},
+		);
+		expect(calls).toEqual([["install", "-g", "signetai@1.2.3-rc.1+build.7"]]);
 	});
 });
