@@ -441,7 +441,8 @@ async function fetchStableFromGitHub(): Promise<{
 	if (data.draft || data.prerelease) {
 		throw new Error("GitHub latest release is not stable");
 	}
-	const version = data.tag_name.replace(/^v/, "");
+	const version = typeof data.tag_name === "string" ? normalizeExactSemver(data.tag_name) : null;
+	if (!version) throw new Error("GitHub release has an invalid version");
 
 	return {
 		version,
@@ -462,11 +463,12 @@ async function fetchLatestFromNpm(channel: UpdateChannel = "stable"): Promise<st
 	}
 
 	const npmData = (await npmRes.json()) as { version?: string };
-	if (!npmData.version) {
-		throw new Error("npm registry response missing version");
+	const version = typeof npmData.version === "string" ? normalizeExactSemver(npmData.version) : null;
+	if (!version) {
+		throw new Error("npm registry response has an invalid version");
 	}
 
-	return npmData.version;
+	return version;
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +869,7 @@ export async function runUpdate(targetVersion?: string, deps: RunUpdateDeps = {}
 	try {
 		if (!normalizedTargetVersion) {
 			const check = await checkForUpdates();
-			normalizedTargetVersion = check.latestVersion;
+			normalizedTargetVersion = check.latestVersion ? normalizeExactSemver(check.latestVersion) : null;
 		}
 		if (!normalizedTargetVersion) {
 			return updateFailure("no_target_version", "Update failed: no target version available");
