@@ -81,7 +81,7 @@ Signet runs underneath the tools you already use. Run `signet setup` to configur
 |[Codex](https://github.com/openai/codex)|Native plugin + hooks/MCP fallback|
 |[Kimi Code](https://github.com/MoonshotAI/kimi-cli)|Hooks + MCP / ACPX|
 |[Hermes Agent](https://github.com/NousResearch/hermes-agent)|Memory provider plugin|
-|[Pi](https://github.com/mariozechner/pi-coding-agent)|Extension|
+|[Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)|Extension|
 |Oh My Pi|Extension|
 |[Gemini CLI](https://github.com/google-gemini/gemini-cli)|MCP + GEMINI.md sync|
 |[ForgeCode](https://forgecode.dev/)|Hooks + MCP|
@@ -209,3 +209,5 @@ Apache-2.0.
 Nightly publishing is opt-in on this fork. Set the repository variable `RELEASES_ENABLED=true` only after configuring `RELEASE_PAT` and the publishing credentials required by `.github/workflows/release.yml`. Quality checks remain enabled independently.
 
 The HTTP-side compatibility accessor uses a zero SQLite busy timeout: lock contention fails explicitly and existing worker retry loops can retry after owner maintenance. Diagnostics, embedding candidate reads, and usage accounting run through the database owner. This does not complete the repository-wide migration of all legacy callbacks.
+
+The link check excludes the three exact X, LinkedIn, and npm website URLs that reject unauthenticated CI crawlers. The npm package is checked separately through its registry; social profile ownership still requires a browser review.
