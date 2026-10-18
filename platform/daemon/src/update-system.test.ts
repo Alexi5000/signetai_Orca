@@ -1107,6 +1107,11 @@ describe("release version trust boundary", () => {
 			}
 			globalThis.fetch = (async () => Response.json({ tag_name: "v1.2.3", version: "1.2.3" })) as typeof fetch;
 			expect((await checkForUpdates()).latestVersion).toBe("1.2.3");
+			globalThis.fetch = (async (input) =>
+				String(input).includes("api.github.com")
+					? Response.json({ tag_name: "invalid release" })
+					: Response.json({ version: "1.2.4-rc.1+build.7" })) as typeof fetch;
+			expect((await checkForUpdates()).latestVersion).toBe("1.2.4-rc.1+build.7");
 		} finally {
 			globalThis.fetch = originalFetch;
 			rmSync(temp, { recursive: true, force: true });
