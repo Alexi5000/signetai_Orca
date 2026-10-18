@@ -17,4 +17,11 @@ jobs:
       - run: bun scripts/checks/run-readme-checks.ts
       - uses: lycheeverse/lychee-action@v2
         with:
-          args: --no-progress README.md docs/ORCA-HERO-STORY.md docs/assets/README.md
+          args: >-
+            --no-progress
+            --exclude '^https://x\.com/AlexCinovoj/?$'
+            --exclude '^https://www\.linkedin\.com/in/alexcinovoj/?$'
+            --exclude '^https://www\.npmjs\.com/package/signetai/?$'
+            README.md docs/ORCA-HERO-STORY.md docs/assets/README.md
+      - name: Verify package destination through npm registry
+        run: npm view signetai name version

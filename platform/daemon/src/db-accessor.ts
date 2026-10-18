@@ -433,7 +433,8 @@ function configurePragmas(db: SqliteDatabase, path: string): void {
 	db.exec("PRAGMA auto_vacuum = INCREMENTAL");
 	const journal = resolveSqliteJournalConfig({ directory: dirname(path) });
 	db.exec(`PRAGMA journal_mode = ${journal.journalMode}`);
-	db.exec("PRAGMA busy_timeout = 5000");
+	// Compatibility calls on the HTTP thread must fail promptly; only the owner may wait for SQLite locks.
+	db.exec("PRAGMA busy_timeout = 0");
 	db.exec(`PRAGMA synchronous = ${journal.networkFilesystem ? "FULL" : "NORMAL"}`);
 	db.exec("PRAGMA temp_store = MEMORY");
 }
@@ -2411,7 +2412,7 @@ function createAccessor(writeConn: SqliteDatabase): RuntimeDbAccessor {
 	function openReadConnection(): SqliteDatabase {
 		if (dbPath === null) throw new Error("DbAccessor not initialised");
 		const conn = new (getDatabaseConstructor())(dbPath, { readonly: true });
-		conn.exec("PRAGMA busy_timeout = 5000");
+		conn.exec("PRAGMA busy_timeout = 0");
 		loadVecExtension(conn);
 		readInUse.add(conn);
 		updateQueueTelemetry();

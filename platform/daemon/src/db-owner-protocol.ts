@@ -282,7 +282,20 @@ export type DbOwnerRequest =
 	| { readonly kind: "dreaming_evidence_requeue"; readonly input: DbOwnerDreamingEvidenceRequeue }
 	| { readonly kind: "embedding_migration_progress"; readonly configuredBaseUrl?: string }
 	| { readonly kind: "health_ready" }
-	| { readonly kind: "diagnostics"; readonly trackerStats: DbOwnerProviderTrackerStats }
+	| {
+			readonly kind: "diagnostics";
+			readonly trackerStats: DbOwnerProviderTrackerStats;
+			readonly updateState?: Parameters<typeof import("./diagnostics").getDiagnostics>[2];
+			readonly openclawHealth?: Parameters<typeof import("./diagnostics").getDiagnostics>[3];
+			readonly options?: Parameters<typeof import("./diagnostics").getDiagnostics>[4];
+	  }
+	| { readonly kind: "queue_diagnostics" }
+	| {
+			readonly kind: "embedding_tracker_candidates";
+			readonly model: string;
+			readonly limit: number;
+			readonly now: string;
+	  }
 	| {
 			readonly kind: "vector_backfill";
 			readonly expectedDimensions: number;
