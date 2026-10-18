@@ -65,7 +65,6 @@ function withSpawnDefaults(
 	}
 	return {
 		...withWindowsHide(options),
-		shell: false,
 	};
 }
 
@@ -74,8 +73,12 @@ export const spawnHidden: typeof nodeSpawn = ((
 	argsOrOptions?: readonly string[] | ProcessOptions,
 	options?: ProcessOptions,
 ) => {
-	if (Array.isArray(argsOrOptions)) return nodeSpawn(command, argsOrOptions, withSpawnDefaults(options));
-	return nodeSpawn(command, withSpawnDefaults(options ?? (argsOrOptions as ProcessOptions | undefined)));
+	if (Array.isArray(argsOrOptions))
+		return nodeSpawn(command, argsOrOptions, { ...withSpawnDefaults(options), shell: false });
+	return nodeSpawn(command, {
+		...withSpawnDefaults(options ?? (argsOrOptions as ProcessOptions | undefined)),
+		shell: false,
+	});
 }) as typeof nodeSpawn;
 
 export const spawnSyncHidden: typeof nodeSpawnSync = ((
@@ -83,8 +86,12 @@ export const spawnSyncHidden: typeof nodeSpawnSync = ((
 	argsOrOptions?: readonly string[] | ProcessOptions,
 	options?: ProcessOptions,
 ) => {
-	if (Array.isArray(argsOrOptions)) return nodeSpawnSync(command, argsOrOptions, withSpawnDefaults(options));
-	return nodeSpawnSync(command, withSpawnDefaults(options ?? (argsOrOptions as ProcessOptions | undefined)));
+	if (Array.isArray(argsOrOptions))
+		return nodeSpawnSync(command, argsOrOptions, { ...withSpawnDefaults(options), shell: false });
+	return nodeSpawnSync(command, {
+		...withSpawnDefaults(options ?? (argsOrOptions as ProcessOptions | undefined)),
+		shell: false,
+	});
 }) as typeof nodeSpawnSync;
 
 const nodeExecFileAsync = promisify(nodeExecFile);
