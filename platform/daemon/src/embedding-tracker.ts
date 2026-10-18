@@ -10,13 +10,12 @@ import { randomUUID } from "node:crypto";
 import type { PipelineEmbeddingTrackerConfig, PipelineRepairConfig } from "@signet/core";
 import type { DbAccessor } from "./db-accessor";
 import { syncVecDeleteBySourceExceptHash, syncVecInsert, vectorToBlob } from "./db-helpers";
-import { listStaleEmbeddingRows } from "./embedding-coverage";
+import { getDbOwnerMaintenance, ownerQueryAll } from "./db-owner-maintenance";
 import { isActiveEmbeddingConfig } from "./embedding-index-state";
 import {
 	acquireEmbeddingRepairLease,
 	computeRetryBackoffMs,
 	finishEmbeddingRepairLease,
-	loadEmbeddingRepairFailures,
 } from "./embedding-repair-state";
 import { logger } from "./logger";
 import type { EmbeddingConfig } from "./memory-config";
@@ -184,20 +183,31 @@ export function startEmbeddingTracker(
 			// failure backoff so restarting the daemon cannot immediately replay a
 			// poison row against the provider.
 			const now = Date.now();
-			// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
-			const staleRows: StaleRow[] = accessor.withReadDb((db: import("./db-accessor").ReadDb) => {
-				return listStaleEmbeddingRows(
-					db,
-					embeddingCfg.model,
-					trackerCfg.batchSize,
-					new Date(now).toISOString(),
-				) as StaleRow[];
-			}, "embedding-tracker.ts:188");
-			const persistedFailures = loadEmbeddingRepairFailures(
-				accessor,
-				staleRows.map((row) => ({ id: row.id, contentHash: row.contentHash })),
-				embeddingCfg.model,
-			);
+			const maintenance = getDbOwnerMaintenance();
+			if (!maintenance) throw new Error("Database owner unavailable");
+			const staleRows = await maintenance.owner.submit<StaleRow[]>(
+				{
+					kind: "embedding_tracker_candidates",
+					model: embeddingCfg.model,
+					limit: trackerCfg.batchSize,
+					now: new Date(now).toISOString(),
+				},
+				{ operation: "embedding.tracker.candidates", lane: "read", deadlineMs: 5000 },
+			).result;
+			const persistedFailures = new Map<string, { attempts: number; retryAt: number }>();
+			for (const row of staleRows) {
+				const records = await ownerQueryAll<{ attempts: number; retry_at: string }>(
+					maintenance.owner,
+					"embedding.tracker.backoff",
+					"SELECT attempts, retry_at FROM embedding_repair_backoff WHERE memory_id = ? AND content_hash = ? AND model = ?",
+					[row.id, row.contentHash, embeddingCfg.model],
+				);
+				for (const record of records) {
+					const retryAt = Date.parse(record.retry_at);
+					if (Number.isFinite(retryAt))
+						persistedFailures.set(failureKey(row, embeddingCfg.model), { attempts: record.attempts, retryAt });
+				}
+			}
 			for (const [key, state] of persistedFailures) {
 				failures.set(key, { count: state.attempts, retryAt: state.retryAt });
 			}
@@ -293,7 +303,7 @@ export function startEmbeddingTracker(
 							processed++;
 						}
 						return true;
-					}, "embedding-tracker.ts:273");
+					}, "db:embedding-tracker.legacy-273");
 				}
 
 				finishEmbeddingRepairLease(accessor, admission.lease, {

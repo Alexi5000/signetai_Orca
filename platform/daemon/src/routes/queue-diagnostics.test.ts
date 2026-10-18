@@ -1,7 +1,12 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createDbOwnerMaintenance, registerDbOwnerMaintenance, type DbOwnerMaintenance } from "../db-owner-maintenance";
+const owners: Array<{ owner: DbOwnerMaintenance; directory: string }> = [];
 /**
  * Issue #901 — regression tests for /api/diagnostics/queue + repair.
  *
- * Uses an in-memory SQLite DB with real migrations so the queue
+ * Uses a file-backed SQLite DB and real database owner with migrations so the queue
  * breakdowns read against production-shaped tables.
  */
 
@@ -70,10 +75,15 @@ interface DbEnv {
 }
 
 function setup(authConfig?: NonNullable<Parameters<typeof registerQueueDiagnosticsRoutes>[1]>["authConfig"]): DbEnv {
-	const db = new Database(":memory:");
+	const directory = mkdtempSync(join(tmpdir(), "queue-owner-test-"));
+	const dbPath = join(directory, "memory.db");
+	const db = new Database(dbPath);
 	db.exec("PRAGMA journal_mode = WAL");
 	runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
 	seedDb(db);
+	const owner = createDbOwnerMaintenance({ dbPath });
+	registerDbOwnerMaintenance(owner);
+	owners.push({ owner, directory });
 	const accessor = makeAccessor(db);
 	const limiter = createRateLimiter();
 	const app = new Hono();
@@ -86,8 +96,13 @@ describe("/api/diagnostics/queue", () => {
 	beforeEach(() => {
 		env = setup();
 	});
-	afterEach(() => {
+	afterEach(async () => {
 		env.db.close();
+		for (const item of owners.splice(0)) {
+			await item.owner.close();
+			rmSync(item.directory, { recursive: true, force: true });
+		}
+		registerDbOwnerMaintenance(null);
 	});
 
 	it("requires admin permission in team mode", async () => {
@@ -163,8 +178,13 @@ describe("POST /api/diagnostics/queue/repair", () => {
 	beforeEach(() => {
 		env = setup();
 	});
-	afterEach(() => {
+	afterEach(async () => {
 		env.db.close();
+		for (const item of owners.splice(0)) {
+			await item.owner.close();
+			rmSync(item.directory, { recursive: true, force: true });
+		}
+		registerDbOwnerMaintenance(null);
 	});
 
 	it("rejects retired summary repair tables with an actionable status", async () => {
@@ -196,7 +216,9 @@ describe("repair action integration via the new dispatch path", () => {
 		// error). The handler must return the documented RepairResult instead
 		// of propagating an unhandled exception. Mirrors the GET sibling and
 		// the Rust parity handler.
-		const db = new Database(":memory:");
+		const directory = mkdtempSync(join(tmpdir(), "queue-owner-test-"));
+		const dbPath = join(directory, "memory.db");
+		const db = new Database(dbPath);
 		try {
 			runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
 			const throwingAccessor: DbAccessor = {
@@ -204,6 +226,9 @@ describe("repair action integration via the new dispatch path", () => {
 					throw new Error("simulated degraded runtime: DbAccessor is closed");
 				},
 				withWriteTx: () => {
+					throw new Error("simulated degraded runtime: DbAccessor is closed");
+				},
+				withWriteTxAsync: async () => {
 					throw new Error("simulated degraded runtime: DbAccessor is closed");
 				},
 				close(): void {},
@@ -227,6 +252,7 @@ describe("repair action integration via the new dispatch path", () => {
 			expect(body.message).toMatch(/simulated degraded runtime/);
 		} finally {
 			db.close();
+			rmSync(directory, { recursive: true, force: true });
 		}
 	});
 });

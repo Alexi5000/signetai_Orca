@@ -185,7 +185,14 @@ describe("daemon status contract", () => {
 
 	it("keeps the real HTTP listener responsive during an active DB-owner VACUUM window", async () => {
 		const { createDbOwnerClient } = await import("./db-owner-client");
-		const owner = createDbOwnerClient({ dbPath: join(dir, "memory", "memories.db") });
+		const { Database } = await import("bun:sqlite");
+		const vacuumPath = join(dir, "memory", "vacuum-fixture.db");
+		const fixture = new Database(vacuumPath);
+		fixture.exec("CREATE TABLE fixture (id INTEGER PRIMARY KEY, value TEXT)");
+		fixture.exec("PRAGMA auto_vacuum = NONE");
+		fixture.exec("VACUUM");
+		fixture.close();
+		const owner = createDbOwnerClient({ dbPath: vacuumPath });
 		const previousPause = process.env.SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS;
 		process.env.SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS = "1000";
 		const server = Bun.serve({ port: 0, fetch: app.fetch });

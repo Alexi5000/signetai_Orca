@@ -205,6 +205,8 @@ async function executeInlineOwnerRequest(accessor: DbAccessor, request: DbOwnerR
 		case "embedding_migration_progress":
 		case "health_ready":
 		case "diagnostics":
+		case "queue_diagnostics":
+		case "embedding_tracker_candidates":
 		case "vector_backfill":
 		case "vacuum_conversion":
 		case "incremental_vacuum":

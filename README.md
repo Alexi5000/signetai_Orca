@@ -203,3 +203,9 @@ Apache-2.0.
 [upstream](https://github.com/Signet-AI/signetai) ·
 [orca fork](https://github.com/Alexi5000/signetai_Orca) ·
 [issues](https://github.com/Signet-AI/signetai/issues)
+
+### Fork release automation
+
+Nightly publishing is opt-in on this fork. Set the repository variable `RELEASES_ENABLED=true` only after configuring `RELEASE_PAT` and the publishing credentials required by `.github/workflows/release.yml`. Quality checks remain enabled independently.
+
+The HTTP-side compatibility accessor uses a zero SQLite busy timeout: lock contention fails explicitly and existing worker retry loops can retry after owner maintenance. Diagnostics, embedding candidate reads, and usage accounting run through the database owner. This does not complete the repository-wide migration of all legacy callbacks.

@@ -1059,6 +1059,16 @@ export function runDbOwnerWorker(): void {
 					: ({ base_url: job.request.configuredBaseUrl } as never),
 			);
 		}
+		if (job.request.kind === "queue_diagnostics") {
+			const { getQueueDiagnosticsSnapshot } = await import("./diagnostics-queue");
+			return getQueueDiagnosticsSnapshot(db as never, { fresh: true });
+		}
+		if (job.request.kind === "embedding_tracker_candidates") {
+			const { listStaleEmbeddingRows } = await import("./embedding-coverage");
+			if (!Number.isInteger(job.request.limit) || job.request.limit < 1 || job.request.limit > 1000)
+				throw new Error("Invalid embedding candidate limit");
+			return listStaleEmbeddingRows(db as never, job.request.model, job.request.limit, job.request.now);
+		}
 		if (job.request.kind === "health_ready") {
 			const { hasPendingMigrations } = await import("@signet/core");
 			const { getQueueHealth } = await import("./diagnostics");
@@ -1069,10 +1079,16 @@ export function runDbOwnerWorker(): void {
 		}
 		if (job.request.kind === "diagnostics") {
 			const { getDiagnostics } = await import("./diagnostics");
-			return getDiagnostics(db as never, {
-				record: () => {},
-				stats: job.request.trackerStats,
-			});
+			return getDiagnostics(
+				db as never,
+				{
+					record: () => {},
+					stats: job.request.trackerStats,
+				},
+				job.request.updateState,
+				job.request.openclawHealth,
+				job.request.options,
+			);
 		}
 		if (job.request.kind === "source_artifact_upsert" || job.request.kind === "source_artifact_upsert_batch")
 			return executeSourceArtifactUpsert(job.request, context);

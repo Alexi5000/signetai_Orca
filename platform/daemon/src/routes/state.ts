@@ -1,3 +1,4 @@
+import { getDbOwnerMaintenance } from "../db-owner-maintenance";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,8 +11,7 @@ import {
 } from "@signet/core";
 import { createAnalyticsCollector } from "../analytics";
 import { type AuthConfig, AuthRateLimiter, loadOrCreateSecret, parseAuthConfig } from "../auth";
-import { getDbAccessor } from "../db-accessor";
-import { type DiagnosticsOptions, type DiagnosticsReport, createProviderTracker, getDiagnostics } from "../diagnostics";
+import { type DiagnosticsOptions, type DiagnosticsReport, createProviderTracker } from "../diagnostics";
 import type { EmbeddingTrackerHandle } from "../embedding-tracker";
 import { logger } from "../logger";
 import { type ResolvedMemoryConfig, loadMemoryConfig, readRuntimeConfig } from "../memory-config";
@@ -441,19 +441,25 @@ export function getDiagnosticsOptions(): DiagnosticsOptions {
 	}
 }
 
-export function getCachedDiagnosticsReport(): DiagnosticsReport {
+export async function getCachedDiagnosticsReport(): Promise<DiagnosticsReport> {
 	const now = Date.now();
 	if (diagnosticsCache !== null && diagnosticsCache.expiresAt > now) {
 		return diagnosticsCache.report;
 	}
 
-	const diagnosticsOptions = getDiagnosticsOptions();
-	// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
-	const report = getDbAccessor().withReadDb(
-		(db: import("../db-accessor").ReadDb) =>
-			getDiagnostics(db, providerTracker, getUpdateState(), buildOpenClawHealth(), diagnosticsOptions),
-		"db:diagnostics.cached.read",
-	);
+	const maintenance = getDbOwnerMaintenance();
+	if (!maintenance) throw new Error("Database owner unavailable");
+	const report = await maintenance.owner.submit<DiagnosticsReport>(
+		{
+			kind: "diagnostics",
+			trackerStats: providerTracker.stats,
+			updateState: getUpdateState(),
+			openclawHealth: buildOpenClawHealth(),
+			options: getDiagnosticsOptions(),
+		},
+		{ operation: "diagnostics.cached.read", lane: "read", deadlineMs: 5000 },
+	).result;
+
 	diagnosticsCache = {
 		report,
 		expiresAt: now + DIAGNOSTICS_CACHE_TTL_MS,

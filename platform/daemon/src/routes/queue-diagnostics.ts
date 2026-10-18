@@ -1,3 +1,4 @@
+import { getDbOwnerMaintenance } from "../db-owner-maintenance";
 /**
  * Issue #901 — surface queue diagnostics and provide a safe repair
  * endpoint. Mounted next to the existing `/api/diagnostics/*` and
@@ -13,14 +14,12 @@
 
 import type { Hono } from "hono";
 import { requirePermission } from "../auth";
-import type { DbAccessor, ReadDb } from "../db-accessor";
+import type { DbAccessor } from "../db-accessor";
 import { getDbAccessor } from "../db-accessor.js";
 import {
 	DEFAULT_QUEUE_THRESHOLDS,
-	type QueueCounts,
 	type QueueThresholds,
-	type getOldestDeadJob,
-	getQueueDiagnosticsSnapshot,
+	type getQueueDiagnosticsSnapshot,
 	invalidateQueueDiagnosticsCache,
 } from "../diagnostics-queue.js";
 import { loadMemoryConfig } from "../memory-config.js";
@@ -38,17 +37,6 @@ function resolveAgentsDir(): string {
 	return process.env.SIGNET_AGENTS_DIR ?? process.env.AGENTS_DIR ?? `${process.env.HOME ?? "/tmp"}/.agents`;
 }
 
-interface QueueDiagnosticsResponse {
-	readonly timestamp: string;
-	readonly queues: {
-		readonly memory: QueueCounts;
-		readonly summary: QueueCounts;
-	};
-	readonly oldestDeadSummaryJob: ReturnType<typeof getOldestDeadJob>;
-	readonly oldestDeadMemoryJob: ReturnType<typeof getOldestDeadJob>;
-	readonly thresholds: QueueThresholds;
-}
-
 function loadThresholds(): QueueThresholds {
 	try {
 		const cfg = loadMemoryConfig(resolveAgentsDir());
@@ -58,20 +46,6 @@ function loadThresholds(): QueueThresholds {
 	} catch {
 		return DEFAULT_QUEUE_THRESHOLDS;
 	}
-}
-
-function buildQueueDiagnosticsResponse(db: ReadDb): QueueDiagnosticsResponse {
-	const snapshot = getQueueDiagnosticsSnapshot(db, { fresh: true });
-	return {
-		timestamp: new Date().toISOString(),
-		queues: {
-			memory: snapshot.memory,
-			summary: snapshot.summary,
-		},
-		oldestDeadSummaryJob: snapshot.oldestDeadSummaryJob,
-		oldestDeadMemoryJob: snapshot.oldestDeadMemoryJob,
-		thresholds: loadThresholds(),
-	};
 }
 
 interface RepairRequestBody {
@@ -163,16 +137,23 @@ export function registerQueueDiagnosticsRoutes(
 		return deps.accessor ?? getDbAccessor();
 	}
 
-	app.get("/api/diagnostics/queue", adminGuard, (c) => {
+	app.get("/api/diagnostics/queue", adminGuard, async (c) => {
 		try {
-			// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
-			const response = resolveAccessor().withReadDb(
-				(db: import("../db-accessor").ReadDb) => buildQueueDiagnosticsResponse(db),
-				"routes/queue-diagnostics.ts:169",
-			);
-			return c.json(response);
+			const maintenance = getDbOwnerMaintenance();
+			if (!maintenance) throw new Error("Database owner unavailable");
+			const snapshot = await maintenance.owner.submit<ReturnType<typeof getQueueDiagnosticsSnapshot>>(
+				{ kind: "queue_diagnostics" },
+				{ operation: "diagnostics.queue", lane: "read", deadlineMs: 5000 },
+			).result;
+			return c.json({
+				timestamp: new Date().toISOString(),
+				queues: { memory: snapshot.memory, summary: snapshot.summary },
+				oldestDeadSummaryJob: snapshot.oldestDeadSummaryJob,
+				oldestDeadMemoryJob: snapshot.oldestDeadMemoryJob,
+				thresholds: loadThresholds(),
+			});
 		} catch (err) {
-			return c.json({ error: (err as Error).message }, 500);
+			return c.json({ error: (err as Error).message }, 503);
 		}
 	});
 

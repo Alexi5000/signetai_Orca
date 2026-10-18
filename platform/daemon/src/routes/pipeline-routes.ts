@@ -52,7 +52,6 @@ import {
 } from "../pipeline/model-registry.js";
 import { getCachedResourceSnapshot } from "../resource-monitor.js";
 import { activeSessionCount, getBypassedSessionKeys, getSessionTrackerStats } from "../session-tracker.js";
-import { getTranscriptCaptureStatus } from "../transcript-capture-worker.js";
 import { getTranscriptHealthReport } from "../transcript-health.js";
 import {
 	AGENTS_DIR,
@@ -126,7 +125,7 @@ export function pipelineQueueBlock(options: { readonly allowSynchronousRead?: bo
 				summary: snapshot.summary,
 				oldestDeadSummaryJob: snapshot.oldestDeadSummaryJob,
 			};
-		}, "routes/pipeline-routes.ts:122");
+		}, "db:routes.pipeline-routes.legacy-122");
 	} catch {
 		return {
 			memory: { ...UNKNOWN_QUEUE_COUNTS_SHAPE },
@@ -343,9 +342,9 @@ export function registerPipelineRoutes(app: Hono): void {
 		try {
 			const ownerMaintenance = getDbOwnerMaintenance();
 			embeddingMigration = ownerMaintenance
-				? await ownerMaintenance.embeddingMigrationProgress(config.embedding.base_url)
+				? await ownerMaintenance.embeddingMigrationProgress(config.embedding.base_url, { deadlineMs: 300 })
 				: await getDbAccessor().withReadDbAsync((db) => readEmbeddingIndexMigrationProgress(db, config.embedding), {
-						siteToken: "routes/pipeline-routes.ts:347",
+						siteToken: "db:routes.pipeline-routes.legacy-347",
 					});
 		} catch {
 			// Database may still be initializing; omit migration visibility.
@@ -376,13 +375,21 @@ export function registerPipelineRoutes(app: Hono): void {
 			  }
 			| undefined;
 		try {
-			const capture = await getTranscriptCaptureStatus(getDbAccessor(), resolveDaemonAgentId());
-			transcriptCapture = {
-				pending: capture.pending,
-				failed: capture.failed,
-				dead: capture.dead,
-				processing: capture.processing,
-			};
+			const maintenance = getDbOwnerMaintenance();
+			if (!maintenance) throw new Error("Database owner unavailable");
+			transcriptCapture =
+				(await maintenance.owner.submit<{ pending: number; failed: number; dead: number; processing: number }>(
+					{
+						kind: "query",
+						statement: {
+							sql: "SELECT pending, failed, dead, processing FROM transcript_capture_status WHERE agent_id = ?",
+							params: [resolveDaemonAgentId()],
+							result: "get",
+							readonly: true,
+						},
+					},
+					{ operation: "status.transcript-capture", lane: "read", deadlineMs: 300 },
+				).result) ?? undefined;
 		} catch {
 			// DB may still be initializing; omit compact transcript health.
 		}
@@ -481,8 +488,8 @@ export function registerPipelineRoutes(app: Hono): void {
 		return c.json({ greeting: greetingCache.greeting, cachedAt: greetingCache.cachedAt });
 	});
 
-	app.get("/api/diagnostics", (c) => {
-		const report = getCachedDiagnosticsReport();
+	app.get("/api/diagnostics", async (c) => {
+		const report = await getCachedDiagnosticsReport();
 		const requestedAgentId = c.req.query("agentId") ?? c.req.query("agent_id") ?? c.req.header("x-signet-agent-id");
 		const scopedAgent = resolveScopedAgentId(c, requestedAgentId, resolveDaemonAgentId());
 		if (scopedAgent.error) return c.json({ error: scopedAgent.error }, 403);
@@ -528,7 +535,7 @@ export function registerPipelineRoutes(app: Hono): void {
 					limit,
 					offset,
 				}),
-			"routes/pipeline-routes.ts:522",
+			"db:routes.pipeline-routes.legacy-522",
 		);
 		return c.json({
 			agentId: resolveAgentId({ agentId: scopedAgent.agentId }),
@@ -554,7 +561,7 @@ export function registerPipelineRoutes(app: Hono): void {
 		// aggregate subobject. Any new single-segment diagnostics route must
 		// either be registered before this route or be added here.
 		if (domain === "queue" || domain === "openclaw" || domain === "workloads") return next();
-		const report = getCachedDiagnosticsReport();
+		const report = await getCachedDiagnosticsReport();
 
 		const domainData = report[domain as keyof typeof report];
 		if (!domainData || typeof domainData === "string") {
@@ -632,7 +639,7 @@ export function registerPipelineRoutes(app: Hono): void {
 		const memoryRows = ownerMaintenance
 			? await ownerQueryAll<{ status: string; count: number }>(
 					ownerMaintenance.owner,
-					"routes/pipeline-routes.ts:616",
+					"db:routes.pipeline-routes.legacy-616",
 					"SELECT status, COUNT(*) as count FROM memory_jobs GROUP BY status",
 				)
 			: await accessor.withReadDbAsync(
@@ -641,7 +648,7 @@ export function registerPipelineRoutes(app: Hono): void {
 							status: string;
 							count: number;
 						}>,
-					{ siteToken: "routes/pipeline-routes.ts:638", operation: "pipeline.status" },
+					{ siteToken: "db:routes.pipeline-routes.legacy-638", operation: "pipeline.status" },
 				);
 		const dbData = {
 			queues: {
@@ -649,7 +656,7 @@ export function registerPipelineRoutes(app: Hono): void {
 				summary: toCountMap([]),
 			},
 		};
-		const diagnostics = getCachedDiagnosticsReport();
+		const diagnostics = await getCachedDiagnosticsReport();
 
 		const pipelineV2 = cfg.pipelineV2;
 		const workers = getPipelineWorkerStatus();
@@ -979,7 +986,7 @@ export function registerPipelineRoutes(app: Hono): void {
 			const hasTransientSummaryExclusion = ownerMaintenance
 				? (await ownerQueryOne<{ present: number }>(
 						ownerMaintenance.owner,
-						"routes/pipeline-routes.ts:971",
+						"db:routes.pipeline-routes.legacy-971",
 						"SELECT 1 AS present FROM dreaming_evidence_exclusions WHERE agent_id = ? AND source_kind = 'summary' AND source_id = ? AND resolved_at IS NULL",
 						[agentId, sourceId],
 					)) != null
@@ -990,7 +997,7 @@ export function registerPipelineRoutes(app: Hono): void {
 									"SELECT 1 FROM dreaming_evidence_exclusions WHERE agent_id = ? AND source_kind = 'summary' AND source_id = ? AND resolved_at IS NULL",
 								)
 								.get(agentId, sourceId) != null,
-						{ siteToken: "routes/pipeline-routes.ts:986" },
+						{ siteToken: "db:routes.pipeline-routes.legacy-986" },
 					);
 			if (hasTransientSummaryExclusion) {
 				return c.json({ error: "Summary evidence requeue is retired; requeue the completed transcript instead" }, 410);

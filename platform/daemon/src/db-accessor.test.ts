@@ -71,6 +71,24 @@ describe("DbAccessor", () => {
 		cleanupDirs.length = 0;
 	});
 
+	test("legacy write contention fails promptly and recovers after the owner releases its lock", async () => {
+		const dbPath = tmpDbPath();
+		cleanupDirs.push(join(dbPath, ".."));
+		initDbAccessor(dbPath);
+		const accessor = getDbAccessor();
+		const blocker = new Database(dbPath);
+		blocker.exec("BEGIN IMMEDIATE");
+		try {
+			const started = performance.now();
+			await expect(accessor.withWriteTxAsync(() => undefined)).rejects.toThrow(/locked|busy/i);
+			expect(performance.now() - started).toBeLessThan(250);
+		} finally {
+			blocker.exec("ROLLBACK");
+			blocker.close();
+		}
+		await expect(accessor.withWriteTxAsync(() => "recovered")).resolves.toBe("recovered");
+	});
+
 	test("initializes without error", () => {
 		const dbPath = tmpDbPath();
 		cleanupDirs.push(join(dbPath, ".."));
@@ -142,9 +160,11 @@ describe("DbAccessor", () => {
 				id, content, type, agent_id, visibility, created_at, updated_at, updated_by
 			) VALUES (?, ?, 'fact', 'default', 'global', datetime('now'), datetime('now'), 'test')`,
 		);
-		for (let index = 0; index < 10_000; index += 1) {
-			insert.run(`large-fts-memory-${index}`, `large deferred FTS corpus memory ${index}`);
-		}
+		db.transaction(() => {
+			for (let index = 0; index < 10_000; index += 1) {
+				insert.run(`large-fts-memory-${index}`, `large deferred FTS corpus memory ${index}`);
+			}
+		})();
 		db.exec("DROP TRIGGER memories_ai");
 		db.exec("DROP TRIGGER memories_ad");
 		db.exec("DROP TRIGGER memories_au");
@@ -442,7 +462,7 @@ describe("DbAccessor", () => {
 
 		if (state.latched === null) throw new Error("in-flight latch did not produce liveness data");
 		expect(state.latched.status).toBe("wedged");
-		expect(state.latched.syncDbCallSites).toContain("withWriteTxAsync@platform/daemon/src/db-accessor.test.ts:432");
+		expect(state.latched.syncDbCallSites).toContain("withWriteTxAsync@platform/daemon/src/db-accessor.test.ts:452");
 	});
 
 	test("write statements expose the number of affected rows", () => {

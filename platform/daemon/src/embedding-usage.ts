@@ -18,7 +18,7 @@
  */
 
 import type { DbAccessor } from "./db-accessor";
-import { getDbAccessor, hasDbAccessor } from "./db-accessor";
+import { getDbOwnerMaintenance, ownerTransaction } from "./db-owner-maintenance";
 import { type EmbeddingCostRates, resolveEmbeddingAccounting } from "./embedding-cost";
 import { logger } from "./logger";
 import { getActiveTelemetry } from "./telemetry";
@@ -84,26 +84,25 @@ export function recordEmbeddingUsage(input: {
 		cost: accounting.cost,
 		accountingProvenance: accounting.accountingProvenance,
 	});
-	if (!hasDbAccessor()) return;
+	const maintenance = getDbOwnerMaintenance();
+	if (!maintenance) return;
 	try {
-		void getDbAccessor()
-			.withWriteTxAsync(
-				(db: import("./db-accessor").WriteDb) => {
-					db.prepare(UPSERT_SQL).run(
-						todayKey(input.now),
-						input.agentId ?? "",
-						input.source,
-						input.provider,
-						input.tokens,
-					);
+		void ownerTransaction(
+			maintenance.owner,
+			"embedding.usage.record",
+			[
+				{
+					sql: UPSERT_SQL,
+					params: [todayKey(input.now), input.agentId ?? "", input.source, input.provider, input.tokens],
+					result: "run",
 				},
-				{ siteToken: "embedding-usage.ts:90", operation: "embedding.usage", estimatedWorkUnits: 1 },
-			)
-			.catch((e) => {
-				logger.warn("embedding", "Failed to record embedding usage", {
-					error: e instanceof Error ? e.message : String(e),
-				});
+			],
+			{ deadlineMs: 1000 },
+		).catch((e) => {
+			logger.warn("embedding", "Failed to record embedding usage", {
+				error: e instanceof Error ? e.message : String(e),
 			});
+		});
 	} catch (e) {
 		logger.warn("embedding", "Failed to record embedding usage", {
 			error: e instanceof Error ? e.message : String(e),
@@ -126,39 +125,47 @@ let cachedEmbeddingUsageSummary: EmbeddingUsageSummary | null = null;
  * absent (pre-migration database) or the DB is unavailable.
  */
 export async function readEmbeddingUsageSummary(
-	accessor: DbAccessor,
+	_accessor: DbAccessor,
 	now: Date = new Date(),
 ): Promise<EmbeddingUsageSummary | null> {
 	try {
-		const summary = await accessor.withReadDbAsync(
-			(db: import("./db-accessor").ReadDb) => {
-				const day = todayKey(now);
-				const totals = db
-					.prepare(
-						"SELECT COALESCE(SUM(requests), 0) AS requests, COALESCE(SUM(tokens), 0) AS tokens FROM embedding_usage",
-					)
-					.get() as { requests: number; tokens: number };
-				const today = db
-					.prepare(
-						"SELECT COALESCE(SUM(requests), 0) AS requests, COALESCE(SUM(tokens), 0) AS tokens FROM embedding_usage WHERE day = ?",
-					)
-					.get(day) as { requests: number; tokens: number };
-				const bySource = db
-					.prepare(
-						`SELECT source_kind AS source, SUM(requests) AS requests, SUM(tokens) AS tokens
-					 FROM embedding_usage GROUP BY source_kind ORDER BY tokens DESC`,
-					)
-					.all() as Array<{ source: string; requests: number; tokens: number }>;
-				const byProvider = db
-					.prepare(
-						`SELECT provider, SUM(requests) AS requests, SUM(tokens) AS tokens
-					 FROM embedding_usage GROUP BY provider ORDER BY tokens DESC`,
-					)
-					.all() as Array<{ provider: string; requests: number; tokens: number }>;
-				return { total: totals, today, bySource, byProvider };
+		const owner = getDbOwnerMaintenance();
+		if (!owner) throw new Error("Database owner unavailable for embedding usage");
+		const queries = [
+			{
+				sql: "SELECT COALESCE(SUM(requests), 0) AS requests, COALESCE(SUM(tokens), 0) AS tokens FROM embedding_usage",
+				params: [],
+				result: "get" as const,
 			},
-			{ siteToken: "embedding-usage.ts:133" },
+			{
+				sql: "SELECT COALESCE(SUM(requests), 0) AS requests, COALESCE(SUM(tokens), 0) AS tokens FROM embedding_usage WHERE day = ?",
+				params: [todayKey(now)],
+				result: "get" as const,
+			},
+			{
+				sql: "SELECT source_kind AS source, SUM(requests) AS requests, SUM(tokens) AS tokens FROM embedding_usage GROUP BY source_kind ORDER BY tokens DESC",
+				params: [],
+				result: "all" as const,
+			},
+			{
+				sql: "SELECT provider, SUM(requests) AS requests, SUM(tokens) AS tokens FROM embedding_usage GROUP BY provider ORDER BY tokens DESC",
+				params: [],
+				result: "all" as const,
+			},
+		];
+		const [total, today, bySource, byProvider] = await Promise.all(
+			queries.map(
+				(statement) =>
+					owner.owner.submit(
+						{
+							kind: "query",
+							statement: { ...statement, readonly: true },
+						},
+						{ operation: "embedding.usage.summary", lane: "read", deadlineMs: 200 },
+					).result,
+			),
 		);
+		const summary = { total, today, bySource, byProvider } as EmbeddingUsageSummary;
 		cachedEmbeddingUsageSummary = summary;
 		return summary;
 	} catch (e) {

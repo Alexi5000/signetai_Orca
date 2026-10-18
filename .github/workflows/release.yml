@@ -20,7 +20,7 @@ jobs:
       group: nightly-release-pipeline
       cancel-in-progress: true
     # Skip release commits (prevent loops) and non-code commits
-    if: "!contains(github.event.head_commit.message, 'chore: release')"
+    if: "vars.RELEASES_ENABLED == 'true' && !contains(github.event.head_commit.message, 'chore: release')"
 
     permissions:
       contents: write
