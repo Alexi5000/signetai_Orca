@@ -34,7 +34,6 @@ const STOP_POLL_MS = 50;
 const outputDir = process.argv.includes("--out")
 	? resolve(process.argv[process.argv.indexOf("--out") + 1] ?? "boot-wedge-artifacts")
 	: null;
-const outputPath = join(outputDir ?? tmpdir(), "boot-wedge.json");
 
 interface CpuSnapshot {
 	readonly processTicks: number;
@@ -87,8 +86,10 @@ interface BootWedgeReport {
 	readonly error?: string;
 }
 
-function parseOutputDir(): void {
-	if (outputDir) mkdirSync(outputDir, { recursive: true });
+export function createReportPath(directory: string | null): string {
+	const reportDirectory = directory ?? mkdtempSync(join(tmpdir(), "signet-boot-wedge-report-"));
+	if (directory) mkdirSync(directory, { recursive: true });
+	return join(reportDirectory, "boot-wedge.json");
 }
 
 function appendBounded(target: string[], chunk: Buffer): void {
@@ -527,7 +528,7 @@ async function run(): Promise<BootWedgeReport> {
 }
 
 if (import.meta.main) {
-	parseOutputDir();
+	const outputPath = createReportPath(outputDir);
 	const report = await run();
 	writeFileSync(outputPath, JSON.stringify(report, null, 2));
 	for (const check of report.evaluation.checks) {
