@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileIfExistsSync, writeFileAtomicSync } from "@signet/core";
 import { readFile, writeFile } from "node:fs/promises";
 
 /**
@@ -6,9 +6,9 @@ import { readFile, writeFile } from "node:fs/promises";
  * Returns true when a write occurred.
  */
 export function writeFileIfChanged(path: string, content: string): boolean {
-	const existing = existsSync(path) ? readFileSync(path, "utf-8") : null;
+	const existing = readFileIfExistsSync(path, "utf-8");
 	if (existing === content) return false;
-	writeFileSync(path, content);
+	writeFileAtomicSync(path, content);
 	return true;
 }
 

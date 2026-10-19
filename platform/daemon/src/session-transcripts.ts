@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { writeFileAtomicSync } from "@signet/core";
 import { dirname, join } from "node:path";
 import { extractAnchorTerms } from "./anchor-terms";
 import { type DbAccessor, type ReadDb, type WriteDb, getDbAccessor } from "./db-accessor";
@@ -103,7 +104,7 @@ function tableExists(name: string): boolean {
 		// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
 		return getDbAccessor().withReadDb(
 			(db: import("./db-accessor").ReadDb) => tableExistsInDatabase(db, name),
-			"session-transcripts.ts:104",
+			"db:session-transcripts.legacy.line104",
 		);
 	} catch {
 		return false;
@@ -116,7 +117,7 @@ function sessionTranscriptsHasColumn(column: string): boolean {
 		return getDbAccessor().withReadDb((db: import("./db-accessor").ReadDb) => {
 			const cols = db.prepare("PRAGMA table_info(session_transcripts)").all() as ReadonlyArray<Record<string, unknown>>;
 			return cols.some((col) => col.name === column);
-		}, "session-transcripts.ts:116");
+		}, "db:session-transcripts.legacy.line116");
 	} catch {
 		return false;
 	}
@@ -264,7 +265,7 @@ async function backfillDatabaseTranscripts(
 						ORDER BY agent_id, harness, session_key, rowid
 						LIMIT ? OFFSET ?`;
 				return db.prepare(sql).all(PAGE_SIZE, offset) as unknown as StoredTranscriptBackfillRow[];
-			}, "session-transcripts.ts:252");
+			}, "db:session-transcripts.legacy.line252");
 			if (rows.length === 0) break;
 			for (const row of rows) {
 				const rowAgentId = row.agent_id?.trim() || "default";
@@ -376,10 +377,10 @@ export async function ensureCanonicalTranscriptHistory(basePath: string, agentId
 function writeMarker(markerPath: string, agentId?: string): boolean {
 	try {
 		mkdirSync(dirname(markerPath), { recursive: true });
-		writeFileSync(
+		writeFileAtomicSync(
 			markerPath,
 			JSON.stringify({ completed_at: new Date().toISOString(), agent_id: agentId ?? "*" }),
-			"utf8",
+			{ fsync: false },
 		);
 		return true;
 	} catch (error) {
@@ -396,7 +397,7 @@ function hasUpdatedAt(): boolean {
 		return getDbAccessor().withReadDb((db: import("./db-accessor").ReadDb) => {
 			const cols = db.prepare("PRAGMA table_info(session_transcripts)").all() as ReadonlyArray<Record<string, unknown>>;
 			return cols.some((col) => col.name === "updated_at");
-		}, "session-transcripts.ts:396");
+		}, "db:session-transcripts.legacy.line396");
 	} catch {
 		return false;
 	}
@@ -515,7 +516,7 @@ export function upsertSessionTranscript(
 				content: retainedTranscript,
 			});
 			return true;
-		}, "session-transcripts.ts:450");
+		}, "db:session-transcripts.legacy.line450");
 	} catch (error) {
 		logger.warn("transcripts", "Transcript upsert failed", {
 			error: error instanceof Error ? error.message : String(error),
@@ -604,7 +605,7 @@ export async function upsertSessionTranscriptAsync(
 				});
 				return true;
 			},
-			{ siteToken: "session-transcripts.ts:541", operation: "transcripts.upsert", signal: options?.signal },
+			{ siteToken: "db:session-transcripts.legacy.line541", operation: "transcripts.upsert", signal: options?.signal },
 		);
 	} catch (error) {
 		if (options?.signal?.aborted) throw error;
@@ -656,7 +657,7 @@ export function markSessionTranscriptCompleted(
 		return (accessor ?? getDbAccessor()).withWriteTx((db: import("./db-accessor").WriteDb) => {
 			if (!tableExistsInDatabase(db, "session_transcripts")) return false;
 			return markSessionTranscriptCompletedInTx(db, sessionKey, agentId, completedAt);
-		}, "session-transcripts.ts:656");
+		}, "db:session-transcripts.legacy.line656");
 	} catch (error) {
 		logger.warn("transcripts", "Transcript completion marker failed", {
 			error: error instanceof Error ? error.message : String(error),
@@ -721,7 +722,7 @@ export function getStoredSessionTranscriptInfo(sessionKey: string, agentId: stri
 				completedAt: row.completed_at ?? null,
 				contentHash: row.content_hash ?? null,
 			};
-		}, "session-transcripts.ts:690");
+		}, "db:session-transcripts.legacy.line690");
 	} catch {
 		return undefined;
 	}
@@ -791,7 +792,7 @@ export async function getStoredSessionTranscriptInfoAsync(
 				if (!tableExistsInDatabase(db, "session_transcripts")) return undefined;
 				return readStoredSessionTranscriptInfo(db, sessionKey, agentId);
 			},
-			{ siteToken: "session-transcripts.ts:789", operation: "transcripts.lookup", signal },
+			{ siteToken: "db:session-transcripts.legacy.line789", operation: "transcripts.lookup", signal },
 		);
 	} catch (error) {
 		if (signal?.aborted) throw error;
@@ -815,7 +816,7 @@ export function getSessionTranscriptContent(sessionKey: string, agentId: string)
 				)
 				.get(agentId, ...aliases, sessionKey) as { content: string } | undefined;
 			return row?.content;
-		}, "session-transcripts.ts:808");
+		}, "db:session-transcripts.legacy.line808");
 	} catch {
 		return undefined;
 	}
@@ -871,7 +872,7 @@ export function findStaleLiveSessions(staleOlderThanMs: number, limit = 50): Sta
 				content: row.content,
 				lastActivityAt: row.last_activity,
 			}));
-		}, "session-transcripts.ts:847");
+		}, "db:session-transcripts.legacy.line847");
 	} catch {
 		return [];
 	}
@@ -919,7 +920,7 @@ export function searchTranscriptFallback(params: {
 					].join("\n"),
 				)
 				.all(...args) as unknown as TranscriptRow[];
-		}, "session-transcripts.ts:902");
+		}, "db:session-transcripts.legacy.line902");
 		if (exactRows.length > 0) {
 			return exactRows
 				.map((row) => ({
@@ -962,7 +963,7 @@ export function searchTranscriptFallback(params: {
 							parts.push(`ORDER BY rank ASC, ${seenExpr} DESC LIMIT ?`);
 							args.push(limit * 2);
 							return db.prepare(parts.join("\n")).all(...args) as unknown as TranscriptRow[];
-						}, "session-transcripts.ts:947");
+						}, "db:session-transcripts.legacy.line947");
 
 					const hits = rows
 						.map((row) => ({
@@ -1032,7 +1033,7 @@ export function searchTranscriptFallback(params: {
 				parts.push(`ORDER BY rank DESC, ${seenExpr} DESC LIMIT ?`);
 				args.push(limit);
 				return db.prepare(parts.join("\n")).all(...args) as unknown as TranscriptRow[];
-			}, "session-transcripts.ts:1011");
+			}, "db:session-transcripts.legacy.line1011");
 
 		return rows
 			.map((row) => ({

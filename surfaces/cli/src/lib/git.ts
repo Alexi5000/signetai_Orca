@@ -5,7 +5,8 @@ import {
 	mergeSignetGitignoreEntries,
 	resolveLaunchdExecutable,
 } from "@signet/core";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { readFileIfExistsSync, writeFileAtomicSync } from "@signet/core";
 import { join } from "node:path";
 import { spawnHidden as spawn, type ChildProcessWithoutNullStreams } from "@signet/core";
 
@@ -66,10 +67,10 @@ export async function gitAddAndCommit(dir: string, message: string): Promise<boo
 
 function ensureProtectedGitignore(dir: string): void {
 	const path = join(dir, ".gitignore");
-	const prev = existsSync(path) ? readFileSync(path, "utf-8") : "";
+	const prev = readFileIfExistsSync(path, "utf-8") ?? "";
 	const next = mergeSignetGitignoreEntries(prev);
 	if (next !== prev) {
-		writeFileSync(path, next, "utf-8");
+		writeFileAtomicSync(path, next);
 	}
 }
 

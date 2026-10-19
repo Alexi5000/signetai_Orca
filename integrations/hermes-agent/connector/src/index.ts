@@ -5,7 +5,14 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BaseConnector, type InstallResult, type UninstallResult, resolveSignetApiKey } from "@signet/connector-base";
-import { expandHome, resolveHermesHomePath, resolveHermesRepoPath } from "@signet/core";
+import {
+	expandHome,
+	readFileIfExistsSync,
+	resolveHermesHomePath,
+	resolveHermesRepoPath,
+	writeFileAtomicSync,
+	writeFileExclusiveSync,
+} from "@signet/core";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -323,7 +330,6 @@ function writeProviderBackup(
 ): string | null {
 	if (previousProvider === "signet") return null;
 	const backupPath = getProviderBackupPath(hermesHome);
-	if (existsSync(backupPath)) return null;
 	const backup: ProviderBackup = {
 		schemaVersion: 1,
 		configPath,
@@ -332,7 +338,9 @@ function writeProviderBackup(
 		createdAt: new Date().toISOString(),
 	};
 	mkdirSync(dirname(backupPath), { recursive: true });
-	writeFileSync(backupPath, `${JSON.stringify(backup, null, 2)}\n`);
+	// Never replace the first backup: create it exclusively instead of
+	// checking for it and writing later.
+	if (!writeFileExclusiveSync(backupPath, `${JSON.stringify(backup, null, 2)}\n`)) return null;
 	return backupPath;
 }
 
@@ -441,7 +449,7 @@ function configureProvider(
 		}
 		if (!changed) return { configPath: null, backupPath: null };
 		mkdirSync(dirname(configPath), { recursive: true });
-		writeFileSync(configPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
+		writeFileAtomicSync(configPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
 		return { configPath, backupPath };
 	}
 	if (content && block === null) {
@@ -468,7 +476,7 @@ function configureProvider(
 	}
 
 	mkdirSync(dirname(configPath), { recursive: true });
-	writeFileSync(configPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
+	writeFileAtomicSync(configPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
 	return { configPath, backupPath };
 }
 
@@ -511,7 +519,7 @@ function restoreOrClearProvider(
 		configChanged = true;
 	}
 	if (configChanged) {
-		writeFileSync(safeConfigPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
+		writeFileAtomicSync(safeConfigPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
 	}
 	return {
 		configPath: configChanged ? safeConfigPath : null,
@@ -922,10 +930,7 @@ export class HermesAgentConnector extends BaseConnector {
 			"",
 		);
 		try {
-			let envContent = "";
-			if (existsSync(envPath)) {
-				envContent = readFileSync(envPath, "utf-8");
-			}
+			let envContent = readFileIfExistsSync(envPath, "utf-8") ?? "";
 
 			const signetVars: Record<string, string> = {};
 
@@ -1002,7 +1007,7 @@ export class HermesAgentConnector extends BaseConnector {
 
 			if (changed) {
 				mkdirSync(hermesHome, { recursive: true });
-				writeFileSync(envPath, envContent);
+				writeFileAtomicSync(envPath, envContent);
 				configsPatched.push(envPath);
 			}
 		} catch (e) {
@@ -1111,7 +1116,7 @@ export class HermesAgentConnector extends BaseConnector {
 					}
 				}
 				if (changed) {
-					writeFileSync(envPath, `${envContent.replace(/\n{3,}/g, "\n\n").trimEnd()}\n`);
+					writeFileAtomicSync(envPath, `${envContent.replace(/\n{3,}/g, "\n\n").trimEnd()}\n`);
 					configsPatched.push(envPath);
 				}
 			} catch (e) {

@@ -1,15 +1,6 @@
-import { spawnSyncHidden as spawnSync } from "@signet/core";
+import { appendFileSecureSync, readFileIfExistsSync, spawnSyncHidden as spawnSync } from "@signet/core";
 import { createHash } from "node:crypto";
-import {
-	chmodSync,
-	copyFileSync,
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import chalk from "chalk";
@@ -126,11 +117,14 @@ export function persistNativeInstallPath(
 
 	let contents = "";
 	try {
-		if (existsSync(profilePath)) contents = readFileSync(profilePath, "utf8");
+		contents = readFileIfExistsSync(profilePath, "utf8") ?? "";
 		if (!profileContainsPath(contents, binDir, home, platform)) {
 			const entry = shellPathEntry(binDir, home, platform);
 			const prefix = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
-			writeFileSync(profilePath, `${contents}${prefix}export PATH="${entry}:$PATH"\n`, "utf8");
+			// Append in place: keeps the profile's mode, owner, and any dotfile symlink,
+			// and never discards edits made after the read above. New files get the
+			// usual umask-filtered default mode.
+			appendFileSecureSync(profilePath, `${prefix}export PATH="${entry}:$PATH"\n`, 0o666);
 		}
 		return { profilePath, persisted: true };
 	} catch {

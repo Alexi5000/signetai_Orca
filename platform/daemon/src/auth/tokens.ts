@@ -5,7 +5,8 @@
  * Token format: {base64url(payload)}.{base64url(hmac)}
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
+import { readFileIfExistsSync, writeFileAtomicSync, writeFileExclusiveSync } from "@signet/core";
 import { dirname } from "node:path";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { AuthResult, TokenClaims, TokenRole, TokenScope } from "./types";
@@ -27,25 +28,23 @@ export function generateSecret(): Buffer {
 const SECRET_LENGTH = 32;
 
 export function loadOrCreateSecret(secretPath: string): Buffer {
-	if (existsSync(secretPath)) {
-		const secret = readFileSync(secretPath);
-		if (secret.length !== SECRET_LENGTH) {
+	const existing = readFileIfExistsSync(secretPath);
+	if (existing !== null) {
+		if (existing.length !== SECRET_LENGTH) {
 			console.warn(
-				`[auth] Secret at ${secretPath} has unexpected length ${secret.length} — regenerating. All existing tokens will be invalidated.`,
+				`[auth] Secret at ${secretPath} has unexpected length ${existing.length} — regenerating. All existing tokens will be invalidated.`,
 			);
 			const fresh = generateSecret();
-			writeFileSync(secretPath, fresh, { mode: 0o600 });
+			writeFileAtomicSync(secretPath, fresh, { mode: 0o600 });
 			return fresh;
 		}
-		return secret;
+		return existing;
 	}
-	const dir = dirname(secretPath);
-	if (!existsSync(dir)) {
-		mkdirSync(dir, { recursive: true });
-	}
+	mkdirSync(dirname(secretPath), { recursive: true });
 	const secret = generateSecret();
-	writeFileSync(secretPath, secret, { mode: 0o600 });
-	return secret;
+	if (writeFileExclusiveSync(secretPath, secret, { mode: 0o600 })) return secret;
+	// Another process created the secret concurrently; adopt it.
+	return loadOrCreateSecret(secretPath);
 }
 
 function sign(secret: Buffer, payload: string): Buffer {

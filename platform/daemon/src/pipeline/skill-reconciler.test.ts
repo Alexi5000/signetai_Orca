@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "../db-accessor";
 import { type LogEntry, logger } from "../logger";
@@ -15,6 +14,7 @@ import {
 	startReconciler,
 	withSkillReconciliationLock,
 } from "./skill-reconciler";
+import { createTestTempDir } from "../test-temp-dir";
 
 /** Poll `cond` until it returns true or `timeoutMs` elapses. */
 async function waitFor(cond: () => boolean, timeoutMs = 3_000): Promise<void> {
@@ -45,7 +45,7 @@ function embeddingCount(skillName: string): number {
 }
 
 function setup(): { root: string; db: string } {
-	const root = join(tmpdir(), `signet-skill-reconciler-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	const root = createTestTempDir("signet-skill-reconciler-");
 	mkdirSync(root, { recursive: true });
 	return { root, db: join(root, "memories.db") };
 }
@@ -784,8 +784,8 @@ describe("single-flight trigger overlap (#1354)", () => {
 		// Two different agentsDirs with the same skill name must not serialize
 		// against each other: a lock held for one agent's workspace cannot
 		// block another agent's reconcile of the same-named skill.
-		const dirA = join(tmpdir(), `signet-lock-a-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		const dirB = join(tmpdir(), `signet-lock-b-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const dirA = createTestTempDir("signet-lock-a-");
+		const dirB = createTestTempDir("signet-lock-b-");
 		try {
 			let releaseA: (() => void) | undefined;
 			let startedB = 0;

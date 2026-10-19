@@ -24,15 +24,17 @@
  * ```
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { BaseConnector, type InstallResult, type UninstallResult, atomicWriteJson } from "@signet/connector-base";
 import {
 	expandHome,
+	readFileIfExistsSync,
 	resolvePromptSubmitTimeoutMs,
 	resolveSessionStartTimeoutMs,
 	resolveSignetDaemonUrl,
+	writeFileAtomicSync,
 } from "@signet/core";
 
 // ---------------------------------------------------------------------------
@@ -237,22 +239,22 @@ export function removeSignetKimiHookBlocks(content: string): string {
 
 function patchConfigToml(path: string, entries: readonly KimiHookEntry[]): boolean {
 	mkdirSync(join(path, ".."), { recursive: true });
-	const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
+	const existing = readFileIfExistsSync(path, "utf-8") ?? "";
 	const cleaned = removeSignetKimiHookBlocks(existing).trimEnd();
 	const blocks = entries.map(serializeHookEntry).join("\n\n");
 	const updated = `${cleaned.length > 0 ? `${cleaned}\n\n` : ""}${blocks}\n`;
 	if (updated === existing) return false;
-	writeFileSync(path, updated);
+	writeFileAtomicSync(path, updated);
 	return true;
 }
 
 function unpatchConfigToml(path: string): boolean {
-	if (!existsSync(path)) return false;
-	const content = readFileSync(path, "utf-8");
+	const content = readFileIfExistsSync(path, "utf-8");
+	if (content === null) return false;
 	if (!SIGNET_KIMI_HOOK_PATTERN.test(content)) return false;
 	const updated = removeSignetKimiHookBlocks(content);
 	if (updated === content) return false;
-	writeFileSync(path, updated);
+	writeFileAtomicSync(path, updated);
 	return true;
 }
 

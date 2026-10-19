@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { readFileWithStatSync } from "../platform/core/src/secure-fs";
 import { spawnSync } from "node:child_process";
 
 const root = join(import.meta.dir, "..");
@@ -30,8 +31,10 @@ if (result.status !== 0) {
 	throw new Error(`tar exited with status ${result.status ?? "unknown"}`);
 }
 
-const bytes = statSync(tarballPath).size;
-const sha256 = createHash("sha256").update(readFileSync(tarballPath)).digest("hex");
+const tarball = readFileWithStatSync(tarballPath);
+if (!tarball) throw new Error(`tarball was not written: ${tarballPath}`);
+const bytes = tarball.stat.size;
+const sha256 = createHash("sha256").update(tarball.content).digest("hex");
 const metadata = {
 	name: `signet-daemon-js-${version}.tar.gz`,
 	sha256,

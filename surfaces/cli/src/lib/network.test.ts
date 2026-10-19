@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createPrivateTempDir } from "@signet/core";
 import { daemonAccessLines, resolveDaemonNetwork } from "./network.js";
 
 const DIRS: string[] = [];
@@ -13,8 +13,7 @@ afterEach(() => {
 });
 
 function makeDir(): string {
-	const dir = join(tmpdir(), `signet-network-test-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-	mkdirSync(dir, { recursive: true });
+	const dir = createPrivateTempDir("signet-network-test-");
 	DIRS.push(dir);
 	return dir;
 }

@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import {
 	getNativeTransformersBindings,
 	materializeEmbeddedAssetTree,
@@ -78,7 +77,8 @@ describe("native-runtime-assets", () => {
 		expect(concurrentPaths.every((path) => path && existsSync(path))).toBe(true);
 		expect(concurrentPaths[0] ? readFileSync(concurrentPaths[0], "utf8") : "").toBe("fake-native-binding");
 
-		const addonDir = join(tmpdir(), "signet-native-addons");
+		// Inspect the directory the runtime actually materialized into.
+		const addonDir = dirname(concurrentPaths[0] ?? "");
 		const addonEntries = readdirSync(addonDir).filter((entry) => entry.startsWith("napi-rs-keyring-"));
 		expect(addonEntries).toHaveLength(1);
 		expect(addonEntries[0]?.endsWith(".node")).toBe(true);
@@ -99,11 +99,12 @@ describe("native-runtime-assets", () => {
 		expect(pathA ? readFileSync(pathA) : null).toEqual(contentA);
 		expect(pathB ? readFileSync(pathB) : null).toEqual(contentB);
 
-		const dir = join(tmpdir(), "signet-native-addons");
+		const dir = dirname(pathA ?? "");
 		const corrupt = join(dir, "fenced-addon-deadbeefdeadbeef.node");
 		const stray = join(dir, "fenced-addon-stray.tmp");
-		writeFileSync(corrupt, "torn");
-		writeFileSync(stray, "temp");
+		// Planted fixtures are owner-only, like the runtime's own files.
+		writeFileSync(corrupt, "torn", { mode: 0o600 });
+		writeFileSync(stray, "temp", { mode: 0o600 });
 		materializeEmbeddedNativeAddon("fenced-addon");
 		expect(pathA ? existsSync(pathA) : false).toBe(true);
 		expect(pathB ? existsSync(pathB) : false).toBe(true);

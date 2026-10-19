@@ -5,7 +5,7 @@
  * db-accessor.ts).
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,9 +16,11 @@ import {
 	type WorkspaceSourceRepoSyncResult,
 	detectSignetInstallations,
 	parseSimpleYaml,
+	readFileIfExistsSync,
 	resolveGlobalPackagePath,
 	resolvePrimaryPackageManager,
 	syncWorkspaceSourceRepoAsync,
+	writeFileAtomicSync,
 } from "@signet/core";
 import {
 	UPDATE_INSTALL_TIMEOUT_MS,
@@ -384,10 +386,9 @@ export function persistUpdateConfig(config: UpdateConfig): boolean {
 	const paths = [join(agentsDir, "agent.yaml"), join(agentsDir, "AGENT.yaml")];
 
 	for (const p of paths) {
-		if (!existsSync(p)) continue;
-
 		try {
-			const current = readFileSync(p, "utf-8");
+			const current = readFileIfExistsSync(p, "utf-8");
+			if (current === null) continue;
 			const updatesSection = formatUpdatesSection(config);
 			const updatesPattern = /^updates:\n(?:[ \t].*(?:\n|$))*/m;
 			const trimmedCurrent = current.trimEnd();
@@ -399,7 +400,7 @@ export function persistUpdateConfig(config: UpdateConfig): boolean {
 					: updatesSection;
 
 			if (updated !== current) {
-				writeFileSync(p, updated);
+				writeFileAtomicSync(p, updated, { fsync: false });
 			}
 
 			return true;

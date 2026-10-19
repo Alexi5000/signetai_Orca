@@ -3,6 +3,7 @@
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { readFileIfExistsSync, writeFileAtomicSync } from "../platform/core/src/secure-fs";
 
 const REFERENCE_FILE = "package.json";
 const EXCLUDED_FILES = new Set(["surfaces/dashboard/package.json"]);
@@ -297,9 +298,8 @@ export function syncSignetNativeOptionalDependencies(
 	checkOnly: boolean,
 	file = "dist/signetai/package.json",
 ): string[] {
-	if (!existsSync(file)) return [];
-
-	const raw = readFileSync(file, "utf8");
+	const raw = readFileIfExistsSync(file, "utf8");
+	if (raw === null) return [];
 	const pkg = JSON.parse(raw) as { optionalDependencies?: Record<string, string> };
 	const optionalDependencies = pkg.optionalDependencies;
 	if (!optionalDependencies) return [];
@@ -314,7 +314,7 @@ export function syncSignetNativeOptionalDependencies(
 
 	if (!changed) return [];
 	if (!checkOnly) {
-		writeFileSync(file, stringifyPackageJson(pkg));
+		writeFileAtomicSync(file, stringifyPackageJson(pkg));
 	}
 	return [file];
 }

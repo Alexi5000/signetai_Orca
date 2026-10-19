@@ -123,6 +123,24 @@ describe("tokens", () => {
 			expect(buf.length).toBe(32);
 		});
 
+		test("concurrent processes adopt one fully published secret", async () => {
+			const path = join(tmpDir, "concurrent-secret");
+			const modulePath = new URL("./tokens.ts", import.meta.url).href;
+			const code = `import {loadOrCreateSecret} from ${JSON.stringify(modulePath)};
+import {createHash} from "node:crypto";
+console.log(createHash("sha256").update(loadOrCreateSecret(process.argv[1])).digest("hex"));`;
+			const results = await Promise.all(
+				Array.from({ length: 8 }, async () => {
+					const child = Bun.spawn([process.execPath, "-e", code, path], { stdout: "pipe", stderr: "pipe" });
+					const output = await new Response(child.stdout).text();
+					expect(await child.exited).toBe(0);
+					return output.trim();
+				}),
+			);
+			expect(new Set(results).size).toBe(1);
+			expect(results[0]).toMatch(/^[a-f0-9]{64}$/);
+		});
+
 		test("reads existing file rather than regenerating", () => {
 			const path = join(tmpDir, "secret");
 			const first = loadOrCreateSecret(path);

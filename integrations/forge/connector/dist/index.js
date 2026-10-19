@@ -1,13 +1,13 @@
 // src/index.ts
 import {
   existsSync as existsSync2,
-  lstatSync as lstatSync2,
+  lstatSync as lstatSync3,
   mkdirSync,
   readFileSync as readFileSync2,
   readdirSync,
   readlinkSync,
   rmSync as rmSync2,
-  unlinkSync as unlinkSync3,
+  unlinkSync as unlinkSync4,
   writeFileSync as writeFileSync2
 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
@@ -15,9 +15,20 @@ import { join as join6, resolve as resolve6 } from "node:path";
 
 // ../../../libs/connector-base/dist/index.js
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fchmodSync as fchmodSync2,
+  readFileSync,
+  realpathSync as realpathSync2,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync as writeSync3
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname as dirname2, isAbsolute, join as join3, relative, sep } from "node:path";
+import { dirname as dirname3, isAbsolute, join as join3, relative, sep } from "node:path";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,51 +46,85 @@ import { join as join2, resolve } from "node:path";
 import { createHash as createHash2 } from "node:crypto";
 import { createRequire as createRequire2 } from "node:module";
 import {
+  chmodSync as chmodSync2,
   closeSync as closeSync2,
-  existsSync as existsSync6,
+  constants,
+  fchmodSync,
+  fstatSync,
   fsyncSync as fsyncSync2,
-  mkdirSync as mkdirSync3,
+  lstatSync,
+  mkdtempSync,
   openSync as openSync2,
-  readFileSync as readFileSync5,
+  readFileSync as readFileSync4,
+  realpathSync,
   renameSync as renameSync2,
-  rmSync,
-  statSync as statSync3,
+  unlinkSync as unlinkSync2,
   writeSync
 } from "node:fs";
+import {
+  closeSync as closeSync3,
+  existsSync as existsSync6,
+  fsyncSync as fsyncSync3,
+  mkdirSync as mkdirSync3,
+  openSync as openSync3,
+  readFileSync as readFileSync6,
+  renameSync as renameSync3,
+  rmSync,
+  statSync as statSync3,
+  writeSync as writeSync2
+} from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { dirname as dirname3, join as join7, resolve as resolve2 } from "node:path";
+import { dirname as dirname4, join as join8, resolve as resolve2 } from "node:path";
 import { createRequire as createRequire3 } from "node:module";
 import { homedir as homedir5 } from "node:os";
-import { dirname as dirname4, join as join8, resolve as resolve3 } from "node:path";
+import { dirname as dirname5, join as join9, resolve as resolve3 } from "node:path";
 import { homedir as homedir6, platform as platform2 } from "node:os";
-import { basename, dirname as dirname5, resolve as resolve5 } from "node:path";
+import { basename as basename2, dirname as dirname6, resolve as resolve5 } from "node:path";
 import { homedir as homedir8 } from "node:os";
-import { existsSync as existsSync13, lstatSync, mkdirSync as mkdirSync8, readdirSync as readdirSync6, symlinkSync, unlinkSync as unlinkSync2 } from "node:fs";
-import { join as join13 } from "node:path";
+import { existsSync as existsSync13, lstatSync as lstatSync2, mkdirSync as mkdirSync8, readdirSync as readdirSync6, symlinkSync, unlinkSync as unlinkSync3 } from "node:fs";
+import { join as join14 } from "node:path";
 var __create2 = Object.create;
 var __getProtoOf2 = Object.getPrototypeOf;
 var __defProp2 = Object.defineProperty;
 var __getOwnPropNames2 = Object.getOwnPropertyNames;
 var __hasOwnProp2 = Object.prototype.hasOwnProperty;
+function __accessProp2(key) {
+  return this[key];
+}
+var __toESMCache_node2;
+var __toESMCache_esm2;
 var __toESM2 = (mod, isNodeMode, target) => {
+  var canCache = mod != null && typeof mod === "object";
+  if (canCache) {
+    var cache = isNodeMode ? __toESMCache_node2 ??= new WeakMap : __toESMCache_esm2 ??= new WeakMap;
+    var cached = cache.get(mod);
+    if (cached)
+      return cached;
+  }
   target = mod != null ? __create2(__getProtoOf2(mod)) : {};
   const to = isNodeMode || !mod || !mod.__esModule ? __defProp2(target, "default", { value: mod, enumerable: true }) : target;
   for (let key of __getOwnPropNames2(mod))
     if (!__hasOwnProp2.call(to, key))
       __defProp2(to, key, {
-        get: () => mod[key],
+        get: __accessProp2.bind(mod, key),
         enumerable: true
       });
+  if (canCache)
+    cache.set(mod, to);
   return to;
 };
 var __commonJS2 = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
 var __export = (target, all) => {
   for (var name in all)
     __defProp2(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter.bind(all, name)
     });
 };
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
@@ -7013,7 +7058,7 @@ var require_package2 = __commonJS2((exports, module) => {
   };
 });
 var require_keyring = __commonJS2((exports, module) => {
-  var __filename2 = "/home/nicholai/signet/signetai/.worktrees/connectors-dashboard-health/node_modules/.bun/@napi-rs+keyring@1.3.0/node_modules/@napi-rs/keyring/index.js";
+  var __filename2 = "/home/.z/workspaces/con_Vvb8Q5RFSSF3eueE/lanes/signetai_Orca/node_modules/.bun/@napi-rs+keyring@1.3.0/node_modules/@napi-rs/keyring/index.js";
   var { createRequire: createRequire22 } = __require("node:module");
   __require = createRequire22(__filename2);
   var { readFileSync: readFileSync3 } = __require("node:fs");
@@ -17916,6 +17961,10 @@ class NativeSecretKeyringAdapter {
     }
   }
 }
+var PRIVATE_FILE_MODE = 384;
+function openFileExclusiveSync(path, mode = PRIVATE_FILE_MODE) {
+  return openSync2(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, mode);
+}
 var LOOPBACK_HOST = "127.0.0.1";
 function normalizeLoopbackHost(host) {
   const normalized = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
@@ -18014,9 +18063,9 @@ function readTrimmedEnv(env, name) {
 function readConfigHome(env, home) {
   const raw = env.XDG_CONFIG_HOME;
   if (typeof raw !== "string")
-    return join7(home, ".config");
+    return join8(home, ".config");
   const trimmed = raw.trim();
-  return trimmed.length > 0 ? normalizeWorkspacePath(trimmed, home) : join7(home, ".config");
+  return trimmed.length > 0 ? normalizeWorkspacePath(trimmed, home) : join8(home, ".config");
 }
 function isExistingDirectory(path) {
   try {
@@ -18029,7 +18078,7 @@ function isRecord5(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function getWorkspaceConfigPath(env = process.env, home = homedir4()) {
-  return join7(readConfigHome(env, home), "signet", "workspace.json");
+  return join8(readConfigHome(env, home), "signet", "workspace.json");
 }
 function readConfiguredWorkspacePath(env = process.env, home = homedir4(), options = {}) {
   const strict = options.strict ?? true;
@@ -18038,7 +18087,7 @@ function readConfiguredWorkspacePath(env = process.env, home = homedir4(), optio
     return null;
   let raw;
   try {
-    raw = JSON.parse(readFileSync5(configPath, "utf-8"));
+    raw = JSON.parse(readFileSync6(configPath, "utf-8"));
   } catch (err) {
     if (!strict)
       return null;
@@ -18083,7 +18132,7 @@ function resolveWorkspacePath(options = {}) {
     };
   }
   return {
-    path: join7(home, DEFAULT_AGENTS_DIRNAME),
+    path: join8(home, DEFAULT_AGENTS_DIRNAME),
     source: "default",
     configPath,
     configuredPath: configValue
@@ -18106,7 +18155,7 @@ try {
   const esmRequire = createRequire3(import.meta.url);
   native = esmRequire("@signet/native");
 } catch {}
-var GRAPHIQ_DEFAULT_INSTALL_DIR = join8(homedir5(), ".local", "bin");
+var GRAPHIQ_DEFAULT_INSTALL_DIR = join9(homedir5(), ".local", "bin");
 var SIGNET_SOURCE_CHECKOUT_DIRNAME = "signetai";
 var SIGNET_GIT_ALLOWED_DIRECTORIES = ["skills", "tools", "dreaming"];
 var SIGNET_GIT_PROTECTED_PATHS = [
@@ -18251,7 +18300,7 @@ function symlinkSkills(sourceDir, targetDir, options = {}) {
   if (!existsSync13(sourceDir)) {
     return result;
   }
-  const targetParent = join13(targetDir, "..");
+  const targetParent = join14(targetDir, "..");
   if (!existsSync13(targetParent)) {
     mkdirSync8(targetParent, { recursive: true });
   }
@@ -18269,10 +18318,10 @@ function symlinkSkills(sourceDir, targetDir, options = {}) {
     return result;
   }
   for (const entry of entries) {
-    const srcPath = join13(sourceDir, entry);
-    const destPath = join13(targetDir, entry);
+    const srcPath = join14(sourceDir, entry);
+    const destPath = join14(targetDir, entry);
     try {
-      const src = lstatSync(srcPath);
+      const src = lstatSync2(srcPath);
       if (src.isSymbolicLink() || !src.isDirectory()) {
         result.skipped.push(srcPath);
         continue;
@@ -18285,10 +18334,10 @@ function symlinkSkills(sourceDir, targetDir, options = {}) {
       continue;
     }
     try {
-      const destStat = lstatSync(destPath);
+      const destStat = lstatSync2(destPath);
       if (destStat.isSymbolicLink()) {
         if (!options.dryRun) {
-          unlinkSync2(destPath);
+          unlinkSync3(destPath);
         }
       } else {
         result.skipped.push(destPath);
@@ -18337,15 +18386,21 @@ class BaseConnector {
     const cleaned = stripSignetBlock(raw);
     if (cleaned === raw)
       return null;
-    const root = realpathSync(basePath);
-    const parent = realpathSync(dirname2(agentsPath));
+    const root = realpathSync2(basePath);
+    const parent = realpathSync2(dirname3(agentsPath));
     const rel = relative(root, join3(parent, "AGENTS.md"));
     if (rel.startsWith("..") || isAbsolute(rel)) {
       throw new Error(`Target path escapes validated root: ${agentsPath}`);
     }
     const tmp = join3(basePath, `.${randomBytes(6).toString("hex")}.tmp`);
     try {
-      writeFileSync(tmp, cleaned, "utf-8");
+      const fd = openFileExclusiveSync(tmp);
+      try {
+        writeSync3(fd, cleaned, null, "utf-8");
+        fchmodSync2(fd, 438 & ~process.umask());
+      } finally {
+        closeSync(fd);
+      }
       renameSync(tmp, agentsPath);
     } catch (err) {
       try {
@@ -18361,7 +18416,7 @@ class BaseConnector {
   generateHeader(sourcePath, targetName) {
     const name = targetName || this.name;
     const safe = (p2) => p2.replace(/[\n\r]/g, "");
-    const root = dirname2(sourcePath);
+    const root = dirname3(sourcePath);
     return `# Auto-generated from ${safe(sourcePath)}
 # Source: ${safe(sourcePath)}
 # Generated: ${new Date().toISOString()}
@@ -18431,7 +18486,7 @@ function isSignetGeneratedFile(raw) {
   });
 }
 function atomicWriteText(path, content, mode) {
-  const tmp = join3(dirname2(path), `.${randomBytes(6).toString("hex")}.tmp`);
+  const tmp = join3(dirname3(path), `.${randomBytes(6).toString("hex")}.tmp`);
   let writeMode = mode;
   if (writeMode === undefined) {
     try {
@@ -18514,7 +18569,7 @@ function resolveRemoteDaemonUrl() {
 
 // ../../../platform/core/dist/index.js
 import { createRequire as createRequire4 } from "node:module";
-import { dirname as dirname6, join as join4 } from "node:path";
+import { dirname as dirname2, join as join4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 import {
   execFile as nodeExecFile2,
@@ -18531,36 +18586,54 @@ import { createHash as createHash22 } from "node:crypto";
 import { createRequire as createRequire22 } from "node:module";
 import { createRequire as createRequire32 } from "node:module";
 import { homedir as homedir52 } from "node:os";
-import { dirname as dirname42, join as join82, resolve as resolve32 } from "node:path";
+import { dirname as dirname52, join as join92, resolve as resolve32 } from "node:path";
 import { homedir as homedir62, platform as platform22 } from "node:os";
-import { basename as basename2, dirname as dirname52, resolve as resolve52 } from "node:path";
-import { existsSync as existsSync11, readFileSync as readFileSync9, realpathSync as realpathSync2, statSync as statSync7 } from "node:fs";
-import { dirname as dirname62, join as join11 } from "node:path";
+import { basename as basename22, dirname as dirname62, resolve as resolve52 } from "node:path";
+import { existsSync as existsSync11, readFileSync as readFileSync10, realpathSync as realpathSync22, statSync as statSync6 } from "node:fs";
+import { dirname as dirname7, join as join12 } from "node:path";
 import { homedir as homedir82 } from "node:os";
 var __create = Object.create;
 var __getProtoOf = Object.getPrototypeOf;
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+function __accessProp(key) {
+  return this[key];
+}
+var __toESMCache_node;
+var __toESMCache_esm;
 var __toESM = (mod, isNodeMode, target) => {
+  var canCache = mod != null && typeof mod === "object";
+  if (canCache) {
+    var cache = isNodeMode ? __toESMCache_node ??= new WeakMap : __toESMCache_esm ??= new WeakMap;
+    var cached = cache.get(mod);
+    if (cached)
+      return cached;
+  }
   target = mod != null ? __create(__getProtoOf(mod)) : {};
   const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
   for (let key of __getOwnPropNames(mod))
     if (!__hasOwnProp.call(to, key))
       __defProp(to, key, {
-        get: () => mod[key],
+        get: __accessProp.bind(mod, key),
         enumerable: true
       });
+  if (canCache)
+    cache.set(mod, to);
   return to;
 };
 var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __returnValue2 = (v2) => v2;
+function __exportSetter2(name, newValue) {
+  this[name] = __returnValue2.bind(null, newValue);
+}
 var __export2 = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => all[name] = () => newValue
+      set: __exportSetter2.bind(all, name)
     });
 };
 var __esm2 = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
@@ -25494,7 +25567,7 @@ var require_package22 = __commonJS((exports, module) => {
   };
 });
 var require_keyring2 = __commonJS((exports, module) => {
-  var __filename3 = "/home/nicholai/signet/signetai/.worktrees/connectors-dashboard-health/node_modules/.bun/@napi-rs+keyring@1.3.0/node_modules/@napi-rs/keyring/index.js";
+  var __filename3 = "/home/.z/workspaces/con_Vvb8Q5RFSSF3eueE/lanes/signetai_Orca/node_modules/.bun/@napi-rs+keyring@1.3.0/node_modules/@napi-rs/keyring/index.js";
   var { createRequire: createRequire23 } = __require2("node:module");
   __require2 = createRequire23(__filename3);
   var { readFileSync: readFileSync3 } = __require2("node:fs");
@@ -36236,7 +36309,7 @@ var MIGRATIONS2 = [
 var LATEST_SCHEMA_VERSION2 = MIGRATIONS2[MIGRATIONS2.length - 1]?.version ?? 0;
 var NETWORK_FILESYSTEM_TYPES2 = new Set(["afpfs", "nfs", "smbfs", "webdav"]);
 var __filename22 = fileURLToPath2(import.meta.url);
-var __dirname22 = dirname6(__filename22);
+var __dirname22 = dirname2(__filename22);
 var import_yaml3 = __toESM(require_dist2(), 1);
 function expandHome2(p3, home2 = homedir22()) {
   if (p3 === "~")
@@ -36413,7 +36486,7 @@ try {
   const esmRequire = createRequire32(import.meta.url);
   native2 = esmRequire("@signet/native");
 } catch {}
-var GRAPHIQ_DEFAULT_INSTALL_DIR2 = join82(homedir52(), ".local", "bin");
+var GRAPHIQ_DEFAULT_INSTALL_DIR2 = join92(homedir52(), ".local", "bin");
 var SIGNET_SOURCE_CHECKOUT_DIRNAME2 = "signetai";
 var SIGNET_GIT_ALLOWED_DIRECTORIES2 = ["skills", "tools", "dreaming"];
 var SIGNET_GIT_PROTECTED_PATHS2 = [
@@ -36590,7 +36663,7 @@ function hasValidIdentity(basePath) {
   if (mode !== "managed")
     return true;
   for (const path of resolveRequiredIdentityPaths(basePath)) {
-    if (!existsSync11(join11(basePath, path))) {
+    if (!existsSync11(join12(basePath, path))) {
       return false;
     }
   }
@@ -36598,11 +36671,11 @@ function hasValidIdentity(basePath) {
 }
 function resolveRequiredIdentityPaths(basePath) {
   const legacyRequired = () => REQUIRED_IDENTITY_KEYS2.map((key) => IDENTITY_FILES2[key].path);
-  const agentYaml = join11(basePath, "agent.yaml");
+  const agentYaml = join12(basePath, "agent.yaml");
   if (!existsSync11(agentYaml))
     return legacyRequired();
   try {
-    const config = parseSimpleYaml(readFileSync9(agentYaml, "utf-8"));
+    const config = parseSimpleYaml(readFileSync10(agentYaml, "utf-8"));
     const identity = readRecord(readRecord(config).identity);
     const configured = readIdentityEntryList(readRecord(identity.startup).load);
     if (configured.length > 0)
@@ -36645,11 +36718,11 @@ function resolveIdentityModeFromConfig(config) {
   return "managed";
 }
 function loadIdentityMode(agentsDir) {
-  const agentYaml = join11(agentsDir, "agent.yaml");
+  const agentYaml = join12(agentsDir, "agent.yaml");
   if (!existsSync11(agentYaml))
     return "managed";
   try {
-    return resolveIdentityModeFromConfig(parseSimpleYaml(readFileSync9(agentYaml, "utf-8")));
+    return resolveIdentityModeFromConfig(parseSimpleYaml(readFileSync10(agentYaml, "utf-8")));
   } catch {
     return "managed";
   }
@@ -36920,13 +36993,13 @@ ${header}${body}
     for (const entry of entries) {
       const entryPath = join6(skillsDir, entry);
       try {
-        if (!lstatSync2(entryPath).isSymbolicLink())
+        if (!lstatSync3(entryPath).isSymbolicLink())
           continue;
         const rawTarget = readlinkSync(entryPath);
         const target = resolve6(skillsDir, rawTarget);
         if (!isChildOf(target, skillsSource))
           continue;
-        unlinkSync3(entryPath);
+        unlinkSync4(entryPath);
         filesRemoved.push(entryPath);
       } catch {}
     }

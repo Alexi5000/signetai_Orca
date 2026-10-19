@@ -4,6 +4,8 @@ import {
 	closeSync,
 	createReadStream,
 	existsSync,
+	fchmodSync,
+	fstatSync,
 	fsyncSync,
 	mkdirSync,
 	openSync,
@@ -17,7 +19,12 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
-import { resolveDefaultBasePath } from "@signet/core";
+import {
+	openFileExclusiveSync,
+	resolveDefaultBasePath,
+	writeFileAtomicSync,
+	writeFileExclusiveSync,
+} from "@signet/core";
 
 export type TranscriptRole = "user" | "assistant" | "unknown";
 export type TranscriptSourceFormat = "jsonl" | "markdown" | "db" | "live" | "normalized";
@@ -185,13 +192,20 @@ function parseRecords(text: string): CanonicalTranscriptRecord[] {
 }
 
 function readTailRecords(path: string): CanonicalTranscriptRecord[] {
-	if (!existsSync(path)) return [];
-	const size = statSync(path).size;
-	const start = Math.max(0, size - TAIL_SCAN_BYTES);
-	const length = size - start;
-	if (length <= 0) return [];
-	const fd = openSync(path, "r");
+	// Open first, then size the descriptor: the tail offsets always match the
+	// file being read even if the path is replaced concurrently.
+	let fd: number;
 	try {
+		fd = openSync(path, "r");
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+		throw error;
+	}
+	try {
+		const size = fstatSync(fd).size;
+		const start = Math.max(0, size - TAIL_SCAN_BYTES);
+		const length = size - start;
+		if (length <= 0) return [];
 		const buffer = Buffer.alloc(length);
 		readSync(fd, buffer, 0, length, start);
 		const text = buffer.toString("utf8");
@@ -201,12 +215,26 @@ function readTailRecords(path: string): CanonicalTranscriptRecord[] {
 	}
 }
 
+/**
+ * Create the rewrite temp file exclusively with mode 0o600. Callers hold the
+ * transcript lock, so a leftover temp from a crashed rewrite is stale and is
+ * removed first; a pre-planted file or symlink is never opened.
+ */
+function openRewriteTemp(tmpPath: string): number {
+	rmSync(tmpPath, { force: true });
+	return openFileExclusiveSync(tmpPath);
+}
+
+/** Mode the rewritten file should keep (the replaced file's mode). */
+function replacedFileMode(path: string): number {
+	return statSync(path).mode & 0o7777;
+}
+
 function writeRecords(path: string, records: readonly CanonicalTranscriptRecord[]): void {
 	mkdirSync(dirname(path), { recursive: true });
-	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
 	const body = records.map((record) => JSON.stringify(record)).join("\n");
-	writeFileSync(tmp, body.length > 0 ? `${body}\n` : "", "utf8");
-	renameSync(tmp, path);
+	// Exclusive 0o600 sibling temp + rename (removed on failure).
+	writeFileAtomicSync(path, body.length > 0 ? `${body}\n` : "", { fsync: false });
 }
 
 function appendRecords(path: string, records: readonly CanonicalTranscriptRecord[]): void {
@@ -269,10 +297,11 @@ async function acquireTranscriptFileLock(path: string): Promise<{ readonly lockP
 		const token = randomUUID();
 		try {
 			mkdirSync(lockPath);
-			writeFileSync(
+			// The lock directory was created exclusively above; its owner record
+			// is created exclusively too so it can never be pre-planted.
+			writeFileExclusiveSync(
 				join(lockPath, "owner.json"),
 				JSON.stringify({ pid: process.pid, token, created_at: new Date().toISOString() }),
-				"utf8",
 			);
 			if (lockOwnerToken(lockPath) !== token) continue;
 			return { lockPath, token };
@@ -442,10 +471,10 @@ export function writeCanonicalTranscriptSnapshot(
 			.filter((record): record is CanonicalTranscriptRecord => record !== null);
 		if (next.length === 0) return null;
 
-		if (!existsSync(path)) {
-			mkdirSync(dirname(path), { recursive: true });
-			const body = next.map((r) => JSON.stringify(r)).join("\n");
-			writeFileSync(path, `${body}\n`, "utf8");
+		mkdirSync(dirname(path), { recursive: true });
+		const body = next.map((r) => JSON.stringify(r)).join("\n");
+		// Create-if-missing without a check-then-write window.
+		if (writeFileExclusiveSync(path, `${body}\n`)) {
 			sessionSeqCache.set(
 				sessionSeqCacheKey(input),
 				next.reduce((max, record) => Math.max(max, record.seq), 0),
@@ -456,7 +485,7 @@ export function writeCanonicalTranscriptSnapshot(
 		const tmpPath = `${path}.snapshot-tmp`;
 		let fd: number | null = null;
 		try {
-			fd = openSync(tmpPath, "w");
+			fd = openRewriteTemp(tmpPath);
 			const lines = createInterface({
 				input: createReadStream(path, { encoding: "utf8" }),
 				crlfDelay: Number.POSITIVE_INFINITY,
@@ -487,6 +516,7 @@ export function writeCanonicalTranscriptSnapshot(
 			for (const r of next) {
 				writeSync(fd, `${JSON.stringify(r)}\n`);
 			}
+			fchmodSync(fd, replacedFileMode(path));
 			fsyncSync(fd);
 			closeSync(fd);
 			fd = null;
@@ -593,7 +623,7 @@ export function rewriteReplacingLiveOnlySessions(
 		const rewritten = new Set<string>();
 		let fd: number | null = null;
 		try {
-			fd = openSync(tmpPath, "w");
+			fd = openRewriteTemp(tmpPath);
 			const lines = createInterface({
 				input: createReadStream(jsonlPath, { encoding: "utf8" }),
 				crlfDelay: Number.POSITIVE_INFINITY,
@@ -642,6 +672,7 @@ export function rewriteReplacingLiveOnlySessions(
 			} finally {
 				lines.close();
 			}
+			fchmodSync(fd, replacedFileMode(jsonlPath));
 			fsyncSync(fd);
 			closeSync(fd);
 			fd = null;

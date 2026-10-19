@@ -43,6 +43,24 @@ export type {
 } from "./secrets";
 export { getSecretKeyring, setSecretKeyringForTests } from "./secrets-keyring";
 export type { SecretKeyringAdapter, SecretKeyringResult, SecretKeyringState } from "./secrets-keyring";
+export {
+	PRIVATE_DIR_MODE,
+	PRIVATE_FILE_MODE,
+	appendFileSecure,
+	appendFileSecureSync,
+	createPrivateTempDir,
+	createPrivateTempDirAsync,
+	openAppendSync,
+	openFileExclusiveSync,
+	readFileIfExists,
+	readFileIfExistsSync,
+	readFileWithStat,
+	readFileWithStatSync,
+	writeFileAtomic,
+	writeFileAtomicSync,
+	writeFileExclusiveSync,
+} from "./secure-fs";
+export type { AtomicWriteOptions, FileWithStat, SecureWriteData } from "./secure-fs";
 export { detectFilesystemType, isNetworkFilesystem, resolveSqliteJournalConfig } from "./sqlite-journal";
 export type { SqliteJournalConfig, SqliteJournalMode } from "./sqlite-journal";
 export {

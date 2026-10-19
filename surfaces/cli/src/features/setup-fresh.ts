@@ -1,5 +1,6 @@
 import { createDaemonClient } from "../lib/daemon.js";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { writeFileExclusiveSync } from "@signet/core";
 import { join } from "node:path";
 import { OpenClawConnector } from "@signet/connector-openclaw";
 import {
@@ -248,12 +249,10 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 		for (const doc of docFiles) {
 			const templatePath = join(templatesDir, doc.template);
 			const destPath = join(context.basePath, doc.name);
-			if (existsSync(destPath)) {
-				continue;
-			}
 			if (existsSync(templatePath)) {
 				const content = readFileSync(templatePath, "utf-8").replace(/\{\{AGENT_NAME\}\}/g, plan.agentName);
-				writeFileSync(destPath, content);
+				// O_EXCL: never overwrite an identity file that already exists.
+				writeFileExclusiveSync(destPath, content);
 			}
 		}
 

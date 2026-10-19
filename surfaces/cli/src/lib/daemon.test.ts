@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createPrivateTempDir } from "@signet/core";
 import { createDaemonClient } from "./daemon.js";
 
 const originalFetch = globalThis.fetch;
@@ -67,8 +67,7 @@ describe("createDaemonClient", () => {
 	});
 
 	test("rejects a malformed persisted URL instead of contacting another daemon", () => {
-		const dir = join(tmpdir(), `daemon-badurl-${Date.now()}`);
-		mkdirSync(dir, { recursive: true });
+		const dir = createPrivateTempDir("daemon-badurl-");
 		writeFileSync(join(dir, "agent.yaml"), "daemon:\n  url: https://host.example/signet\n");
 		const previous = process.env.SIGNET_DAEMON_URL;
 		Reflect.deleteProperty(process.env, "SIGNET_DAEMON_URL");

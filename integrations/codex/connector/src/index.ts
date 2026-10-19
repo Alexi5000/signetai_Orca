@@ -1,16 +1,6 @@
 import { spawnSyncHidden as spawnSync } from "@signet/core";
 import { createHash } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	opendirSync,
-	readFileSync,
-	readdirSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-	type Dirent,
-} from "node:fs";
+import { existsSync, mkdirSync, opendirSync, readFileSync, readdirSync, rmSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import {
@@ -24,7 +14,13 @@ import {
 	resolveSignetCliCommand,
 	resolveSignetMcpCommand,
 } from "@signet/connector-base";
-import { expandHome, resolvePromptSubmitTimeoutMs, resolveSessionStartTimeoutMs } from "@signet/core";
+import {
+	expandHome,
+	readFileIfExistsSync,
+	resolvePromptSubmitTimeoutMs,
+	resolveSessionStartTimeoutMs,
+	writeFileAtomicSync,
+} from "@signet/core";
 
 export type SignetMcpConfig =
 	| {
@@ -603,7 +599,7 @@ export function writeCodexPluginBundle(input: {
 	)) {
 		const path = join(marketplaceRoot, file.relativePath);
 		mkdirSync(join(path, ".."), { recursive: true });
-		writeFileSync(path, file.content, "utf-8");
+		writeFileAtomicSync(path, file.content);
 		filesWritten.push(path);
 	}
 	if (windowsHookCommand && !filesWritten.includes(windowsHookCommand)) filesWritten.push(windowsHookCommand);
@@ -808,7 +804,8 @@ function writeWindowsHookWrapper(
 	const invocation = signetArgs.map(windowsBatchArg).join(" ");
 	lines.push(`${windowsBatchEntrypoint(signetArgs[0] ?? "")}${invocation} %*`);
 	lines.push("exit /b %ERRORLEVEL%", "");
-	writeFileSync(wrapperPath, `${lines.join("\r\n")}`, "utf-8");
+	// The wrapper embeds the daemon API key, so keep it owner-only.
+	writeFileAtomicSync(wrapperPath, `${lines.join("\r\n")}`, { mode: 0o600 });
 	return wrapperPath;
 }
 
@@ -1090,9 +1087,9 @@ function tomlDottedKeyQuote(value: string): string {
 }
 
 function patchHookTrustState(path: string, entries: readonly HookTrustEntry[]): boolean {
-	if (entries.length === 0 || !existsSync(path)) return false;
-
-	const content = readFileSync(path, "utf-8");
+	if (entries.length === 0) return false;
+	const content = readFileIfExistsSync(path, "utf-8");
+	if (content === null) return false;
 	const lines = content.split("\n");
 	const filtered: string[] = [];
 	let skipping = false;
@@ -1127,14 +1124,14 @@ function patchHookTrustState(path: string, entries: readonly HookTrustEntry[]): 
 		updated = updated.replace("[mcp_servers.signet]", "# Signet MCP server\n[mcp_servers.signet]");
 	}
 	if (updated === content) return false;
-	writeFileSync(path, updated);
+	writeFileAtomicSync(path, updated);
 	return true;
 }
 
 function removeHookTrustState(path: string, entries: readonly HookTrustEntry[]): boolean {
-	if (entries.length === 0 || !existsSync(path)) return false;
-
-	const content = readFileSync(path, "utf-8");
+	if (entries.length === 0) return false;
+	const content = readFileIfExistsSync(path, "utf-8");
+	if (content === null) return false;
 	const lines = content.split("\n");
 	const filtered: string[] = [];
 	let skipping = false;
@@ -1156,7 +1153,7 @@ function removeHookTrustState(path: string, entries: readonly HookTrustEntry[]):
 		.replace(/\n{3,}/g, "\n\n")
 		.trimEnd()}\n`;
 	if (updated === content) return false;
-	writeFileSync(path, updated);
+	writeFileAtomicSync(path, updated);
 	return true;
 }
 
@@ -1226,30 +1223,29 @@ function patchConfigToml(path: string, mcp: SignetMcpConfig): boolean {
 
 	const block = buildMcpBlock(mcp);
 
-	if (!existsSync(path)) {
-		writeFileSync(path, block);
+	const content = readFileIfExistsSync(path, "utf-8");
+	if (content === null) {
+		writeFileAtomicSync(path, block);
 		return true;
 	}
 
-	const content = readFileSync(path, "utf-8");
-
 	if (!content.includes("[mcp_servers.signet]")) {
-		writeFileSync(path, `${content.trimEnd()}\n\n${block}`);
+		writeFileAtomicSync(path, `${content.trimEnd()}\n\n${block}`);
 		return true;
 	}
 
 	// Section exists but may be stale (e.g. old array-format command).
 	// Remove and re-add with correct format.
 	unpatchConfigToml(path);
-	const updated = existsSync(path) ? readFileSync(path, "utf-8").trim() : "";
+	const updated = (readFileIfExistsSync(path, "utf-8") ?? "").trim();
 	const prefix = updated.length > 0 ? `${updated}\n\n` : "";
-	writeFileSync(path, prefix + block);
+	writeFileAtomicSync(path, prefix + block);
 	return true;
 }
 
 function unpatchConfigToml(path: string): boolean {
-	if (!existsSync(path)) return false;
-	const content = readFileSync(path, "utf-8");
+	const content = readFileIfExistsSync(path, "utf-8");
+	if (content === null) return false;
 	if (!content.includes("[mcp_servers.signet]")) return false;
 
 	// Remove the signet MCP block — handles both with and without comment
@@ -1275,7 +1271,7 @@ function unpatchConfigToml(path: string): boolean {
 		}
 		filtered.push(line);
 	}
-	writeFileSync(
+	writeFileAtomicSync(
 		path,
 		`${filtered
 			.join("\n")
@@ -1311,13 +1307,13 @@ function removeTomlSection(content: string, header: string): string {
 }
 
 function unpatchNativePluginConfig(path: string): boolean {
-	if (!existsSync(path)) return false;
 	const marketplaceHeader = `[marketplaces.${CODEX_PLUGIN_MARKETPLACE_NAME}]`;
 	const pluginHeader = `[plugins."${CODEX_PLUGIN_CONFIG_NAME}"]`;
-	const content = readFileSync(path, "utf-8");
+	const content = readFileIfExistsSync(path, "utf-8");
+	if (content === null) return false;
 	const updated = removeTomlSection(removeTomlSection(content, marketplaceHeader), pluginHeader);
 	if (updated === content) return false;
-	writeFileSync(path, updated);
+	writeFileAtomicSync(path, updated);
 	return true;
 }
 

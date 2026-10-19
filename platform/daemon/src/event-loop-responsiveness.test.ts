@@ -2,12 +2,12 @@ import { describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { yieldEvery } from "./async-yield";
+import { createTestTempDir } from "./test-temp-dir";
 
 describe("event-loop responsiveness during async file processing", () => {
 	it("event loop remains responsive while processing 500+ files with yields", async () => {
-		const dir = join(tmpdir(), `signet-el-test-${Date.now()}`);
+		const dir = createTestTempDir("signet-el-test-");
 		mkdirSync(dir, { recursive: true });
 
 		for (let i = 0; i < 500; i++) {

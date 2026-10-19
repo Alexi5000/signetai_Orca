@@ -7,7 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readdir, rename, stat, unlink } from "node:fs/promises";
+import { appendFile, mkdir, open, readdir, rename, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
 	type AccountingProvenance,
@@ -128,20 +128,20 @@ async function appendToTelemetryLog(
 			dropped++;
 			continue;
 		}
+		// Size the log through the same append descriptor that receives the
+		// line (owner-only when created), instead of stat-then-append by path.
+		let handle: Awaited<ReturnType<typeof open>> | undefined;
 		try {
-			let currentSize = 0;
-			try {
-				currentSize = (await stat(logPath)).size;
-			} catch (error) {
-				if (error && typeof error === "object" && "code" in error && error.code !== "ENOENT") {
-					throw error;
-				}
-			}
+			handle = await open(logPath, "a", 0o600);
+			const currentSize = (await handle.stat()).size;
 			if (currentSize > 0 && currentSize + Buffer.byteLength(payload) > options.maxBytes) {
 				const rotatedPath = `${rotatedTelemetryLogPrefix(logPath)}${Date.now()}-${telemetryLogRotationSequence++}.jsonl`;
+				await handle.close();
+				handle = undefined;
 				await rename(logPath, rotatedPath);
+				handle = await open(logPath, "a", 0o600);
 			}
-			await appendFile(logPath, payload, "utf-8");
+			await handle.appendFile(payload, "utf-8");
 		} catch (error) {
 			// Do not continue past a failed write or rotation. Writing a later line
 			// would make the JSONL appear reordered relative to this batch. The
@@ -153,6 +153,8 @@ async function appendToTelemetryLog(
 				error: error instanceof Error ? error.message : String(error),
 			});
 			break;
+		} finally {
+			await handle?.close().catch(() => {});
 		}
 	}
 
@@ -615,14 +617,14 @@ function getOrCreateInstallId(db: DbAccessor, daemonVersion: string, owner?: DbO
 		// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withWriteTx migration site
 		return db.withWriteTx(
 			(w: import("./db-accessor").WriteDb) => resolveInstallIdentity(w, daemonVersion),
-			"telemetry.ts:616",
+			"db:telemetry.legacy.line616",
 		);
 	} catch {
 		try {
 			// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withWriteTx migration site
 			return db.withWriteTx(
 				(w: import("./db-accessor").WriteDb) => resolveLegacyInstallIdentity(w),
-				"telemetry.ts:623",
+				"db:telemetry.legacy.line623",
 			);
 		} catch {
 			return fallback;

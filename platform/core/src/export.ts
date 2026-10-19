@@ -6,7 +6,7 @@
  * import with conflict resolution.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { MEMORY_CONTENT_SAFETY_POLICY_VERSION, scanMemoryContent } from "./memory-content-safety";
 
@@ -221,12 +221,18 @@ function collectSkillFiles(dir: string, prefix: string, out: Array<{ path: strin
 			if (entry.isDirectory()) {
 				collectSkillFiles(fullPath, relPath, out);
 			} else {
-				const stat = statSync(fullPath);
-				if (stat.size > 1_000_000) continue; // skip files > 1MB
+				// Open once and size-check the descriptor, so the file we measure is
+				// the file we read.
+				const fd = openSync(fullPath, "r");
 				try {
-					out.push({ path: relPath, content: readFileSync(fullPath, "utf-8") });
-				} catch {
-					// Skip binary files
+					if (fstatSync(fd).size > 1_000_000) continue; // skip files > 1MB
+					try {
+						out.push({ path: relPath, content: readFileSync(fd, "utf-8") });
+					} catch {
+						// Skip binary files
+					}
+				} finally {
+					closeSync(fd);
 				}
 			}
 		}

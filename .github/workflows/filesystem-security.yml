@@ -1,0 +1,32 @@
+name: Filesystem Security
+on:
+  pull_request:
+    paths:
+      - 'platform/core/**'
+      - 'platform/daemon/**'
+      - '.github/workflows/filesystem-security.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'platform/core/**'
+      - 'platform/daemon/**'
+      - '.github/workflows/filesystem-security.yml'
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: bun run build:core
+      - name: Filesystem containment and native cache regression tests
+        run: bun run test:hermetic platform/core/src/secure-fs.test.ts platform/daemon/src/native-runtime-assets.test.ts platform/daemon/src/test-temp-dir.test.ts platform/daemon/src/event-loop-responsiveness.test.ts
+      - name: Secret publication concurrency and authentication
+        run: bun run test:hermetic platform/daemon/src/auth/auth.test.ts
+      - name: Transcript atomic replacement and recovery
+        run: bun run test:hermetic platform/daemon/src/transcript-jsonl.test.ts

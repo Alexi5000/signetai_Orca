@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { appendFileSecureSync, writeFileExclusiveSync } from "../platform/core/src/secure-fs";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(join(dirname(fileURLToPath(import.meta.url)), ".."));
@@ -175,16 +176,15 @@ function record(runId: string, note: string): void {
 	const report = readReport(runId);
 	const m = metrics(report);
 	mkdirSync(dirname(resultsTsv), { recursive: true });
-	if (!existsSync(resultsTsv)) {
-		writeFileSync(
-			resultsTsv,
-			"timestamp\trun_id\taccuracy\tcorrect\ttotal\thit_at_k\tf1\tmrr\tndcg\tsearch_ms\tcontext_tokens\tnote\n",
-		);
-	}
-	writeFileSync(
+	// Create the header only when the file is new (O_EXCL), then append via one descriptor.
+	writeFileExclusiveSync(
+		resultsTsv,
+		"timestamp\trun_id\taccuracy\tcorrect\ttotal\thit_at_k\tf1\tmrr\tndcg\tsearch_ms\tcontext_tokens\tnote\n",
+	);
+	appendFileSecureSync(
 		resultsTsv,
 		`${new Date().toISOString()}\t${runId}\t${m.accuracy.toFixed(6)}\t${m.correct}\t${m.total}\t${m.hitAtK.toFixed(6)}\t${m.f1.toFixed(6)}\t${m.mrr.toFixed(6)}\t${m.ndcg.toFixed(6)}\t${Math.round(m.searchMs)}\t${Math.round(m.contextTokens)}\t${note.replace(/\s+/g, " ")}\n`,
-		{ flag: "a" },
+		0o644,
 	);
 	console.log(`Recorded ${runId} in ${resultsTsv}`);
 }

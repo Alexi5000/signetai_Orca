@@ -1,11 +1,11 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runMigrations } from "../../core/src/migrations";
 import { closeDbAccessor, initDbAccessor } from "./db-accessor";
 import { MAX_TRANSCRIPT_SCAN_BYTES, recordSkillsFromTranscript } from "./skill-transcript-scan";
+import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
 
 // Each JSONL line: { sessionId, timestamp, cwd, message: { content: [...] } }
 // Two resolved Skill uses (toolu_AAA=web-search, toolu_BBB=tavily-cli),
@@ -48,14 +48,16 @@ describe("recordSkillsFromTranscript", () => {
 	let db: Database;
 	let dbPath: string;
 	let fixturePath: string;
+	let scratchDir: string;
 
 	beforeEach(() => {
-		dbPath = join(tmpdir(), `signet-transcript-scan-${crypto.randomUUID()}.db`);
+		scratchDir = createTestTempDir("signet-transcript-scan-");
+		dbPath = join(scratchDir, `signet-transcript-scan-${crypto.randomUUID()}.db`);
 		initDbAccessor(dbPath);
 		db = new Database(dbPath);
 		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
 
-		fixturePath = join(tmpdir(), `transcript-fixture-${crypto.randomUUID()}.jsonl`);
+		fixturePath = join(scratchDir, `transcript-fixture-${crypto.randomUUID()}.jsonl`);
 		writeFileSync(fixturePath, FIXTURE_JSONL);
 	});
 
@@ -64,6 +66,7 @@ describe("recordSkillsFromTranscript", () => {
 		closeDbAccessor();
 		rmSync(dbPath, { force: true });
 		rmSync(fixturePath, { force: true });
+		cleanupTestTempDir(scratchDir);
 	});
 
 	it("inserts exactly 2 resolved invocations and skips the unresolved one", () => {
@@ -107,7 +110,7 @@ describe("recordSkillsFromTranscript", () => {
 	});
 
 	it("skips records missing session ids when a session is expected", () => {
-		const missingSessionPath = join(tmpdir(), `transcript-missing-session-${crypto.randomUUID()}.jsonl`);
+		const missingSessionPath = join(scratchDir, `transcript-missing-session-${crypto.randomUUID()}.jsonl`);
 		try {
 			writeFileSync(
 				missingSessionPath,
@@ -142,7 +145,7 @@ describe("recordSkillsFromTranscript", () => {
 	});
 
 	it("skips non-file transcript paths", () => {
-		const dirPath = join(tmpdir(), `transcript-dir-${crypto.randomUUID()}`);
+		const dirPath = join(scratchDir, `transcript-dir-${crypto.randomUUID()}`);
 		mkdirSync(dirPath);
 		try {
 			recordSkillsFromTranscript({
@@ -159,7 +162,7 @@ describe("recordSkillsFromTranscript", () => {
 	});
 
 	it("skips oversized transcript files", () => {
-		const oversizedPath = join(tmpdir(), `transcript-oversized-${crypto.randomUUID()}.jsonl`);
+		const oversizedPath = join(scratchDir, `transcript-oversized-${crypto.randomUUID()}.jsonl`);
 		try {
 			writeFileSync(oversizedPath, "");
 			truncateSync(oversizedPath, MAX_TRANSCRIPT_SCAN_BYTES + 1);

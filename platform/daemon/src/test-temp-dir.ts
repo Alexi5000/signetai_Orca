@@ -9,13 +9,12 @@
  * remove it (best-effort; SIGKILL cannot be trapped).
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
+import { createPrivateTempDir } from "@signet/core";
 
-/** Create a temp dir and guarantee it is removed when the process exits. */
+/** Create a private (0o700, mkdtemp) temp dir and guarantee it is removed when the process exits. */
 export function createTestTempDir(prefix: string): string {
-	const dir = mkdtempSync(join(tmpdir(), prefix));
+	const dir = createPrivateTempDir(prefix);
 	installCleanupHandlers();
 	registered.add(dir);
 	return dir;

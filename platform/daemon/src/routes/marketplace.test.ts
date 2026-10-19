@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { createTestTempDir } from "../test-temp-dir";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { extractStandardMcpConfig, mountMarketplaceRoutes, parseReferenceServersMarkdown } from "./marketplace.js";
@@ -82,11 +82,12 @@ describe("extractStandardMcpConfig", () => {
 });
 
 describe("marketplace routes", () => {
-	const tmpAgentsDir = join(tmpdir(), `signet-marketplace-route-test-${process.pid}`);
+	let tmpAgentsDir: string;
 	let origSignetPath: string | undefined;
 	let app: Hono;
 
 	beforeEach(() => {
+		tmpAgentsDir = createTestTempDir("signet-marketplace-route-test-");
 		origSignetPath = process.env.SIGNET_PATH;
 		process.env.SIGNET_PATH = tmpAgentsDir;
 		mkdirSync(tmpAgentsDir, { recursive: true });

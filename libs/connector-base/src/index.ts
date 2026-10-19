@@ -33,17 +33,33 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	existsSync,
+	fchmodSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+	writeSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import {
 	type SymlinkOptions,
 	type SymlinkResult,
+	openFileExclusiveSync,
 	resolveSignetDaemonUrl as resolveCoreSignetDaemonUrl,
 	resolveWorkspacePath,
 	stripSignetBlock,
 	symlinkSkills,
 } from "@signet/core";
+
+// Secure filesystem helpers, re-exported for connectors that depend only on
+// connector-base.
+export { readFileIfExistsSync, writeFileAtomicSync, writeFileExclusiveSync } from "@signet/core";
 
 // ============================================================================
 // Types
@@ -150,7 +166,16 @@ export abstract class BaseConnector {
 		}
 		const tmp = join(basePath, `.${randomBytes(6).toString("hex")}.tmp`);
 		try {
-			writeFileSync(tmp, cleaned, "utf-8");
+			// Create the temp file exclusively (O_EXCL, owner-only while it is being
+			// written), then give it the process default mode before the rename so
+			// the resulting AGENTS.md permissions are unchanged.
+			const fd = openFileExclusiveSync(tmp);
+			try {
+				writeSync(fd, cleaned, null, "utf-8");
+				fchmodSync(fd, 0o666 & ~process.umask());
+			} finally {
+				closeSync(fd);
+			}
 			renameSync(tmp, agentsPath);
 		} catch (err) {
 			try {

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -13,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createPrivateTempDir, writeFileAtomicSync, writeFileExclusiveSync } from "@signet/core";
 
 export interface EmbeddedDashboardAsset {
 	readonly path: string;
@@ -89,6 +91,47 @@ export function resolveEmbeddedDashboardAsset(requestPath: string): EmbeddedDash
 	return assets.find((asset) => asset.path === normalized) ?? null;
 }
 
+const privateCacheFallbacks = new Map<string, string>();
+
+/**
+ * Whether `dir` is a real directory owned by this user that no other user
+ * could have written into. Owner-only read/execute bits are tightened.
+ */
+function isTrustedPrivateDir(dir: string): boolean {
+	const st = lstatSync(dir);
+	if (st.isSymbolicLink() || !st.isDirectory()) return false;
+	if (process.platform === "win32") return true;
+	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+	if (uid !== undefined && st.uid !== uid) return false;
+	// Group/other-writable: another user may have planted content.
+	if ((st.mode & 0o022) !== 0) return false;
+	if ((st.mode & 0o077) !== 0) chmodSync(dir, 0o700);
+	return true;
+}
+
+/**
+ * Resolve the content-addressed cache directory `tmpdir()/<name>`, reused
+ * across runs. The shared temp root is world-writable, so the directory must
+ * be created owner-only (0o700) and verified to be ours before any cached
+ * code is trusted; otherwise a fresh private mkdtemp directory is used for
+ * the rest of this process.
+ */
+function ensurePrivateCacheDir(name: string): string {
+	const fallback = privateCacheFallbacks.get(name);
+	if (fallback !== undefined) return fallback;
+	const dir = join(tmpdir(), name);
+	try {
+		mkdirSync(dir, { mode: 0o700 });
+	} catch (error) {
+		const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+		if (code !== "EEXIST") throw error;
+	}
+	if (isTrustedPrivateDir(dir)) return dir;
+	const isolated = createPrivateTempDir(`${name}-`);
+	privateCacheFallbacks.set(name, isolated);
+	return isolated;
+}
+
 function materializeEmbeddedWorker(path: string, content: Buffer): void {
 	const valid = (): boolean => {
 		try {
@@ -133,9 +176,8 @@ export function resolveEmbeddedWorkerPath(name: string): string | null {
 	if (!worker) return null;
 
 	const hash = createHash("sha256").update(worker.contentBase64).digest("hex").slice(0, 16);
-	const dir = join(tmpdir(), "signet-native-workers");
+	const dir = ensurePrivateCacheDir("signet-native-workers");
 	const path = join(dir, `${name.replace(/[^a-zA-Z0-9_.-]/g, "_")}-${hash}.mjs`);
-	mkdirSync(dir, { recursive: true });
 	materializeEmbeddedWorker(path, Buffer.from(worker.contentBase64, "base64"));
 	return path;
 }
@@ -149,9 +191,8 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 
 	const content = Buffer.from(asset.contentBase64, "base64");
 	const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
-	const dir = join(tmpdir(), "signet-native-addons");
+	const dir = ensurePrivateCacheDir("signet-native-addons");
 	const path = join(dir, `${name.replace(/[^a-zA-Z0-9_.-]/g, "_")}-${hash}.node`);
-	mkdirSync(dir, { recursive: true });
 	const safeName = name.replace(/[^a-zA-Z0-9_.-]/g, "_");
 	const prefix = `${safeName}-`;
 	const validName = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}[a-f0-9]{16}\\.node$`);
@@ -220,13 +261,12 @@ export function materializeEmbeddedWasmAssets(): string | null {
 		.update(assets.map((asset) => `${asset.name}:${asset.contentBase64}`).join("\n"))
 		.digest("hex")
 		.slice(0, 16);
-	const dir = join(tmpdir(), "signet-native-wasm", hash);
-	mkdirSync(dir, { recursive: true });
+	const dir = join(ensurePrivateCacheDir("signet-native-wasm"), hash);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	for (const asset of assets) {
 		const path = join(dir, asset.name.replace(/[/\\]/g, "_"));
-		if (!existsSync(path)) {
-			writeFileSync(path, Buffer.from(asset.contentBase64, "base64"));
-		}
+		// Create-if-missing without a check-then-write window.
+		writeFileExclusiveSync(path, Buffer.from(asset.contentBase64, "base64"));
 	}
 	return dir;
 }
@@ -238,20 +278,20 @@ export function materializeEmbeddedAssetTree(kind: "connectors" | "graphiq" | "s
 	const sourceHash = createHash("sha256")
 		.update(assets.map((asset) => `${asset.path}:${asset.contentBase64}:${asset.mode ?? ""}`).join("\n"))
 		.digest("hex");
-	const root = join(tmpdir(), `signet-native-${kind}`, sourceHash.slice(0, 16));
-	mkdirSync(root, { recursive: true });
+	const root = join(ensurePrivateCacheDir(`signet-native-${kind}`), sourceHash.slice(0, 16));
+	mkdirSync(root, { recursive: true, mode: 0o700 });
 	for (const asset of assets) {
 		const parts = asset.path.split(/[\\/]+/).filter(Boolean);
 		if (parts.length === 0 || parts.includes("..")) continue;
 		const path = join(root, ...parts);
 		mkdirSync(dirname(path), { recursive: true });
-		if (!existsSync(path)) {
-			writeFileSync(path, Buffer.from(asset.contentBase64, "base64"));
-			if (asset.mode !== undefined) chmodSync(path, asset.mode);
-		}
+		// Create-if-missing (O_EXCL); the asset mode is applied to the descriptor.
+		writeFileExclusiveSync(path, Buffer.from(asset.contentBase64, "base64"), { mode: asset.mode });
 	}
 	if (kind === "connectors") {
-		writeFileSync(join(root, ".signet-assets.json"), `${JSON.stringify({ kind, sourceHash }, null, 2)}\n`);
+		writeFileAtomicSync(join(root, ".signet-assets.json"), `${JSON.stringify({ kind, sourceHash }, null, 2)}\n`, {
+			fsync: false,
+		});
 	}
 	return root;
 }

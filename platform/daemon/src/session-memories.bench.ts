@@ -16,11 +16,11 @@
 
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runMigrations } from "@signet/core";
+import { createTestTempDir } from "./test-temp-dir";
 
-const TEST_DIR = join(tmpdir(), `signet-bench-${Date.now()}`);
+const TEST_DIR = createTestTempDir("signet-bench-");
 process.env.SIGNET_PATH = TEST_DIR;
 
 const { initDbAccessor, closeDbAccessor } = await import("./db-accessor");

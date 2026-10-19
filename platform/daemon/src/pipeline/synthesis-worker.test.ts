@@ -1,8 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { readFileWithStatSync } from "@signet/core";
 import { startSynthesisWorker } from "./synthesis-worker";
+import { createTestTempDir } from "../test-temp-dir";
 
 let agentsDir = "";
 let previousSignetPath: string | undefined;
@@ -64,7 +65,7 @@ function createWorker() {
 describe("synthesis-worker", () => {
 	beforeAll(() => {
 		previousSignetPath = process.env.SIGNET_PATH;
-		agentsDir = mkdtempSync(join(tmpdir(), "signet-synthesis-worker-"));
+		agentsDir = createTestTempDir("signet-synthesis-worker-");
 		process.env.SIGNET_PATH = agentsDir;
 	});
 
@@ -119,8 +120,10 @@ describe("synthesis-worker", () => {
 	it("does not publish the legacy rendered projection to MEMORY.md", async () => {
 		const memoryPath = join(agentsDir, "MEMORY.md");
 		writeFileSync(memoryPath, "Dreaming-owned head\n");
-		const before = statSync(memoryPath);
-		const beforeContent = readFileSync(memoryPath, "utf-8");
+		const beforeRead = readFileWithStatSync(memoryPath, "utf8");
+		if (!beforeRead) throw new Error("MEMORY.md missing");
+		const before = beforeRead.stat;
+		const beforeContent = beforeRead.content;
 		const worker = createWorker();
 
 		try {
@@ -132,8 +135,9 @@ describe("synthesis-worker", () => {
 			});
 			expect(worker.isSynthesizing).toBe(false);
 			expect(mockWriteMemoryMd).not.toHaveBeenCalled();
-			expect(readFileSync(memoryPath, "utf-8")).toBe(beforeContent);
-			expect(statSync(memoryPath).mtimeMs).toBe(before.mtimeMs);
+			const after = readFileWithStatSync(memoryPath, "utf8");
+			expect(after?.content).toBe(beforeContent);
+			expect(after?.stat.mtimeMs).toBe(before.mtimeMs);
 		} finally {
 			worker.stop();
 			await worker.drain();

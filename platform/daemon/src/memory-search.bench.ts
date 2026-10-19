@@ -26,14 +26,15 @@
  */
 
 import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
 import { fetchEmbedding } from "./embedding-fetch";
 import { loadMemoryConfig } from "./memory-config";
 import { type RecallStageTiming, hybridRecall } from "./memory-search";
+import { createTestTempDir } from "./test-temp-dir";
 
-const TEST_DIR = join(tmpdir(), `signet-recall-bench-${Date.now()}`);
+const TEST_DIR = createTestTempDir("signet-recall-bench-");
 const MEMORY_COUNT = parseEnvInt("SIGNET_RECALL_BENCH_MEMORIES", 2000);
 const ITERS = parseEnvInt("SIGNET_RECALL_BENCH_ITERS", 60);
 const EMBED_MS = parseEnvInt("SIGNET_RECALL_BENCH_EMBED_MS", 40);

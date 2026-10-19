@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { readFileWithStatSync } from "../platform/core/src/secure-fs";
 
 interface NativeAsset {
 	readonly name: string;
@@ -53,14 +54,16 @@ const assets: NativeAsset[] = readdirSync(nativeDir)
 		const platform = platformFromName(name);
 		if (!platform) return [];
 		const path = join(nativeDir, name);
-		const stat = statSync(path);
-		if (!stat.isFile()) return [];
+		if (!statSync(path).isFile()) return [];
+		// Hash and size come from one descriptor so they describe the same file.
+		const file = readFileWithStatSync(path);
+		if (!file?.stat.isFile()) return [];
 		return [
 			{
 				name,
 				platform,
-				sha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
-				size: stat.size,
+				sha256: createHash("sha256").update(file.content).digest("hex"),
+				size: file.stat.size,
 			},
 		];
 	})
@@ -69,10 +72,10 @@ const assets: NativeAsset[] = readdirSync(nativeDir)
 function loadConnectorComponent(): ComponentEntry | null {
 	const tarballName = `signet-connectors-${version}.tar.gz`;
 	const tarballPath = join(nativeDir, tarballName);
-	if (!existsSync(tarballPath)) return null;
-	const stat = statSync(tarballPath);
-	if (!stat.isFile() || stat.size === 0) return null;
-	const sha256 = createHash("sha256").update(readFileSync(tarballPath)).digest("hex");
+	const file = readFileWithStatSync(tarballPath);
+	if (!file?.stat.isFile() || file.stat.size === 0) return null;
+	const { stat } = file;
+	const sha256 = createHash("sha256").update(file.content).digest("hex");
 	return {
 		// The wrapper resolves the manifest URL relative to the GitHub release
 		// page that hosts the binary. Keep the path consistent with how the
@@ -86,13 +89,12 @@ function loadConnectorComponent(): ComponentEntry | null {
 function loadDaemonJsComponent(): ComponentEntry | null {
 	const tarballName = `signet-daemon-js-${version}.tar.gz`;
 	const tarballPath = join(nativeDir, tarballName);
-	if (!existsSync(tarballPath)) return null;
-	const stat = statSync(tarballPath);
-	if (!stat.isFile() || stat.size === 0) return null;
+	const file = readFileWithStatSync(tarballPath);
+	if (!file?.stat.isFile() || file.stat.size === 0) return null;
 	return {
 		url: tarballName,
-		sha256: createHash("sha256").update(readFileSync(tarballPath)).digest("hex"),
-		size: stat.size,
+		sha256: createHash("sha256").update(file.content).digest("hex"),
+		size: file.stat.size,
 	};
 }
 

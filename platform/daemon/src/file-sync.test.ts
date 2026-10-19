@@ -1,12 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { readFileWithStatSync } from "@signet/core";
 import { writeFileIfChanged, writeFileIfChangedAsync } from "./file-sync";
+import { createTestTempDir } from "./test-temp-dir";
 
 describe("writeFileIfChanged", () => {
 	it("skips writing when content is unchanged", () => {
-		const dir = mkdtempSync(join(tmpdir(), "signet-file-sync-"));
+		const dir = createTestTempDir("signet-file-sync-");
 		try {
 			const path = join(dir, "workspace", "AGENTS.md");
 			mkdirSync(join(dir, "workspace"), { recursive: true });
@@ -15,17 +16,18 @@ describe("writeFileIfChanged", () => {
 			const firstMtimeMs = statSync(path).mtimeMs;
 
 			expect(writeFileIfChanged(path, "alpha")).toBe(false);
-			const secondMtimeMs = statSync(path).mtimeMs;
+			// Read content and metadata through one descriptor (no stat-then-read race).
+			const second = readFileWithStatSync(path, "utf8");
 
-			expect(secondMtimeMs).toBe(firstMtimeMs);
-			expect(readFileSync(path, "utf-8")).toBe("alpha");
+			expect(second?.stat.mtimeMs).toBe(firstMtimeMs);
+			expect(second?.content).toBe("alpha");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
 	it("writes when content changes", () => {
-		const dir = mkdtempSync(join(tmpdir(), "signet-file-sync-"));
+		const dir = createTestTempDir("signet-file-sync-");
 		try {
 			const path = join(dir, "workspace", "AGENTS.md");
 			mkdirSync(join(dir, "workspace"), { recursive: true });
@@ -41,7 +43,7 @@ describe("writeFileIfChanged", () => {
 
 describe("writeFileIfChangedAsync", () => {
 	it("skips writing when content is unchanged", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "signet-file-sync-"));
+		const dir = createTestTempDir("signet-file-sync-");
 		try {
 			const path = join(dir, "workspace", "AGENTS.md");
 			mkdirSync(join(dir, "workspace"), { recursive: true });
@@ -50,17 +52,18 @@ describe("writeFileIfChangedAsync", () => {
 			const firstMtimeMs = statSync(path).mtimeMs;
 
 			expect(await writeFileIfChangedAsync(path, "alpha")).toBe(false);
-			const secondMtimeMs = statSync(path).mtimeMs;
+			// Read content and metadata through one descriptor (no stat-then-read race).
+			const second = readFileWithStatSync(path, "utf8");
 
-			expect(secondMtimeMs).toBe(firstMtimeMs);
-			expect(readFileSync(path, "utf-8")).toBe("alpha");
+			expect(second?.stat.mtimeMs).toBe(firstMtimeMs);
+			expect(second?.content).toBe("alpha");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
 	it("writes when content changes", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "signet-file-sync-"));
+		const dir = createTestTempDir("signet-file-sync-");
 		try {
 			const path = join(dir, "workspace", "AGENTS.md");
 			mkdirSync(join(dir, "workspace"), { recursive: true });

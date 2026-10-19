@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileExclusiveSync } from "@signet/core";
 import { join } from "node:path";
 import { OpenClawConnector } from "@signet/connector-openclaw";
 import {
@@ -143,9 +144,7 @@ function scaffoldIdentityIfNeeded(basePath: string, identityMode: IdentityMode, 
 	};
 	for (const [name, content] of Object.entries(requiredFiles)) {
 		const filePath = join(basePath, name);
-		if (!existsSync(filePath)) {
-			writeFileSync(filePath, content);
-		}
+		writeFileExclusiveSync(filePath, content);
 	}
 }
 

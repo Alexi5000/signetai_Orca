@@ -31,6 +31,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, wr
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createPrivateTempDir, writeFileAtomicSync } from "../../../platform/core/src/secure-fs";
 import { buildProductionDb, type ProductionDbResult } from "./build-db";
 import { evaluateStability, percentile, type StabilityMeasurements } from "./criteria";
 
@@ -217,15 +218,26 @@ function markPhase(phase: string): void {
 	phaseMarks.push({ at: Date.now(), phase });
 }
 
-const emergencyArtifactPath = join(
-	resolve(args.out ?? join(tmpdir(), "phase-d-acceptance-artifacts")),
-	`phase-d-acceptance-${args.scale}-failure.json`,
-);
+const emergencyArtifactName = `phase-d-acceptance-${args.scale}-failure.json`;
+
+/**
+ * Directory for the emergency failure artifact. Without --out this is a fresh
+ * private (mkdtemp, 0o700) directory rather than a predictable shared /tmp path.
+ */
+function emergencyArtifactDir(): string {
+	if (args.out) {
+		const dir = resolve(args.out);
+		mkdirSync(dir, { recursive: true });
+		return dir;
+	}
+	return createPrivateTempDir("phase-d-acceptance-artifacts-");
+}
 
 function writeEmergencyArtifact(kind: string, message: string): void {
+	let emergencyArtifactPath = emergencyArtifactName;
 	try {
-		mkdirSync(resolve(args.out ?? join(tmpdir(), "phase-d-acceptance-artifacts")), { recursive: true });
-		writeFileSync(
+		emergencyArtifactPath = join(emergencyArtifactDir(), emergencyArtifactName);
+		writeFileAtomicSync(
 			emergencyArtifactPath,
 			JSON.stringify(
 				{

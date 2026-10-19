@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
 	type LlmProvider,
@@ -1129,25 +1129,37 @@ async function doReindex(agentId?: string): Promise<void> {
 		if (breakerOpen) break;
 		let statKey: string;
 		let mtime: number;
+		// Stat and read through one descriptor so the cache key always
+		// describes the bytes that were indexed.
+		let handle: Awaited<ReturnType<typeof open>>;
 		try {
-			const s = await stat(path);
-			statKey = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
-			mtime = s.mtimeMs;
+			handle = await open(path, "r");
 		} catch {
 			await yielder();
 			continue;
 		}
-		if (cache.get(path) === statKey) {
-			await yielder();
-			continue;
-		}
-
 		let content: string;
 		try {
-			content = await readFile(path, "utf8");
-		} catch {
-			cacheOnlyUpdates.push({ path, statKey });
-			continue;
+			try {
+				const s = await handle.stat();
+				statKey = `${s.mtimeMs}:${s.ctimeMs}:${s.size}`;
+				mtime = s.mtimeMs;
+			} catch {
+				await yielder();
+				continue;
+			}
+			if (cache.get(path) === statKey) {
+				await yielder();
+				continue;
+			}
+			try {
+				content = await handle.readFile("utf8");
+			} catch {
+				cacheOnlyUpdates.push({ path, statKey });
+				continue;
+			}
+		} finally {
+			await handle.close().catch(() => {});
 		}
 
 		const parsed = parseFrontmatterDocument(content);
