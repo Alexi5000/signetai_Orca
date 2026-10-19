@@ -187,7 +187,7 @@ describe("OpenClawConnector config patching", () => {
 			timeouts: { before_prompt_build: 12_000 },
 		});
 		expect(entry.config).toEqual({
-			daemonUrl: "http://localhost:3850",
+			daemonUrl: "http://127.0.0.1:3850",
 			customSetting: "preserved",
 		});
 	});
@@ -696,5 +696,27 @@ describe("OpenClawConnector.install — legacy SIGNET block migration", () => {
 		});
 		expect(readFileSync(agentsPath, "utf-8")).toBe("plain content\n");
 		expect(result.filesWritten).not.toContain(agentsPath);
+	});
+});
+
+describe("OpenClawConnector config prototype safety", () => {
+	it("ignores prototype keys while preserving nested legitimate patches", () => {
+		const configPath = join(tmpRoot, "openclaw.json");
+		writeFileSync(configPath, '{"agents":{"defaults":{"existing":true}}}');
+		const connector = new OpenClawConnector();
+		const patch = JSON.parse(
+			'{"__proto__":{"signetPolluted":true},"constructor":{"prototype":{"signetPolluted":true}},"agents":{"defaults":{"workspace":"/safe","__proto__":{"signetPolluted":true}}}}',
+		);
+		const patcher = connector as unknown as { patchConfig(path: string, patch: Record<string, unknown>): void };
+		try {
+			patcher.patchConfig(configPath, patch);
+			expect((Object.prototype as Record<string, unknown>).signetPolluted).toBeUndefined();
+			const result = JSON.parse(readFileSync(configPath, "utf-8"));
+			expect(result.agents.defaults).toEqual({ existing: true, workspace: "/safe" });
+			expect(Object.hasOwn(result, "constructor")).toBe(false);
+			expect(Object.hasOwn(result, "__proto__")).toBe(false);
+		} finally {
+			delete (Object.prototype as Record<string, unknown>).signetPolluted;
+		}
 	});
 });
