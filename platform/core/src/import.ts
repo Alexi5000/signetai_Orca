@@ -181,8 +181,8 @@ export function chunkMarkdownHierarchically(
 	let currentContent: string[] = [];
 	let chunkIndex = 0;
 
-	// Regex for markdown headers (h1-h3)
-	const headerPattern = /^(#{1,3})\s+(.+)$/;
+	// Keep the title disjoint from leading whitespace; retain legacy whitespace-only headings.
+	const headerPattern = /^#{1,3}\s+(?:\S.*|[^\S\r\n\u2028\u2029])$/;
 
 	const flushSection = () => {
 		if (currentContent.length === 0) return;
