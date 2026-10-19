@@ -90,14 +90,15 @@ describe("writeFileAtomicSync / writeFileAtomic", () => {
 		if (posix) chmodSync(path, 0o751);
 		const inodeBefore = statSync(path).ino;
 		writeFileAtomicSync(path, "new");
-		expect(readFileSync(path, "utf8")).toBe("new");
+		const replaced = readFileWithStatSync(path, "utf8");
+		expect(replaced?.content).toBe("new");
 		if (posix) {
 			expect(mode(path)).toBe(0o751);
 			// Replacement is a rename of a fresh file, never an in-place truncate.
-			expect(statSync(path).ino).not.toBe(inodeBefore);
+			expect(replaced?.stat.ino).not.toBe(inodeBefore);
 		}
 		await writeFileAtomic(path, "newer");
-		expect(readFileSync(path, "utf8")).toBe("newer");
+		expect(readFileWithStatSync(path, "utf8")?.content).toBe("newer");
 		if (posix) expect(mode(path)).toBe(0o751);
 	});
 

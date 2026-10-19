@@ -923,8 +923,6 @@ export async function indexNativeMemoryFile(
 	let mtimeMs = options.mtimeMs ?? 0;
 	if (options.content === undefined) {
 		try {
-			const linkStat = await lstat(filePath);
-			if (linkStat.isSymbolicLink()) return false;
 			// Async reads and stats run in the threadpool: a transiently locked
 			// file (EDEADLK from Obsidian or a sync service) or a stalled
 			// filesystem must not block the daemon event loop for seconds
@@ -933,7 +931,8 @@ export async function indexNativeMemoryFile(
 			const handle = await open(filePath, NO_FOLLOW_READ_FLAGS);
 			try {
 				const fileStat = await handle.stat();
-				if (!fileStat.isFile()) return false;
+				const linkStat = await lstat(filePath);
+				if (linkStat.isSymbolicLink() || !fileStat.isFile()) return false;
 				mtimeMs = fileStat.mtimeMs;
 				content = await handle.readFile("utf-8");
 			} finally {

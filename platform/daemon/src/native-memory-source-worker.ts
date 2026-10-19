@@ -148,26 +148,25 @@ async function scan(command: ScanCommand): Promise<NativeSourceWorkerPage> {
 		const path = frontier.pop();
 		if (path === undefined) break;
 		try {
-			const info = await lstat(path);
-			if (info.isDirectory()) {
-				const directory = await opendir(path);
-				const entries: string[] = [];
-				for await (const entry of directory) {
-					if (entry.name !== ".git") entries.push(join(path, entry.name));
-				}
-				entries.sort((left, right) => right.localeCompare(left));
-				frontier.push(...entries);
-				continue;
-			}
-			if (!info.isFile()) continue;
-			const kind = matchesPattern(command.source, path);
-			if (kind === null) continue;
-			// Open once (no-follow, non-blocking for FIFOs) and fstat the
-			// descriptor so the lstat-checked regular file is the one read.
 			const handle = await open(path, NO_FOLLOW_READ_FLAGS);
 			let content: string;
+			let mtimeMs: number;
+			const kind = matchesPattern(command.source, path);
 			try {
-				if (!(await handle.stat()).isFile()) continue;
+				const info = await handle.stat();
+				if ((await lstat(path)).isSymbolicLink()) continue;
+				if (info.isDirectory()) {
+					const directory = await opendir(path);
+					const entries: string[] = [];
+					for await (const entry of directory) {
+						if (entry.name !== ".git") entries.push(join(path, entry.name));
+					}
+					entries.sort((left, right) => right.localeCompare(left));
+					frontier.push(...entries);
+					continue;
+				}
+				if (!info.isFile() || kind === null) continue;
+				mtimeMs = info.mtimeMs;
 				content = await handle.readFile("utf8");
 			} finally {
 				await handle.close().catch(() => {});
@@ -187,7 +186,7 @@ async function scan(command: ScanCommand): Promise<NativeSourceWorkerPage> {
 			const descriptor: NativeSourceWorkerFile = {
 				path,
 				content,
-				mtimeMs: info.mtimeMs,
+				mtimeMs,
 				kind,
 				...contentMetadata(content),
 				...(nativeSourceId(command.source) === undefined ? {} : { sourceId: nativeSourceId(command.source) }),
