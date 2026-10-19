@@ -139,7 +139,7 @@ async function appendToTelemetryLog(
 				await handle.close();
 				handle = undefined;
 				await rename(logPath, rotatedPath);
-				handle = await open(logPath, "ax", 0o600);
+				handle = await open(logPath, "wx", 0o600);
 			}
 			await handle.appendFile(payload, "utf-8");
 		} catch (error) {
