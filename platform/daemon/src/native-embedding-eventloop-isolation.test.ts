@@ -192,7 +192,9 @@ async function waitForBlackholeConnection(
 		if (child.exitCode !== null || child.signalCode !== null) throw await childExitError(child, lifecycle);
 		await Bun.sleep(100);
 	}
-	throw new Error(`native embedding worker did not reach the blackhole within ${deadlineMs}ms`);
+	throw new Error(
+		`native embedding worker did not reach the blackhole within ${deadlineMs}ms\n${Buffer.concat(lifecycle.stderr).toString("utf8")}\n${readDaemonLogTail(lifecycle.agentsDir)}`,
+	);
 }
 
 async function waitForHealth(
@@ -268,6 +270,7 @@ describe("native embedding event-loop isolation (e2e)", () => {
 				"    enabled: false",
 				"embedding:",
 				"  provider: native",
+				"  preloadNative: true",
 				"  model: nomic-ai/nomic-embed-text-v1.5",
 				"  dimensions: 768",
 				"",

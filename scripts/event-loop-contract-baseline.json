@@ -5121,7 +5121,7 @@
     },
     {
       "path": "telemetry.ts",
-      "line": 618,
+      "line": 627,
       "api": "withWriteTx",
       "source": "return db.withWriteTx(",
       "category": "hot-path",
@@ -5129,7 +5129,7 @@
     },
     {
       "path": "telemetry.ts",
-      "line": 625,
+      "line": 634,
       "api": "withWriteTx",
       "source": "return db.withWriteTx(",
       "category": "hot-path",
