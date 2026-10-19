@@ -3273,14 +3273,19 @@
           { name: "STRIPE_SECRET_KEY", src: "1password", icon: "key", ref: "<b>$secret:STRIPE_SECRET_KEY</b> · billing webhooks" },
           { name: "BW_SESSION", src: "bitwarden", icon: "token", ref: "<b>bitwarden</b> · provider session token" },
         ];
+        function escapeSecretName(value) {
+          return String(value).replace(/[&<>"']/g, (character) => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+          })[character]);
+        }
         function mask() { return "•".repeat(12 + Math.floor(Math.random() * 4)); }
         function cardHtml(s) {
           return [
-            '<div class="sec-card" data-name="' + s.name + '">',
+            '<div class="sec-card" data-name="' + escapeSecretName(s.name) + '">',
               '<div class="sec-card__top">',
                 '<div class="sec-card__ic">' + (SECRET_ICONS[s.icon] || SECRET_ICONS.key) + '</div>',
                 '<div class="sec-card__meta">',
-                  '<div class="sec-card__name">' + s.name + '</div>',
+                  '<div class="sec-card__name">' + escapeSecretName(s.name) + '</div>',
                   '<div class="sec-card__src sec-card__src--' + s.src + '"><span class="sec-card__src-dot"></span>' + s.src + '</div>',
                 '</div>',
               '</div>',
@@ -3372,7 +3377,7 @@
         if (modalSave) modalSave.addEventListener("click", () => {
           const nameEl = document.getElementById("sec-field-name");
           if (nameEl && nameEl.value.trim()) {
-            SECRETS.unshift({ name: nameEl.value.trim().toUpperCase(), src: "local", icon: "key", ref: "<b>$secret:" + nameEl.value.trim().toUpperCase() + "</b> · new" });
+            SECRETS.unshift({ name: nameEl.value.trim().toUpperCase(), src: "local", icon: "key", ref: "<b>$secret:" + escapeSecretName(nameEl.value.trim().toUpperCase()) + "</b> · new" });
             nameEl.value = "";
             const valEl = document.getElementById("sec-field-value"); if (valEl) valEl.value = "";
             closeModal(); render();
