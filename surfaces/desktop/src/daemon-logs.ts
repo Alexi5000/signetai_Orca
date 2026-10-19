@@ -44,43 +44,34 @@ function privateDirectory(path: string): void {
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 	}
-	const before = lstatSync(path);
-	if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("Daemon log directory must not be a symlink");
-	assertOwned(before);
-	if (process.platform === "win32") return;
-	const fd = openSync(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0));
-	try {
-		const opened = fstatSync(fd);
-		if (!opened.isDirectory() || opened.dev !== before.dev || opened.ino !== before.ino)
-			throw new Error("Daemon log directory changed while opening");
-		assertOwned(opened);
-		fchmodSync(fd, 0o700);
-	} finally {
-		closeSync(fd);
-	}
+	const directory = lstatSync(path);
+	if (!directory.isDirectory() || directory.isSymbolicLink())
+		throw new Error("Daemon log directory must not be a symlink");
+	assertOwned(directory);
+	if (process.platform !== "win32" && (directory.mode & 0o022) !== 0)
+		throw new Error("Daemon log directory must not be writable by other users");
 }
 
 function openLog(path: string): number {
-	let before: Stats | undefined;
+	const flags = constants.O_WRONLY | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+	let fd: number;
 	try {
-		before = lstatSync(path);
+		fd = openSync(path, flags | constants.O_CREAT | constants.O_EXCL, 0o600);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		fd = openSync(path, flags);
 	}
-	if (before && (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1))
-		throw new Error("Daemon log must be a single-link regular file");
-	if (before) assertOwned(before);
-	const flags =
-		constants.O_WRONLY |
-		constants.O_APPEND |
-		(constants.O_NOFOLLOW ?? 0) |
-		(constants.O_NONBLOCK ?? 0) |
-		(before ? 0 : constants.O_CREAT | constants.O_EXCL);
-	const fd = openSync(path, flags, 0o600);
 	try {
 		const opened = fstatSync(fd);
-		if (!opened.isFile() || opened.nlink !== 1 || (before && (opened.dev !== before.dev || opened.ino !== before.ino)))
-			throw new Error("Daemon log changed while opening");
+		const named = lstatSync(path);
+		if (
+			!opened.isFile() ||
+			opened.nlink !== 1 ||
+			named.isSymbolicLink() ||
+			opened.dev !== named.dev ||
+			opened.ino !== named.ino
+		)
+			throw new Error("Daemon log must be a single-link regular file");
 		assertOwned(opened);
 		if (process.platform !== "win32") fchmodSync(fd, 0o600);
 		return fd;
