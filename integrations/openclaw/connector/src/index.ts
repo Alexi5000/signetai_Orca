@@ -94,8 +94,9 @@ export type OpenClawRuntimeState = "plugin" | "legacy" | "dual" | null;
  */
 function deepMerge(target: JsonObject, source: JsonObject): JsonObject {
 	for (const key of Object.keys(source)) {
+		if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
 		const srcVal = source[key];
-		const tgtVal = target[key];
+		const tgtVal = Object.hasOwn(target, key) ? target[key] : undefined;
 
 		if (
 			srcVal !== null &&
