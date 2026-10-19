@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
@@ -219,4 +220,12 @@ describe("read helpers", () => {
 		expect(() => readFileWithStatSync(dir)).toThrow();
 		expect(existsSync(dir)).toBe(true);
 	});
+});
+
+test("descriptor readers reject FIFOs without waiting for a writer", async () => {
+	if (!posix) return;
+	const path = join(scratch(), "pipe");
+	expect(spawnSync("mkfifo", [path]).status).toBe(0);
+	expect(() => readFileWithStatSync(path)).toThrow("Expected a regular file");
+	await expect(readFileWithStat(path)).rejects.toThrow("Expected a regular file");
 });

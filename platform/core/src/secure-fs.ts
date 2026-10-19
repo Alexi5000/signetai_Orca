@@ -273,13 +273,14 @@ export function readFileWithStatSync(
 ): FileWithStat<string> | FileWithStat<Buffer> | null {
 	let fd: number;
 	try {
-		fd = openSync(path, constants.O_RDONLY);
+		fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
 	} catch (error) {
 		if (isErrnoCode(error, "ENOENT")) return null;
 		throw error;
 	}
 	try {
 		const stat = fstatSync(fd);
+		if (!stat.isFile()) throw Object.assign(new Error("Expected a regular file"), { code: "EINVAL" });
 		const raw = readFileSync(fd);
 		return encoding ? { content: raw.toString(encoding), stat } : { content: raw, stat };
 	} finally {
@@ -296,13 +297,14 @@ export async function readFileWithStat(
 ): Promise<FileWithStat<string> | FileWithStat<Buffer> | null> {
 	let handle: Awaited<ReturnType<typeof open>>;
 	try {
-		handle = await open(path, constants.O_RDONLY);
+		handle = await open(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
 	} catch (error) {
 		if (isErrnoCode(error, "ENOENT")) return null;
 		throw error;
 	}
 	try {
 		const stat = await handle.stat();
+		if (!stat.isFile()) throw Object.assign(new Error("Expected a regular file"), { code: "EINVAL" });
 		const raw = await handle.readFile();
 		return encoding ? { content: raw.toString(encoding), stat } : { content: raw, stat };
 	} finally {
