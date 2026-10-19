@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	BITWARDEN_ACTIVE_PROVIDER_SECRET,
@@ -27,6 +26,7 @@ import {
 	setSecretKeyringAdapterForTests,
 	startSecretExecJob,
 } from "./secrets.js";
+import { createTestTempDir } from "./test-temp-dir";
 
 const originalSignetPath = process.env.SIGNET_PATH;
 const originalUser = process.env.USER;
@@ -73,7 +73,7 @@ function makeKeyring(initial: SecretKeyringResult): SecretKeyringAdapter & { set
 
 describe("local secrets provider", () => {
 	beforeEach(() => {
-		agentsDir = join(tmpdir(), `signet-secrets-provider-${process.pid}-${Date.now()}`);
+		agentsDir = createTestTempDir("signet-secrets-provider-");
 		process.env.SIGNET_PATH = agentsDir;
 		mkdirSync(agentsDir, { recursive: true });
 		setSecretKeyringAdapterForTests({

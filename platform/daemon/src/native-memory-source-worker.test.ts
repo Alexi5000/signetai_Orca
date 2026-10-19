@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "bun:test";
@@ -20,6 +20,25 @@ async function fixture(): Promise<{
 }
 
 describe("native source worker", () => {
+	it("ignores symlinks and FIFOs while retaining regular source files", async () => {
+		if (process.platform === "win32") return;
+		const { root, source } = await fixture();
+		const outside = await mkdtemp(join(tmpdir(), "signet-worker-outside-"));
+		const worker = createNativeSourceWorker();
+		try {
+			await writeFile(join(outside, "secret.md"), "private");
+			await symlink(join(outside, "secret.md"), join(root, "link.md"));
+			await symlink(outside, join(root, "linked-dir"));
+			expect(spawnSync("mkfifo", [join(root, "pipe.md")]).status).toBe(0);
+			const page = await worker.scan({ source, cursor: null, pageSize: 100 });
+			expect(page.files.map((file) => file.content).sort()).toEqual(["A", "B"]);
+		} finally {
+			await worker.close();
+			await rm(root, { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
 	it("uses one in-process worker thread for a scan", async () => {
 		const { source } = await fixture();
 		let started = 0;

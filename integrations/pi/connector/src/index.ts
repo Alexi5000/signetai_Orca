@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
 	BaseConnector,
@@ -7,12 +7,14 @@ import {
 	type UninstallResult,
 	buildManagedExtensionContent,
 	isManagedExtensionFile,
+	readFileIfExistsSync,
 	managedExtensionFilePath,
 	removeManagedExtensionFile,
 	resolveSignetAgentId,
 	resolveSignetApiKey,
 	resolveSignetDaemonUrl,
 	resolveSignetWorkspacePath,
+	writeFileAtomicSync,
 } from "@signet/connector-base";
 import { createAgentDir } from "@signet/connector-base/agent-dir";
 import { EXTENSION_BUNDLE } from "./extension-bundle.js";
@@ -77,7 +79,16 @@ export class PiConnector extends BaseConnector {
 		const agentDir = resolvePiAgentDir();
 		const targetPath = managedExtensionFilePath(agentDir, PI_MANAGED_FILENAME);
 
-		if (existsSync(targetPath) && !isManagedExtensionFile(targetPath, PI_MANAGED_MARKER)) {
+		// Read once and reuse the same content for the ownership check and the
+		// change check, instead of checking the path and writing it later.
+		let previous: string | null;
+		try {
+			previous = readFileIfExistsSync(targetPath, "utf8");
+		} catch {
+			// Present but unreadable (e.g. a directory): treat as unmanaged.
+			previous = "";
+		}
+		if (previous !== null && !previous.includes(PI_MANAGED_MARKER)) {
 			throw new Error(
 				`Refusing to overwrite unmanaged pi extension at ${targetPath}. Move or remove it first, then rerun setup.`,
 			);
@@ -95,9 +106,8 @@ export class PiConnector extends BaseConnector {
 			agentId: resolveSignetAgentId(),
 			apiKey: resolveSignetApiKey(),
 		});
-		const previous = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : null;
 		if (previous !== managedContent) {
-			writeFileSync(targetPath, managedContent, "utf8");
+			writeFileAtomicSync(targetPath, managedContent);
 			filesWritten.push(targetPath);
 		}
 

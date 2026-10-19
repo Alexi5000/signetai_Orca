@@ -1,4 +1,5 @@
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { openFileExclusiveSync } from "./secure-fs";
 import { join, resolve } from "node:path";
 import { spawnHidden, spawnSyncHidden, type SpawnSyncReturns } from "./child-process";
 
@@ -555,7 +556,7 @@ async function acquireSourceRepoSyncLockAsync(workspaceDir: string): Promise<Syn
 
 	while (Date.now() < end) {
 		try {
-			const fd = openSync(path, "wx");
+			const fd = openFileExclusiveSync(path);
 			writeFileSync(fd, `${process.pid}\n${Date.now()}\n`);
 			return { status: "acquired", lock: { fd, path } };
 		} catch (err) {
@@ -915,7 +916,7 @@ function readTrimmedValue(result: GitCommandResult): string | null {
 
 function tryAcquireSourceRepoSyncLock(path: string): SyncLockAttempt {
 	try {
-		const fd = openSync(path, "wx");
+		const fd = openFileExclusiveSync(path);
 		writeFileSync(fd, `${process.pid}\n${Date.now()}\n`);
 		return { status: "acquired", lock: { fd, path } };
 	} catch (err) {

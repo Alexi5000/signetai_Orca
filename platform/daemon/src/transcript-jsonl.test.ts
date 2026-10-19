@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
@@ -14,11 +13,12 @@ import {
 	sessionSeqCacheKey,
 	writeCanonicalTranscriptSnapshot,
 } from "./transcript-jsonl";
+import { createTestTempDir } from "./test-temp-dir";
 
 const roots: string[] = [];
 
 function makeRoot(name: string): string {
-	const root = join(tmpdir(), `signet-transcript-jsonl-${name}-${process.pid}-${Date.now()}`);
+	const root = createTestTempDir(`signet-transcript-jsonl-${name}-`);
 	roots.push(root);
 	return root;
 }

@@ -1,5 +1,10 @@
-import { spawnHidden as spawn, type ChildProcessWithoutNullStreams } from "@signet/core";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+	spawnHidden as spawn,
+	type ChildProcessWithoutNullStreams,
+	readFileIfExistsSync,
+	writeFileAtomicSync,
+} from "@signet/core";
+import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
 	SIGNET_GIT_PROTECTED_PATHS,
@@ -833,10 +838,10 @@ export function ensureWorkspaceGitignore(): boolean {
 
 function ensureProtectedGitignore(dir: string): boolean {
 	const gitignorePath = join(dir, ".gitignore");
-	const existingContent = existsSync(gitignorePath) ? readFileSync(gitignorePath, "utf-8") : "";
+	const existingContent = readFileIfExistsSync(gitignorePath, "utf-8") ?? "";
 	const nextContent = mergeSignetGitignoreEntries(existingContent);
 	if (nextContent !== existingContent) {
-		writeFileSync(gitignorePath, nextContent, "utf-8");
+		writeFileAtomicSync(gitignorePath, nextContent, { fsync: false });
 		return true;
 	}
 	return false;

@@ -15,9 +15,10 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readFileWithStatSync } from "../platform/core/src/secure-fs";
 
 const root = join(import.meta.dir, "..");
 const wrapperPackageJsonPath = join(root, "dist", "signetai", "package.json");
@@ -110,15 +111,15 @@ describe("signet-mcp stdio server (regression guard for issue #826)", () => {
 	});
 
 	test("bundle is a real Node-runnable file (not a redirect or stub)", () => {
-		if (!existsSync(stdioBundlePath)) {
+		const bundle = readFileWithStatSync(stdioBundlePath, "utf-8");
+		if (!bundle) {
 			// Skipped on clean checkouts — the bundle is a build artifact.
 			return;
 		}
-		const stat = statSync(stdioBundlePath);
-		expect(stat.isFile()).toBe(true);
+		expect(bundle.stat.isFile()).toBe(true);
 		// Bundle must have a Node shebang so `signet-mcp` runs directly when
 		// the package manager installs the bin symlink with default perms.
-		const head = readFileSync(stdioBundlePath, { encoding: "utf-8", flag: "r" }).slice(0, 64);
+		const head = bundle.content.slice(0, 64);
 		expect(head.startsWith("#!/usr/bin/env node")).toBe(true);
 	});
 

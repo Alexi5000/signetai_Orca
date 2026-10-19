@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createPrivateTempDir } from "@signet/core";
 import { detectExistingSetup, type SetupDetection } from "./setup-detection.js";
 
-const TMP = join(tmpdir(), `signet-setup-detection-test-${Date.now()}`);
+let TMP = "";
 const ENVIRONMENT_KEYS = [
 	"HOME",
 	"USERPROFILE",
@@ -31,7 +31,7 @@ afterEach(() => {
 });
 
 beforeEach(() => {
-	mkdirSync(TMP, { recursive: true });
+	TMP = createPrivateTempDir("signet-setup-detection-test-");
 	process.env.HOME = TMP;
 	process.env.PATH = join(TMP, "bin");
 	for (const key of ENVIRONMENT_KEYS) {

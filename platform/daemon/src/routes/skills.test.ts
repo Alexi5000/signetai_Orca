@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { createTestTempDir } from "../test-temp-dir";
 import { join } from "node:path";
 import { Hono } from "hono";
 import {
@@ -290,11 +290,13 @@ describe("formatInstalls", () => {
 // ---------------------------------------------------------------------------
 
 describe("listInstalledSkills", () => {
-	const tmpAgentsDir = join(tmpdir(), `signet-test-agents-${process.pid}`);
-	const tmpSkillsDir = join(tmpAgentsDir, "skills");
+	let tmpAgentsDir: string;
+	let tmpSkillsDir: string;
 	let origSignetPath: string | undefined;
 
 	beforeEach(() => {
+		tmpAgentsDir = createTestTempDir("signet-test-agents-");
+		tmpSkillsDir = join(tmpAgentsDir, "skills");
 		origSignetPath = process.env.SIGNET_PATH;
 		process.env.SIGNET_PATH = tmpAgentsDir;
 		mkdirSync(tmpSkillsDir, { recursive: true });
@@ -373,12 +375,14 @@ description: Valid
 // ---------------------------------------------------------------------------
 
 describe("skills routes", () => {
-	const tmpAgentsDir = join(tmpdir(), `signet-route-test-${process.pid}`);
-	const skillsDir = join(tmpAgentsDir, "skills");
+	let tmpAgentsDir: string;
+	let skillsDir: string;
 	let origSignetPath: string | undefined;
 	let app: Hono;
 
 	beforeEach(() => {
+		tmpAgentsDir = createTestTempDir("signet-route-test-");
+		skillsDir = join(tmpAgentsDir, "skills");
 		origSignetPath = process.env.SIGNET_PATH;
 		process.env.SIGNET_PATH = tmpAgentsDir;
 
@@ -755,7 +759,11 @@ describe("install command args", () => {
 });
 
 describe("ClawHub skill archive validation", () => {
-	const tmpRoot = join(tmpdir(), `signet-clawhub-validate-${process.pid}`);
+	let tmpRoot: string;
+
+	beforeEach(() => {
+		tmpRoot = createTestTempDir("signet-clawhub-validate-");
+	});
 
 	afterEach(() => {
 		rmSync(tmpRoot, { recursive: true, force: true });

@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { createPrivateTempDir } from "@signet/core";
 import { join } from "node:path";
 import {
 	CodexConnector,
@@ -179,7 +179,7 @@ beforeEach(() => {
 	Reflect.deleteProperty(process.env, "SIGNET_CODEX_FORCE_COMPAT_HOOKS");
 	Reflect.deleteProperty(process.env, "SIGNET_WRAPPER_DIR");
 	Reflect.deleteProperty(process.env, "CODEX_HOME");
-	tempHome = join(tmpdir(), `signet-codex-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	tempHome = createPrivateTempDir("signet-codex-test-");
 	codexDir = join(tempHome, ".codex");
 	configPath = join(codexDir, "config.toml");
 	hooksPath = join(codexDir, "hooks.json");

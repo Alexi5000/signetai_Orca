@@ -18,14 +18,7 @@ import {
 	truncateSync,
 	unlinkSync,
 } from "node:fs";
-import {
-	open as openAsync,
-	rm as rmAsync,
-	readFile as readFileAsync,
-	rename as renameAsync,
-	unlink as unlinkAsync,
-	writeFile as writeFileAsync,
-} from "node:fs/promises";
+import { open as openAsync, rm as rmAsync, readFile as readFileAsync, unlink as unlinkAsync } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -44,6 +37,7 @@ import {
 	recreateMemoriesFtsSchema,
 	resolveSqliteJournalConfig,
 	runMigrations,
+	writeFileAtomic,
 } from "@signet/core";
 import { convertToIncrementalVacuum, DbSpacePreflightError, ensureVacuumConversionState } from "./db-vacuum";
 import type { DbSpaceMetrics } from "./db-vacuum";
@@ -1371,9 +1365,9 @@ async function readMigrationBackupCursor(
 
 async function writeMigrationBackupCursor(cursor: MigrationBackupCursor): Promise<void> {
 	const cursorPath = `${cursor.destination}.cursor.json`;
-	const tempPath = `${cursorPath}.tmp-${process.pid}`;
-	await writeFileAsync(tempPath, `${JSON.stringify(cursor)}\n`, "utf8");
-	await renameAsync(tempPath, cursorPath);
+	// Exclusive 0o600 sibling temp + rename: the cursor is never observed torn
+	// and a pre-planted temp path cannot redirect the write.
+	await writeFileAtomic(cursorPath, `${JSON.stringify(cursor)}\n`, { fsync: false });
 }
 
 async function probeMigrationBackupThroughput(

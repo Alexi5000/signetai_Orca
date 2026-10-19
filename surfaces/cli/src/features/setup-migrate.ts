@@ -1,4 +1,5 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileAtomicSync, writeFileExclusiveSync } from "@signet/core";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { confirm } from "@inquirer/prompts";
@@ -398,9 +399,9 @@ export async function runExistingSetupWizard(
 				}
 				updatedConfig.memory = existingMemory;
 			}
-			writeFileSync(agentYamlPath, formatYaml(updatedConfig));
+			writeFileAtomicSync(agentYamlPath, formatYaml(updatedConfig));
 		} else {
-			writeFileSync(agentYamlPath, formatYaml(config));
+			writeFileAtomicSync(agentYamlPath, formatYaml(config));
 		}
 
 		writeSetupCorePluginRegistry(basePath, { signetSecretsEnabled, graphiqEnabled });
@@ -413,13 +414,14 @@ export async function runExistingSetupWizard(
 		}
 
 		const agentsPath = join(basePath, "AGENTS.md");
-		if (identityMode === "managed" && !existsSync(agentsPath)) {
+		if (identityMode === "managed") {
 			const agentsTemplate = join(templatesDir, "AGENTS.md.template");
+			// O_EXCL create-if-missing: an existing AGENTS.md is never overwritten.
 			if (existsSync(agentsTemplate)) {
 				const content = readFileSync(agentsTemplate, "utf-8").replace(/\{\{AGENT_NAME\}\}/g, agentName);
-				writeFileSync(agentsPath, content);
+				writeFileExclusiveSync(agentsPath, content);
 			} else {
-				writeFileSync(
+				writeFileExclusiveSync(
 					agentsPath,
 					`# ${agentName}\n\nThis is your agent identity file. Define your agent's personality, capabilities,\nand behaviors here. This file is shared across all your AI tools.\n`,
 				);
@@ -441,15 +443,12 @@ export async function runExistingSetupWizard(
 
 		for (const doc of docs) {
 			const path = join(basePath, doc.name);
-			if (existsSync(path)) {
-				continue;
-			}
 			const template = join(templatesDir, doc.template);
 			if (!existsSync(template)) {
 				continue;
 			}
 			const content = readFileSync(template, "utf-8").replace(/\{\{AGENT_NAME\}\}/g, agentName);
-			writeFileSync(path, content);
+			writeFileExclusiveSync(path, content);
 		}
 
 		spinner.text = "Initializing database...";

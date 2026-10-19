@@ -7,9 +7,9 @@
  * when SQLite reports an index mismatch.
  */
 
-import { spawnHidden as spawn, type ChildProcess } from "@signet/core";
+import { spawnHidden as spawn, type ChildProcess, createPrivateTempDirAsync } from "@signet/core";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -601,10 +601,12 @@ async function runKillableTelemetryRepair(
 	requireBase?: string,
 ): Promise<void> {
 	return await withIntegrityChildSlot(async () => {
-		const dir = workerPath === undefined ? await mkdtemp(join(tmpdir(), "signet-integrity-repair-")) : null;
-		const scriptPath = workerPath ?? join(dir ?? tmpdir(), "repair.mjs");
+		const dir = workerPath === undefined ? await createPrivateTempDirAsync("signet-integrity-repair-") : null;
+		const scriptPath = workerPath ?? join(dir as string, "repair.mjs");
 		try {
-			if (workerPath === undefined) await writeFile(scriptPath, REPAIR_WORKER_SOURCE, "utf8");
+			if (dir !== null) {
+				await writeFile(scriptPath, REPAIR_WORKER_SOURCE, { encoding: "utf8", mode: 0o600, flag: "wx" });
+			}
 			const output = await runKillableChild({
 				executable: runtimePath ?? process.execPath,
 				args: [scriptPath],

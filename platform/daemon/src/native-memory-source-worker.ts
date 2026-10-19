@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { lstat, opendir, readFile } from "node:fs/promises";
+import { constants as fsConstants, existsSync } from "node:fs";
+import { lstat, open, opendir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker, isMainThread, parentPort, threadId } from "node:worker_threads";
 import { resolveEmbeddedWorkerPath } from "./native-runtime-assets";
 import { buildObsidianSourceChunks, type ObsidianSourceChunk } from "./obsidian-source-chunks";
+
+const NO_FOLLOW_READ_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
 
 export interface NativeSourceWorkerPattern {
 	readonly glob: string;
@@ -146,21 +148,29 @@ async function scan(command: ScanCommand): Promise<NativeSourceWorkerPage> {
 		const path = frontier.pop();
 		if (path === undefined) break;
 		try {
-			const info = await lstat(path);
-			if (info.isDirectory()) {
-				const directory = await opendir(path);
-				const entries: string[] = [];
-				for await (const entry of directory) {
-					if (entry.name !== ".git") entries.push(join(path, entry.name));
-				}
-				entries.sort((left, right) => right.localeCompare(left));
-				frontier.push(...entries);
-				continue;
-			}
-			if (!info.isFile()) continue;
+			const handle = await open(path, NO_FOLLOW_READ_FLAGS);
+			let content: string;
+			let mtimeMs: number;
 			const kind = matchesPattern(command.source, path);
-			if (kind === null) continue;
-			const content = await readFile(path, "utf8");
+			try {
+				const info = await handle.stat();
+				if ((await lstat(path)).isSymbolicLink()) continue;
+				if (info.isDirectory()) {
+					const directory = await opendir(path);
+					const entries: string[] = [];
+					for await (const entry of directory) {
+						if (entry.name !== ".git") entries.push(join(path, entry.name));
+					}
+					entries.sort((left, right) => right.localeCompare(left));
+					frontier.push(...entries);
+					continue;
+				}
+				if (!info.isFile() || kind === null) continue;
+				mtimeMs = info.mtimeMs;
+				content = await handle.readFile("utf8");
+			} finally {
+				await handle.close().catch(() => {});
+			}
 			if (!content.trim()) continue;
 			const chunks =
 				command.source.harness === "obsidian" &&
@@ -176,7 +186,7 @@ async function scan(command: ScanCommand): Promise<NativeSourceWorkerPage> {
 			const descriptor: NativeSourceWorkerFile = {
 				path,
 				content,
-				mtimeMs: info.mtimeMs,
+				mtimeMs,
 				kind,
 				...contentMetadata(content),
 				...(nativeSourceId(command.source) === undefined ? {} : { sourceId: nativeSourceId(command.source) }),

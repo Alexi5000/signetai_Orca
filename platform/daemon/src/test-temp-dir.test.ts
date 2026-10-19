@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
@@ -21,6 +21,7 @@ describe("test-temp-dir (exit-safe cleanup)", () => {
 		leaked.push(dir);
 		expect(dir.startsWith(join(tmpdir(), "signet-test-tempdir-"))).toBe(true);
 		expect(existsSync(dir)).toBe(true);
+		if (process.platform !== "win32") expect(statSync(dir).mode & 0o777).toBe(0o700);
 	});
 
 	it("cleanupTestTempDir removes the dir and deregisters it", () => {

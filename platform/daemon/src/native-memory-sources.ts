@@ -1,4 +1,5 @@
-import { lstat, readFile, stat } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, readFile, stat } from "node:fs/promises";
 
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -47,6 +48,8 @@ import {
 	type NativeSourceWorkerPage,
 	type NativeSourceWorkerSource,
 } from "./native-memory-source-worker";
+
+const NO_FOLLOW_READ_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
 
 /** Keep one owner-side source descriptor bounded without using the 5s default. */
 export const NATIVE_MEMORY_OWNER_DEADLINE_MS = 60_000;
@@ -920,16 +923,21 @@ export async function indexNativeMemoryFile(
 	let mtimeMs = options.mtimeMs ?? 0;
 	if (options.content === undefined) {
 		try {
-			const linkStat = await lstat(filePath);
-			if (linkStat.isSymbolicLink()) return false;
-			const fileStat = await stat(filePath);
-			if (!fileStat.isFile()) return false;
-			mtimeMs = fileStat.mtimeMs;
 			// Async reads and stats run in the threadpool: a transiently locked
 			// file (EDEADLK from Obsidian or a sync service) or a stalled
 			// filesystem must not block the daemon event loop for seconds
-			// (#1135, #1142).
-			content = await readFile(filePath, "utf-8");
+			// (#1135, #1142). Open once (no-follow, non-blocking for FIFOs) and
+			// fstat the descriptor so the checked file is the one that is read.
+			const handle = await open(filePath, NO_FOLLOW_READ_FLAGS);
+			try {
+				const fileStat = await handle.stat();
+				const linkStat = await lstat(filePath);
+				if (linkStat.isSymbolicLink() || !fileStat.isFile()) return false;
+				mtimeMs = fileStat.mtimeMs;
+				content = await handle.readFile("utf-8");
+			} finally {
+				await handle.close().catch(() => {});
+			}
 		} catch (err) {
 			if (isEnoentError(err)) {
 				// The file vanished between the scan listing and the read — it is

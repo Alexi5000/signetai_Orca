@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { readFileWithStatSync } from "@signet/core";
 import { capTranscriptAuditContent, writeTranscriptAudit } from "./transcript-audit";
+import { createTestTempDir } from "./test-temp-dir";
 
 describe("transcript audit sizing (#1163)", () => {
 	it("caps oversized audit transcripts with a truncation marker", () => {
@@ -15,7 +15,7 @@ describe("transcript audit sizing (#1163)", () => {
 	});
 
 	it("archives by renaming the latest instead of writing the content twice", async () => {
-		const root = mkdtempSync(join(tmpdir(), "signet-audit-"));
+		const root = createTestTempDir("signet-audit-");
 		try {
 			// 10MB raw — well over the 8MB cap — so a duplicated write would
 			// leave ~20MB of audit files for one session.
@@ -36,10 +36,12 @@ describe("transcript audit sizing (#1163)", () => {
 			// The archive exists with the capped content (~8MB cap, not the
 			// full 10MB), and the latest was renamed away rather than
 			// duplicated — one copy on disk, not two.
-			expect(statSync(finalPath).size).toBeLessThan(9 * 1024 * 1024);
-			expect(statSync(finalPath).size).toBeGreaterThan(7 * 1024 * 1024);
+			const archived = readFileWithStatSync(finalPath, "utf8");
+			if (!archived) throw new Error("archive missing");
+			expect(archived.stat.size).toBeLessThan(9 * 1024 * 1024);
+			expect(archived.stat.size).toBeGreaterThan(7 * 1024 * 1024);
 			expect(existsSync(result?.latestPath ?? "")).toBe(false);
-			const content = readFileSync(finalPath, "utf-8");
+			const content = archived.content;
 			expect(content).toContain("audit transcript truncated");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
@@ -47,7 +49,7 @@ describe("transcript audit sizing (#1163)", () => {
 	});
 
 	it("keeps the rolling latest file when no archive timestamp is supplied", async () => {
-		const root = mkdtempSync(join(tmpdir(), "signet-audit-"));
+		const root = createTestTempDir("signet-audit-");
 		try {
 			const result = await writeTranscriptAudit({
 				basePath: root,

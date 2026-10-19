@@ -11,7 +11,8 @@
 
 import type { DbOwnerClient } from "./db-owner-client";
 import { DB_OWNER_MAX_MAINTENANCE_DEADLINE_MS } from "./db-owner-protocol";
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { writeFileAtomicSync } from "@signet/core";
 import { basename } from "node:path";
 import {
 	incrementMigrationVerifyAttempt,
@@ -52,14 +53,12 @@ function writeMigrationVerifyTerminalVerdict(
 	log?: (message: string, details?: Record<string, unknown>) => void,
 ): void {
 	const verdictPath = migrationVerifyVerdictPath(backupPath);
-	const tempPath = `${verdictPath}.tmp-${process.pid}`;
 	try {
-		writeFileSync(
-			tempPath,
+		writeFileAtomicSync(
+			verdictPath,
 			`${JSON.stringify({ status, classifiedAt: new Date().toISOString(), findingsCount })}\n`,
-			"utf8",
+			{ fsync: false },
 		);
-		renameSync(tempPath, verdictPath);
 	} catch (error) {
 		log?.("Migration integrity terminal verdict sidecar write failed", {
 			status,

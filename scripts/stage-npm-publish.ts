@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 
-import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, cpSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { writeFileAtomicSync } from "../platform/core/src/secure-fs";
 
 export const NPM_PACKAGE_RENAMES: ReadonlyMap<string, string> = new Map([
 	["@signet/core", "@signetai/core"],
@@ -78,19 +79,33 @@ export function rewritePackageManifest(raw: string): string {
 }
 
 function rewriteTextFiles(dir: string): void {
-	for (const entry of readdirSync(dir)) {
+	for (const dirent of readdirSync(dir, { withFileTypes: true })) {
+		const entry = dirent.name;
 		const path = join(dir, entry);
-		const stat = statSync(path);
-		if (stat.isDirectory()) {
+		if (dirent.isDirectory()) {
 			rewriteTextFiles(path);
 			continue;
 		}
-		if (!stat.isFile() || !looksTextFile(path) || stat.size > 5_000_000) continue;
-
-		const raw = readFileSync(path, "utf8");
-		if (raw.includes("\0")) continue;
+		// Inspect and read through one descriptor so the checks apply to the bytes we rewrite.
+		const fd = openSync(path, "r");
+		let raw: string | null = null;
+		let isDirectory = false;
+		try {
+			const stat = fstatSync(fd);
+			isDirectory = stat.isDirectory();
+			if (!isDirectory && stat.isFile() && looksTextFile(path) && stat.size <= 5_000_000) {
+				raw = readFileSync(fd, "utf8");
+			}
+		} finally {
+			closeSync(fd);
+		}
+		if (isDirectory) {
+			rewriteTextFiles(path);
+			continue;
+		}
+		if (raw === null || raw.includes("\0")) continue;
 		const next = entry === "package.json" ? rewritePackageManifest(raw) : rewritePackageSpecifiers(raw);
-		if (next !== raw) writeFileSync(path, next);
+		if (next !== raw) writeFileAtomicSync(path, next);
 	}
 }
 

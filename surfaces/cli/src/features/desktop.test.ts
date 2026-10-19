@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
 	chmodSync,
+	closeSync,
+	constants as fsConstants,
 	existsSync,
+	fstatSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
@@ -23,6 +27,17 @@ import {
 	installWindowsDesktopApp,
 	resolveDesktopSourceCheckout,
 } from "./desktop.js";
+
+/** Read a launcher through one no-follow descriptor; throws (ELOOP) if it is a symlink. */
+function readRegularFileNoFollow(path: string): string {
+	const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+	try {
+		expect(fstatSync(fd).isFile()).toBe(true);
+		return readFileSync(fd, "utf8");
+	} finally {
+		closeSync(fd);
+	}
+}
 
 function makeCheckout(): string {
 	const root = mkdtempSync(join(tmpdir(), "signet-desktop-test-"));
@@ -237,8 +252,7 @@ describe("linux desktop install", () => {
 			const result = installLinuxDesktopApp(root, home, workspace);
 
 			expect(readFileSync(result.appImage, "utf8")).toBe("new");
-			expect(lstatSync(result.binary).isSymbolicLink()).toBe(false);
-			const launcher = readFileSync(result.binary, "utf8");
+			const launcher = readRegularFileNoFollow(result.binary);
 			expect(launcher).toContain("# signet-desktop managed launcher");
 			expect(launcher).toContain(`export SIGNET_PATH='${workspace}'`);
 			expect(launcher).toContain(`exec '${result.appImage}' "$@"`);
@@ -341,8 +355,7 @@ describe("linux desktop install", () => {
 
 			const result = installLinuxDesktopApp(root, home, join(home, "workspace"));
 
-			expect(lstatSync(result.binary).isSymbolicLink()).toBe(false);
-			expect(readFileSync(result.binary, "utf8")).toContain(`exec '${result.appImage}' "$@"`);
+			expect(readRegularFileNoFollow(result.binary)).toContain(`exec '${result.appImage}' "$@"`);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(home, { recursive: true, force: true });

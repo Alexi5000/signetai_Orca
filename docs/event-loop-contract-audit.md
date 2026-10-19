@@ -4,18 +4,18 @@ This report is generated from the deterministic migration ledger in `scripts/eve
 
 ## Current inventory
 
-- Exact ledger inventory: 821 sites
+- Exact ledger inventory: 803 sites
 - Synchronous `withWriteTx()` sites: 62
 - Synchronous `withReadDb()` sites: 93
 - Async-named DB sites: 166
 - Async-named ON-PARENT DB sites: 164
 - Async-named OFF-PARENT DB sites: 2
-- Synchronous filesystem/process sites: 500
+- Synchronous filesystem/process sites: 482
 - Compile-visible legacy DB sites remaining: 155
   - `withWriteTx`: 62
   - `withReadDb`: 93
 
-The 821-site inventory excludes test, benchmark, generated, and `__tests__` fixtures and includes every synchronous filesystem, process, and database call, including async-named DB callbacks. The 62 synchronous writes, 93 synchronous reads, and 166 async-named DB sites are the complete database-call inventory; 155 compatibility DB operations remain transitional callers for the later migration phase. The async-named DB counts above separate the 164 ON-PARENT callbacks from the 2 OFF-PARENT callbacks. Those compatibility calls are marked with `@ts-expect-error LEGACY_SYNC_DB_ACCESS`, so the compiler reports every remaining site without forcing this phase to migrate them.
+The 803-site inventory excludes test, benchmark, generated, and `__tests__` fixtures and includes every synchronous filesystem, process, and database call, including async-named DB callbacks. The 62 synchronous writes, 93 synchronous reads, and 166 async-named DB sites are the complete database-call inventory; 155 compatibility DB operations remain transitional callers for the later migration phase. The async-named DB counts above separate the 164 ON-PARENT callbacks from the 2 OFF-PARENT callbacks. Those compatibility calls are marked with `@ts-expect-error LEGACY_SYNC_DB_ACCESS`, so the compiler reports every remaining site without forcing this phase to migrate them.
 
 ## Execution-home inventory
 
@@ -59,7 +59,7 @@ The classifier follows execution home, not API spelling. A direct accessor callb
 - `db:database.integrity.write` (withWriteTxAsync)
 - `db:database.integrity.read-checks` (withReadDbAsync)
 - `db:database.integrity.verify` (withReadDbAsync)
-- `db-accessor.ts:3039` (withWriteTxAsync)
+- `db-accessor.ts:3033` (withWriteTxAsync)
 - `db-vacuum.ts:331` (withReadDb)
 - `db-vacuum.ts:339` (withReadDbAsync)
 - `db-vacuum.ts:347` (withWriteTxAsync)
@@ -217,7 +217,7 @@ The classifier follows execution home, not API spelling. A direct accessor callb
 - `routes/hooks-routes.ts:1180` (withReadDb)
 - `routes/hooks-routes.ts:1209` (withWriteTx)
 - `routes/hooks-routes.ts:1329` (withWriteTx)
-- `routes/import-routes.ts:334` (withReadDb)
+- `db:routes-import-routes.legacy.line334` (withReadDb)
 - `routes/knowledge-routes.ts:305` (withReadDbAsync)
 - `routes/knowledge-routes.ts:373` (withReadDbAsync)
 - `routes/knowledge-routes.ts:413` (withReadDbAsync)
@@ -225,7 +225,7 @@ The classifier follows execution home, not API spelling. A direct accessor callb
 - `routes/knowledge-routes.ts:606` (withReadDbAsync)
 - `routes/knowledge-routes.ts:623` (withReadDbAsync)
 - `routes/knowledge-routes.ts:728` (withReadDbAsync)
-- `routes/marketplace.ts:1128` (withWriteTx)
+- `db:routes-marketplace.legacy.line1128` (withWriteTx)
 - `routes/mcp-analytics.ts:89` (withReadDb)
 - `routes/mcp-analytics.ts:171` (withReadDb)
 - `routes/memory-routes.ts:121` (withReadDbAsync)
@@ -301,20 +301,20 @@ The classifier follows execution home, not API spelling. A direct accessor callb
 - `session-recall-dedupe.ts:233` (withWriteTxAsync)
 - `session-recall-dedupe.ts:324` (withWriteTxAsync)
 - `session-recall-dedupe.ts:372` (withWriteTx)
-- `session-transcripts.ts:104` (withReadDb)
-- `session-transcripts.ts:116` (withReadDb)
-- `session-transcripts.ts:252` (withReadDb)
-- `session-transcripts.ts:396` (withReadDb)
-- `session-transcripts.ts:450` (withWriteTx)
-- `session-transcripts.ts:541` (withWriteTxAsync)
-- `session-transcripts.ts:656` (withWriteTx)
-- `session-transcripts.ts:690` (withReadDb)
-- `session-transcripts.ts:789` (withReadDbAsync)
-- `session-transcripts.ts:808` (withReadDb)
-- `session-transcripts.ts:847` (withReadDb)
-- `session-transcripts.ts:902` (withReadDb)
-- `session-transcripts.ts:947` (withReadDb)
-- `session-transcripts.ts:1011` (withReadDb)
+- `db:session-transcripts.legacy.line104` (withReadDb)
+- `db:session-transcripts.legacy.line116` (withReadDb)
+- `db:session-transcripts.legacy.line252` (withReadDb)
+- `db:session-transcripts.legacy.line396` (withReadDb)
+- `db:session-transcripts.legacy.line450` (withWriteTx)
+- `db:session-transcripts.legacy.line541` (withWriteTxAsync)
+- `db:session-transcripts.legacy.line656` (withWriteTx)
+- `db:session-transcripts.legacy.line690` (withReadDb)
+- `db:session-transcripts.legacy.line789` (withReadDbAsync)
+- `db:session-transcripts.legacy.line808` (withReadDb)
+- `db:session-transcripts.legacy.line847` (withReadDb)
+- `db:session-transcripts.legacy.line902` (withReadDb)
+- `db:session-transcripts.legacy.line947` (withReadDb)
+- `db:session-transcripts.legacy.line1011` (withReadDb)
 - `session-ttl-finalizer.ts:81` (withReadDbAsync)
 - `session-ttl-finalizer.ts:96` (withWriteTxAsync)
 - `skill-invocations.ts:50` (withWriteTx)
@@ -324,8 +324,8 @@ The classifier follows execution home, not API spelling. A direct accessor callb
 - `startup-recovery.ts:78` (withWriteTxAsync)
 - `startup-recovery.ts:100` (withReadDbAsync)
 - `startup-recovery.ts:521` (withReadDbAsync)
-- `telemetry.ts:616` (withWriteTx)
-- `telemetry.ts:623` (withWriteTx)
+- `db:telemetry.legacy.line616` (withWriteTx)
+- `db:telemetry.legacy.line623` (withWriteTx)
 - `temporal-expand.ts:178` (withReadDb)
 - `temporal-fallback.ts:36` (withReadDb)
 - `temporal-fallback.ts:153` (withReadDb)

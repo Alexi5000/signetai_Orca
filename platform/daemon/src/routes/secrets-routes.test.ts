@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { type BitwardenClient, setBitwardenClientFactoryForTests } from "../bitwarden.js";
@@ -10,6 +9,7 @@ import { SIGNET_SECRETS_PLUGIN_ID, signetSecretsManifest } from "../plugins/bund
 import { PluginHostV1 } from "../plugins/host.js";
 import { getLocalSecretValue, getSecret, putSecret, resetSecretExecJobsForTests } from "../secrets.js";
 import { registerSecretRoutes } from "./secrets-routes.js";
+import { createTestTempDir } from "../test-temp-dir";
 
 const originalSignetPath = process.env.SIGNET_PATH;
 let agentsDir = "";
@@ -33,7 +33,7 @@ function makeApp(host: PluginHostV1): Hono {
 
 describe("secrets routes plugin capability enforcement", () => {
 	beforeEach(() => {
-		agentsDir = join(tmpdir(), `signet-secrets-routes-${process.pid}-${Date.now()}`);
+		agentsDir = createTestTempDir("signet-secrets-routes-");
 		process.env.SIGNET_PATH = agentsDir;
 		mkdirSync(agentsDir, { recursive: true });
 	});

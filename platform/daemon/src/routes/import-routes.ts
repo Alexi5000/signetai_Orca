@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { basename } from "node:path";
 import { addImportedSource, loadSourcesConfig, markSourceIndexed, removeSourceIfGeneration } from "@signet/core";
 import type { Context } from "hono";
@@ -80,8 +80,12 @@ export function registerImportRoutes(app: Hono): void {
 		const uploadedBytes = uploadedEntries.reduce((total, file) => total + file.size, 0);
 		let pathBytes = 0;
 		for (const path of pathEntries) {
+			// Open once and fstat the descriptor: the size limits are enforced on
+			// the same file that is read, not on a path that can be swapped.
+			let handle: Awaited<ReturnType<typeof open>> | undefined;
 			try {
-				const fileStat = await stat(path);
+				handle = await open(path, "r");
+				const fileStat = await handle.stat();
 				if (!fileStat.isFile()) throw new Error("path is not a file");
 				if (fileStat.size > IMPORT_MAX_FILE_BYTES) {
 					statuses.push({
@@ -94,13 +98,24 @@ export function registerImportRoutes(app: Hono): void {
 				pathBytes += fileStat.size;
 				if (uploadedBytes + pathBytes > IMPORT_MAX_BATCH_BYTES)
 					return c.json({ error: `Import batch exceeds the ${IMPORT_MAX_BATCH_BYTES} byte limit` }, 413);
-				pathFiles.push(new File([new Uint8Array(await readFile(path))], basename(path)));
+				const content = await handle.readFile();
+				if (content.byteLength > IMPORT_MAX_FILE_BYTES) {
+					statuses.push({
+						fileName: basename(path),
+						status: "failed",
+						error: `File exceeds the ${IMPORT_MAX_FILE_BYTES} byte limit`,
+					});
+					continue;
+				}
+				pathFiles.push(new File([new Uint8Array(content)], basename(path)));
 			} catch (error) {
 				statuses.push({
 					fileName: basename(path),
 					status: "failed",
 					error: error instanceof Error ? error.message : "Could not read file",
 				});
+			} finally {
+				await handle?.close().catch(() => {});
 			}
 		}
 		const entries = [...uploadedEntries, ...pathFiles];
@@ -341,7 +356,7 @@ function hasIndexedSource(sourceId: string, agentId: string): boolean {
 			)
 			.get(agentId, sourceId) as { present: number } | null | undefined;
 		return row != null;
-	}, "routes/import-routes.ts:334");
+	}, "db:routes-import-routes.legacy.line334");
 }
 
 function persistedImportBytes(value: {

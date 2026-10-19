@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, rename } from "node:fs/promises";
 import { join } from "node:path";
-import { resolveDefaultBasePath } from "@signet/core";
+import { resolveDefaultBasePath, writeFileAtomic } from "@signet/core";
 
 // #1163: a runaway session once wrote two 302MB audit files (the raw + the
 // latest, same content twice), ballooning the transcripts dir and choking
@@ -60,7 +60,7 @@ export async function writeTranscriptAudit(params: {
 	const token = resolveAuditToken(params.agentId, params.sessionId, params.sessionKey, params.rawTranscript);
 	const content = capTranscriptAuditContent(params.rawTranscript);
 	const latestPath = buildAuditPath(dir, `${token}--latest.log`);
-	await writeFile(latestPath, content, "utf8");
+	await writeFileAtomic(latestPath, content, { fsync: false });
 
 	if (!params.capturedAt) {
 		return { latestPath };
@@ -74,7 +74,7 @@ export async function writeTranscriptAudit(params: {
 	} catch {
 		// The archive matters more than avoiding the copy; fall back to a
 		// direct write of the (already capped) content.
-		await writeFile(finalPath, content, "utf8");
+		await writeFileAtomic(finalPath, content, { fsync: false });
 	}
 	return { latestPath, finalPath };
 }

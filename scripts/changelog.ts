@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { readFileIfExistsSync, writeFileAtomicSync } from "../platform/core/src/secure-fs";
 import { type BumpLevel, computeBumpLevel } from "./bump-level";
 
 const CHANGELOG_PATH = "CHANGELOG.md";
@@ -304,9 +305,9 @@ export function buildDocumentFromSections(sections: readonly string[]): string {
 }
 
 export function prependChangelogEntry(newEntry: string): void {
-	const existing = existsSync(CHANGELOG_PATH) ? readFileSync(CHANGELOG_PATH, "utf8") : "";
+	const existing = readFileIfExistsSync(CHANGELOG_PATH, "utf8") ?? "";
 	const sections = extractRenderedSectionStrings(existing);
-	writeFileSync(CHANGELOG_PATH, buildDocumentFromSections([newEntry.trim(), ...sections]));
+	writeFileAtomicSync(CHANGELOG_PATH, buildDocumentFromSections([newEntry.trim(), ...sections]));
 }
 
 export function listVersionTags(): string[] {

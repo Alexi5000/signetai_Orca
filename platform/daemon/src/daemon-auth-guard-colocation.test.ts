@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DbOwnerClient, DbOwnerJobHandle, DbOwnerSubmitOptions } from "./db-owner-client";
 import type { DbOwnerRequest } from "./db-owner-protocol";
 import type { RecallParams, RecallResponse } from "./memory-search";
+import { createTestTempDir } from "./test-temp-dir";
 
 /*
  * Regression test for auth guard co-location refactoring.
@@ -23,7 +23,7 @@ import type { RecallParams, RecallResponse } from "./memory-search";
  */
 
 const prevSignetPath = process.env.SIGNET_PATH;
-const tmpDir = join(tmpdir(), `signet-test-auth-coloc-${Date.now()}`);
+const tmpDir = createTestTempDir("signet-test-auth-coloc-");
 mkdirSync(join(tmpDir, "memory"), { recursive: true });
 mkdirSync(join(tmpDir, ".daemon"), { recursive: true });
 writeFileSync(join(tmpDir, ".daemon", "auth-secret"), "test-secret-key-32-bytes-min!!");

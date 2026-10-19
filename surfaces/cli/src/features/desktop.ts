@@ -3,9 +3,9 @@ import {
 	chmodSync,
 	closeSync,
 	copyFileSync,
+	constants as fsConstants,
 	cpSync,
 	existsSync,
-	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -20,7 +20,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveWorkspaceSourceRepoPath, syncWorkspaceSourceRepo } from "@signet/core";
+import { resolveWorkspaceSourceRepoPath, syncWorkspaceSourceRepo, writeFileExclusiveSync } from "@signet/core";
 import { resolveAgentsDir } from "../lib/workspace.js";
 
 export interface DesktopCommandOptions {
@@ -681,13 +681,37 @@ function linuxArtifactArchNames(arch: string): ReadonlySet<string> {
 
 const MANAGED_LAUNCHER_MARKER = "# signet-desktop managed launcher";
 
+type LauncherState =
+	| { readonly kind: "missing" }
+	| { readonly kind: "symlink"; readonly target: string }
+	| { readonly kind: "file"; readonly content: string };
+
+/**
+ * Classify an existing launcher through a single no-follow open, so the
+ * symlink/content decision applies to exactly the object that was inspected.
+ */
+function inspectLauncher(path: string): LauncherState {
+	let fd: number;
+	try {
+		fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+	} catch (err) {
+		const code = err && typeof err === "object" && "code" in err ? err.code : undefined;
+		if (code === "ENOENT") return { kind: "missing" };
+		if (code === "ELOOP") return { kind: "symlink", target: resolve(dirname(path), readlinkSync(path)) };
+		throw err;
+	}
+	try {
+		return { kind: "file", content: readFileSync(fd, "utf8") };
+	} finally {
+		closeSync(fd);
+	}
+}
+
 function isManagedAppImage(target: string, launcher: string): boolean {
 	try {
-		const stat = lstatSync(launcher);
-		if (stat.isSymbolicLink()) {
-			return resolve(dirname(launcher), readlinkSync(launcher)) === resolve(target);
-		}
-		return readFileSync(launcher, "utf8").includes(MANAGED_LAUNCHER_MARKER);
+		const state = inspectLauncher(launcher);
+		if (state.kind === "symlink") return state.target === resolve(target);
+		return state.kind === "file" && state.content.includes(MANAGED_LAUNCHER_MARKER);
 	} catch {
 		return false;
 	}
@@ -695,31 +719,26 @@ function isManagedAppImage(target: string, launcher: string): boolean {
 
 function writeManagedLauncher(path: string, target: string, workspace: string): void {
 	const appDir = dirname(target);
-	try {
-		const stat = lstatSync(path);
-		if (stat.isSymbolicLink()) {
-			const current = resolve(dirname(path), readlinkSync(path));
-			if (current !== resolve(target) && !isPathWithin(appDir, current)) {
-				throw new Error(
-					`Refusing to replace launcher symlink at ${path} because it does not point at Signet's desktop install directory.`,
-				);
-			}
-			rmSync(path, { force: true });
-		} else if (readFileSync(path, "utf8").includes(MANAGED_LAUNCHER_MARKER)) {
-			rmSync(path, { force: true });
-		} else {
+	const state = inspectLauncher(path);
+	if (state.kind === "symlink") {
+		if (state.target !== resolve(target) && !isPathWithin(appDir, state.target)) {
+			throw new Error(
+				`Refusing to replace launcher symlink at ${path} because it does not point at Signet's desktop install directory.`,
+			);
+		}
+		rmSync(path, { force: true });
+	} else if (state.kind === "file") {
+		if (!state.content.includes(MANAGED_LAUNCHER_MARKER)) {
 			throw new Error(
 				`Refusing to replace existing non-managed launcher at ${path}. Remove it first if it is not needed.`,
 			);
 		}
-	} catch (err) {
-		const code = err && typeof err === "object" && "code" in err ? err.code : undefined;
-		if (code !== "ENOENT") {
-			throw err;
-		}
+		rmSync(path, { force: true });
 	}
-	writeFileSync(path, launcherContent(target, workspace), { mode: 0o755 });
-	chmodSync(path, 0o755);
+	// O_EXCL: never follow or overwrite anything that appeared after the inspection above.
+	if (!writeFileExclusiveSync(path, launcherContent(target, workspace), { mode: 0o755 })) {
+		throw new Error(`Launcher at ${path} changed while it was being replaced; re-run the install.`);
+	}
 }
 
 function launcherContent(target: string, workspace: string): string {

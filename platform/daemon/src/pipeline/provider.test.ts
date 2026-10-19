@@ -10,9 +10,9 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { createTestTempDir } from "../test-temp-dir";
 import { spawn as nodeSpawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	LlmConcurrencySemaphore,
@@ -96,7 +96,7 @@ describe("createAcpxProvider", () => {
 	});
 
 	it("regression: boolean terminal false passes --no-terminal", async () => {
-		const root = join(tmpdir(), `signet-acpx-provider-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-provider-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx.sh");
 		const argsPath = join(root, "args.json");
@@ -162,7 +162,7 @@ printf '  acpx answer  \\n'
 	});
 
 	it("lets OpenCode use its native model config unless ACP selection is explicit", async () => {
-		const root = join(tmpdir(), `signet-acpx-opencode-model-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-opencode-model-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx.sh");
 		const argsPath = join(root, "args.txt");
@@ -201,7 +201,7 @@ printf 'ok\n'
 	});
 
 	it("defaults hook-disabled ACPX background runs to a sterile cwd and empty tool catalog", async () => {
-		const root = join(tmpdir(), `signet-acpx-isolated-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-isolated-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-isolated.sh");
 		const argsPath = join(root, "args.json");
@@ -239,7 +239,7 @@ printf 'ok\\n'
 	});
 
 	it("retries a sterile quiet-mode empty completion in a fresh one-shot session", async () => {
-		const root = join(tmpdir(), `signet-acpx-empty-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-empty-retry-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-empty-then-valid.sh");
 		const countPath = join(root, "count.txt");
@@ -288,7 +288,7 @@ fi
 	});
 
 	it("caps sterile retries at the caller deadline instead of launching another process", async () => {
-		const root = join(tmpdir(), `signet-acpx-empty-deadline-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-empty-deadline-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-always-empty.sh");
 		const countPath = join(root, "count.txt");
@@ -325,7 +325,7 @@ printf '\\n'
 	});
 
 	it("cancels a sterile retry while waiting for backoff", async () => {
-		const root = join(tmpdir(), `signet-acpx-empty-cancel-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-empty-cancel-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-empty.sh");
 		writeFileSync(
@@ -355,7 +355,7 @@ printf '\\n'
 	});
 
 	it("releases the concurrency slot while a sterile caller backs off", async () => {
-		const root = join(tmpdir(), `signet-acpx-empty-concurrent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-empty-concurrent-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-concurrent.sh");
 		const firstCountPath = join(root, "first-count.txt");
@@ -403,7 +403,7 @@ fi
 	});
 
 	it("does not let a queued ACPX attempt succeed after its caller deadline", async () => {
-		const root = join(tmpdir(), `signet-acpx-queued-deadline-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-queued-deadline-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-queued-deadline.sh");
 		const holderSeenPath = join(root, "holder-seen");
@@ -465,7 +465,7 @@ fi
 	});
 
 	it("reports structured diagnostics after repeated empty completions", async () => {
-		const root = join(tmpdir(), `signet-acpx-empty-terminal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-empty-terminal-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-always-empty.sh");
 		const countPath = join(root, "count.txt");
@@ -501,7 +501,7 @@ printf '%s\n' '[acpx] tokens: input=20 output=1 total=21' >&2
 	});
 
 	it("retries JSON end_turn with zero assistant chunks and preserves ACP diagnostics", async () => {
-		const root = join(tmpdir(), `signet-acpx-json-empty-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-json-empty-retry-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-json-empty-then-valid.sh");
 		const countPath = join(root, "count.txt");
@@ -541,7 +541,7 @@ fi
 	});
 
 	it("does not retry JSON output after observable tool activity", async () => {
-		const root = join(tmpdir(), `signet-acpx-json-side-effect-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-json-side-effect-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-json-tool.sh");
 		const countPath = join(root, "count.txt");
@@ -575,7 +575,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
 	});
 
 	it("injects a tool-denying OpenCode profile and defaults sterile runs to JSON", async () => {
-		const root = join(tmpdir(), `signet-acpx-opencode-profile-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-opencode-profile-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-opencode-acpx.sh");
 		const argsPath = join(root, "args.txt");
@@ -646,7 +646,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
 
 	it("cleans up detached Codex ACP agent processes after successful ACPX exec", async () => {
 		if (process.platform !== "linux") return;
-		const root = join(tmpdir(), `signet-acpx-success-cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-success-cleanup-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-daemonizes.sh");
 		const codexAcp = join(root, "codex-acp");
@@ -706,7 +706,7 @@ printf 'ok\\n'
 	});
 
 	it("regression: cleanup barriers resolve when a target exits after SIGTERM", async () => {
-		const root = join(tmpdir(), `signet-acpx-immediate-cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-immediate-cleanup-");
 		const procRoot = join(root, "proc");
 		const escapedPid = 12348;
 		const escapedProc = join(procRoot, String(escapedPid));
@@ -766,7 +766,7 @@ printf 'first\\n'
 	});
 
 	it("regression: normal completion returns before escaped-child reaping while the next same-agent attempt waits", async () => {
-		const root = join(tmpdir(), `signet-acpx-success-cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-success-cleanup-");
 		const procRoot = join(root, "proc");
 		const escapedPid = 12345;
 		const escapedProc = join(procRoot, String(escapedPid));
@@ -830,7 +830,7 @@ printf 'ok\\n'
 	});
 
 	it("regression: same-agent admission serializes spawn before the global permit", async () => {
-		const root = join(tmpdir(), `signet-acpx-admission-toctou-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-admission-toctou-");
 		const bin = join(root, "fake-acpx.sh");
 		const startsPath = join(root, "starts.txt");
 		mkdirSync(root, { recursive: true });
@@ -866,7 +866,7 @@ printf '%s\\n' "$prompt"
 	});
 
 	it("regression: same-agent cleanup re-admission does not hold the only global permit", async () => {
-		const root = join(tmpdir(), `signet-acpx-cleanup-readmit-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-cleanup-readmit-");
 		const procRoot = join(root, "proc");
 		const escapedPid = 12347;
 		const escapedProc = join(procRoot, String(escapedPid));
@@ -942,7 +942,7 @@ printf '%s\\n' "$prompt"
 	});
 
 	it("regression: cleanup-barrier waits honor caller abort and deadline", async () => {
-		const root = join(tmpdir(), `signet-acpx-cleanup-wait-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-cleanup-wait-");
 		const procRoot = join(root, "proc");
 		const escapedPid = 12346;
 		const escapedProc = join(procRoot, String(escapedPid));
@@ -1011,7 +1011,7 @@ printf 'ok\\n'
 	});
 
 	it("reaps escaped Codex ACP children on darwin via a bounded ps sweep (#1459)", async () => {
-		const root = join(tmpdir(), `signet-acpx-darwin-sweep-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-darwin-sweep-");
 		mkdirSync(root, { recursive: true });
 		const childPid = 4242;
 		const foreignPid = 4243;
@@ -1090,7 +1090,7 @@ printf 'ok\\n'
 	});
 
 	it("fails closed and warns when Darwin ps enumeration fails", async () => {
-		const root = join(tmpdir(), `signet-acpx-darwin-ps-failure-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-darwin-ps-failure-");
 		mkdirSync(root, { recursive: true });
 		const fakePs = join(root, "ps");
 		const bin = join(root, "fake-acpx.sh");
@@ -1141,10 +1141,7 @@ printf 'ok\\n'
 	});
 
 	it("counts and logs Darwin ps environment failures without signaling the candidate", async () => {
-		const root = join(
-			tmpdir(),
-			`signet-acpx-darwin-ps-environment-failure-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-		);
+		const root = createTestTempDir("signet-acpx-darwin-ps-environment-failure-");
 		mkdirSync(root, { recursive: true });
 		const candidatePid = 4244;
 		const fakePs = join(root, "ps");
@@ -1205,10 +1202,7 @@ printf 'ok\\n'
 	});
 
 	it("bounds Darwin candidate inspection at 128 processes and warns when capped", async () => {
-		const root = join(
-			tmpdir(),
-			`signet-acpx-darwin-candidate-cap-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-		);
+		const root = createTestTempDir("signet-acpx-darwin-candidate-cap-");
 		mkdirSync(root, { recursive: true });
 		const firstPid = 5000;
 		const fakePs = join(root, "ps");
@@ -1281,10 +1275,7 @@ printf 'ok\\n'
 	});
 
 	it("hard-kills SIGTERM-resistant ps probes and bounds the total Darwin sweep", async () => {
-		const root = join(
-			tmpdir(),
-			`signet-acpx-darwin-sweep-deadline-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-		);
+		const root = createTestTempDir("signet-acpx-darwin-sweep-deadline-");
 		mkdirSync(root, { recursive: true });
 		const candidateCount = 8;
 		const firstPid = 6000;
@@ -1364,7 +1355,7 @@ printf 'ok\\n'
 
 	it("treats an unreadable ACPX proc root as best-effort cleanup", async () => {
 		if (process.platform !== "linux") return;
-		const root = join(tmpdir(), `signet-acpx-missing-proc-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-missing-proc-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-ok.sh");
 		writeFileSync(
@@ -1387,7 +1378,7 @@ printf 'ok\\n'
 	});
 
 	it("keeps the event loop responsive while ACPX cleanup waits on proc I/O (#1328)", async () => {
-		const root = join(tmpdir(), `signet-acpx-async-cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-async-cleanup-");
 		const procRoot = join(root, "proc");
 		const procPid = join(procRoot, "12345");
 		const cmdlinePath = join(procPid, "cmdline");
@@ -1434,7 +1425,7 @@ sleep 30
 	});
 
 	it("captures ACPX JSON events while preserving the final text provider contract", async () => {
-		const root = join(tmpdir(), `signet-acpx-events-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-events-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-json.sh");
 		const argsPath = join(root, "args.json");
@@ -1471,7 +1462,7 @@ printf '%s\n' '{"type":"result","text":"final answer"}'
 	});
 
 	it("uses ACP JSON-RPC message chunks as final text when completion carries only stop metadata", async () => {
-		const root = join(tmpdir(), `signet-acpx-jsonrpc-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-jsonrpc-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-jsonrpc.sh");
 		writeFileSync(
@@ -1501,7 +1492,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
 	});
 
 	it("does not deliver ACPX JSON events when captureEvents is disabled", async () => {
-		const root = join(tmpdir(), `signet-acpx-events-disabled-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-events-disabled-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-json-disabled.sh");
 		writeFileSync(
@@ -1529,7 +1520,7 @@ printf '%s\n' '{"type":"result","text":"final answer"}'
 	});
 
 	it("rejects ACPX JSON output that does not contain a final response", async () => {
-		const root = join(tmpdir(), `signet-acpx-events-empty-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-events-empty-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-json-empty.sh");
 		writeFileSync(
@@ -1553,7 +1544,7 @@ printf '%s\n' '{"type":"progress","message":"still working"}'
 	});
 
 	it("passes configured ACPX package to an absolute launcher", async () => {
-		const root = join(tmpdir(), `signet-acpx-package-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-package-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-bunx.sh");
 		const argsPath = join(root, "args.json");
@@ -1577,7 +1568,7 @@ printf 'ok\n'
 	});
 
 	it("maps the legacy claude-code agent alias to ACPX's claude command", async () => {
-		const root = join(tmpdir(), `signet-acpx-claude-alias-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-claude-alias-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-bunx.sh");
 		const argsPath = join(root, "args.json");
@@ -1602,7 +1593,7 @@ printf 'ok\n'
 	});
 
 	it("normalizes relative ACPX cwd before spawning and forwarding --cwd", async () => {
-		const root = join(tmpdir(), `signet-acpx-cwd-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-cwd-");
 		mkdirSync(join(root, "workspace"), { recursive: true });
 		const bin = join(root, "fake-acpx.sh");
 		const argsPath = join(root, "args.json");
@@ -1633,7 +1624,7 @@ printf 'ok\n'
 	});
 
 	it("regression: timeout starts escaped-stdio cleanup but releases its permit after a bounded termination wait", async () => {
-		const root = join(tmpdir(), `signet-acpx-escaped-stdio-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-escaped-stdio-");
 		const procRoot = join(root, "proc");
 		const bin = join(root, "fake-acpx.sh");
 		const childSpawner = join(root, "spawn-escaped-child.mjs");
@@ -1764,7 +1755,7 @@ touch ${JSON.stringify(holderReadyPath)}
 	}, 4_000);
 
 	it("does not launch a same-agent request aborted during ACPX cleanup", async () => {
-		const root = join(tmpdir(), `signet-acpx-aborted-cleanup-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-aborted-cleanup-");
 		const procRoot = join(root, "proc");
 		const bin = join(root, "fake-acpx.sh");
 		const holderReadyPath = join(root, "holder-ready");
@@ -1850,7 +1841,7 @@ fi
 
 	it("kills the ACPX process group on timeout so codex grandchildren do not leak", async () => {
 		if (process.platform === "win32") return;
-		const root = join(tmpdir(), `signet-acpx-timeout-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-acpx-timeout-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "fake-acpx-leak.sh");
 		const childPidPath = join(root, "child.pid");
@@ -2128,7 +2119,7 @@ describe("awaitSubprocessWithDeadline — success-after-timeout race", () => {
 
 	it("SIGKILLs the process group when the leader exits before a SIGTERM-resistant descendant", async () => {
 		if (process.platform === "win32") return;
-		const root = join(tmpdir(), `signet-deadline-group-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-deadline-group-");
 		mkdirSync(root, { recursive: true });
 		const bin = join(root, "leader-exits-descendant-ignores-term.sh");
 		const leaderPidPath = join(root, "leader.pid");

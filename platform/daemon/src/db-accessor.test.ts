@@ -14,7 +14,6 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDbOwnerClient } from "./db-owner-client";
 import { isFtsIndexIncomplete } from "./fts-index-state";
@@ -53,9 +52,10 @@ import {
 	backfillVecEmbeddings,
 	VEC_EMBEDDING_POST_READY_BUDGET_MS,
 } from "./db-accessor";
+import { createTestTempDir } from "./test-temp-dir";
 
 function tmpDbPath(): string {
-	const dir = join(tmpdir(), `signet-accessor-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	const dir = createTestTempDir("signet-accessor-test-");
 	mkdirSync(dir, { recursive: true });
 	return join(dir, "test.db");
 }
@@ -1459,7 +1459,7 @@ describe("resolveCustomSqlitePath", () => {
 	});
 
 	test("uses persisted workspace config when SIGNET_PATH is unset", () => {
-		const root = join(tmpdir(), `signet-workspace-config-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const root = createTestTempDir("signet-workspace-config-");
 		const cfgDir = join(root, "xdg", "signet");
 		mkdirSync(cfgDir, { recursive: true });
 		writeFileSync(

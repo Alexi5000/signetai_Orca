@@ -4,12 +4,12 @@
  * Exposes MCP server catalog browsing, install state, and tool routing.
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { resolveDefaultBasePath } from "@signet/core";
+import { readFileWithStatSync, resolveDefaultBasePath } from "@signet/core";
 import type { Hono } from "hono";
 import { getDbAccessor } from "../db-accessor.js";
 import { logger } from "../logger.js";
@@ -320,13 +320,11 @@ function parseExposurePolicy(value: unknown, fallbackUpdatedAt?: string): Market
 
 function readExposurePolicy(): MarketplaceMcpExposurePolicy {
 	const path = getExposurePolicyPath();
-	if (!existsSync(path)) {
-		return DEFAULT_EXPOSURE_POLICY;
-	}
-
 	try {
-		const mtime = statSync(path).mtime.toISOString();
-		const raw = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+		const file = readFileWithStatSync(path, "utf-8");
+		if (file === null) return DEFAULT_EXPOSURE_POLICY;
+		const mtime = file.stat.mtime.toISOString();
+		const raw = JSON.parse(file.content) as unknown;
 		return parseExposurePolicy(raw, mtime) ?? DEFAULT_EXPOSURE_POLICY;
 	} catch {
 		return DEFAULT_EXPOSURE_POLICY;
@@ -1139,7 +1137,7 @@ function recordMcpInvocation(record: McpInvocationRecord): void {
 				record.success ? 1 : 0,
 				record.errorText ?? null,
 			);
-		}, "routes/marketplace.ts:1128");
+		}, "db:routes-marketplace.legacy.line1128");
 	} catch (err) {
 		logger.warn("skills", "Failed to record MCP invocation", err instanceof Error ? err : undefined);
 	}

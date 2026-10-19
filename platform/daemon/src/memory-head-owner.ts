@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { scanMemoryContent } from "@signet/core";
+import { scanMemoryContent, writeFileAtomicSync } from "@signet/core";
 import type { WriteDb } from "./db-accessor";
 import type { MemoryHeadRequest } from "./memory-head";
 import { readEpisodicSource } from "./episodic-sources";
@@ -58,29 +58,41 @@ function isGenerated(db: WriteDb, content: string): boolean {
 	return generatedMarker.test(content.trim());
 }
 
+/** Read `path` through one descriptor, refusing files larger than `budget`. Returns null when absent. */
+function readBoundedProjection(path: string, budget: number): string | null {
+	let fd: number;
+	try {
+		fd = openSync(path, "r");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+	try {
+		if (fstatSync(fd).size > budget)
+			throw new Error("Existing MEMORY.md exceeds projection inspection budget; file preserved");
+		return readFileSync(fd, "utf8");
+	} finally {
+		closeSync(fd);
+	}
+}
+
 /** Called only inside the owner's transaction. Files are projections, never read as the head. */
 function publish(db: WriteDb, root: string, agentId: string, head: Head): void {
 	if (head.is_current !== 1 || !head.content) return;
 	const target = agentId === "default" ? join(root, "MEMORY.md") : join(root, "agents", agentId, "MEMORY.md");
 	// A user edit takes custody of the file. Do not read an unbounded authored file.
 	let existing = "";
-	if (existsSync(target)) {
-		if (statSync(target).size > 262144)
-			throw new Error("Existing MEMORY.md exceeds projection inspection budget; file preserved");
-		existing = readFileSync(target, "utf8");
+	const inspected = readBoundedProjection(target, 262144);
+	if (inspected !== null) {
+		existing = inspected;
 		if (!isGenerated(db, existing))
 			throw new Error("User-authored MEMORY.md preserved; remove or move it to allow generated projection");
 	}
 	const projection = `<!-- signet-generated-memory agent=${agentId} revision=${head.revision}; inspect only, use Signet for current context -->\n\n${head.content}\n`;
 	if (existing !== projection) {
 		mkdirSync(dirname(target), { recursive: true });
-		const temporary = `${target}.head-${head.revision}.tmp`;
-		try {
-			writeFileSync(temporary, projection, "utf8");
-			renameSync(temporary, target);
-		} finally {
-			rmSync(temporary, { force: true });
-		}
+		// Exclusive 0o600 sibling temp + rename; the temp is removed on failure.
+		writeFileAtomicSync(target, projection, { fsync: false });
 	}
 
 	db.prepare(

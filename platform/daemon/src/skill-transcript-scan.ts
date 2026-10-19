@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from "node:fs";
 import { parseTranscriptSkills } from "@signet/core";
 import { logger } from "./logger.js";
 import { recordSkillInvocation } from "./skill-invocations";
@@ -15,8 +15,12 @@ export function recordSkillsFromTranscript(args: {
 	if (args.transcriptPath.trim().length === 0) return;
 
 	let content: string;
+	let fd: number | undefined;
 	try {
-		const stat = statSync(args.transcriptPath);
+		// Open once (non-blocking for FIFOs) and fstat the descriptor so the
+		// size/type checks apply to the file that is actually read.
+		fd = openSync(args.transcriptPath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+		const stat = fstatSync(fd);
 		if (!stat.isFile()) {
 			logger.debug("skills", "Transcript scan skipped for non-file path", { path: args.transcriptPath });
 			return;
@@ -29,13 +33,15 @@ export function recordSkillsFromTranscript(args: {
 			});
 			return;
 		}
-		content = readFileSync(args.transcriptPath, "utf-8");
+		content = readFileSync(fd, "utf-8");
 	} catch (err) {
 		logger.debug("skills", "Transcript read failed (non-fatal)", {
 			path: args.transcriptPath,
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
 	}
 
 	// Fire-and-forget telemetry: this must never throw (callers invoke it from

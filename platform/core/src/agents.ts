@@ -5,8 +5,9 @@
  * and per-agent skill filtering.
  */
 
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { writeFileExclusiveSync } from "./secure-fs";
 import type { AgentDefinition, ReadPolicy } from "./types";
 
 export type AgentRosterReadPolicy = "isolated" | "shared" | "group";
@@ -63,17 +64,18 @@ export function discoverAgents(agentsDir: string): AgentDefinition[] {
 
 /**
  * Creates {agentsDir}/agents/{name}/ and writes stub identity files
- * (SOUL.md, IDENTITY.md) if they don't already exist.
+ * (SOUL.md, IDENTITY.md) if they don't already exist. Files are created
+ * exclusively, so an existing file is never overwritten.
  */
 export function scaffoldAgent(name: string, agentsDir: string): void {
 	const dir = join(agentsDir, "agents", name);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
 	const soul = join(dir, "SOUL.md");
-	if (!existsSync(soul)) writeFileSync(soul, `# Soul\n\nAdd ${name}'s personality here.\n`);
+	writeFileExclusiveSync(soul, `# Soul\n\nAdd ${name}'s personality here.\n`);
 
 	const identity = join(dir, "IDENTITY.md");
-	if (!existsSync(identity)) writeFileSync(identity, `# Identity\n\nname: ${name}\n`);
+	writeFileExclusiveSync(identity, `# Identity\n\nname: ${name}\n`);
 }
 
 /**

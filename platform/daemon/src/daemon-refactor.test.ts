@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isSessionCleanupRunning, stopSessionCleanup } from "./session-tracker";
+import { createTestTempDir } from "./test-temp-dir";
 
 describe("daemon route extraction refactor", () => {
 	beforeEach(() => {
@@ -62,7 +62,7 @@ describe("daemon route extraction refactor", () => {
 		expect.assertions(1);
 		const state = await import("./routes/state.js");
 
-		const tmpDir = join(tmpdir(), `signet-test-auth-${Date.now()}`);
+		const tmpDir = createTestTempDir("signet-test-auth-");
 		mkdirSync(join(tmpDir, "memory"), { recursive: true });
 		mkdirSync(join(tmpDir, ".daemon"), { recursive: true });
 		writeFileSync(join(tmpDir, ".daemon", "auth-secret"), "test-secret-key-for-auth-mode");

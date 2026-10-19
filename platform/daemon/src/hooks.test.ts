@@ -8,12 +8,18 @@
 import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createPromptContext } from "@signet/core";
+import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
 
-const TEST_DIR = join(tmpdir(), `signet-hooks-test-${Date.now()}`);
+const TEST_DIR = createTestTempDir("signet-hooks-test-");
+
+/** Clear the private test root without removing it, so its mkdtemp name and 0o700 mode persist. */
+function emptyTestDir(): void {
+	if (!existsSync(TEST_DIR)) return;
+	for (const entry of readdirSync(TEST_DIR)) rmSync(join(TEST_DIR, entry), { recursive: true, force: true });
+}
 const PREV_SIGNET_AGENT_ID_FOR_HOOKS = process.env.SIGNET_AGENT_ID;
 process.env.SIGNET_AGENT_ID = "default";
 process.env.SIGNET_PATH = TEST_DIR;
@@ -559,9 +565,7 @@ function ledgerSection(content: string): string {
 
 beforeEach(() => {
 	resetProjectionPurgeState();
-	if (existsSync(TEST_DIR)) {
-		rmSync(TEST_DIR, { recursive: true, force: true });
-	}
+	emptyTestDir();
 	ensureDir(TEST_DIR);
 });
 
@@ -570,9 +574,7 @@ afterEach(async () => {
 	setLifecycleObservers(undefined);
 	resetProjectionPurgeState();
 	await closeDbAccessor();
-	if (existsSync(TEST_DIR)) {
-		rmSync(TEST_DIR, { recursive: true, force: true });
-	}
+	emptyTestDir();
 });
 
 describe("db accessor pragmas", () => {
@@ -3218,7 +3220,7 @@ describe("handleSessionStart multi-agent identity", () => {
 
 	beforeAll(() => {
 		previousSignetPath = process.env.SIGNET_PATH;
-		agentsDir = mkdtempSync(join(tmpdir(), "signet-hooks-agent-identity-"));
+		agentsDir = createTestTempDir("signet-hooks-agent-identity-");
 	});
 
 	beforeEach(() => {
@@ -3394,7 +3396,7 @@ describe("writeMemoryMd", () => {
 
 		beforeAll(() => {
 			previousSignetPath = process.env.SIGNET_PATH;
-			agentsDir = mkdtempSync(join(tmpdir(), "signet-hooks-write-memory-"));
+			agentsDir = createTestTempDir("signet-hooks-write-memory-");
 			process.env.SIGNET_PATH = agentsDir;
 		});
 
@@ -4177,6 +4179,7 @@ describe("applyTokenBudget", () => {
 });
 
 afterAll(() => {
+	cleanupTestTempDir(TEST_DIR);
 	if (PREV_SIGNET_AGENT_ID_FOR_HOOKS === undefined) {
 		process.env.SIGNET_AGENT_ID = undefined;
 	} else {

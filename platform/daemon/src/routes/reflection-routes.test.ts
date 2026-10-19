@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LlmProvider } from "@signet/core";
 import { Hono } from "hono";
@@ -9,6 +8,7 @@ import { type DbAccessor, closeDbAccessor, getDbAccessor, initDbAccessor } from 
 import { closeInferenceProviderResolver, initInferenceProviderResolver } from "../llm";
 import { txIngestEnvelope } from "../transactions";
 import { registerReflectionRoutes } from "./reflection-routes";
+import { createTestTempDir } from "../test-temp-dir";
 
 let dir: string;
 let dbAccessor: DbAccessor;
@@ -81,7 +81,7 @@ function app(): Hono {
 
 beforeEach(() => {
 	closeDbAccessor();
-	dir = join(tmpdir(), `signet-reflections-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	dir = createTestTempDir("signet-reflections-");
 	mkdirSync(join(dir, "memory"), { recursive: true });
 	process.env.SIGNET_PATH = dir;
 	writeFileSync(

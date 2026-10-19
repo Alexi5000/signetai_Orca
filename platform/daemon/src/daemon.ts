@@ -50,7 +50,7 @@ import {
 	migrateRetiredMemoryPipelineRoutingV9,
 	migrateSessionSynthesisRoute,
 } from "./config-migration";
-import { findSqliteVecExtension } from "@signet/core";
+import { findSqliteVecExtension, readFileIfExistsSync, writeFileAtomicSync } from "@signet/core";
 import { clearAllPresence, reconcileAcpDeliveries } from "./cross-agent";
 import {
 	MIGRATION_VERIFY_FAILED_STATUS,
@@ -3375,11 +3375,12 @@ async function main() {
 			const healthStampPath = join(DAEMON_DIR, "last-healthy-start");
 			try {
 				let previousVersion: string | null = null;
-				if (existsSync(healthStampPath)) {
-					const prev = JSON.parse(readFileSync(healthStampPath, "utf-8"));
+				const previousStamp = readFileIfExistsSync(healthStampPath, "utf-8");
+				if (previousStamp !== null) {
+					const prev = JSON.parse(previousStamp);
 					previousVersion = typeof prev.version === "string" ? prev.version : null;
 				}
-				writeFileSync(
+				writeFileAtomicSync(
 					healthStampPath,
 					JSON.stringify({
 						version: CURRENT_VERSION,

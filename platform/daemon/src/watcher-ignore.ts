@@ -1,7 +1,6 @@
-import { readFileSync, statSync, writeFileSync } from "node:fs";
-import { existsSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, join, normalize, relative, resolve } from "node:path";
-import { resolveWorkspaceSourceRepoPath } from "@signet/core";
+import { resolveWorkspaceSourceRepoPath, writeFileExclusiveSync } from "@signet/core";
 
 // Canonical artifact filename patterns (keep in sync with daemon.ts)
 const ARTIFACT_FILENAME_RE = /--(?:summary|transcript|compaction|manifest)\.md$/;
@@ -137,9 +136,8 @@ function isIgnoredBySigignore(patterns: readonly SigignorePattern[], relativePat
 
 function ensureDefaultSigignore(sigignorePath: string): void {
 	try {
-		if (!existsSync(sigignorePath)) {
-			writeFileSync(sigignorePath, DEFAULT_SIGNIGNORE_CONTENT, "utf-8");
-		}
+		// Create-if-missing (O_EXCL): never clobbers a concurrently created file.
+		writeFileExclusiveSync(sigignorePath, DEFAULT_SIGNIGNORE_CONTENT);
 	} catch {
 		// Best-effort; watcher still works without a .sigignore file.
 	}
@@ -151,15 +149,21 @@ function createSigignoreMatcher(agentsDir: string): (normalizedPath: string) => 
 	let cache: SigignoreCache = { stamp: "", patterns: [] };
 
 	function loadPatterns(): readonly SigignorePattern[] {
+		let fd: number | undefined;
 		try {
-			const stat = statSync(sigignorePath);
+			// Stamp and read through one descriptor so the cached patterns
+			// always correspond to the stamped file.
+			fd = openSync(sigignorePath, "r");
+			const stat = fstatSync(fd);
 			const stamp = `${stat.mtimeMs}:${stat.size}`;
 			if (cache.stamp === stamp) return cache.patterns;
-			cache = { stamp, patterns: parseSigignore(readFileSync(sigignorePath, "utf-8")) };
+			cache = { stamp, patterns: parseSigignore(readFileSync(fd, "utf-8")) };
 		} catch (error) {
 			const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 			if (code !== "ENOENT") cache = { stamp: "unreadable", patterns: [] };
 			else if (cache.stamp !== "missing") cache = { stamp: "missing", patterns: [] };
+		} finally {
+			if (fd !== undefined) closeSync(fd);
 		}
 		return cache.patterns;
 	}

@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { createPrivateTempDir } from "@signet/core";
 import { join } from "node:path";
 import { KimiConnector, buildKimiHookEntries, removeSignetKimiHookBlocks } from "./index.js";
 
@@ -52,7 +52,7 @@ beforeEach(() => {
 	Reflect.deleteProperty(process.env, "SIGNET_DAEMON_URL");
 	Reflect.deleteProperty(process.env, "SIGNET_API_KEY");
 	Reflect.deleteProperty(process.env, "SIGNET_TOKEN");
-	tempHome = join(tmpdir(), `signet-kimi-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	tempHome = createPrivateTempDir("signet-kimi-test-");
 	kimiDir = join(tempHome, ".kimi-code");
 	configPath = join(kimiDir, "config.toml");
 	mcpPath = join(kimiDir, "mcp.json");

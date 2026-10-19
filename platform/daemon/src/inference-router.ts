@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { readFile as readFileAsync, stat as statAsync } from "node:fs/promises";
 import { isAbsolute, join, normalize, resolve } from "node:path";
 import type { AgentSessionEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
@@ -23,6 +22,7 @@ import {
 	parseRoutingConfig,
 	parseRoutingTargetRef,
 	parseYamlDocument,
+	readFileWithStat,
 	resolveAcpxModelSelection,
 	resolveRoutingDecision,
 	routingTelemetryAttribution,
@@ -565,17 +565,16 @@ export class InferenceRouter {
 		let path: string | null = null;
 		let signature = "no-config";
 		for (const candidate of inferenceConfigPaths(this.agentsDir)) {
-			let stat: Awaited<ReturnType<typeof statAsync>>;
 			try {
-				stat = await statAsync(candidate);
-			} catch {
-				continue;
-			}
-			path = candidate;
-			signature = `${candidate}:${stat.mtimeMs}:${stat.size}`;
-			try {
-				raw = parseYamlDocument(await readFileAsync(candidate, "utf-8"));
+				// Open once and fstat the descriptor so the signature describes
+				// exactly the bytes that were parsed.
+				const file = await readFileWithStat(candidate, "utf-8");
+				if (file === null) continue;
+				path = candidate;
+				signature = `${candidate}:${file.stat.mtimeMs}:${file.stat.size}`;
+				raw = parseYamlDocument(file.content);
 			} catch (error) {
+				path = candidate;
 				return {
 					ok: false,
 					error: {

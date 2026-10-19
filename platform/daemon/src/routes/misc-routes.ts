@@ -1,4 +1,12 @@
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	constants as fsConstants,
+	fstatSync,
+	openSync,
+	readFileSync,
+	readdirSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { parseSimpleYaml, resolveAgentMemoryPolicy } from "@signet/core";
 import type { Hono } from "hono";
@@ -124,10 +132,17 @@ export function registerMiscRoutes(app: Hono): void {
 
 			for (const fileName of configFiles) {
 				const filePath = join(AGENTS_DIR, fileName);
-				const fileStat = statSync(filePath);
-				if (fileStat.isFile()) {
-					const content = readFileSync(filePath, "utf-8");
-					files.push({ name: fileName, content, size: fileStat.size });
+				// Open once (non-blocking so a FIFO cannot stall the request) and
+				// fstat the descriptor so the reported size matches what is read.
+				const fd = openSync(filePath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
+				try {
+					const fileStat = fstatSync(fd);
+					if (fileStat.isFile()) {
+						const content = readFileSync(fd, "utf-8");
+						files.push({ name: fileName, content, size: fileStat.size });
+					}
+				} finally {
+					closeSync(fd);
 				}
 			}
 

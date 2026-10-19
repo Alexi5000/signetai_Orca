@@ -107,7 +107,7 @@ describe("Issue 322: verify installed version after update install", () => {
 	});
 
 	it("syncs the managed Signet source checkout after a successful update", async () => {
-		const workspaceDir = join(tmpdir(), `signet-update-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const workspaceDir = mkdtempSync(join(tmpdir(), "signet-update-"));
 		const calls: string[] = [];
 		initUpdateSystem("0.78.0", workspaceDir);
 
@@ -156,7 +156,7 @@ describe("Issue 322: verify installed version after update install", () => {
 	});
 
 	it("fires the onUpgraded lifecycle hook with (from, to) on success (issue #1026 Phase 2)", async () => {
-		const workspaceDir = join(tmpdir(), `signet-update-upgraded-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const workspaceDir = mkdtempSync(join(tmpdir(), "signet-update-"));
 		initUpdateSystem("0.78.0", workspaceDir);
 
 		const upgrades: Array<{ from: string; to: string }> = [];
@@ -190,7 +190,7 @@ describe("Issue 322: verify installed version after update install", () => {
 	});
 
 	it("attempts managed desktop update after source checkout sync", async () => {
-		const workspaceDir = join(tmpdir(), `signet-update-desktop-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const workspaceDir = mkdtempSync(join(tmpdir(), "signet-update-"));
 		const calls: string[] = [];
 		initUpdateSystem("0.78.0", workspaceDir);
 

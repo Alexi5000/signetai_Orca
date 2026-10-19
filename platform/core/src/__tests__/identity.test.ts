@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildAgentMemoryConfig, getAgentIdentityFiles, normalizeAgentRosterEntry, scaffoldAgent } from "../agents";
 import {
@@ -16,16 +15,19 @@ import {
 	resolveSessionStartTimeoutMs,
 	resolveStartupIdentityFiles,
 } from "../identity";
+import { createPrivateTempDir } from "../secure-fs";
 import { parseRuntimeYaml, parseSimpleYaml } from "../yaml";
 
-const TMP = join(tmpdir(), `signet-identity-test-${Date.now()}`);
+let TMP = "";
 const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_HERMES_REPO = process.env.HERMES_REPO;
 const ORIGINAL_HERMES_HOME = process.env.HERMES_HOME;
 const ORIGINAL_KIMI_SHARE_DIR = process.env.KIMI_SHARE_DIR;
 const ORIGINAL_KIMI_CODE_HOME = process.env.KIMI_CODE_HOME;
 
-beforeEach(() => mkdirSync(TMP, { recursive: true }));
+beforeEach(() => {
+	TMP = createPrivateTempDir("signet-identity-test-");
+});
 afterEach(() => {
 	if (ORIGINAL_HOME === undefined) {
 		delete process.env.HOME;
