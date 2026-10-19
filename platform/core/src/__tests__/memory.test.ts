@@ -84,3 +84,12 @@ Manual note fact heading.
 		expect(parseMemory(markdown).raw).toBe(markdown);
 	});
 });
+
+describe("manual block parsing on adversarial input", () => {
+	test("handles many unclosed manual starts in bounded time", () => {
+		const text = "<!-- MANUAL:START -->\n".repeat(20_000);
+		const started = performance.now();
+		expect(parseMemory(text).manualNotes).toBe("");
+		expect(performance.now() - started).toBeLessThan(1000);
+	});
+});

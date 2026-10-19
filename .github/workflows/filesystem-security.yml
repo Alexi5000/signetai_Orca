@@ -4,12 +4,14 @@ on:
     paths:
       - 'platform/core/**'
       - 'platform/daemon/**'
+      - 'integrations/pi/extension-base/**'
       - '.github/workflows/filesystem-security.yml'
   push:
     branches: [main]
     paths:
       - 'platform/core/**'
       - 'platform/daemon/**'
+      - 'integrations/pi/extension-base/**'
       - '.github/workflows/filesystem-security.yml'
 permissions:
   contents: read
@@ -30,3 +32,5 @@ jobs:
         run: bun run test:hermetic platform/daemon/src/auth/auth.test.ts
       - name: Transcript atomic replacement and recovery
         run: bun run test:hermetic platform/daemon/src/transcript-jsonl.test.ts
+      - name: Bounded token, memory, and transcript parsing
+        run: bun run test:hermetic platform/daemon/src/sync-db-site-token.test.ts platform/core/src/__tests__/memory.test.ts integrations/pi/extension-base/src/transcript.test.ts
