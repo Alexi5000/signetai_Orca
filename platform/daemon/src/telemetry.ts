@@ -6,7 +6,7 @@
  * No memory content, user identity, or file paths are ever included.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, open, readdir, rename, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
@@ -138,8 +138,17 @@ async function appendToTelemetryLog(
 				const rotatedPath = `${rotatedTelemetryLogPrefix(logPath)}${Date.now()}-${telemetryLogRotationSequence++}.jsonl`;
 				await handle.close();
 				handle = undefined;
-				await rename(logPath, rotatedPath);
-				handle = await open(logPath, "wx", 0o600);
+				const replacementPath = `${logPath}.${randomUUID()}.tmp`;
+				let replacement: Awaited<ReturnType<typeof open>> | undefined = await open(replacementPath, "wx", 0o600);
+				try {
+					await rename(logPath, rotatedPath);
+					await rename(replacementPath, logPath);
+					handle = replacement;
+					replacement = undefined;
+				} finally {
+					await replacement?.close();
+					await unlink(replacementPath).catch(() => {});
+				}
 			}
 			await handle.appendFile(payload, "utf-8");
 		} catch (error) {
