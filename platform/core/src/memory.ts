@@ -77,8 +77,10 @@ export function parseMemory(markdown: string): ParsedMemory {
 	}
 	flushSection();
 
-	const manualMatch = markdown.match(/<!--\s*MANUAL:START\s*-->([\s\S]*?)<!--\s*MANUAL:END\s*-->/);
-	const manualNotes = manualMatch ? normalizeManualNotes(manualMatch[1]) : "";
+	const manualStart = /<!--\s*MANUAL:START\s*-->/.exec(markdown);
+	const manualBody = manualStart ? markdown.slice(manualStart.index + manualStart[0].length) : "";
+	const manualEnd = /<!--\s*MANUAL:END\s*-->/.exec(manualBody);
+	const manualNotes = manualEnd ? normalizeManualNotes(manualBody.slice(0, manualEnd.index)) : "";
 
 	return {
 		userProfile: sections["User Profile"] ?? "",

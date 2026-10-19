@@ -11,7 +11,7 @@ export interface SessionFileSnapshot {
 }
 
 function normalizeWhitespace(input: string): string {
-	return input.replace(/\s*\r?\n\s*/g, " ").trim();
+	return input.replace(/\s+/g, (space) => (space.includes("\n") ? " " : space)).trim();
 }
 
 function roleLabel(role: string | undefined): string | undefined {

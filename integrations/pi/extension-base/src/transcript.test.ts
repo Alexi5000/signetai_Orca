@@ -13,3 +13,18 @@ describe("Pi transcript builder", () => {
 		expect(transcript).toBe("User: hello\nAssistant: hi\nTool: tool output");
 	});
 });
+
+describe("transcript whitespace bounds", () => {
+	it("preserves in-line spacing and collapses multiline whitespace", () => {
+		expect(buildTranscriptFromEntries([{ type: "message", message: { role: "user", content: "a  b\r\n \n c" } }])).toBe(
+			"User: a  b c",
+		);
+	});
+	it("handles long whitespace with no newline without backtracking", () => {
+		const started = performance.now();
+		expect(
+			buildTranscriptFromEntries([{ type: "message", message: { role: "user", content: `a${" ".repeat(100_000)}b` } }]),
+		).toContain("User: a");
+		expect(performance.now() - started).toBeLessThan(1000);
+	});
+});
