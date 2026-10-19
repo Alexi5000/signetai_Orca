@@ -1,9 +1,10 @@
 import { spawnHidden as spawn, spawnSyncHidden as spawnSync, type ChildProcess } from "@signet/core";
-import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { LOOPBACK_HOST } from "@signet/core";
 import { type WorkspaceMismatch, healthWorkspaceMismatch } from "./daemon-workspace.js";
 import { bunPath, daemonEntry, daemonRoot } from "./paths.js";
+import { openDaemonLogs } from "./daemon-logs.js";
 
 export type DaemonMode = "attached" | "bundled" | "none";
 export type DaemonStartupErrorCode = "bundled-runtime-enoent" | "bundled-spawn-failed";
@@ -301,14 +302,13 @@ export class DaemonManager {
 			throw new Error(`Bundled daemon entry not found: ${entry}. Install the .dmg or run stage:runtime first.`);
 		}
 
-		const logDir = join(this.#workspacePath, ".daemon", "logs");
-		mkdirSync(logDir, { recursive: true });
 		this.#closeFds();
 
 		// openSync returns a real fd synchronously — no race with spawn's fd validation.
 		// See issue #606: createWriteStream causes "TypeError: stream must have an underlying descriptor"
-		this.#stdoutFd = openSync(join(logDir, "daemon.out.log"), "a");
-		this.#stderrFd = openSync(join(logDir, "daemon.err.log"), "a");
+		const logs = openDaemonLogs(this.#workspacePath);
+		this.#stdoutFd = logs.stdout;
+		this.#stderrFd = logs.stderr;
 
 		this.#child = spawn(bunPath(), [entry], {
 			cwd: daemonRoot(),
