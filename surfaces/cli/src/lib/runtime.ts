@@ -1,17 +1,12 @@
-import { spawnHidden as spawn, spawnSyncHidden as spawnSync, type SpawnSyncReturns } from "@signet/core";
-import { createHash } from "node:crypto";
 import {
-	appendFileSync,
-	closeSync,
-	existsSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	readdirSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+	spawnHidden as spawn,
+	spawnSyncHidden as spawnSync,
+	type SpawnSyncReturns,
+	openPrivateDaemonLog,
+	appendPrivateDaemonLog,
+} from "@signet/core";
+import { createHash } from "node:crypto";
+import { closeSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, connect } from "node:net";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, normalize } from "node:path";
@@ -1794,8 +1789,6 @@ export async function startDaemon(
 
 	const daemonDir = join(agentsDir, ".daemon");
 	const logDir = join(daemonDir, "logs");
-	mkdirSync(daemonDir, { recursive: true });
-	mkdirSync(logDir, { recursive: true });
 
 	const attributionNotice = macOSLaunchAgentAttributionNotice(daemonPath);
 	if (attributionNotice) {
@@ -1811,10 +1804,11 @@ export async function startDaemon(
 	let stderrFd: number | null = null;
 	let stderrTarget: "ignore" | number = "ignore";
 	try {
-		stderrFd = openSync(startupLogPath, "w");
+		stderrFd = openPrivateDaemonLog(agentsDir, "startup.log", true);
 		stderrTarget = stderrFd;
 	} catch {
-		// Non-fatal.
+		console.error(chalk.red("Cannot safely open the daemon startup log; check workspace ownership and log paths."));
+		return false;
 	}
 
 	const tokenizerWasmPath = runtime === "bun-js" ? resolveDaemonJsWasmPath(daemonPath) : null;
@@ -1867,8 +1861,8 @@ export async function startDaemon(
 		startedByServiceManager = didSystemdDaemonStart(result);
 		if (!startedByServiceManager) {
 			try {
-				appendFileSync(
-					startupLogPath,
+				appendPrivateDaemonLog(
+					agentsDir,
 					`[systemd-run fallback] status=${result.status ?? "null"} error=${result.error?.message ?? ""}\n`,
 				);
 			} catch {
@@ -1950,8 +1944,8 @@ export async function startDaemon(
 			startedByServiceManager = didLaunchdDaemonStart(kickstart);
 			if (!startedByServiceManager) {
 				try {
-					appendFileSync(
-						startupLogPath,
+					appendPrivateDaemonLog(
+						agentsDir,
 						`[launchd fallback] bootoutStatus=${bootout ? (bootout.status ?? "null") : "skipped"} bootstrapStatus=${bootstrap.status ?? "null"} kickstartStatus=${kickstart.status ?? "null"} bootoutError=${bootout?.error?.message ?? ""} bootstrapError=${bootstrap.error?.message ?? ""} kickstartError=${kickstart.error?.message ?? ""}
 `,
 					);
@@ -1972,7 +1966,7 @@ export async function startDaemon(
 
 		proc.on("error", (err) => {
 			try {
-				appendFileSync(startupLogPath, `[spawn error] ${err.message}\n`);
+				appendPrivateDaemonLog(agentsDir, `[spawn error] ${err.message}\n`);
 			} catch {
 				// Best effort.
 			}
