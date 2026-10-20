@@ -712,3 +712,5 @@ export type {
 } from "./signet-os-types";
 
 export { parseTranscriptMessages, buildExportTranscriptRecord } from "./transcript-export";
+
+export { openPrivateDaemonLog, appendPrivateDaemonLog } from "./daemon-logs";

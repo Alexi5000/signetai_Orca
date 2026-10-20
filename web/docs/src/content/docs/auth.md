@@ -101,3 +101,7 @@ SSO and SAML endpoints are reserved but are not configured login providers today
 ## Rotate and recover
 
 Revoking an API key prevents further use of that key. Replacing or deleting the daemon signing secret invalidates existing signed tokens and dashboard sessions; restart the daemon afterward and issue fresh credentials. Treat this as an incident-recovery operation, not routine maintenance.
+
+## Local daemon log files
+
+CLI startup and desktop logs use the same private-file checks. Log directories must be owned by the current user and protected from other-user writes; symlinked directories, symlinked log files, and multiply linked files are rejected. Log files use owner-only permissions on POSIX. CLI startup stops if it cannot open its startup log safely. Repair directory ownership or remove an unintended link rather than making the workspace world-writable.

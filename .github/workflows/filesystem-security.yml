@@ -37,7 +37,7 @@ jobs:
       - name: Bounded token, memory, and transcript parsing
         run: bun run test:hermetic platform/daemon/src/sync-db-site-token.test.ts platform/core/src/__tests__/memory.test.ts platform/core/src/__tests__/import-headings.test.ts platform/core/src/identity-summary.test.ts integrations/pi/extension-base/src/transcript.test.ts
       - name: Desktop private logs and daemon restart regressions
-        run: bun run test:hermetic surfaces/desktop/src/daemon-logs.test.ts surfaces/desktop/src/daemon-manager-regression.test.ts surfaces/desktop/src/daemon-manager.test.ts
+        run: bun run test:hermetic platform/core/src/daemon-logs.test.ts surfaces/cli/src/lib/runtime.test.ts surfaces/desktop/src/daemon-logs.test.ts surfaces/desktop/src/daemon-manager-regression.test.ts surfaces/desktop/src/daemon-manager.test.ts
   desktop-macos:
     runs-on: macos-latest
     timeout-minutes: 10
@@ -49,4 +49,4 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       - run: bun run build:core
       - name: Desktop log filesystem and restart regressions
-        run: bun run test:hermetic surfaces/desktop/src/daemon-logs.test.ts surfaces/desktop/src/daemon-manager-regression.test.ts surfaces/desktop/src/daemon-manager.test.ts
+        run: bun run test:hermetic platform/core/src/daemon-logs.test.ts surfaces/desktop/src/daemon-logs.test.ts surfaces/desktop/src/daemon-manager-regression.test.ts surfaces/desktop/src/daemon-manager.test.ts
