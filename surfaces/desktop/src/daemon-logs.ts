@@ -59,7 +59,7 @@ function openLog(path: string): number {
 		fd = openSync(path, flags | constants.O_CREAT | constants.O_EXCL, 0o600);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		fd = openSync(path, flags);
+		fd = openSync(path, flags, 0o600);
 	}
 	try {
 		const opened = fstatSync(fd);
