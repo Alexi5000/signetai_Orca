@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { basename, extname } from "node:path";
 import { formatFromExtension, toMarkdownBytes } from "@firecrawl/anydoc";
+import { parseHTML } from "linkedom";
 
 export const IMPORT_MAX_FILE_BYTES = 25 * 1024 * 1024;
 export const IMPORT_MAX_BATCH_BYTES = 100 * 1024 * 1024;
@@ -212,25 +213,31 @@ function normalizeText(value: string): string {
 }
 
 function htmlToText(value: string): string {
+	const { document } = parseHTML(value);
+	const pending = Array.from(document.childNodes).reverse();
+	const text: string[] = [];
+	const blocks = new Set(["p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "section", "article"]);
+	while (pending.length > 0) {
+		const node = pending.pop();
+		if (!node) continue;
+		if (node.nodeType === 3) {
+			text.push(node.textContent ?? "");
+			continue;
+		}
+		if (node.nodeType !== 1) continue;
+		const tag = node.nodeName.toLowerCase();
+		if (tag === "script" || tag === "style") continue;
+		if (tag === "br") {
+			text.push("\n");
+			continue;
+		}
+		if (blocks.has(tag)) pending.push(document.createTextNode("\n"));
+		for (let child = node.lastChild; child; child = child.previousSibling) pending.push(child);
+	}
 	return normalizeText(
-		decodeEntities(
-			value
-				.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
-				.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
-				.replace(/<br\s*\/?>(?=.)/gi, "\n")
-				.replace(/<\/(p|div|li|h[1-6]|tr|section|article)>/gi, "\n")
-				.replace(/<[^>]+>/g, "")
-				.replace(/[ \t]+/g, " "),
-		),
+		text
+			.join("")
+			.replace(/\u00a0/g, " ")
+			.replace(/[ \t]+/g, " "),
 	);
-}
-
-function decodeEntities(value: string): string {
-	return value
-		.replace(/&nbsp;/gi, " ")
-		.replace(/&amp;/gi, "&")
-		.replace(/&lt;/gi, "<")
-		.replace(/&gt;/gi, ">")
-		.replace(/&quot;/gi, '"')
-		.replace(/&#39;/gi, "'");
 }

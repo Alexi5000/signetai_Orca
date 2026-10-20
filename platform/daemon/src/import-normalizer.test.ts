@@ -80,3 +80,34 @@ describe("import normalizer", () => {
 		expect(result.value.content.toLowerCase()).toContain("imported note");
 	});
 });
+
+describe("HTML text projection boundaries", () => {
+	for (const [name, input, expected] of [
+		["malformed script close", "<p>Before</p><ScRiPt>hidden()</sCrIpT ><p>After</p>", "Before\nAfter\n"],
+		["malformed style close", "<style>hidden{color:red}</style ><p>Visible</p>", "Visible\n"],
+		["unterminated script", "<p>Visible</p><script>hidden()", "Visible\n"],
+		["single entity decoding", "<p>&amp;lt; &amp;amp; &lt;b&gt; &#x41; &nbsp;</p>", "&lt; &amp; <b> A\n"],
+		["block boundaries", "<div>One<br>Two</div><section><p>Three</p></section>", "One\nTwo\nThree\n"],
+		[
+			"comments and attributes",
+			'<!-- ignored --><p title="invisible">Visible<img onerror="hidden()" src="https://invalid.example/test"></p>',
+			"Visible\n",
+		],
+	] as const) {
+		it(name, async () => {
+			const result = await normalizeImportedFile("page.html", bytes(input), "text/html");
+			if (!result.ok) throw new Error(result.error);
+			expect(result.value.content).toBe(expected);
+			expect(result.value.sourceMeta.representation).toBe("text-projection");
+		});
+	}
+
+	it("handles deep nesting without a recursive extraction stack", async () => {
+		const result = await normalizeImportedFile(
+			"deep.html",
+			bytes(`${"<span>".repeat(10000)}Visible${"</span>".repeat(10000)}`),
+		);
+		if (!result.ok) throw new Error(result.error);
+		expect(result.value.content).toBe("Visible\n");
+	});
+});
