@@ -11,7 +11,7 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 // --- config ---
 
@@ -167,13 +167,15 @@ function parseYaml(raw: string): Spec[] {
 
 // --- graphql helpers ---
 
-function gql(query: string): unknown {
-	const escaped = query.replace(/'/g, "'\\''");
-	const result = execSync(`gh api graphql -f query='${escaped}'`, {
+function gql(query: string, variables: Record<string, string | null>): unknown {
+	const result = execFileSync("gh", ["api", "graphql", "--input", "-"], {
+		input: JSON.stringify({ query, variables }),
 		encoding: "utf8",
 		timeout: 30_000,
 	});
-	return JSON.parse(result);
+	const response = JSON.parse(result);
+	if (response.errors?.length) throw new Error("GitHub project request failed");
+	return response;
 }
 
 interface ProjectItem {
@@ -187,12 +189,12 @@ function fetchItems(): ProjectItem[] {
 	let cursor: string | null = null;
 
 	for (;;) {
-		const after = cursor ? `, after: "${cursor}"` : "";
-		const res = gql(`
-{
-  node(id: "${PROJECT_ID}") {
+		const res = gql(
+			`
+query($projectId: ID!, $cursor: String) {
+  node(id: $projectId) {
     ... on ProjectV2 {
-      items(first: 100${after}) {
+      items(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id
@@ -207,7 +209,9 @@ function fetchItems(): ProjectItem[] {
       }
     }
   }
-}`) as {
+}`,
+			{ projectId: PROJECT_ID, cursor },
+		) as {
 			data: {
 				node: {
 					items: {
@@ -237,44 +241,52 @@ function fetchItems(): ProjectItem[] {
 }
 
 function addDraft(title: string): string {
-	const res = gql(`
-mutation {
-  addProjectV2DraftIssue(input: {
-    projectId: "${PROJECT_ID}"
-    title: "${title.replace(/"/g, '\\"')}"
-  }) {
+	const res = gql(
+		`
+mutation($projectId: ID!, $title: String!) {
+  addProjectV2DraftIssue(input: { projectId: $projectId, title: $title }) {
     projectItem { id }
   }
-}`) as { data: { addProjectV2DraftIssue: { projectItem: { id: string } } } };
+}`,
+		{ projectId: PROJECT_ID, title },
+	) as {
+		data: { addProjectV2DraftIssue: { projectItem: { id: string } } };
+	};
 	return res.data.addProjectV2DraftIssue.projectItem.id;
 }
 
 function setText(itemId: string, fieldId: string, value: string): void {
-	gql(`
-mutation {
+	gql(
+		`
+mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: String!) {
   updateProjectV2ItemFieldValue(input: {
-    projectId: "${PROJECT_ID}"
-    itemId: "${itemId}"
-    fieldId: "${fieldId}"
-    value: { text: "${value.replace(/"/g, '\\"')}" }
+    projectId: $projectId
+    itemId: $itemId
+    fieldId: $fieldId
+    value: { text: $value }
   }) {
     projectV2Item { id }
   }
-}`);
+}`,
+		{ projectId: PROJECT_ID, itemId, fieldId, value },
+	);
 }
 
 function setSelect(itemId: string, fieldId: string, optionId: string): void {
-	gql(`
-mutation {
+	gql(
+		`
+mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
   updateProjectV2ItemFieldValue(input: {
-    projectId: "${PROJECT_ID}"
-    itemId: "${itemId}"
-    fieldId: "${fieldId}"
-    value: { singleSelectOptionId: "${optionId}" }
+    projectId: $projectId
+    itemId: $itemId
+    fieldId: $fieldId
+    value: { singleSelectOptionId: $optionId }
   }) {
     projectV2Item { id }
   }
-}`);
+}`,
+		{ projectId: PROJECT_ID, itemId, fieldId, optionId },
+	);
 }
 
 // --- title formatting ---
