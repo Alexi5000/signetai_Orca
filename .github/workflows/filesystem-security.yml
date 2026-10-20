@@ -31,7 +31,7 @@ jobs:
       - name: Filesystem containment and native cache regression tests
         run: bun run test:hermetic platform/core/src/secure-fs.test.ts platform/daemon/src/native-runtime-assets.test.ts platform/daemon/src/test-temp-dir.test.ts platform/daemon/src/event-loop-responsiveness.test.ts platform/daemon/src/native-memory-source-worker.test.ts
       - name: Secret publication concurrency and authentication
-        run: bun run test:hermetic platform/daemon/src/auth/auth.test.ts
+        run: bun run test:hermetic platform/daemon/src/auth/auth.test.ts platform/daemon/src/middleware-origin.test.ts
       - name: Transcript atomic replacement and recovery
         run: bun run test:hermetic platform/daemon/src/transcript-jsonl.test.ts
       - name: Bounded token, memory, and transcript parsing

@@ -12,6 +12,14 @@ import { logger } from "./logger";
 import { analyticsCollector, authConfig, authSecret, isAllowedOrigin, shuttingDown } from "./routes/state.js";
 
 export function registerGlobalMiddleware(app: Hono): void {
+	app.use("*", async (c, next) => {
+		const origin = c.req.header("Origin");
+		if (origin !== undefined && !isAllowedOrigin(origin)) {
+			return c.json({ error: "origin not allowed" }, 403);
+		}
+		return next();
+	});
+
 	// MW-1: CORS
 	app.use(
 		"*",
