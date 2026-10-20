@@ -11,6 +11,10 @@ Authentication is optional for a single local machine. Use `team` mode for a dae
 - **`team`**: every protected request requires a valid bearer credential. Use this for a shared server or CI-facing daemon.
 - **`hybrid`**: localhost requests can proceed without a credential; remote requests require one. Do not rely on hybrid mode behind an untrusted same-host reverse proxy, because the daemon uses the TCP peer address to identify localhost traffic.
 
+## Browser origins
+
+The daemon rejects requests carrying an Origin outside its configured allowlist with HTTP 403 before authentication or route execution, including local mode and preflight requests. Merely withholding CORS response headers does not prevent a browser from sending a request. CLI and connector requests without Origin retain the selected authentication mode. Origin checks are a browser boundary, not a substitute for team-mode bearer credentials or network isolation.
+
 ## Configure a team daemon
 
 Set the mode explicitly in the workspace `agent.yaml` used by the daemon:
