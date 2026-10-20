@@ -35,7 +35,7 @@ jobs:
       - name: Transcript atomic replacement and recovery
         run: bun run test:hermetic platform/daemon/src/transcript-jsonl.test.ts
       - name: Bounded token, memory, and transcript parsing
-        run: bun run test:hermetic platform/daemon/src/sync-db-site-token.test.ts platform/core/src/__tests__/memory.test.ts platform/core/src/__tests__/import-headings.test.ts integrations/pi/extension-base/src/transcript.test.ts
+        run: bun run test:hermetic platform/daemon/src/sync-db-site-token.test.ts platform/core/src/__tests__/memory.test.ts platform/core/src/__tests__/import-headings.test.ts platform/core/src/identity-summary.test.ts integrations/pi/extension-base/src/transcript.test.ts
       - name: Desktop private logs and daemon restart regressions
         run: bun run test:hermetic surfaces/desktop/src/daemon-logs.test.ts surfaces/desktop/src/daemon-manager-regression.test.ts surfaces/desktop/src/daemon-manager.test.ts
   desktop-macos:
