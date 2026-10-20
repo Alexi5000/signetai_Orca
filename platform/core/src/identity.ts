@@ -668,10 +668,12 @@ export function summarizeIdentity(identity: IdentityMap): string {
 	const parts: string[] = [];
 
 	if (identity.identity?.content) {
-		// Try to extract name from IDENTITY.md
-		const nameMatch = identity.identity.content.match(/^#\s*(.+)$/m);
-		if (nameMatch) {
-			parts.push(`Name: ${nameMatch[1]}`);
+		for (const line of identity.identity.content.split(/\r\n|[\n\r\u2028\u2029]/)) {
+			if (!line.startsWith("#")) continue;
+			const name = line.slice(1).trimStart();
+			if (!name) continue;
+			parts.push(`Name: ${name}`);
+			break;
 		}
 	}
 
