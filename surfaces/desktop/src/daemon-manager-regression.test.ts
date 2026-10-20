@@ -13,7 +13,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import EventEmitter from "node:events";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 
 // ---------------------------------------------------------------------------
 // Module mocks — declared before any dynamic import of the module under test.
@@ -38,6 +38,9 @@ mock.module("./paths.js", () => ({
 	daemonEntry: () => "/tmp/signet-test-daemon/dist/daemon.js",
 	daemonRoot: () => "/tmp/signet-test-daemon",
 }));
+
+const daemonLogs = await import("./daemon-logs.js");
+let openLogsMock: ReturnType<typeof spyOn>;
 
 // ---------------------------------------------------------------------------
 // Import the module under test AFTER mock.module declarations so the mocked
@@ -85,6 +88,7 @@ describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 
 	beforeEach(() => {
 		originalFetch = globalThis.fetch;
+		openLogsMock = spyOn(daemonLogs, "openDaemonLogs").mockReturnValue({ stdout: 17, stderr: 18 });
 	});
 
 	afterEach(() => {
@@ -112,15 +116,7 @@ describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 		const fs = await import("node:fs");
 		const STDOUT_FD = 17;
 		const STDERR_FD = 18;
-		let openSyncCallCount = 0;
-		const openedPaths: string[] = [];
-		const openSyncSpy = spyOn(fs, "openSync").mockImplementation(
-			(path: fs.PathLike | number, _flags: fs.OpenMode): number => {
-				openSyncCallCount += 1;
-				openedPaths.push(String(path));
-				return openSyncCallCount === 1 ? STDOUT_FD : STDERR_FD;
-			},
-		);
+		openLogsMock.mockClear();
 		spyOn(fs, "existsSync").mockReturnValue(true);
 		spyOn(fs, "mkdirSync").mockReturnValue(undefined);
 
@@ -153,14 +149,8 @@ describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 		expect(stdioArg[1]).toBe(STDOUT_FD);
 		expect(stdioArg[2]).toBe(STDERR_FD);
 
-		// openSync must have been used (proves the sync path, not the lazy createWriteStream path).
-		expect(openSyncSpy).toHaveBeenCalledTimes(2);
-		expect(openedPaths).toEqual([
-			join(resolve("/tmp/signet-workspace"), ".daemon", "logs", "daemon.out.log"),
-			join(resolve("/tmp/signet-workspace"), ".daemon", "logs", "daemon.err.log"),
-		]);
-
-		openSyncSpy.mockRestore();
+		expect(openLogsMock).toHaveBeenCalledTimes(1);
+		expect(openLogsMock.mock.calls[0]).toEqual([resolve("/tmp/signet-workspace")]);
 	});
 
 	// -----------------------------------------------------------------------

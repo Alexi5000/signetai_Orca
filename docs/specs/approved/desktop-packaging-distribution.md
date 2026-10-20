@@ -32,6 +32,17 @@ incomplete as a release contract:
 This spec locks the packaging contract for macOS, Windows, Ubuntu, and
 Arch.
 
+### Bundled daemon logs
+
+The desktop app appends stdout and stderr to `.daemon/logs/daemon.out.log` and
+`daemon.err.log` in the selected workspace. On POSIX, the workspace must be owned
+by the current user and not writable by other users; ancestors must prevent other
+users from replacing the workspace. Startup refuses symlinked log directories,
+symlinked or hard-linked log files, and nonregular log files. New log directories use
+mode 0700 and log files use 0600; existing owned directories must not be writable
+by other users. Existing log contents survive restarts. This
+boundary applies to desktop-bundled startup; CLI startup logs are separate.
+
 ## Contract
 
 1. Desktop build workflows must produce:
