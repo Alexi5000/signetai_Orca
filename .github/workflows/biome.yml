@@ -27,3 +27,6 @@ jobs:
 
       - name: Biome check
         run: bunx biome check .
+
+      - name: Project sync request-boundary regressions
+        run: bun test scripts/sync-specs-to-project.test.ts
