@@ -394,11 +394,6 @@ function normalizeExpansionToken(raw: string): string {
 	if (cleaned.endsWith("s") && cleaned.length > 3) return cleaned.slice(0, -1);
 	return cleaned;
 }
-/**
- * Largest score multiplier access history can add (1 + 0.25). Rehearsal breaks
- * ties between relevant memories; it must not let a frequently read memory
- * outrank a better match for the query.
- */
 const REHEARSAL_MAX_BOOST = 0.25;
 async function applyRehearsalBoost(
 	scored: Array<{ id: string; score: number; source: string }>,

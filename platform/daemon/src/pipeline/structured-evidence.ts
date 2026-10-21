@@ -44,8 +44,6 @@ export const DEFAULT_STRUCTURED_EVIDENCE_OPTIONS: StructuredEvidenceOptions = {
 		structured: 0.15,
 	},
 };
-
-/** Highest score a hint can give a memory that has no direct evidence of its own. */
 export const HINT_ONLY_SCORE_CAP = 0.75;
 
 const PUNCT = /[^a-z0-9\s]/g;
@@ -63,22 +61,6 @@ function tokenize(text: string): Set<string> {
 	}
 	return tokens;
 }
-
-/**
- * How much a hint and a query are about the same thing, from 0 to 1.
- *
- * bm25 ranks hints against each other, so after normalization the best hint
- * scores 1 even when it shares a single generic word with the query. This
- * measures the overlap itself: shared tokens divided by the geometric mean of
- * both token counts (the Ochiai coefficient). A query that restates the hint
- * scores close to 1; one shared word between two long texts scores low.
- *
- * Example: query "undoing a completion event lost its guard check" against
- * hint "check data before summary" shares only "check" and scores about 0.24.
- *
- * Returns 1 when the overlap cannot be measured (no tokens on one side, or
- * FTS matched on words this tokenizer drops), so bm25 alone decides.
- */
 export function hintQueryCoverage(query: string, hint: string): number {
 	const queryTokens = tokenize(query);
 	const hintTokens = tokenize(hint);
@@ -147,8 +129,6 @@ export function shapeStructuredEvidence(
 
 		const lexicalFloor =
 			evidence.lexical > 0 ? (hasSecondaryEvidence ? 0.4 + evidence.lexical * 0.02 : evidence.lexical) : 0;
-		// Same rule as the flat merge: without direct evidence a hint cannot lift a memory
-		// above the hint-only cap, even when traversal relabels the row as "sec".
 		const hasDirectEvidence = evidence.lexical > 0 || evidence.semantic > 0 || evidence.structured > 0;
 		const hintFloor = hasDirectEvidence ? evidence.hint : Math.min(evidence.hint, HINT_ONLY_SCORE_CAP);
 		let score = Math.max(weightedScore(evidence, cfg.weights), lexicalFloor, hintFloor);
