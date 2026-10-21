@@ -55,6 +55,8 @@ import { nativeRerank } from "./native-rerank";
 import { FTS_STOP } from "./pipeline/stop-words";
 import {
 	type EvidenceCandidateInput,
+	HINT_ONLY_SCORE_CAP,
+	hintQueryCoverage,
 	shapeByFacetCoverage,
 	shapeStructuredEvidence,
 } from "./pipeline/structured-evidence";
@@ -392,6 +394,12 @@ function normalizeExpansionToken(raw: string): string {
 	if (cleaned.endsWith("s") && cleaned.length > 3) return cleaned.slice(0, -1);
 	return cleaned;
 }
+/**
+ * Largest score multiplier access history can add (1 + 0.25). Rehearsal breaks
+ * ties between relevant memories; it must not let a frequently read memory
+ * outrank a better match for the query.
+ */
+const REHEARSAL_MAX_BOOST = 0.25;
 async function applyRehearsalBoost(
 	scored: Array<{ id: string; score: number; source: string }>,
 	search: MemorySearchConfig,
@@ -433,7 +441,7 @@ async function applyRehearsalBoost(
 					: search.rehearsal_half_life_days;
 				const recencyFactor = 0.5 ** (daysSinceAccess / search.rehearsal_half_life_days);
 				const boost = search.rehearsal_weight * Math.log(row.access_count + 1) * recencyFactor;
-				s.score *= 1 + boost;
+				s.score *= 1 + Math.min(boost, REHEARSAL_MAX_BOOST);
 			}
 			if (freshnessEnabled) {
 				const createdAtMs = Date.parse(row.created_at);
@@ -1594,7 +1602,6 @@ function describeRecallGraphError(error: unknown): {
 function isRecallGraphDeadlineError(error: { readonly code: string | number | null }): boolean {
 	return error.code === "DB_OWNER_DEADLINE" || error.code === "DB_OWNER_CANCELLED";
 }
-const HINT_ONLY_SCORE_CAP = 0.75;
 const TEMPORAL_TOPIC_SCORE_CAP = 0.85;
 
 function temporalTopicTokens(raw: string): string[] {
@@ -1970,7 +1977,7 @@ export async function hybridRecall(
 		try {
 			await timings.timeAsync("hints_fts", async () => {
 				if (keywordQuery.length === 0) return;
-				const sql = `SELECT h.memory_id AS id, bm25(memory_hints_fts) AS raw_score
+				const sql = `SELECT h.memory_id AS id, h.hint AS hint, bm25(memory_hints_fts) AS raw_score
 				   FROM memory_hints_fts
 				   CROSS JOIN memory_hints h ON memory_hints_fts.rowid = h.rowid
 				   CROSS JOIN memories m ON m.id = h.memory_id
@@ -1980,7 +1987,7 @@ export async function hybridRecall(
 				     ${filter.sql}
 				   ORDER BY raw_score LIMIT ?`;
 
-				const rows = await ownerReadAll<{ id: string; raw_score: number }>(
+				const rows = await ownerReadAll<{ id: string; hint: string; raw_score: number }>(
 					await getDbOwner(getDbAccessorPath()),
 					sql,
 					[keywordQuery, ...filter.args, cfg.search.top_k],
@@ -1995,8 +2002,9 @@ export async function hybridRecall(
 				const rawScores = rows.map((r) => Math.abs(r.raw_score));
 				const maxRaw = rawScores.length > 0 ? Math.max(...rawScores) : 1;
 				const normalizer = maxRaw > 0 ? maxRaw : 1;
+				const hintQuery = params.keywordQuery ?? query;
 				for (const row of rows) {
-					const hint = Math.abs(row.raw_score) / normalizer;
+					const hint = (Math.abs(row.raw_score) / normalizer) * hintQueryCoverage(hintQuery, row.hint);
 					hintMap.set(row.id, Math.max(hintMap.get(row.id) ?? 0, hint));
 				}
 			});

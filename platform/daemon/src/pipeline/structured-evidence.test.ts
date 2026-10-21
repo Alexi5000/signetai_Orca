@@ -1,5 +1,30 @@
 import { describe, expect, it } from "bun:test";
-import { shapeByFacetCoverage, shapeStructuredEvidence } from "./structured-evidence";
+import {
+	HINT_ONLY_SCORE_CAP,
+	hintQueryCoverage,
+	shapeByFacetCoverage,
+	shapeStructuredEvidence,
+} from "./structured-evidence";
+
+describe("hintQueryCoverage", () => {
+	it("scores a query that restates the hint close to 1", () => {
+		const coverage = hintQueryCoverage(
+			"What music streaming service have I been using lately?",
+			"What music streaming service has the user been using lately?",
+		);
+		expect(coverage).toBeGreaterThan(0.8);
+	});
+
+	it("scores a single shared generic word low", () => {
+		const coverage = hintQueryCoverage("undoing a completion event lost its guard check", "check data before summary");
+		expect(coverage).toBeCloseTo(1 / Math.sqrt(18), 5);
+	});
+
+	it("returns 1 when the overlap cannot be measured", () => {
+		expect(hintQueryCoverage("", "check data before summary")).toBe(1);
+		expect(hintQueryCoverage("check", "日本語のヒント")).toBe(1);
+	});
+});
 
 describe("structured evidence shaping", () => {
 	it("caps traversal-only candidates below anchored evidence", () => {
@@ -33,6 +58,18 @@ describe("structured evidence shaping", () => {
 
 		expect(shaped[0]?.id).toBe("spotify");
 		expect(shaped[0]?.source).toBe("hint");
+	});
+
+	it("keeps the hint-only cap when traversal relabels a hint row as sec", () => {
+		const shaped = shapeStructuredEvidence([
+			{ id: "hint-and-graph", source: "hint", hint: 1, traversal: 0.9 },
+			{ id: "hint-and-text", source: "hybrid", lexical: 0.4, hint: 1 },
+		]);
+
+		const capped = shaped.find((row) => row.id === "hint-and-graph");
+		expect(capped?.source).toBe("sec");
+		expect(capped?.score).toBe(HINT_ONLY_SCORE_CAP);
+		expect(shaped.find((row) => row.id === "hint-and-text")?.score).toBe(1);
 	});
 
 	it("lets structured path evidence preserve SEC ranking gains", () => {

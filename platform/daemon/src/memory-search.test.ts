@@ -2621,6 +2621,46 @@ describe("hybridRecall", () => {
 		expect(result.results[0]?.score).toBeLessThan(0.8);
 	});
 
+	it("scales a hint by how much of it the query shares", async () => {
+		const now = new Date().toISOString();
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memories (
+					id, content, type, agent_id, created_at, updated_at, updated_by
+				) VALUES (?, ?, 'fact', 'default', ?, ?, 'test')`,
+			).run("mem-report-rule", "Verify every number before presenting a report.", now, now);
+
+			db.prepare(
+				`INSERT INTO memory_hints (id, memory_id, agent_id, hint, created_at)
+				 VALUES (?, ?, 'default', ?, ?)`,
+			).run("hint-report-rule", "mem-report-rule", "check data before summary", now);
+		});
+
+		const cfg = loadMemoryConfig(dir);
+		cfg.search.rehearsal_enabled = false;
+		cfg.search.min_score = 0;
+		cfg.pipelineV2.graph.enabled = false;
+		cfg.pipelineV2.traversal.enabled = false;
+		cfg.pipelineV2.reranker.enabled = false;
+		cfg.pipelineV2.hints.enabled = true;
+
+		const result = await hybridRecall(
+			{
+				query: "undoing a completion event lost its guard check",
+				keywordQuery: "undoing a completion event lost its guard check",
+				limit: 5,
+				agentId: "default",
+				readPolicy: "isolated",
+			},
+			cfg,
+			async () => null,
+		);
+
+		const hit = result.results.find((row) => row.id === "mem-report-rule");
+		expect(hit?.source).toBe("hint");
+		expect(hit?.score).toBeLessThan(0.3);
+	});
+
 	it("uses structured path candidates when lexical recall misses a music platform", async () => {
 		const now = new Date().toISOString();
 		getDbAccessor().withWriteTx((db) => {
