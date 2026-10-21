@@ -25,9 +25,24 @@
   <a href="https://docs.signetai.sh">Upstream docs</a>
 </p>
 
-Built by [Alex Cinovoj](https://alexcinovoj.com) ([X](https://x.com/AlexCinovoj) · [LinkedIn](https://www.linkedin.com/in/alexcinovoj)) for [TechTide AI](https://techtideai.io). Read the delivery story in [docs/ORCA-HERO-STORY.md](docs/ORCA-HERO-STORY.md).
+Built by [Alex Cinovoj](https://alexcinovoj.com), Founder & CTO of [TechTide AI](https://techtideai.io) ([X](https://x.com/AlexCinovoj) · [LinkedIn](https://www.linkedin.com/in/alexcinovoj)). Read the delivery story in [docs/ORCA-HERO-STORY.md](docs/ORCA-HERO-STORY.md).
 
 Upstream core by Signet AI: [Signet-AI/signetai](https://github.com/Signet-AI/signetai). Product docs at [signetai.sh](https://signetai.sh).
+
+## Why this fork exists
+
+**What it does.** Orca is TechTide's delivery fork of Signet: a local-first memory daemon that ingests transcripts and imports, builds derived memory through a background process called dreaming, and serves recall to Claude Code, OpenCode, OpenClaw, Codex, Kimi, Hermes, Pi, and Gemini CLI through hooks, plugins, and MCP. The fork keeps the upstream core and adds Orca positioning, delivery docs and assets, a README lint gate, and a run of security hardening fixes.
+
+**Who it serves.** Operator teams that run more than one AI coding harness and want a single inspectable memory graph in their own environment, and the TechTide delivery engineers who install that system and hand it over to a client.
+
+**Why Alex forked it.** The fork was created on 2026-03-11 (GitHub `created_at`) and tracked upstream until release 0.226.1 (`9229ff2ac`, 2026-09-13). The first fork-only commits on 2026-09-13 added a README quality harness (`af6971dd5`: "test: add readme quality lint harness"), upstream credit (`373ed9bc0`: "docs: add upstream credit and fork footer"), and the delivery narrative (`a212304a7`: "docs: add Orca hero story"). That narrative records the motivation: Alex Cinovoj, Founder & CTO of TechTide AI, "needed a local first memory layer with an audit trail, not another chat wrapper" for client delivery, and upstream Signet fit because transcripts and imports flow in, dreaming builds a living ontology, and every derived claim keeps a path back to its source ([docs/ORCA-HERO-STORY.md](docs/ORCA-HERO-STORY.md), section "Why Alex picked Signet"). Between 2026-10-17 and 2026-10-20 the fork added fourteen security fixes as PRs #1 to #14 (for example `b088556cf`: "fix: keep daemon responsive during database maintenance" and `f4940e315`: "fix: reject untrusted browser origins before daemon handlers").
+
+**Real-world use case (2025–2026 evidence).** **Proposed use case.** A small operations team uses Claude Code for one workflow and Gemini CLI for another, and every new session starts without the context the other tool already learned. They install Orca once, run `signet setup`, and connect both harnesses: Claude Code through hooks and MCP, Gemini CLI through MCP plus GEMINI.md sync. Both tools then read and write the same local memory graph, and a reviewer can open `signet dashboard` to trace any recalled fact back to the transcript or import it came from. The pattern depends on stable extension points in the harnesses: the Model Context Protocol revision of 2025-11-25 defines the tools and resources interface the daemon serves[^1], Claude Code and Gemini CLI both shipped releases on 2026-10-20[^2][^3], and upstream Signet published v0.237.14 on 2026-10-18 with the harness integrations this fork carries[^4]. The hero story describes a client engagement in narrative form; this repository holds no deployment records, fixtures, or test output for that engagement, so the scenario is labelled proposed rather than verified.
+
+[^1]: Model Context Protocol specification, revision 2025-11-25. https://modelcontextprotocol.io/specification/2025-11-25 (published 2025-11-25).
+[^2]: Anthropic, Claude Code release v2.1.305. https://github.com/anthropics/claude-code/releases/tag/v2.1.305 (published 2026-10-20).
+[^3]: Google, Gemini CLI release v0.65.0. https://github.com/google-gemini/gemini-cli/releases/tag/v0.65.0 (published 2026-10-20).
+[^4]: Signet AI, signetai release v0.237.14. https://github.com/Signet-AI/signetai/releases/tag/v0.237.14 (published 2026-10-18).
 
 ## Trust
 
@@ -188,9 +203,17 @@ Made with love by...
 
 Built by [Alex Cinovoj](https://alexcinovoj.com) for [TechTide AI](https://techtideai.io).
 
-## Built from Signet
+## Upstream
 
-This is TechTide Orca, a maintained fork for client delivery. Upstream is [Signet-AI/signetai](https://github.com/Signet-AI/signetai) by Signet AI. Product docs live at [signetai.sh](https://signetai.sh) and [docs.signetai.sh](https://docs.signetai.sh). Our changes are Orca positioning, hero story, docs assets, and README structure. Core memory behavior stays with upstream. License stays Apache-2.0. See LICENSE, NOTICE, and THIRD_PARTY_LICENSES.md. Our repo is [Alexi5000/signetai_Orca](https://github.com/Alexi5000/signetai_Orca).
+Upstream is [Signet-AI/signetai](https://github.com/Signet-AI/signetai) by Signet AI, licensed Apache-2.0. LICENSE, NOTICE, and THIRD_PARTY_LICENSES.md are preserved unchanged and this fork does not relicense. Product docs live at [signetai.sh](https://signetai.sh) and [docs.signetai.sh](https://docs.signetai.sh). This fork is [Alexi5000/signetai_Orca](https://github.com/Alexi5000/signetai_Orca), created 2026-03-11 and maintained by Alex Cinovoj, Founder & CTO of TechTide AI, for client delivery. Core memory behavior stays with upstream.
+
+**What changed in this fork.** `git log upstream/main..origin/main` on 2026-10-21 lists 35 fork-only commits:
+
+- Orca positioning, 21 commits on 2026-09-13 and 2026-09-14: README hero and structure, banner and social assets under `docs/assets/`, `docs/ORCA-HERO-STORY.md`, and the README lint gate (`.github/workflows/readme-lint.yml`, `scripts/checks/`).
+- Security hardening, PRs #1 to #14 merged 2026-10-17 to 2026-10-20: daemon lock handling, release version validation, private boot diagnostics, atomic runtime file publishing, regex backtracking bounds, prototype-key rejection in config merge, HTML escaping in mockups, GraphQL variables for project sync, protected daemon log descriptors, browser origin checks, and text-only HTML import parsing.
+- Fork release automation is opt-in; see "Fork release automation" below.
+
+**Behind upstream.** 844 commits as of 2026-10-21 (`gh api repos/Alexi5000/signetai_Orca/compare/Signet-AI:main...Alexi5000:main`: ahead 35, behind 844, diverged; 1,812 files differ). Upstream moved from release 0.226.1 to v0.237.14 in that window and this fork has not merged those releases.
 
 ## License
 
