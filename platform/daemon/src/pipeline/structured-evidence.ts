@@ -130,8 +130,8 @@ export function shapeStructuredEvidence(
 		const lexicalFloor =
 			evidence.lexical > 0 ? (hasSecondaryEvidence ? 0.4 + evidence.lexical * 0.02 : evidence.lexical) : 0;
 		const hasDirectEvidence = evidence.lexical > 0 || evidence.semantic > 0 || evidence.structured > 0;
-		const hintFloor = hasDirectEvidence ? evidence.hint : Math.min(evidence.hint, HINT_ONLY_SCORE_CAP);
-		let score = Math.max(weightedScore(evidence, cfg.weights), lexicalFloor, hintFloor);
+		let score = Math.max(weightedScore(evidence, cfg.weights), lexicalFloor, evidence.hint);
+		if (!hasDirectEvidence) score = Math.min(score, HINT_ONLY_SCORE_CAP);
 		if (evidence.structured >= 0.25) {
 			score += (evidence.structured - 0.25) * 0.8;
 		}

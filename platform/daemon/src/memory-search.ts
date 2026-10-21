@@ -2736,9 +2736,12 @@ export async function hybridRecall(
 		for (const row of scored) {
 			const hasDirectEvidence =
 				(bm25Map.get(row.id) ?? 0) > 0 ||
+				(temporalTopicEvidenceMap.get(row.id) ?? 0) > 0 ||
 				(vectorMap.get(row.id) ?? 0) > 0 ||
 				(structuredEvidenceMap.get(row.id) ?? 0) > 0;
-			if (row.source === "hint" && !hasDirectEvidence) row.score = Math.min(row.score, HINT_ONLY_SCORE_CAP);
+			if ((hintMap.get(row.id) ?? 0) > 0 && !hasDirectEvidence) {
+				row.score = Math.min(row.score, HINT_ONLY_SCORE_CAP);
+			}
 		}
 		const observedScores = await loadObservedScores(
 			scored.map((row) => row.id),

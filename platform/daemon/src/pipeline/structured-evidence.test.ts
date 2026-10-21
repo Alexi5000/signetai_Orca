@@ -72,6 +72,14 @@ describe("structured evidence shaping", () => {
 		expect(shaped.find((row) => row.id === "hint-and-text")?.score).toBe(1);
 	});
 
+	it("keeps the hint-only cap when custom weights favor hints", () => {
+		const shaped = shapeStructuredEvidence([{ id: "hint-and-graph", source: "hint", hint: 1, traversal: 0.9 }], {
+			weights: { lexical: 0.25, semantic: 0.3, hint: 1, traversal: 0.15, structured: 0.15 },
+		});
+
+		expect(shaped[0]?.score).toBe(HINT_ONLY_SCORE_CAP);
+	});
+
 	it("lets structured path evidence preserve SEC ranking gains", () => {
 		const shaped = shapeStructuredEvidence([
 			{ id: "social-justice", source: "hybrid", lexical: 0.56, hint: 0.73, traversal: 0.9, structured: 0.28 },
