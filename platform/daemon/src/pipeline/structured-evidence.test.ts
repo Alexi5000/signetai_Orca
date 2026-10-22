@@ -22,7 +22,18 @@ describe("hintQueryCoverage", () => {
 
 	it("returns 1 when the overlap cannot be measured", () => {
 		expect(hintQueryCoverage("", "check data before summary")).toBe(1);
-		expect(hintQueryCoverage("check", "日本語のヒント")).toBe(1);
+		expect(hintQueryCoverage("the and or", "check data before summary")).toBe(1);
+	});
+
+	it("returns 0 when both sides have tokens and share none", () => {
+		expect(hintQueryCoverage("check", "日本語のヒント")).toBe(0);
+		expect(hintQueryCoverage("alpha beta gamma", "delta epsilon")).toBe(0);
+	});
+
+	it("counts non-ASCII tokens that FTS can match", () => {
+		expect(hintQueryCoverage("alpha beta gamma тест", "тест delta")).toBeCloseTo(1 / Math.sqrt(8), 5);
+		expect(hintQueryCoverage("日本語のヒント", "日本語のヒント")).toBe(1);
+		expect(hintQueryCoverage("Café menu", "cafe opening")).toBeCloseTo(1 / 2, 5);
 	});
 });
 

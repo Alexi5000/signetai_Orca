@@ -61,15 +61,25 @@ function tokenize(text: string): Set<string> {
 	}
 	return tokens;
 }
+
+function tokenizeUnicode(text: string): Set<string> {
+	const tokens = new Set<string>();
+	const folded = text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+	for (const raw of folded.split(/[^\p{L}\p{N}]+/u)) {
+		if (raw.length < 2 || FTS_STOP.has(raw)) continue;
+		tokens.add(raw);
+	}
+	return tokens;
+}
+
 export function hintQueryCoverage(query: string, hint: string): number {
-	const queryTokens = tokenize(query);
-	const hintTokens = tokenize(hint);
+	const queryTokens = tokenizeUnicode(query);
+	const hintTokens = tokenizeUnicode(hint);
 	if (queryTokens.size === 0 || hintTokens.size === 0) return 1;
 	let shared = 0;
 	for (const token of hintTokens) {
 		if (queryTokens.has(token)) shared += 1;
 	}
-	if (shared === 0) return 1;
 	return shared / Math.sqrt(queryTokens.size * hintTokens.size);
 }
 
