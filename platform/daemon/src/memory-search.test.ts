@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { normalizeAndHashContent } from "./content-normalization";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
-import type { DbOwnerJobHandle, DbOwnerRequest, DbOwnerSubmitOptions } from "./db-owner-client";
+import {
+	type DbOwnerJobHandle,
+	type DbOwnerRequest,
+	type DbOwnerSubmitOptions,
+	MAX_DB_OWNER_RESULT_BYTES,
+} from "./db-owner-client";
 import { getDbOwner } from "./db-owner-runtime";
 import { ensureEmbeddingIndexState } from "./embedding-index-state";
 import { type ResolvedMemoryConfig, loadMemoryConfig } from "./memory-config";
@@ -980,6 +985,45 @@ describe("hybridRecall", () => {
 			async () => null,
 		);
 		expect(disabled.results.some((row) => row.id.startsWith("transcript:"))).toBe(false);
+	});
+
+	it("returns transcript evidence from a transcript larger than one DB owner result", async () => {
+		const now = new Date().toISOString();
+		const filler = "user: unrelated planning chatter about other cities and trains. ".repeat(25_000);
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/large-speyer.jsonl",
+				createHash("sha256").update("large-speyer").digest("hex"),
+				"large-speyer",
+				"token-large-speyer",
+				now,
+				`${filler}user: What is the Speyer tourism board phone number? assistant: +49 6232 142.`,
+				now,
+			);
+		});
+
+		const result = await hybridRecall(
+			{
+				query: "Speyer tourism board phone number",
+				limit: 3,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				trackRecallAccess: false,
+			},
+			testCfg(),
+			async () => null,
+		);
+
+		expect(filler.length).toBeGreaterThan(MAX_DB_OWNER_RESULT_BYTES);
+		expect(result.meta.transcriptEvidence).toEqual({ returned: 1, ranking: "keyword" });
+		const transcript = result.results.find((row) => row.id === "transcript:large-speyer");
+		expect(transcript?.content).toContain("+49 6232 142");
+		expect(transcript?.truncated).toBe(true);
 	});
 
 	it("places transcript excerpts by cross-encoder relevance against the bottom results", async () => {

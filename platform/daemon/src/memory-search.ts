@@ -19,7 +19,7 @@ import type { DbOwnerClient } from "./db-owner-client";
 import { vectorSearchThroughDbOwner } from "./db-owner-recall";
 import { ownerBytesFromHex, ownerReadAll, ownerReadOne } from "./db-owner-sql";
 import { getDbOwner, getDbRecallOwner } from "./db-owner-runtime";
-import { DB_OWNER_MAX_WORK_UNITS } from "./db-owner-protocol";
+import { DB_OWNER_MAX_RESULT_BYTES, DB_OWNER_MAX_WORK_UNITS } from "./db-owner-protocol";
 import {
 	embeddingProfileFingerprint,
 	embeddingProfileFingerprintsEqual,
@@ -1349,6 +1349,28 @@ export async function placeTranscriptEvidence(
 	};
 }
 
+const TRANSCRIPT_PAGE_CHARS = Math.floor((DB_OWNER_MAX_RESULT_BYTES - 4096) / 6);
+
+async function readTranscriptContent(owner: DbOwnerClient, rowid: number, chars: number): Promise<string | null> {
+	const pages: string[] = [];
+	for (let start = 1; start <= chars; start += TRANSCRIPT_PAGE_CHARS) {
+		const page = await ownerReadOne<{ readonly chunk: string | null }>(
+			owner,
+			"SELECT substr(content, ?, ?) AS chunk FROM memory_artifacts WHERE rowid = ? AND COALESCE(is_deleted, 0) = 0",
+			[start, TRANSCRIPT_PAGE_CHARS, rowid],
+			{
+				operation: "memory-search.transcript-evidence.content",
+				workloadClass: "foreground",
+				estimatedWorkUnits: 1,
+				deadlineMs: 30_000,
+			},
+		);
+		if (page === null || page.chunk === null) return null;
+		pages.push(page.chunk);
+	}
+	return pages.join("");
+}
+
 async function buildTranscriptEvidenceResults(
 	agentId: string,
 	project: string | undefined,
@@ -1369,13 +1391,14 @@ async function buildTranscriptEvidenceResults(
 		readonly harness: string | null;
 		readonly project: string | null;
 		readonly captured_at: string;
-		readonly content: string;
+		readonly artifact_rowid: number;
+		readonly content_chars: number;
 		readonly rank: number;
 	}>(
 		owner,
 		`SELECT ma.session_id, ma.source_id, ma.source_path, ma.harness, ma.project,
-			COALESCE(ma.started_at, ma.captured_at) AS captured_at, ma.content,
-			bm25(memory_artifacts_fts) AS rank
+			COALESCE(ma.started_at, ma.captured_at) AS captured_at, ma.rowid AS artifact_rowid,
+			length(ma.content) AS content_chars, bm25(memory_artifacts_fts) AS rank
 		 FROM memory_artifacts_fts
 		 JOIN memory_artifacts ma ON ma.rowid = memory_artifacts_fts.rowid
 		 WHERE memory_artifacts_fts MATCH ?
@@ -1392,20 +1415,28 @@ async function buildTranscriptEvidenceResults(
 			deadlineMs: 30_000,
 		},
 	);
-	return rows
+	const selected = rows
 		.filter((row) => {
 			const sessionId = row.session_id ?? row.source_path;
 			return !represented.has(sessionId) && !(row.source_id && represented.has(row.source_id));
 		})
-		.slice(0, maxResults)
-		.map((row): RecallResult => {
-			const sessionId = row.session_id ?? row.source_path;
-			const content = transcriptExcerpt(redactCredentials(row.content), query, 900);
-			return {
+		.slice(0, maxResults);
+	const transcripts = await Promise.all(
+		selected.map(async (row) => ({
+			row,
+			fullContent: await readTranscriptContent(owner, row.artifact_rowid, row.content_chars),
+		})),
+	);
+	return transcripts.flatMap(({ row, fullContent }): RecallResult[] => {
+		if (fullContent === null) return [];
+		const sessionId = row.session_id ?? row.source_path;
+		const content = transcriptExcerpt(redactCredentials(fullContent), query, 900);
+		return [
+			{
 				id: `transcript:${sessionId}`,
 				content,
 				content_length: content.length,
-				truncated: content.length < row.content.length,
+				truncated: content.length < fullContent.length,
 				score: Math.round((1 / (1 + Math.abs(row.rank))) * 100) / 100,
 				source: "transcript",
 				source_id: row.source_id ?? sessionId,
@@ -1419,8 +1450,9 @@ async function buildTranscriptEvidenceResults(
 				project: row.project,
 				created_at: row.captured_at,
 				supplementary: true,
-			};
-		});
+			},
+		];
+	});
 }
 
 async function buildNativeArtifactRecallHits(
