@@ -67,7 +67,7 @@ import {
 	findStructuredPathCandidatesViaOwner,
 	scoreStructuredPathEvidenceViaOwner,
 } from "./pipeline/structured-path-evidence";
-import { rankPositions, reciprocalRankScore } from "./recall-rank-fusion";
+import { rankPositions, reciprocalRankScore, selectPrimaryCandidates } from "./recall-rank-fusion";
 import { type RecallDedupeMeta, applyRecallDedupe } from "./session-recall-dedupe";
 import { recordFirstSourceRecall } from "./source-lifecycle-telemetry";
 import { escapeLike } from "./sql-utils";
@@ -2339,22 +2339,15 @@ export async function hybridRecall(
 			const candidateBudget = Math.max(limit, Math.min(cfg.search.top_k, limit * 4));
 			const flatIds = new Set(flatScored.map((row) => row.id));
 			const minFlat = Math.ceil(candidateBudget * 0.4);
+			const reservedSemantic = Math.ceil(candidateBudget * 0.25);
 			const byId = new Map<string, { id: string; score: number; source: string }>();
 			for (const row of flatScored) mergeCandidate(byId, row);
 			for (const row of traversalScored) mergeCandidate(byId, row);
 			const fused = [...byId.values()].sort((a, b) => b.score - a.score);
-			const selected: Array<{ id: string; score: number; source: string }> = [];
-			let flatCount = 0;
-			for (const row of fused) {
-				if (selected.length >= candidateBudget) break;
-				const isFlat = flatIds.has(row.id);
-				const remaining = candidateBudget - selected.length;
-				const neededFlat = Math.max(0, Math.min(minFlat, flatScored.length) - flatCount);
-				if (!isFlat && neededFlat >= remaining) continue;
-				selected.push(row);
-				if (isFlat) flatCount++;
-			}
-			scored = selected;
+			const reservedIds = new Set(
+				[...semanticRank].filter(([, position]) => position <= reservedSemantic).map(([id]) => id),
+			);
+			scored = selectPrimaryCandidates(fused, candidateBudget, flatIds, minFlat, reservedIds);
 		});
 	} else {
 		scored = flatScored;

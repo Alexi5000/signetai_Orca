@@ -17,3 +17,26 @@ export function reciprocalRankScore(
 	}
 	return (sum * (k + 1)) / positions.length;
 }
+
+export function selectPrimaryCandidates<T extends { readonly id: string }>(
+	fused: readonly T[],
+	budget: number,
+	flatIds: ReadonlySet<string>,
+	minFlat: number,
+	reservedIds: ReadonlySet<string>,
+): T[] {
+	const selected = fused.filter((row) => reservedIds.has(row.id)).slice(0, budget);
+	const kept = new Set(selected.map((row) => row.id));
+	const flatTarget = Math.min(minFlat, flatIds.size);
+	let flatCount = selected.filter((row) => flatIds.has(row.id)).length;
+	for (const row of fused) {
+		if (selected.length >= budget) break;
+		if (kept.has(row.id)) continue;
+		const isFlat = flatIds.has(row.id);
+		const neededFlat = Math.max(0, flatTarget - flatCount);
+		if (!isFlat && neededFlat >= budget - selected.length) continue;
+		selected.push(row);
+		if (isFlat) flatCount++;
+	}
+	return selected;
+}
