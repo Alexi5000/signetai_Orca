@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { normalizeAndHashContent } from "./content-normalization";
-import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
+import { closeDbAccessor, getDbAccessor, getDbAccessorPath, initDbAccessor } from "./db-accessor";
 import {
 	type DbOwnerJobHandle,
 	type DbOwnerRequest,
@@ -22,8 +22,11 @@ import {
 	hybridRecall,
 	placeTranscriptEvidence,
 	MAX_LEXICAL_FALLBACK_SCAN_ROWS,
+	ownerVectorPageRows,
+	readOwnerVectorsBySource,
 	transcriptExcerpt,
 } from "./memory-search";
+import { ownerReadAll } from "./db-owner-sql";
 import type { RecallResult } from "./memory-search";
 import { setActiveTelemetry } from "./telemetry";
 
@@ -1024,6 +1027,51 @@ describe("hybridRecall", () => {
 		const transcript = result.results.find((row) => row.id === "transcript:large-speyer");
 		expect(transcript?.content).toContain("+49 6232 142");
 		expect(transcript?.truncated).toBe(true);
+	});
+
+	it("reads more vectors than one DB owner result holds, decoded", async () => {
+		const now = new Date().toISOString();
+		const vectorFor = (index: number) =>
+			Array.from({ length: 768 }, (_, dim) => (dim === index % 768 ? 1 : dim === 767 ? 0.5 : 0));
+		const sourceIds = Array.from({ length: 400 }, (_, index) => `mem-vector-${index}`);
+		getDbAccessor().withWriteTx((db) => {
+			const insert = db.prepare(
+				`INSERT INTO embeddings (
+					id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id
+				) VALUES (?, ?, ?, 768, 'memory', ?, '', ?, 'default')`,
+			);
+			sourceIds.forEach((sourceId, index) => {
+				insert.run(`emb-${index}`, `hash-${index}`, vectorBlob(vectorFor(index)), sourceId, now);
+			});
+			insert.run("emb-0-chunk-2", "hash-0-chunk-2", vectorBlob(vectorFor(1)), "mem-vector-0", now);
+		});
+		const owner = await getDbOwner(getDbAccessorPath());
+		const pages: number[] = [];
+
+		const vectors = await readOwnerVectorsBySource(sourceIds, 768, async (sql, params, pageRows) => {
+			const rows = await ownerReadAll<{ rowid: number; source_id: string; vector_hex: string | null }>(
+				owner,
+				sql,
+				params,
+				{
+					operation: "test.vector-pages",
+					workloadClass: "foreground",
+					estimatedWorkUnits: pageRows,
+					deadlineMs: 30_000,
+				},
+			);
+			pages.push(rows.length);
+			return rows;
+		});
+
+		expect(400 * 768 * 4).toBeGreaterThan(MAX_DB_OWNER_RESULT_BYTES);
+		expect(vectors).toHaveLength(401);
+		expect(Math.max(...pages)).toBeLessThanOrEqual(ownerVectorPageRows(768));
+		const byId = new Map(vectors.map((row) => [row.source_id, row.vector]));
+		expect(byId.get("mem-vector-399")?.length).toBe(768);
+		expect(byId.get("mem-vector-399")?.[399]).toBe(1);
+		expect(byId.get("mem-vector-399")?.[767]).toBe(0.5);
+		expect(vectors.filter((row) => row.source_id === "mem-vector-0")).toHaveLength(2);
 	});
 
 	it("places transcript excerpts by cross-encoder relevance against the bottom results", async () => {

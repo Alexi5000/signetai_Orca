@@ -798,6 +798,48 @@ function ownerVectorFromHex(value: unknown): Float32Array | null {
 	return vector.every(Number.isFinite) ? vector : null;
 }
 
+export interface OwnerVectorRow {
+	readonly rowid: number;
+	readonly source_id: string;
+	readonly vector_hex: string | null;
+}
+
+export function ownerVectorPageRows(dimensions: number): number {
+	const hexChars = Math.max(1, dimensions) * Float32Array.BYTES_PER_ELEMENT * 2;
+	return Math.max(1, Math.floor((DB_OWNER_MAX_RESULT_BYTES - 4096) / (hexChars + 256)));
+}
+
+export async function readOwnerVectorsBySource(
+	sourceIds: readonly string[],
+	dimensions: number,
+	read: (sql: string, params: readonly unknown[], pageRows: number) => Promise<ReadonlyArray<OwnerVectorRow>>,
+): Promise<Array<{ source_id: string; vector: Float32Array }>> {
+	const pageRows = ownerVectorPageRows(dimensions);
+	const vectors: Array<{ source_id: string; vector: Float32Array }> = [];
+	for (let offset = 0; offset < sourceIds.length; offset += pageRows) {
+		const pageIds = sourceIds.slice(offset, offset + pageRows);
+		const placeholders = pageIds.map(() => "?").join(", ");
+		let cursor = 0;
+		for (;;) {
+			const rows = await read(
+				`SELECT rowid, source_id, hex(vector) AS vector_hex FROM embeddings
+				 WHERE source_id IN (${placeholders}) AND vector IS NOT NULL AND rowid > ?
+				 ORDER BY rowid LIMIT ?`,
+				[...pageIds, cursor, pageRows],
+				pageRows,
+			);
+			for (const row of rows) {
+				const vector = ownerVectorFromHex(row.vector_hex);
+				if (vector) vectors.push({ source_id: row.source_id, vector });
+			}
+			const last = rows.at(-1);
+			if (rows.length < pageRows || last === undefined) break;
+			cursor = last.rowid;
+		}
+	}
+	return vectors;
+}
+
 function recallQueryVectorIsValid(query: Float32Array, expectedDimensions: number): boolean {
 	return query.length === expectedDimensions && query.length > 0 && query.every(Number.isFinite);
 }
@@ -2208,18 +2250,19 @@ export async function hybridRecall(
 							const cosineMap = new Map<string, number>();
 							if (queryVecF32 && traversal.memoryScores.size > 0) {
 								const ids = [...traversal.memoryScores.keys()];
-								const ph = ids.map(() => "?").join(", ");
-								let embRows: Array<{ source_id: string; vector: Buffer | null }> = [];
+								let embRows: Array<{ source_id: string; vector: Float32Array }> = [];
 								try {
-									embRows = [
-										...(await graphOwnerReadAll<{ source_id: string; vector: Buffer | null }>(
-											`SELECT source_id, vector FROM embeddings
-											 WHERE source_id IN (${ph}) AND vector IS NOT NULL`,
-											ids,
-											"memory-search.traversal.embedding-rescore",
-											ids.length,
-										)),
-									];
+									embRows = await readOwnerVectorsBySource(
+										ids,
+										cfg.embedding.dimensions,
+										async (sql, sqlParams, pageRows) =>
+											await graphOwnerReadAll<OwnerVectorRow>(
+												sql,
+												sqlParams,
+												"memory-search.traversal.embedding-rescore",
+												pageRows,
+											),
+									);
 								} catch (e) {
 									logger.warn("memory", "Traversal embedding re-scoring failed (non-fatal)", {
 										error: e instanceof Error ? e.message : String(e),
@@ -2227,9 +2270,7 @@ export async function hybridRecall(
 								}
 								const qv = queryVecF32;
 								for (const row of embRows) {
-									if (!row.vector) continue;
-									const mv = new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4);
-									const cosine = cosineSimilarity(qv, mv);
+									const cosine = cosineSimilarity(qv, row.vector);
 									cosineMap.set(row.source_id, cosine);
 									semanticEvidenceMap.set(row.source_id, Math.max(semanticEvidenceMap.get(row.source_id) ?? 0, cosine));
 								}
