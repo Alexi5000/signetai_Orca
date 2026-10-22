@@ -5373,7 +5373,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 256,
+      "line": 259,
       "api": "withReadDbAsync",
       "source": "return dbAccessor.withReadDbAsync(",
       "category": "hot-path",
@@ -5381,7 +5381,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 278,
+      "line": 281,
       "api": "withReadDbAsync",
       "source": "return dbAccessor.withReadDbAsync(",
       "category": "hot-path",
@@ -5389,7 +5389,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 308,
+      "line": 311,
       "api": "withWriteTxAsync",
       "source": "await dbAccessor.withWriteTxAsync(",
       "category": "hot-path",
@@ -5397,7 +5397,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 328,
+      "line": 331,
       "api": "withWriteTxAsync",
       "source": "await dbAccessor.withWriteTxAsync(",
       "category": "hot-path",
@@ -5405,7 +5405,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 433,
+      "line": 436,
       "api": "withWriteTxAsync",
       "source": "await dbAccessor.withWriteTxAsync(",
       "category": "hot-path",
@@ -5413,7 +5413,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 447,
+      "line": 450,
       "api": "withReadDbAsync",
       "source": "const existingCapture = await dbAccessor.withReadDbAsync(",
       "category": "hot-path",
@@ -5421,7 +5421,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 483,
+      "line": 486,
       "api": "withWriteTxAsync",
       "source": "await dbAccessor.withWriteTxAsync(",
       "category": "hot-path",
