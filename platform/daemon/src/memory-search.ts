@@ -67,7 +67,7 @@ import {
 	findStructuredPathCandidatesViaOwner,
 	scoreStructuredPathEvidenceViaOwner,
 } from "./pipeline/structured-path-evidence";
-import { fusedRankScores, rankPositions, selectPrimaryCandidates } from "./recall-rank-fusion";
+import { rankPositions, reciprocalRankScore, selectPrimaryCandidates } from "./recall-rank-fusion";
 import { type RecallDedupeMeta, applyRecallDedupe } from "./session-recall-dedupe";
 import { recordFirstSourceRecall } from "./source-lifecycle-telemetry";
 import { escapeLike } from "./sql-utils";
@@ -2186,7 +2186,6 @@ export async function hybridRecall(
 	const flatScored: Array<{ id: string; score: number; source: string }> = [];
 	const lexicalRank = rankPositions(bm25Map, minScore);
 	const semanticRank = rankPositions(vectorMap, minScore);
-	const rankScores = fusedRankScores([lexicalRank, semanticRank]);
 
 	timings.time("flat_score_merge", () => {
 		for (const id of allIds) {
@@ -2204,7 +2203,7 @@ export async function hybridRecall(
 			let source: string;
 
 			if (ranked) {
-				score = rankScores.get(id) ?? 0;
+				score = reciprocalRankScore([lexicalPosition, semanticPosition]);
 				source =
 					lexicalPosition !== undefined && semanticPosition !== undefined
 						? "hybrid"

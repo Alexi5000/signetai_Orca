@@ -139,15 +139,17 @@ Candidate collection uses several independent channels:
 Flat lexical, hint, vector, and structured scores are merged by memory ID.
 Keyword and vector hits are fused by rank, not by raw score: each list is
 ordered after the `min_score` cut, each hit adds `1 / (60 + position)` for
-every list it appears in, and the sums are divided by the best sum. The best
-fused hit scores 1, a hit in both lists outranks a hit at the same position
-in one list, and BM25 and cosine magnitudes never compete on one scale. Hint,
-structured, and temporal evidence then replace a fused score only when they
-are stronger. Pure hint-only hits are capped at 0.75, so generated hints can
-rescue recall but never outrank the best fused hit. The cap does not keep a
-hint-only hit below every direct hit: when one hit leads both lists, a hit
-second in only one list scores about 0.49, and a hint-only hit at 0.75
-outranks it.
+every list it appears in, and the sum is scaled by `61 / 2`. A hit first in
+both lists scores 1, a hit first in only one list scores 0.5, a hit in both
+lists outranks a hit at the same position in one list, and BM25 and cosine
+magnitudes never compete on one scale. Hint, structured, and temporal
+evidence then replace a fused score only when they are stronger.
+
+Pure hint-only hits are capped at 0.75. Because a hit found by keyword or
+vector search alone scores at most 0.5, a hint-only hit can outrank it; only
+hits found by both lists can score above the cap. Hints are generated
+alternate phrasings, so this lets them rescue a memory whose words differ
+from the query.
 
 In traversal-primary mode, the merged order fills a bounded candidate budget.
 A quarter of that budget is reserved for the top vector hits, so a long
