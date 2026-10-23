@@ -64,3 +64,16 @@ test("documentation validation never deploys PR content or inherited upstream ta
 		expect(steps.find((step) => step.name === name)?.if).toBeUndefined();
 	}
 });
+
+test("Docker build and runtime use the repository Bun version with an immutable image", () => {
+	const manifest = JSON.parse(readFileSync(resolve(import.meta.dir, "../package.json"), "utf8"));
+	const version = manifest.packageManager.replace("bun@", "");
+	const dockerfile = readFileSync(resolve(import.meta.dir, "../deploy/docker/Dockerfile"), "utf8");
+	const images = [...dockerfile.matchAll(/^FROM (\S+) AS (build|runtime)$/gm)].map((match) => match[1]);
+	expect(images).toHaveLength(2);
+	for (const image of images) {
+		expect(image.startsWith(`oven/bun:${version}@sha256:`)).toBe(true);
+		expect(image.split("@sha256:")[1]).toMatch(/^[a-f0-9]{64}$/);
+	}
+	expect(images[0]).toBe(images[1]);
+});
