@@ -1023,7 +1023,8 @@ function mergeBetaHeaders(headers: Record<string, string>): boolean {
 
 function isAnthropicApiUrl(url: string): boolean {
 	try {
-		return new URL(url).hostname === "api.anthropic.com";
+		const parsed = new URL(url);
+		return parsed.origin === "https://api.anthropic.com" && parsed.username === "" && parsed.password === "";
 	} catch {
 		return false;
 	}
