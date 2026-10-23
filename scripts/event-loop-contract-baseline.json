@@ -3474,7 +3474,7 @@
     },
     {
       "path": "routes/marketplace.ts",
-      "line": 1117,
+      "line": 1134,
       "api": "withWriteTx",
       "source": "getDbAccessor().withWriteTx((db: import(\"../db-accessor\").WriteDb) => {",
       "category": "hot-path",
