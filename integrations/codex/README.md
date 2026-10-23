@@ -15,7 +15,7 @@ older Codex installs.
   used by Linux desktop packages, and known per-user/system Windows roots,
   including bundled Codex executables and Node runtimes, so native plugin
   installation does not depend on the desktop app's shell `PATH`
-- Honors `CODEX_HOME` (including `~` expansion) so multiple Codex clients on
+- Honors `CODEX_HOME` (including `~` expansion and relative paths resolved against the current working directory) so multiple Codex clients on
   the same OS can deliberately share or separate their plugin/config state
 - Uses absolute Signet launch commands when running from the packaged native
   binary; the MCP worker is started with `SIGNET_MCP_STDIO_WORKER=1`

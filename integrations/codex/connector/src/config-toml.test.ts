@@ -8,7 +8,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createPrivateTempDir } from "@signet/core";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
 	CodexConnector,
 	buildHooksFile,
@@ -1246,6 +1246,21 @@ describe("CodexConnector.install — hooks.json schema", () => {
 
 		expect(query).toContain("'OpenAI.ChatGPT-Desktop'");
 		expect(roots).toEqual([packageRoot]);
+	});
+
+	test("normalizes relative and option-looking CODEX_HOME before constructing CLI arguments", () => {
+		const c = new (class extends CodexConnector {
+			readHome(): string {
+				return this.getCodexHome();
+			}
+		})();
+		for (const configured of ["relative workspace", "--config=unexpected", "./nested/../codex"]) {
+			process.env.CODEX_HOME = configured;
+			const home = c.readHome();
+			expect(home).toBe(resolve(configured));
+			expect(isAbsolute(home)).toBe(true);
+			expect(home.startsWith("-")).toBe(false);
+		}
 	});
 
 	test("honors CODEX_HOME for the desktop connector", async () => {
