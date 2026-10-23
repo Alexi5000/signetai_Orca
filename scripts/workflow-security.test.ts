@@ -37,18 +37,30 @@ test("desktop release upload retains its explicit write grant", () => {
 	expect(jobs.build.permissions).toEqual({ contents: "write" });
 });
 
-
 test("documentation validation never deploys PR content or inherited upstream targets", () => {
-	const jobs = load("deploy-docs.yml").jobs as Record<string, { steps: { name?: string; id?: string; if?: string; with: Record<string, string> }[] }>;
+	const jobs = load("deploy-docs.yml").jobs as Record<
+		string,
+		{ steps: { name?: string; id?: string; if?: string; with: Record<string, string> }[] }
+	>;
 	const steps = jobs["build-and-deploy"].steps;
-	const deploy = steps.find((step) => step.id === "deploy")!;
-	const validation = steps.find((step) => step.name === "Validate deployment configuration")!;
-	expect(deploy.if).toBe("github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_DOCS_DEPLOY == 'true'");
+	const deploy = steps.find((step) => step.id === "deploy");
+	const validation = steps.find((step) => step.name === "Validate deployment configuration");
+	if (!deploy || !validation) throw new Error("Missing guarded deployment steps");
+	expect(deploy.if).toBe(
+		"github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.ENABLE_DOCS_DEPLOY == 'true'",
+	);
 	expect(validation.if).toBe(deploy.if);
 	expect(steps.indexOf(validation)).toBeLessThan(steps.indexOf(deploy));
-	expect(deploy.with.accountId).toBe("${{ vars.CLOUDFLARE_ACCOUNT_ID }}");
-	expect(deploy.with.command).toBe("pages deploy dist --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT }} --branch=main");
-	for (const name of ["Verify root-derived docs", "Validate public content", "Typecheck documentation site", "Build documentation site"]) {
+	expect(deploy.with.accountId).toBe(`\${{ vars.CLOUDFLARE_ACCOUNT_ID }}`);
+	expect(deploy.with.command).toBe(
+		`pages deploy dist --project-name=\${{ vars.CLOUDFLARE_PAGES_PROJECT }} --branch=main`,
+	);
+	for (const name of [
+		"Verify root-derived docs",
+		"Validate public content",
+		"Typecheck documentation site",
+		"Build documentation site",
+	]) {
 		expect(steps.find((step) => step.name === name)?.if).toBeUndefined();
 	}
 });
