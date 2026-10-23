@@ -3397,112 +3397,84 @@
     },
     {
       "path": "routes/marketplace-reviews.ts",
-      "line": 62,
-      "api": "existsSync",
-      "source": "if (!existsSync(dir)) {",
-      "category": "hot-path"
-    },
-    {
-      "path": "routes/marketplace-reviews.ts",
-      "line": 63,
-      "api": "mkdirSync",
-      "source": "mkdirSync(dir, { recursive: true });",
-      "category": "hot-path"
-    },
-    {
-      "path": "routes/marketplace-reviews.ts",
-      "line": 127,
+      "line": 120,
       "api": "existsSync",
       "source": "if (!existsSync(path)) return [];",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace-reviews.ts",
-      "line": 129,
+      "line": 122,
       "api": "readFileSync",
       "source": "const raw = JSON.parse(readFileSync(path, \"utf-8\")) as unknown;",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace-reviews.ts",
-      "line": 139,
-      "api": "writeFileSync",
-      "source": "writeFileSync(getReviewsPath(), JSON.stringify(reviews, null, 2), \"utf-8\");",
+      "line": 131,
+      "api": "writeFileScopedAtomicSync",
+      "source": "writeFileScopedAtomicSync(getAgentsDir(), \"marketplace/reviews.json\", JSON.stringify(reviews, null, 2));",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace-reviews.ts",
-      "line": 144,
+      "line": 136,
       "api": "existsSync",
       "source": "if (!existsSync(path)) return DEFAULT_CONFIG;",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace-reviews.ts",
-      "line": 146,
+      "line": 138,
       "api": "readFileSync",
       "source": "const raw = JSON.parse(readFileSync(path, \"utf-8\")) as unknown;",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace-reviews.ts",
-      "line": 162,
-      "api": "writeFileSync",
-      "source": "writeFileSync(getReviewsConfigPath(), JSON.stringify(config, null, 2), \"utf-8\");",
+      "line": 153,
+      "api": "writeFileScopedAtomicSync",
+      "source": "writeFileScopedAtomicSync(getAgentsDir(), \"marketplace/reviews-config.json\", JSON.stringify(config, null, 2));",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace.ts",
-      "line": 176,
-      "api": "existsSync",
-      "source": "if (!existsSync(dir)) {",
-      "category": "hot-path"
-    },
-    {
-      "path": "routes/marketplace.ts",
-      "line": 177,
-      "api": "mkdirSync",
-      "source": "mkdirSync(dir, { recursive: true });",
-      "category": "hot-path"
-    },
-    {
-      "path": "routes/marketplace.ts",
-      "line": 324,
+      "line": 317,
       "api": "readFileWithStatSync",
       "source": "const file = readFileWithStatSync(path, \"utf-8\");",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace.ts",
-      "line": 336,
-      "api": "writeFileSync",
-      "source": "writeFileSync(getExposurePolicyPath(), JSON.stringify(policy, null, 2));",
+      "line": 328,
+      "api": "writeFileScopedAtomicSync",
+      "source": "writeFileScopedAtomicSync(getAgentsDir(), \"marketplace/mcp-policy.json\", JSON.stringify(policy, null, 2));",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace.ts",
-      "line": 805,
+      "line": 797,
       "api": "existsSync",
       "source": "if (!existsSync(path)) return [];",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace.ts",
-      "line": 808,
+      "line": 800,
       "api": "readFileSync",
       "source": "const raw = JSON.parse(readFileSync(path, \"utf-8\")) as unknown;",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace.ts",
-      "line": 820,
-      "api": "writeFileSync",
-      "source": "writeFileSync(getInstalledMcpPath(), JSON.stringify(servers, null, 2));",
+      "line": 811,
+      "api": "writeFileScopedAtomicSync",
+      "source": "writeFileScopedAtomicSync(getAgentsDir(), \"marketplace/mcp-servers.json\", JSON.stringify(servers, null, 2));",
       "category": "hot-path"
     },
     {
       "path": "routes/marketplace.ts",
-      "line": 1126,
+      "line": 1117,
       "api": "withWriteTx",
       "source": "getDbAccessor().withWriteTx((db: import(\"../db-accessor\").WriteDb) => {",
       "category": "hot-path",

@@ -19,6 +19,7 @@ export const SYNC_APIS = [
 	"readFileIfExistsSync",
 	"readFileWithStatSync",
 	"writeFileAtomicSync",
+	"writeFileScopedAtomicSync",
 	"writeFileExclusiveSync",
 	"openFileExclusiveSync",
 	"appendFileSecureSync",
