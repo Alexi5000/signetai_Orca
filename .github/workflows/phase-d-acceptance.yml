@@ -35,8 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Build @signet/core and @signet/daemon
@@ -60,7 +60,7 @@ jobs:
           bun tests/integration/acceptance/run.ts --scale "$SCALE" --out "$GITHUB_WORKSPACE/phase-d-artifacts"
       - name: Upload acceptance artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: phase-d-acceptance-${{ github.run_id }}
           path: phase-d-artifacts/

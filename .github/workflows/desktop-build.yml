@@ -15,6 +15,9 @@ on:
           - official
           - self-signed
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -42,9 +45,9 @@ jobs:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: latest
 
@@ -291,7 +294,7 @@ jobs:
           bash deploy/aur/generate-pkgbuild.sh "${VER}" "${URL}" "${SHA}"
 
       - name: Upload desktop artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: desktop-${{ matrix.os_name }}
           path: |
@@ -306,7 +309,7 @@ jobs:
 
       - name: Upload AUR metadata
         if: matrix.runner == 'ubuntu-22.04' && startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: aur-metadata
           path: |
@@ -341,10 +344,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Download AUR metadata
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: aur-metadata
           path: deploy/aur
