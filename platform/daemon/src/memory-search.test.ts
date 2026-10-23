@@ -24,6 +24,7 @@ import {
 	MAX_LEXICAL_FALLBACK_SCAN_ROWS,
 	ownerVectorPageRows,
 	readOwnerVectorsBySource,
+	TRANSCRIPT_EVIDENCE_MAX_PAGES,
 	transcriptExcerpt,
 } from "./memory-search";
 import { ownerReadAll } from "./db-owner-sql";
@@ -204,7 +205,7 @@ describe("hybridRecall", () => {
 	it("does not classify post-traversal parent reads as graph failures", () => {
 		const source = readFileSync(join(import.meta.dir, "memory-search.ts"), "utf-8");
 		const embeddingStart = source.indexOf("let embRows:");
-		const embeddingEnd = source.indexOf("const qv = queryVecF32", embeddingStart);
+		const embeddingEnd = source.indexOf("const cosineWeight = 0.7", embeddingStart);
 		const embeddingBlock = source.slice(embeddingStart, embeddingEnd);
 		expect(embeddingBlock).toContain("Traversal embedding re-scoring failed");
 		expect(embeddingBlock).not.toContain("recordGraphResult");
@@ -313,18 +314,27 @@ describe("hybridRecall", () => {
 		};
 
 		try {
-			const result = await hybridRecall(
-				{
-					query: "Signet",
-					keywordQuery: "Signet",
-					limit: 5,
-					agentId: "default",
-					readPolicy: "isolated",
-					trackRecallAccess: false,
-				},
-				testCfg({ graph: true, traversal: true }),
-				async () => unitVector(),
-			);
+			const recall = async () =>
+				await hybridRecall(
+					{
+						query: "Signet",
+						keywordQuery: "Signet",
+						limit: 5,
+						agentId: "default",
+						readPolicy: "isolated",
+						trackRecallAccess: false,
+					},
+					testCfg({ graph: true, traversal: true }),
+					async () => unitVector(),
+				);
+			getDbAccessor().withWriteTx((db) => {
+				db.prepare("DELETE FROM embedding_index_state").run();
+			});
+			await recall();
+			expect(injected).toBe(false);
+
+			await markActiveEmbeddingProfileKnown();
+			const result = await recall();
 			expect(result.results.map((row) => row.id)).toContain("graph-owner-failure-memory");
 			expect(injected).toBe(true);
 			expect(result.meta.graphPartial).toBeUndefined();
@@ -1029,6 +1039,105 @@ describe("hybridRecall", () => {
 		expect(transcript?.truncated).toBe(true);
 	});
 
+	it("drops transcript evidence whose row leaves the agent scope between reads", async () => {
+		const now = new Date().toISOString();
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/moved-speyer.jsonl",
+				createHash("sha256").update("moved-speyer").digest("hex"),
+				"moved-speyer",
+				"token-moved-speyer",
+				now,
+				"user: What is the Speyer tourism board phone number? assistant: +49 6232 142.",
+				now,
+			);
+		});
+		const owner = await getDbOwner();
+		const originalSubmit = owner.submit.bind(owner);
+		let contentReads = 0;
+		owner.submit = <Result>(request: DbOwnerRequest, options: DbOwnerSubmitOptions): DbOwnerJobHandle<Result> => {
+			if (options.operation === "memory-search.transcript-evidence.content" && contentReads++ === 0) {
+				getDbAccessor().withWriteTx((db) => {
+					db.prepare("UPDATE memory_artifacts SET agent_id = 'agent-b' WHERE session_id = 'moved-speyer'").run();
+				});
+			}
+			return originalSubmit<Result>(request, options);
+		};
+
+		try {
+			const result = await hybridRecall(
+				{
+					query: "Speyer tourism board phone number",
+					limit: 3,
+					agentId: "agent-a",
+					readPolicy: "isolated",
+					trackRecallAccess: false,
+				},
+				testCfg(),
+				async () => null,
+			);
+			expect(contentReads).toBeGreaterThan(0);
+			expect(result.results.some((row) => row.id === "transcript:moved-speyer")).toBe(false);
+			expect(result.meta.transcriptEvidence).toEqual({ returned: 0, ranking: "keyword" });
+		} finally {
+			owner.submit = originalSubmit;
+		}
+	});
+
+	it("caps the transcript pages one recall reads", async () => {
+		const now = new Date().toISOString();
+		const filler = " user: unrelated planning chatter about other cities and trains.".repeat(50_000);
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/huge-speyer.jsonl",
+				createHash("sha256").update("huge-speyer").digest("hex"),
+				"huge-speyer",
+				"token-huge-speyer",
+				now,
+				`user: What is the Speyer tourism board phone number? assistant: +49 6232 142.${filler}`,
+				now,
+			);
+		});
+		const owner = await getDbOwner();
+		const originalSubmit = owner.submit.bind(owner);
+		let contentReads = 0;
+		owner.submit = <Result>(request: DbOwnerRequest, options: DbOwnerSubmitOptions): DbOwnerJobHandle<Result> => {
+			if (options.operation === "memory-search.transcript-evidence.content") contentReads++;
+			return originalSubmit<Result>(request, options);
+		};
+
+		try {
+			const result = await hybridRecall(
+				{
+					query: "Speyer tourism board phone number",
+					limit: 3,
+					agentId: "agent-a",
+					readPolicy: "isolated",
+					trackRecallAccess: false,
+				},
+				testCfg(),
+				async () => null,
+			);
+			expect(filler.length).toBeGreaterThan(MAX_DB_OWNER_RESULT_BYTES * 2.5);
+			expect(contentReads).toBe(TRANSCRIPT_EVIDENCE_MAX_PAGES);
+			const transcript = result.results.find((row) => row.id === "transcript:huge-speyer");
+			expect(transcript?.content).toContain("+49 6232 142");
+			expect(transcript?.truncated).toBe(true);
+		} finally {
+			owner.submit = originalSubmit;
+		}
+	});
+
 	it("reads more vectors than one DB owner result holds, decoded", async () => {
 		const now = new Date().toISOString();
 		const vectorFor = (index: number) =>
@@ -1044,6 +1153,24 @@ describe("hybridRecall", () => {
 				insert.run(`emb-${index}`, `hash-${index}`, vectorBlob(vectorFor(index)), sourceId, now);
 			});
 			insert.run("emb-0-chunk-2", "hash-0-chunk-2", vectorBlob(vectorFor(1)), "mem-vector-0", now);
+			db.prepare(
+				`INSERT INTO embeddings (
+					id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id
+				) VALUES (?, ?, ?, ?, ?, ?, '', ?, 'default')`,
+			).run(
+				"emb-1-old-profile",
+				"hash-1-old-profile",
+				vectorBlob(Array(384).fill(1)),
+				384,
+				"memory",
+				"mem-vector-1",
+				now,
+			);
+			db.prepare(
+				`INSERT INTO embeddings (
+					id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id
+				) VALUES (?, ?, ?, 768, 'transcript', ?, '', ?, 'default')`,
+			).run("emb-2-transcript", "hash-2-transcript", vectorBlob(vectorFor(5)), "mem-vector-2", now);
 		});
 		const owner = await getDbOwner(getDbAccessorPath());
 		const pages: number[] = [];
@@ -1072,6 +1199,9 @@ describe("hybridRecall", () => {
 		expect(byId.get("mem-vector-399")?.[399]).toBe(1);
 		expect(byId.get("mem-vector-399")?.[767]).toBe(0.5);
 		expect(vectors.filter((row) => row.source_id === "mem-vector-0")).toHaveLength(2);
+		expect(vectors.filter((row) => row.source_id === "mem-vector-1")).toHaveLength(1);
+		expect(vectors.filter((row) => row.source_id === "mem-vector-2")).toHaveLength(1);
+		expect(vectors.every((row) => row.vector.length === 768)).toBe(true);
 	});
 
 	it("places transcript excerpts by cross-encoder relevance against the bottom results", async () => {

@@ -823,14 +823,15 @@ export async function readOwnerVectorsBySource(
 		for (;;) {
 			const rows = await read(
 				`SELECT rowid, source_id, hex(vector) AS vector_hex FROM embeddings
-				 WHERE source_id IN (${placeholders}) AND vector IS NOT NULL AND rowid > ?
+				 WHERE source_type = 'memory' AND source_id IN (${placeholders})
+				   AND dimensions = ? AND vector IS NOT NULL AND rowid > ?
 				 ORDER BY rowid LIMIT ?`,
-				[...pageIds, cursor, pageRows],
+				[...pageIds, dimensions, cursor, pageRows],
 				pageRows,
 			);
 			for (const row of rows) {
 				const vector = ownerVectorFromHex(row.vector_hex);
-				if (vector) vectors.push({ source_id: row.source_id, vector });
+				if (vector?.length === dimensions) vectors.push({ source_id: row.source_id, vector });
 			}
 			const last = rows.at(-1);
 			if (rows.length < pageRows || last === undefined) break;
@@ -1392,19 +1393,32 @@ export async function placeTranscriptEvidence(
 }
 
 const TRANSCRIPT_PAGE_CHARS = Math.floor((DB_OWNER_MAX_RESULT_BYTES - 4096) / 6);
+export const TRANSCRIPT_EVIDENCE_MAX_PAGES = 16;
+const TRANSCRIPT_EVIDENCE_DEADLINE_MS = 30_000;
 
-async function readTranscriptContent(owner: DbOwnerClient, rowid: number, chars: number): Promise<string | null> {
+async function readTranscriptContent(
+	owner: DbOwnerClient,
+	agentId: string,
+	rowid: number,
+	chars: number,
+	deadlineAt: number,
+): Promise<string | null> {
 	const pages: string[] = [];
-	for (let start = 1; start <= chars; start += TRANSCRIPT_PAGE_CHARS) {
+	const readChars = Math.min(chars, TRANSCRIPT_PAGE_CHARS * TRANSCRIPT_EVIDENCE_MAX_PAGES);
+	for (let start = 1; start <= readChars; start += TRANSCRIPT_PAGE_CHARS) {
+		const remainingMs = deadlineAt - Date.now();
+		if (remainingMs <= 0) throw new Error("Transcript evidence read exceeded its deadline");
 		const page = await ownerReadOne<{ readonly chunk: string | null }>(
 			owner,
-			"SELECT substr(content, ?, ?) AS chunk FROM memory_artifacts WHERE rowid = ? AND COALESCE(is_deleted, 0) = 0",
-			[start, TRANSCRIPT_PAGE_CHARS, rowid],
+			`SELECT substr(content, ?, ?) AS chunk FROM memory_artifacts
+			 WHERE rowid = ? AND agent_id = ? AND source_kind = 'transcript'
+			   AND COALESCE(is_deleted, 0) = 0 AND length(content) = ?`,
+			[start, Math.min(TRANSCRIPT_PAGE_CHARS, readChars - start + 1), rowid, agentId, chars],
 			{
 				operation: "memory-search.transcript-evidence.content",
 				workloadClass: "foreground",
 				estimatedWorkUnits: 1,
-				deadlineMs: 30_000,
+				deadlineMs: remainingMs,
 			},
 		);
 		if (page === null || page.chunk === null) return null;
@@ -1463,10 +1477,11 @@ async function buildTranscriptEvidenceResults(
 			return !represented.has(sessionId) && !(row.source_id && represented.has(row.source_id));
 		})
 		.slice(0, maxResults);
+	const deadlineAt = Date.now() + TRANSCRIPT_EVIDENCE_DEADLINE_MS;
 	const transcripts = await Promise.all(
 		selected.map(async (row) => ({
 			row,
-			fullContent: await readTranscriptContent(owner, row.artifact_rowid, row.content_chars),
+			fullContent: await readTranscriptContent(owner, agentId, row.artifact_rowid, row.content_chars, deadlineAt),
 		})),
 	);
 	return transcripts.flatMap(({ row, fullContent }): RecallResult[] => {
@@ -1478,7 +1493,7 @@ async function buildTranscriptEvidenceResults(
 				id: `transcript:${sessionId}`,
 				content,
 				content_length: content.length,
-				truncated: content.length < fullContent.length,
+				truncated: content.length < row.content_chars,
 				score: Math.round((1 / (1 + Math.abs(row.rank))) * 100) / 100,
 				source: "transcript",
 				source_id: row.source_id ?? sessionId,
@@ -2090,6 +2105,7 @@ export async function hybridRecall(
 	const vectorMap = new Map<string, number>();
 	let vectorCompleteness: VectorSearchCompleteness | undefined;
 	let searchedWindow: number | undefined;
+	let comparableQueryVector = null as Float32Array | null;
 	if (queryVecF32) {
 		const queryVector = queryVecF32;
 		if (!recallQueryVectorIsValid(queryVector, cfg.embedding.dimensions)) {
@@ -2105,6 +2121,7 @@ export async function hybridRecall(
 						);
 						return;
 					}
+					comparableQueryVector = queryVector;
 					const vectorResult = await findAuthorizedVectorCandidates(queryVector, params, cfg, filter, execution);
 					vectorCompleteness = vectorResult.completeness;
 					searchedWindow = vectorResult.searchedWindow;
@@ -2248,7 +2265,8 @@ export async function hybridRecall(
 							});
 							recordGraphResult(traversal);
 							const cosineMap = new Map<string, number>();
-							if (queryVecF32 && traversal.memoryScores.size > 0) {
+							if (comparableQueryVector && traversal.memoryScores.size > 0) {
+								const qv = comparableQueryVector;
 								const ids = [...traversal.memoryScores.keys()];
 								let embRows: Array<{ source_id: string; vector: Float32Array }> = [];
 								try {
@@ -2268,7 +2286,6 @@ export async function hybridRecall(
 										error: e instanceof Error ? e.message : String(e),
 									});
 								}
-								const qv = queryVecF32;
 								for (const row of embRows) {
 									const cosine = cosineSimilarity(qv, row.vector);
 									cosineMap.set(row.source_id, cosine);
@@ -2824,19 +2841,16 @@ export async function hybridRecall(
 			const missing = [...temporalCandidateSet].filter((id) => !present.has(id));
 			if (missing.length > 0) {
 				const similarity = new Map<string, number>();
-				if (queryVecF32) {
-					const queryVector = queryVecF32;
-					const embRows = await graphOwnerReadAll<{ source_id: string; vector: Buffer | null }>(
-						`SELECT source_id, vector FROM embeddings
-						 WHERE source_type = 'memory' AND source_id IN (${missing.map(() => "?").join(", ")}) AND vector IS NOT NULL`,
+				if (comparableQueryVector) {
+					const queryVector = comparableQueryVector;
+					const embRows = await readOwnerVectorsBySource(
 						missing,
-						"memory-search.temporal-window-fill",
-						missing.length,
+						cfg.embedding.dimensions,
+						async (sql, sqlParams, pageRows) =>
+							await graphOwnerReadAll<OwnerVectorRow>(sql, sqlParams, "memory-search.temporal-window-fill", pageRows),
 					);
 					for (const row of embRows) {
-						if (!row.vector) continue;
-						const vector = new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4);
-						similarity.set(row.source_id, cosineSimilarity(queryVector, vector));
+						similarity.set(row.source_id, cosineSimilarity(queryVector, row.vector));
 					}
 				}
 				const floor = Math.min(minScore, ...scored.map((row) => row.score));
