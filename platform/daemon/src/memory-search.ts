@@ -824,9 +824,9 @@ export async function readOwnerVectorsBySource(
 			const rows = await read(
 				`SELECT rowid, source_id, hex(vector) AS vector_hex FROM embeddings
 				 WHERE source_type = 'memory' AND source_id IN (${placeholders})
-				   AND dimensions = ? AND vector IS NOT NULL AND rowid > ?
+				   AND dimensions = ? AND length(vector) = ? AND rowid > ?
 				 ORDER BY rowid LIMIT ?`,
-				[...pageIds, dimensions, cursor, pageRows],
+				[...pageIds, dimensions, dimensions * Float32Array.BYTES_PER_ELEMENT, cursor, pageRows],
 				pageRows,
 			);
 			for (const row of rows) {

@@ -28,7 +28,7 @@ import {
 	TRANSCRIPT_PAGE_BYTES,
 	transcriptExcerpt,
 } from "./memory-search";
-import { ownerReadAll } from "./db-owner-sql";
+import { ownerBytesFromHex, ownerReadAll } from "./db-owner-sql";
 import type { RecallResult } from "./memory-search";
 import { setActiveTelemetry } from "./telemetry";
 
@@ -1126,6 +1126,44 @@ describe("hybridRecall", () => {
 		expect(transcript?.truncated).toBe(false);
 	});
 
+	it("keeps a multibyte character split across transcript pages whole", async () => {
+		const now = new Date().toISOString();
+		const lead = " user: What is the Speyer tourism board phone number? assistant: +49 6232 142, caf";
+		const content = `${"x".repeat(TRANSCRIPT_PAGE_BYTES - 1 - lead.length)}${lead}é hours 9 to 5.`;
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/split-speyer.jsonl",
+				createHash("sha256").update("split-speyer").digest("hex"),
+				"split-speyer",
+				"token-split-speyer",
+				now,
+				content,
+				now,
+			);
+		});
+
+		const result = await hybridRecall(
+			{
+				query: "Speyer tourism board phone number",
+				limit: 3,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				trackRecallAccess: false,
+			},
+			testCfg(),
+			async () => null,
+		);
+
+		expect(Buffer.byteLength(content.slice(0, content.indexOf("é")))).toBe(TRANSCRIPT_PAGE_BYTES - 1);
+		const transcript = result.results.find((row) => row.id === "transcript:split-speyer");
+		expect(transcript?.content).toContain("+49 6232 142, café hours");
+	});
+
 	it("caps the transcript pages one recall reads", async () => {
 		const now = new Date().toISOString();
 		const filler = " user: unrelated planning chatter about other cities and trains.".repeat(140_000);
@@ -1239,6 +1277,45 @@ describe("hybridRecall", () => {
 		expect(vectors.filter((row) => row.source_id === "mem-vector-1")).toHaveLength(1);
 		expect(vectors.filter((row) => row.source_id === "mem-vector-2")).toHaveLength(1);
 		expect(vectors.every((row) => row.vector.length === 768)).toBe(true);
+	});
+
+	it("decodes DB owner hex and rejects malformed hex", () => {
+		const bytes = Uint8Array.from([0, 1, 127, 128, 255]);
+		expect(ownerBytesFromHex(Buffer.from(bytes).toString("hex").toUpperCase())).toEqual(bytes);
+		expect(ownerBytesFromHex("")).toEqual(new Uint8Array(0));
+		expect(() => ownerBytesFromHex("00zz")).toThrow("invalid hex blob");
+		expect(() => ownerBytesFromHex("abc")).toThrow("invalid hex blob");
+	});
+
+	it("skips vector blobs whose size disagrees with their declared dimensions", async () => {
+		const now = new Date().toISOString();
+		const sourceIds = Array.from({ length: 200 }, (_, index) => `mem-oversized-${index}`);
+		getDbAccessor().withWriteTx((db) => {
+			const insert = db.prepare(
+				`INSERT INTO embeddings (
+					id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id
+				) VALUES (?, ?, ?, 768, 'memory', ?, '', ?, 'default')`,
+			);
+			sourceIds.forEach((sourceId, index) => {
+				insert.run(`emb-oversized-${index}`, `hash-oversized-${index}`, vectorBlob(Array(3072).fill(1)), sourceId, now);
+			});
+			insert.run("emb-oversized-valid", "hash-oversized-valid", vectorBlob(Array(768).fill(1)), "mem-oversized-0", now);
+		});
+		const owner = await getDbOwner(getDbAccessorPath());
+
+		const vectors = await readOwnerVectorsBySource(sourceIds, 768, async (sql, params, pageRows) =>
+			ownerReadAll<{ rowid: number; source_id: string; vector_hex: string | null }>(owner, sql, params, {
+				operation: "test.vector-pages",
+				workloadClass: "foreground",
+				estimatedWorkUnits: pageRows,
+				deadlineMs: 30_000,
+			}),
+		);
+
+		expect(ownerVectorPageRows(768) * 3072 * 4 * 2).toBeGreaterThan(MAX_DB_OWNER_RESULT_BYTES);
+		expect(vectors).toHaveLength(1);
+		expect(vectors[0]?.source_id).toBe("mem-oversized-0");
+		expect(vectors[0]?.vector.length).toBe(768);
 	});
 
 	it("places transcript excerpts by cross-encoder relevance against the bottom results", async () => {
