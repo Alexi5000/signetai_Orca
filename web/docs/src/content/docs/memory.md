@@ -137,10 +137,20 @@ Candidate collection uses several independent channels:
   retrieval channel rather than a small boost.
 
 Flat lexical, hint, vector, and structured scores are merged by memory ID.
-When a memory appears in multiple channels, the strongest calibrated evidence
-wins unless there is an explicit blend. Pure hint-only hits are capped so
-generated hints can rescue recall but do not outrank directly grounded
-keyword, vector, or structured evidence.
+Keyword and vector hits are fused by rank, not by raw score: each list is
+ordered after the `min_score` cut, each hit adds `1 / (60 + position)` for
+every list it appears in, and the sums are divided by the best sum. The best
+fused hit scores 1, a hit in both lists outranks a hit at the same position
+in one list, and BM25 and cosine magnitudes never compete on one scale. Hint,
+structured, and temporal evidence then replace a fused score only when they
+are stronger. Pure hint-only hits are capped at 0.75, below the best fused
+hit, so generated hints can rescue recall without outranking directly
+grounded keyword or vector evidence in this merge.
+
+In traversal-primary mode, the merged order fills a bounded candidate budget.
+A quarter of that budget is reserved for the top vector hits, so a long
+keyword list or graph walk cannot crowd out the best semantic matches before
+reranking.
 
 Traversal-primary mode sorts traversal candidates before selection and
 max-merges traversal overlap with flat candidates. This prevents a weak graph

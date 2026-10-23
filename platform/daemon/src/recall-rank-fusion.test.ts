@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { RECIPROCAL_RANK_K, rankPositions, reciprocalRankScore, selectPrimaryCandidates } from "./recall-rank-fusion";
+import { RECIPROCAL_RANK_K, fusedRankScores, rankPositions, selectPrimaryCandidates } from "./recall-rank-fusion";
 
 describe("rankPositions", () => {
 	it("ranks ids from the highest score, starting at 1", () => {
@@ -33,31 +33,44 @@ describe("rankPositions", () => {
 	});
 });
 
-describe("reciprocalRankScore", () => {
-	it("scores 1 when an id is first in every list", () => {
-		expect(reciprocalRankScore([1, 1])).toBe(1);
+describe("fusedRankScores", () => {
+	const ranks = (...ids: string[]) => new Map(ids.map((id, index) => [id, index + 1]));
+
+	it("scores the best fused row 1, like the best keyword row before fusion", () => {
+		const scores = fusedRankScores([ranks("a", "b"), ranks("c", "a")]);
+
+		expect(scores.get("a")).toBe(1);
+		expect(Math.max(...scores.values())).toBe(1);
 	});
 
-	it("scores the same for rank 1 in either list, whatever the raw scores were", () => {
-		expect(reciprocalRankScore([1, undefined])).toBe(reciprocalRankScore([undefined, 1]));
-		expect(reciprocalRankScore([1, undefined])).toBeCloseTo(0.5, 10);
+	it("scores the top of a single list 1 when no row is in both lists", () => {
+		const scores = fusedRankScores([ranks("keyword-top"), ranks("vector-top")]);
+
+		expect(scores.get("keyword-top")).toBe(1);
+		expect(scores.get("vector-top")).toBe(1);
 	});
 
-	it("ranks an id found in both lists above one found in a single list", () => {
-		expect(reciprocalRankScore([5, 5])).toBeGreaterThan(reciprocalRankScore([1, undefined]));
+	it("keeps reciprocal rank order: both lists above one list, then by position", () => {
+		const scores = fusedRankScores([ranks("both", "lexical-only"), ranks("semantic-only", "both")]);
+		const order = [...scores].sort((left, right) => right[1] - left[1]).map(([id]) => id);
+
+		expect(order[0]).toBe("both");
+		expect(scores.get("lexical-only")).toBeCloseTo(
+			1 / (RECIPROCAL_RANK_K + 2) / (1 / (RECIPROCAL_RANK_K + 1) + 1 / (RECIPROCAL_RANK_K + 2)),
+			10,
+		);
+		expect(scores.get("semantic-only")).toBeGreaterThan(scores.get("lexical-only") ?? 1);
 	});
 
-	it("drops as the position grows", () => {
-		const first = reciprocalRankScore([1, undefined]);
-		const tenth = reciprocalRankScore([10, undefined]);
+	it("keeps the best direct row above the hint-only cap", () => {
+		const scores = fusedRankScores([ranks("weak-keyword"), ranks()]);
 
-		expect(tenth).toBeLessThan(first);
-		expect(tenth).toBeCloseTo((RECIPROCAL_RANK_K + 1) / (2 * (RECIPROCAL_RANK_K + 10)), 10);
+		expect(scores.get("weak-keyword")).toBeGreaterThan(0.75);
 	});
 
-	it("scores 0 when the id is in no list", () => {
-		expect(reciprocalRankScore([undefined, undefined])).toBe(0);
-		expect(reciprocalRankScore([])).toBe(0);
+	it("returns no scores when every list is empty", () => {
+		expect(fusedRankScores([ranks(), ranks()]).size).toBe(0);
+		expect(fusedRankScores([]).size).toBe(0);
 	});
 });
 

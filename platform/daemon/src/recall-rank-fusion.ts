@@ -6,16 +6,17 @@ export function rankPositions(scores: ReadonlyMap<string, number>, minScore: num
 	return new Map(kept.map(([id], index) => [id, index + 1]));
 }
 
-export function reciprocalRankScore(
-	positions: ReadonlyArray<number | undefined>,
+export function fusedRankScores(
+	rankings: ReadonlyArray<ReadonlyMap<string, number>>,
 	k: number = RECIPROCAL_RANK_K,
-): number {
-	if (positions.length === 0) return 0;
-	let sum = 0;
-	for (const position of positions) {
-		if (position !== undefined) sum += 1 / (k + position);
+): Map<string, number> {
+	const sums = new Map<string, number>();
+	for (const ranks of rankings) {
+		for (const [id, position] of ranks) sums.set(id, (sums.get(id) ?? 0) + 1 / (k + position));
 	}
-	return (sum * (k + 1)) / positions.length;
+	let best = 0;
+	for (const sum of sums.values()) best = Math.max(best, sum);
+	return new Map([...sums].map(([id, sum]) => [id, best > 0 ? sum / best : 0]));
 }
 
 export function selectPrimaryCandidates<T extends { readonly id: string }>(
