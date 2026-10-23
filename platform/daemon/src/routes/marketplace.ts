@@ -4,12 +4,12 @@
  * Exposes MCP server catalog browsing, install state, and tool routing.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { readFileWithStatSync, resolveDefaultBasePath } from "@signet/core";
+import { readFileWithStatSync, resolveDefaultBasePath, writeFileScopedAtomicSync } from "@signet/core";
 import type { Hono } from "hono";
 import { getDbAccessor } from "../db-accessor.js";
 import { logger } from "../logger.js";
@@ -171,13 +171,6 @@ function getExposurePolicyPath(): string {
 	return join(getMarketplaceDir(), "mcp-policy.json");
 }
 
-function ensureMarketplaceDir(): void {
-	const dir = getMarketplaceDir();
-	if (!existsSync(dir)) {
-		mkdirSync(dir, { recursive: true });
-	}
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -332,8 +325,7 @@ function readExposurePolicy(): MarketplaceMcpExposurePolicy {
 }
 
 function writeExposurePolicy(policy: MarketplaceMcpExposurePolicy): void {
-	ensureMarketplaceDir();
-	writeFileSync(getExposurePolicyPath(), JSON.stringify(policy, null, 2));
+	writeFileScopedAtomicSync(getAgentsDir(), "marketplace/mcp-policy.json", JSON.stringify(policy, null, 2));
 }
 
 function extractContextFromRequest(c: {
@@ -816,8 +808,7 @@ function readInstalledServers(): InstalledMarketplaceMcpServer[] {
 }
 
 function writeInstalledServers(servers: readonly InstalledMarketplaceMcpServer[]): void {
-	ensureMarketplaceDir();
-	writeFileSync(getInstalledMcpPath(), JSON.stringify(servers, null, 2));
+	writeFileScopedAtomicSync(getAgentsDir(), "marketplace/mcp-servers.json", JSON.stringify(servers, null, 2));
 }
 
 async function fetchMcpServersOrgDetail(catalogId: string): Promise<DetailConfig> {

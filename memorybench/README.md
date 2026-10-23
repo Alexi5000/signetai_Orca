@@ -41,6 +41,12 @@ cp .env.example .env.local  # Add your API keys
 bun run src/index.ts run -p supermemory -b locomo
 ```
 
+## Dataset cache writes
+
+LoCoMo and ConvoMem publish completed downloads atomically. The configured cache directory remains an operator-selected destination, including directory aliases and paths outside the working directory. Cache files must be regular, unlinked files; existing or dangling symlinks, hard links, and special files are rejected. Other local processes must not rename ancestor directories concurrently. This protects cache writes, not the authenticity of remote dataset contents or existing cache reads.
+
+MemoryBench uses the workspace `@signet/core` filesystem helpers. From the repository root, run `bun run build:core` after installation before running MemoryBench.
+
 ## Configuration
 
 ```bash

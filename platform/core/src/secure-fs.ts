@@ -23,6 +23,7 @@ import {
 	fstatSync,
 	fsyncSync,
 	lstatSync,
+	mkdirSync,
 	linkSync,
 	mkdtempSync,
 	openSync,
@@ -34,7 +35,7 @@ import {
 } from "node:fs";
 import { chmod, lstat, mkdtemp, open, realpath, rename, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const PRIVATE_DIR_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
@@ -48,6 +49,8 @@ export interface AtomicWriteOptions {
 	readonly encoding?: BufferEncoding;
 	/** Flush file data to disk before the rename (default false, matching ordinary writes). */
 	readonly fsync?: boolean;
+	/** Defaults to true for compatibility. False rejects linked and nonregular leaves. */
+	readonly followSymlinks?: boolean;
 }
 
 export interface FileWithStat<T extends string | Buffer> {
@@ -91,13 +94,16 @@ export async function createPrivateTempDirAsync(prefix: string, parent: string =
 }
 
 /** Resolve the file that a write to `path` should replace, following an existing symlink. */
-function resolveWriteTargetSync(path: string): { target: string; existingMode: number | null } {
+function resolveWriteTargetSync(path: string, followSymlinks = true): { target: string; existingMode: number | null } {
 	let st: Stats;
 	try {
 		st = lstatSync(path);
 	} catch (error) {
 		if (isErrnoCode(error, "ENOENT")) return { target: path, existingMode: null };
 		throw error;
+	}
+	if (!followSymlinks && (!st.isFile() || st.nlink !== 1)) {
+		throw new Error("Refusing to replace a linked or nonregular file");
 	}
 	if (st.isSymbolicLink()) {
 		let target: string;
@@ -113,13 +119,19 @@ function resolveWriteTargetSync(path: string): { target: string; existingMode: n
 	return { target: path, existingMode: st.mode & 0o7777 };
 }
 
-async function resolveWriteTarget(path: string): Promise<{ target: string; existingMode: number | null }> {
+async function resolveWriteTarget(
+	path: string,
+	followSymlinks = true,
+): Promise<{ target: string; existingMode: number | null }> {
 	let st: Stats;
 	try {
 		st = await lstat(path);
 	} catch (error) {
 		if (isErrnoCode(error, "ENOENT")) return { target: path, existingMode: null };
 		throw error;
+	}
+	if (!followSymlinks && (!st.isFile() || st.nlink !== 1)) {
+		throw new Error("Refusing to replace a linked or nonregular file");
 	}
 	if (st.isSymbolicLink()) {
 		let target: string;
@@ -140,7 +152,7 @@ async function resolveWriteTarget(path: string): Promise<{ target: string; exist
  * destinations are preserved by replacing the link target.
  */
 export function writeFileAtomicSync(path: string, data: SecureWriteData, options: AtomicWriteOptions = {}): void {
-	const { target, existingMode } = resolveWriteTargetSync(path);
+	const { target, existingMode } = resolveWriteTargetSync(path, options.followSymlinks);
 	const finalMode = options.mode ?? existingMode ?? defaultFileMode();
 	const tmp = tempSiblingPath(target);
 	const buffer = toBuffer(data, options.encoding);
@@ -168,13 +180,40 @@ export function writeFileAtomicSync(path: string, data: SecureWriteData, options
 	}
 }
 
+/** The selected root may be an alias; descendants must be unlinked. Ancestor directory mutation by another process is outside this boundary. */
+export function writeFileScopedAtomicSync(
+	root: string,
+	path: string,
+	data: SecureWriteData,
+	options: AtomicWriteOptions = {},
+): void {
+	const lexicalRoot = resolve(root);
+	const suffix = relative(lexicalRoot, resolve(lexicalRoot, path));
+	if (!suffix || suffix === ".." || suffix.startsWith(`..${sep}`) || isAbsolute(suffix)) {
+		throw new Error("Write destination is outside the selected directory");
+	}
+	mkdirSync(lexicalRoot, { recursive: true });
+	const canonicalRoot = realpathSync(lexicalRoot);
+	let parent = canonicalRoot;
+	for (const segment of suffix.split(sep).slice(0, -1)) {
+		parent = join(parent, segment);
+		try {
+			mkdirSync(parent);
+		} catch (error) {
+			if (!isErrnoCode(error, "EEXIST")) throw error;
+		}
+		if (!lstatSync(parent).isDirectory()) throw new Error("Write parent must be an unlinked directory");
+	}
+	writeFileAtomicSync(join(canonicalRoot, suffix), data, { ...options, followSymlinks: false });
+}
+
 /** Async variant of {@link writeFileAtomicSync}. */
 export async function writeFileAtomic(
 	path: string,
 	data: SecureWriteData,
 	options: AtomicWriteOptions = {},
 ): Promise<void> {
-	const { target, existingMode } = await resolveWriteTarget(path);
+	const { target, existingMode } = await resolveWriteTarget(path, options.followSymlinks);
 	const finalMode = options.mode ?? existingMode ?? defaultFileMode();
 	const tmp = tempSiblingPath(target);
 	const buffer = toBuffer(data, options.encoding);

@@ -481,3 +481,14 @@ expect(syncAccessorType).toContain("export interface SyncDbAccessor");
 expect(syncAccessorType).toContain("checkpointWal(): void");
 expect(syncAccessorType).toContain("incrementalVacuum(): number");
 expect(syncAccessorType).toContain("vacuumConversion(): boolean");
+
+test("scoped atomic writes remain visible in the synchronous filesystem inventory", () => {
+	const root = mkdtempSync(join(tmpdir(), "signet-scoped-ledger-"));
+	try {
+		writeFileSync(join(root, "route.ts"), 'writeFileScopedAtomicSync(root, "config.json", content);\n');
+		const result = runAudit({ sourceRoot: root });
+		expect(result.sites.map((site) => site.api)).toEqual(["writeFileScopedAtomicSync"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
