@@ -143,9 +143,11 @@ every list it appears in, and the sums are divided by the best sum. The best
 fused hit scores 1, a hit in both lists outranks a hit at the same position
 in one list, and BM25 and cosine magnitudes never compete on one scale. Hint,
 structured, and temporal evidence then replace a fused score only when they
-are stronger. Pure hint-only hits are capped at 0.75, below the best fused
-hit, so generated hints can rescue recall without outranking directly
-grounded keyword or vector evidence in this merge.
+are stronger. Pure hint-only hits are capped at 0.75, so generated hints can
+rescue recall but never outrank the best fused hit. The cap does not keep a
+hint-only hit below every direct hit: when one hit leads both lists, a hit
+second in only one list scores about 0.49, and a hint-only hit at 0.75
+outranks it.
 
 In traversal-primary mode, the merged order fills a bounded candidate budget.
 A quarter of that budget is reserved for the top vector hits, so a long
