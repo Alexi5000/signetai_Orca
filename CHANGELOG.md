@@ -6,6 +6,10 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-10-23
+- Bug fixes: skip subagent transcripts in recovery scan; forward home overrides to service daemon; send Anthropic auth headers on probe.
+- Docs: sync translations.
+
 ### 2026-10-18
 - Bug fixes: register implicit agents as isolated.
 
@@ -32,13 +36,22 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Bug fixes: check Bun before desktop source installation; accept native binaries above 256 MiB; count key management against the admin limit once; count only usable keys as active; address review of permission gating; list a new API key once; spend fewer admin calls on API keys; return 403 and 429 from combined auth guards; say why the auth mode check failed; skip handoff in local mode, flag dead targets; bound session rechecks, follow other tabs; keep open paths off the key database; redeem handoff links in an open tab; open the resolved daemon in signet dashboard; verify API keys on whoami, add session exchange; read multiline skill descriptions from frontmatter; restore graph layout and keep the inspector clear of chat; smooth the chat dock to sidebar transition; calmer Dreams and correct pass times; page health reads and report failed checks as unknown.
 - Docs: cover dashboard key management and permission states; add a Teams guide for shared daemons; document dashboard sign-in and session routes.
 
-### 2026-10-05
-- Features: redesign homepage and blog; add Notion source provider; report blocked layout upgrades in status; create new workspaces on layout v2; upgrade v1 workspaces to v2 in place; Liquid Glass macOS app icon via Icon Composer.
-- Bug fixes: refresh changed Notion properties; bound Notion syncs and block passes; use the canonical Notion logo; harden Notion block and purge logic; anchor v2 storage roots in gitignore; defer to an interrupted layout upgrade; verify v1 data before finishing upgrades; keep legacy volumes on layout v1; keep same-millisecond snapshots apart; report v2 storage in status and diagnostics; recognize older template test dirs; harden layout upgrade recovery; reject incomplete v2 databases; validate upgrade record paths; preserve legacy workspace state; preserve legacy state; preserve transcript-only workspaces; harden recovery checks; verify interrupted move identity; reject missing upgrade moves; keep original transcript provenance; resolve workspace paths through layout; resume upgrades from the daemon entry; scope upgrade rollback and resume; harden in-place layout upgrade; resolve runtime paths through layout; use shared MCP resolver; register native Signet binary as MCP stdio server; create macOS descriptor files with a mode openat actually reads; require exact manifest zip names; verify published macOS manifest; publish one macOS update manifest for both architectures; ship precompiled Assets.car instead of compiling .icon in CI; select Xcode 26 for deep-link package CI; drop comments; gate mac updates on release team; stop offering updates unsigned macOS builds cannot install.
-- Refactoring: remove relocation migration.
-- Docs: sync translations; list Notion as a supported source; add German, Korean, Simplified Chinese, and Japanese translations; narrow the transcript upgrade row; describe v2 paths and memory/ rule.
-
 ## Release Ledger
+
+## [0.237.15] - 2026-10-23
+
+Release summary: 3 bug fixes and 1 docs update.
+Tag range: `v0.237.14..v0.237.15`.
+
+### Bug Fixes
+
+- **daemon**: skip subagent transcripts in recovery scan
+- **cli**: forward home overrides to service daemon
+- **daemon**: send Anthropic auth headers on probe
+
+### Docs
+
+- **readme**: sync translations
 
 ## [0.237.14] - 2026-10-18
 
