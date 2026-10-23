@@ -2268,6 +2268,27 @@ describe("installFetchSanitizer", () => {
 		}
 	});
 
+	it("does not inject credentials or mutate requests outside the exact HTTPS provider origin", async () => {
+		const remove = installFetchSanitizer();
+		const body = JSON.stringify({ system: [{ type: "text", text: "Original prompt" }] });
+		try {
+			for (const url of [
+				"http://api.anthropic.com/v1/messages",
+				"https://api.anthropic.com:8443/v1/messages",
+				"https://api.anthropic.com.attacker.invalid/v1/messages",
+				"https://user:pass@api.anthropic.com/v1/messages",
+			]) {
+				expect(_sanitization.isAnthropicApiUrl(url)).toBe(false);
+				await globalThis.fetch(url, { method: "POST", body, headers: { "x-original": "retained" } });
+				expect(capturedBodies.at(-1)).toBe(body);
+				expect(capturedHeaders.at(-1)).toEqual({ "x-original": "retained" });
+			}
+			expect(_sanitization.isAnthropicApiUrl("https://api.anthropic.com:443/v1/messages")).toBe(true);
+		} finally {
+			remove();
+		}
+	});
+
 	it("does not modify non-provider requests", async () => {
 		const remove = installFetchSanitizer();
 		try {
