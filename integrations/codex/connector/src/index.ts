@@ -2,7 +2,7 @@ import { spawnSyncHidden as spawnSync } from "@signet/core";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, opendirSync, readFileSync, readdirSync, rmSync, statSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import {
 	BaseConnector,
 	type InstallResult,
@@ -1331,7 +1331,7 @@ export class CodexConnector extends BaseConnector {
 
 	protected getCodexHome(): string {
 		const configured = readTrimmedEnv("CODEX_HOME");
-		return configured ? expandHome(configured) : join(homedir(), ".codex");
+		return configured ? resolve(expandHome(configured)) : join(homedir(), ".codex");
 	}
 
 	protected getCodexDesktopAppPaths(): readonly string[] {
