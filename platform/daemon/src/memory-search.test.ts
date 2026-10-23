@@ -25,6 +25,7 @@ import {
 	ownerVectorPageRows,
 	readOwnerVectorsBySource,
 	TRANSCRIPT_EVIDENCE_MAX_PAGES,
+	TRANSCRIPT_PAGE_BYTES,
 	transcriptExcerpt,
 } from "./memory-search";
 import { ownerReadAll } from "./db-owner-sql";
@@ -1089,9 +1090,45 @@ describe("hybridRecall", () => {
 		}
 	});
 
+	it("reads transcript content past a NUL character", async () => {
+		const now = new Date().toISOString();
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/nul-speyer.jsonl",
+				createHash("sha256").update("nul-speyer").digest("hex"),
+				"nul-speyer",
+				"token-nul-speyer",
+				now,
+				"user: What is the Speyer tourism board phone number?\u0000 assistant: +49 6232 142, café hours 9 to 5.",
+				now,
+			);
+		});
+
+		const result = await hybridRecall(
+			{
+				query: "Speyer tourism board phone number",
+				limit: 3,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				trackRecallAccess: false,
+			},
+			testCfg(),
+			async () => null,
+		);
+
+		const transcript = result.results.find((row) => row.id === "transcript:nul-speyer");
+		expect(transcript?.content).toContain("+49 6232 142, café hours");
+		expect(transcript?.truncated).toBe(false);
+	});
+
 	it("caps the transcript pages one recall reads", async () => {
 		const now = new Date().toISOString();
-		const filler = " user: unrelated planning chatter about other cities and trains.".repeat(50_000);
+		const filler = " user: unrelated planning chatter about other cities and trains.".repeat(140_000);
 		getDbAccessor().withWriteTx((db) => {
 			db.prepare(
 				`INSERT INTO memory_artifacts (
@@ -1128,7 +1165,7 @@ describe("hybridRecall", () => {
 				testCfg(),
 				async () => null,
 			);
-			expect(filler.length).toBeGreaterThan(MAX_DB_OWNER_RESULT_BYTES * 2.5);
+			expect(filler.length).toBeGreaterThan(TRANSCRIPT_PAGE_BYTES * TRANSCRIPT_EVIDENCE_MAX_PAGES);
 			expect(contentReads).toBe(TRANSCRIPT_EVIDENCE_MAX_PAGES);
 			const transcript = result.results.find((row) => row.id === "transcript:huge-speyer");
 			expect(transcript?.content).toContain("+49 6232 142");

@@ -1392,7 +1392,7 @@ export async function placeTranscriptEvidence(
 	};
 }
 
-const TRANSCRIPT_PAGE_CHARS = Math.floor((DB_OWNER_MAX_RESULT_BYTES - 4096) / 6);
+export const TRANSCRIPT_PAGE_BYTES = Math.floor((DB_OWNER_MAX_RESULT_BYTES - 4096) / 2);
 export const TRANSCRIPT_EVIDENCE_MAX_PAGES = 16;
 const TRANSCRIPT_EVIDENCE_DEADLINE_MS = 30_000;
 
@@ -1400,20 +1400,20 @@ async function readTranscriptContent(
 	owner: DbOwnerClient,
 	agentId: string,
 	rowid: number,
-	chars: number,
+	bytes: number,
 	deadlineAt: number,
-): Promise<string | null> {
-	const pages: string[] = [];
-	const readChars = Math.min(chars, TRANSCRIPT_PAGE_CHARS * TRANSCRIPT_EVIDENCE_MAX_PAGES);
-	for (let start = 1; start <= readChars; start += TRANSCRIPT_PAGE_CHARS) {
+): Promise<{ readonly text: string; readonly complete: boolean } | null> {
+	const pages: Uint8Array[] = [];
+	const readBytes = Math.min(bytes, TRANSCRIPT_PAGE_BYTES * TRANSCRIPT_EVIDENCE_MAX_PAGES);
+	for (let start = 1; start <= readBytes; start += TRANSCRIPT_PAGE_BYTES) {
 		const remainingMs = deadlineAt - Date.now();
 		if (remainingMs <= 0) throw new Error("Transcript evidence read exceeded its deadline");
 		const page = await ownerReadOne<{ readonly chunk: string | null }>(
 			owner,
-			`SELECT substr(content, ?, ?) AS chunk FROM memory_artifacts
+			`SELECT hex(substr(CAST(content AS BLOB), ?, ?)) AS chunk FROM memory_artifacts
 			 WHERE rowid = ? AND agent_id = ? AND source_kind = 'transcript'
-			   AND COALESCE(is_deleted, 0) = 0 AND length(content) = ?`,
-			[start, Math.min(TRANSCRIPT_PAGE_CHARS, readChars - start + 1), rowid, agentId, chars],
+			   AND COALESCE(is_deleted, 0) = 0 AND length(CAST(content AS BLOB)) = ?`,
+			[start, Math.min(TRANSCRIPT_PAGE_BYTES, readBytes - start + 1), rowid, agentId, bytes],
 			{
 				operation: "memory-search.transcript-evidence.content",
 				workloadClass: "foreground",
@@ -1422,9 +1422,9 @@ async function readTranscriptContent(
 			},
 		);
 		if (page === null || page.chunk === null) return null;
-		pages.push(page.chunk);
+		pages.push(ownerBytesFromHex(page.chunk));
 	}
-	return pages.join("");
+	return { text: Buffer.concat(pages).toString("utf8"), complete: readBytes === bytes };
 }
 
 async function buildTranscriptEvidenceResults(
@@ -1448,13 +1448,13 @@ async function buildTranscriptEvidenceResults(
 		readonly project: string | null;
 		readonly captured_at: string;
 		readonly artifact_rowid: number;
-		readonly content_chars: number;
+		readonly content_bytes: number;
 		readonly rank: number;
 	}>(
 		owner,
 		`SELECT ma.session_id, ma.source_id, ma.source_path, ma.harness, ma.project,
 			COALESCE(ma.started_at, ma.captured_at) AS captured_at, ma.rowid AS artifact_rowid,
-			length(ma.content) AS content_chars, bm25(memory_artifacts_fts) AS rank
+			length(CAST(ma.content AS BLOB)) AS content_bytes, bm25(memory_artifacts_fts) AS rank
 		 FROM memory_artifacts_fts
 		 JOIN memory_artifacts ma ON ma.rowid = memory_artifacts_fts.rowid
 		 WHERE memory_artifacts_fts MATCH ?
@@ -1481,19 +1481,19 @@ async function buildTranscriptEvidenceResults(
 	const transcripts = await Promise.all(
 		selected.map(async (row) => ({
 			row,
-			fullContent: await readTranscriptContent(owner, agentId, row.artifact_rowid, row.content_chars, deadlineAt),
+			transcript: await readTranscriptContent(owner, agentId, row.artifact_rowid, row.content_bytes, deadlineAt),
 		})),
 	);
-	return transcripts.flatMap(({ row, fullContent }): RecallResult[] => {
-		if (fullContent === null) return [];
+	return transcripts.flatMap(({ row, transcript }): RecallResult[] => {
+		if (transcript === null) return [];
 		const sessionId = row.session_id ?? row.source_path;
-		const content = transcriptExcerpt(redactCredentials(fullContent), query, 900);
+		const content = transcriptExcerpt(redactCredentials(transcript.text), query, 900);
 		return [
 			{
 				id: `transcript:${sessionId}`,
 				content,
 				content_length: content.length,
-				truncated: content.length < row.content_chars,
+				truncated: !transcript.complete || content.length < transcript.text.length,
 				score: Math.round((1 / (1 + Math.abs(row.rank))) * 100) / 100,
 				source: "transcript",
 				source_id: row.source_id ?? sessionId,
