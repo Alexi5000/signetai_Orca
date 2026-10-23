@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { resolveDefaultBasePath } from "@signet/core";
+import { resolveDefaultBasePath, writeFileScopedAtomicSync } from "@signet/core";
 import type { Hono } from "hono";
 
 type ReviewTargetType = "skill" | "mcp";
@@ -55,13 +55,6 @@ function getReviewsPath(): string {
 
 function getReviewsConfigPath(): string {
 	return join(getMarketplaceDir(), "reviews-config.json");
-}
-
-function ensureMarketplaceDir(): void {
-	const dir = getMarketplaceDir();
-	if (!existsSync(dir)) {
-		mkdirSync(dir, { recursive: true });
-	}
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -135,8 +128,7 @@ function readReviews(): MarketplaceReview[] {
 }
 
 function writeReviews(reviews: readonly MarketplaceReview[]): void {
-	ensureMarketplaceDir();
-	writeFileSync(getReviewsPath(), JSON.stringify(reviews, null, 2), "utf-8");
+	writeFileScopedAtomicSync(getAgentsDir(), "marketplace/reviews.json", JSON.stringify(reviews, null, 2));
 }
 
 function readConfig(): ReviewsSyncConfig {
@@ -158,8 +150,7 @@ function readConfig(): ReviewsSyncConfig {
 }
 
 function writeConfig(config: ReviewsSyncConfig): void {
-	ensureMarketplaceDir();
-	writeFileSync(getReviewsConfigPath(), JSON.stringify(config, null, 2), "utf-8");
+	writeFileScopedAtomicSync(getAgentsDir(), "marketplace/reviews-config.json", JSON.stringify(config, null, 2));
 }
 
 function parseLimit(raw: string | undefined): number {

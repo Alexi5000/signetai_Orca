@@ -58,6 +58,7 @@ export {
 	readFileWithStatSync,
 	writeFileAtomic,
 	writeFileAtomicSync,
+	writeFileScopedAtomicSync,
 	writeFileExclusiveSync,
 } from "./secure-fs";
 export type { AtomicWriteOptions, FileWithStat, SecureWriteData } from "./secure-fs";

@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "fs"
-import { join } from "path"
+import { existsSync, readFileSync, mkdirSync } from "fs"
+import { join, dirname, basename } from "path"
+import { writeFileScopedAtomicSync } from "@signet/core"
 import type { Benchmark, BenchmarkConfig, QuestionFilter } from "../../types/benchmark"
 import type {
   UnifiedQuestion,
@@ -144,7 +145,11 @@ export class ConvoMemBenchmark implements Benchmark {
     }
 
     // Save all items to a single file only after every required slice succeeds.
-    writeFileSync(dataFile, JSON.stringify(allItems, null, 2))
+    writeFileScopedAtomicSync(
+      dirname(dataFile),
+      basename(dataFile),
+      JSON.stringify(allItems, null, 2)
+    )
     logger.success(`Downloaded ConvoMem dataset (${allItems.length} items)`)
   }
 

@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "fs"
-import { join } from "path"
+import { existsSync, readFileSync, mkdirSync } from "fs"
+import { join, dirname, basename } from "path"
+import { writeFileScopedAtomicSync } from "@signet/core"
 import type { Benchmark, BenchmarkConfig, QuestionFilter } from "../../types/benchmark"
 import type {
   UnifiedQuestion,
@@ -108,7 +109,7 @@ export class LoCoMoBenchmark implements Benchmark {
     }
 
     const data = await response.text()
-    writeFileSync(destPath, data)
+    writeFileScopedAtomicSync(dirname(destPath), basename(destPath), data)
     logger.success(`Downloaded LoCoMo dataset (${(data.length / 1024 / 1024).toFixed(1)} MB)`)
   }
 
