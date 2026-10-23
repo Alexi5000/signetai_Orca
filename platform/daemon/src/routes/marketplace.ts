@@ -850,16 +850,33 @@ const GITHUB_RAW_HOST = "https://raw.githubusercontent.com" as const;
 const MAX_README_BYTES = 2 * 1024 * 1024; // 2 MB cap on fetched READMEs
 
 /** Read response body with a size cap to prevent memory exhaustion. */
-async function readCapped(res: Response): Promise<string> {
+export async function readCapped(res: Response): Promise<string> {
 	const len = res.headers.get("content-length");
 	if (len && Number.parseInt(len, 10) > MAX_README_BYTES) {
+		await res.body?.cancel();
 		throw new Error(`response too large: ${len} bytes`);
 	}
-	const text = await res.text();
-	if (text.length > MAX_README_BYTES) {
-		throw new Error(`response too large: ${text.length} chars`);
+	if (!res.body) return "";
+	const reader = res.body.getReader();
+	const decoder = new TextDecoder();
+	const chunks: string[] = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (value.byteLength > MAX_README_BYTES - total) {
+				await reader.cancel();
+				throw new Error("response too large: exceeded README byte limit");
+			}
+			total += value.byteLength;
+			chunks.push(decoder.decode(value, { stream: true }));
+		}
+		chunks.push(decoder.decode());
+		return chunks.join("");
+	} finally {
+		reader.releaseLock();
 	}
-	return text;
 }
 
 /**
