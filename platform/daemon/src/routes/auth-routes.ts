@@ -63,20 +63,21 @@ function pruneHandoffs(now: number): void {
 }
 
 function resolvePasswordLogin(): {
-	readonly username: string;
 	readonly passwordHash: string | null;
 	readonly plainPassword: string | null;
 	readonly configured: boolean;
 } {
-	const username = readEnvTrimmed("SIGNET_ADMIN_USERNAME") ?? authConfig.login.password.username;
 	const passwordHash = readEnvTrimmed("SIGNET_ADMIN_PASSWORD_HASH") ?? authConfig.login.password.passwordHash;
 	const plainPassword = readEnvTrimmed("SIGNET_ADMIN_PASSWORD") ?? null;
 	return {
-		username,
 		passwordHash,
 		plainPassword,
 		configured: Boolean(passwordHash || plainPassword),
 	};
+}
+
+function resolveLoginUsername(): string {
+	return readEnvTrimmed("SIGNET_ADMIN_USERNAME") ?? authConfig.login.password.username;
 }
 
 function isValidLoginString(value: unknown, maxLength: number): value is string {
@@ -92,7 +93,7 @@ function authProviderResponse() {
 				id: "password",
 				type: "password",
 				enabled: login.configured,
-				username: login.username,
+				username: resolveLoginUsername(),
 			},
 			{
 				id: "sso",
@@ -163,7 +164,7 @@ export function registerAuthRoutes(app: Hono): void {
 			return c.json({ error: "password login is not configured" }, 503);
 		}
 
-		const usernameMatches = verifyPlainPassword(payload.username, login.username);
+		const usernameMatches = verifyPlainPassword(payload.username, resolveLoginUsername());
 		const hashMatches = login.passwordHash ? verifyPasswordHash(payload.password, login.passwordHash) : false;
 		const plainMatches = login.plainPassword ? verifyPlainPassword(payload.password, login.plainPassword) : false;
 		if (!usernameMatches || (!hashMatches && !plainMatches)) {
@@ -173,11 +174,11 @@ export function registerAuthRoutes(app: Hono): void {
 		const ttl = authConfig.sessionTokenTtlSeconds;
 		const token = createToken(
 			authSecret,
-			{ sub: "dashboard:admin", name: login.username, scope: {}, role: "admin" },
+			{ sub: "dashboard:admin", name: resolveLoginUsername(), scope: {}, role: "admin" },
 			ttl,
 		);
 		const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
-		return c.json({ token, expiresAt, role: "admin", username: login.username });
+		return c.json({ token, expiresAt, role: "admin", username: resolveLoginUsername() });
 	});
 
 	app.post("/api/auth/session", (c) => {

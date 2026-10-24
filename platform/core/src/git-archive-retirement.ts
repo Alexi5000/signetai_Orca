@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { join, relative, resolve, dirname } from "node:path";
 import { spawnSyncHidden as spawnSync } from "./child-process";
+import { readFileIfExistsSync, writeFileAtomicSync } from "./secure-fs";
 import { tmpdir } from "node:os";
 import { inspectRootGit, type RootGitInventory } from "./git-transition";
 
@@ -139,10 +140,10 @@ export function prepareRootGitArchive(root: string, directory: string): RootGitA
 	writeFileSync(archive.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 	const excludePath = join(gitDir(root), "info", "exclude");
 	mkdirSync(dirname(excludePath), { recursive: true });
-	const exclude = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+	const exclude = readFileIfExistsSync(excludePath, "utf8") ?? "";
 	const marker = `\n# Signet root Git retirement archive\n${relative(root, archive.directory)}/\n`;
 	if (!exclude.includes("# Signet root Git retirement archive"))
-		writeFileSync(excludePath, exclude.replace(/\n?$/, "") + marker);
+		writeFileAtomicSync(excludePath, exclude.replace(/\n?$/, "") + marker);
 	return archive;
 }
 

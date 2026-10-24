@@ -1,17 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { mountMarketplaceReviewsRoutes } from "./marketplace-reviews.js";
 
 describe("marketplace reviews routes", () => {
-	const tmpAgentsDir = join(tmpdir(), `signet-marketplace-reviews-route-test-${process.pid}`);
+	let tmpAgentsDir: string;
 	const originalFetch = globalThis.fetch;
 	let origSignetPath: string | undefined;
 	let app: Hono;
 
 	beforeEach(() => {
+		tmpAgentsDir = mkdtempSync(join(tmpdir(), "signet-marketplace-reviews-route-"));
 		origSignetPath = process.env.SIGNET_PATH;
 		process.env.SIGNET_PATH = tmpAgentsDir;
 		mkdirSync(tmpAgentsDir, { recursive: true });
