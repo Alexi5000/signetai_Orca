@@ -1,6 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { dirname, join } from "node:path";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import {
+	existsSync,
+	readFileSync,
+	readdirSync,
+	writeFileSync,
+	mkdtempSync,
+	symlinkSync,
+	unlinkSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import {
 	getNativeTransformersBindings,
 	materializeEmbeddedAssetTree,
@@ -200,4 +211,29 @@ describe("native-runtime-assets", () => {
 		registerNativeTransformersBindings(bindings);
 		expect(getNativeTransformersBindings()).toBe(bindings);
 	});
+});
+
+test("native libraries reject escaped filenames and reject symlink destinations and publish privately", () => {
+	const dir = mkdtempSync(join(tmpdir(), "signet-library-test-"));
+	const target = join(dir, "outside");
+	const name = basename(dir);
+	writeFileSync(target, "unchanged");
+	registerNativeAssets({
+		nativeAddons: [{ name: name, contentBase64: Buffer.from("native").toString("base64") }],
+	});
+	try {
+		expect(() => materializeEmbeddedNativeLibrary(name, "../outside")).toThrow("Invalid native library filename");
+		const destination = materializeEmbeddedNativeLibrary(name, "library.so");
+		if (!destination) throw new Error("Missing library fixture");
+		unlinkSync(destination);
+		symlinkSync(target, destination);
+		expect(() => materializeEmbeddedNativeLibrary(name, "library.so")).toThrow();
+		unlinkSync(destination);
+		materializeEmbeddedNativeLibrary(name, "library.so");
+		expect(readFileSync(target, "utf8")).toBe("unchanged");
+		expect(readFileSync(destination, "utf8")).toBe("native");
+		if (process.platform !== "win32") expect(statSync(destination).mode & 0o777).toBe(0o600);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

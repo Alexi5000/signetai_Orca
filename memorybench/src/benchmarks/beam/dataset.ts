@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { createReadStream, existsSync, readFileSync, statSync } from "node:fs"
+import { createReadStream, existsSync, readFileSync, statSync, openSync, fstatSync, closeSync } from "node:fs"
 import { basename, isAbsolute, join, relative, resolve } from "node:path"
 import JSON5 from "json5"
 import { z } from "zod"
@@ -1251,16 +1251,14 @@ function resolveSnapshotFile(snapshotPath: string, filePath: string): string {
 
 function verifyFile(snapshotPath: string, file: BeamCanonicalFileManifest): Uint8Array {
   const absolutePath = resolveSnapshotFile(snapshotPath, file.path)
-  if (!existsSync(absolutePath)) throw new Error(`BEAM canonical file is missing: ${file.path}`)
-  const stat = statSync(absolutePath)
-  if (!stat.isFile() || stat.size !== file.byteSize) {
-    throw new Error(`BEAM canonical file size mismatch: ${file.path}`)
-  }
-  const bytes = readFileSync(absolutePath)
-  if (sha256Bytes(bytes) !== file.sha256) {
-    throw new Error(`BEAM canonical file hash mismatch: ${file.path}`)
-  }
-  return bytes
+  const fd = openSync(absolutePath, "r")
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || stat.size !== file.byteSize) throw new Error(`BEAM canonical file size mismatch: ${file.path}`)
+    const bytes = readFileSync(fd)
+    if (sha256Bytes(bytes) !== file.sha256) throw new Error(`BEAM canonical file hash mismatch: ${file.path}`)
+    return bytes
+  } finally { closeSync(fd) }
 }
 
 async function hashFile(filePath: string): Promise<string> {

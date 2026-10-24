@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { open, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveWorkspaceLayout } from "@signet/core";
 import type { DbAccessor, WriteDb } from "./db-accessor";
@@ -187,19 +187,25 @@ async function statSource(path: string): Promise<SourceMetadata> {
 
 async function readSource(path: string): Promise<{ readonly raw: string; readonly fingerprint: SourceFingerprint }> {
 	const resolvedPath = await realpath(path);
-	const before = await stat(resolvedPath);
-	const bytes = await readFile(resolvedPath);
-	const after = await stat(resolvedPath);
-	const fingerprint = {
-		path: resolvedPath,
-		sha256: sha256(bytes),
-		sizeBytes: bytes.byteLength,
-		mtimeMs: after.mtimeMs,
-	};
-	if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || bytes.byteLength !== after.size) {
-		throw new Error(`transcript source changed while reading: ${resolvedPath}`);
+	const handle = await open(resolvedPath, "r");
+	try {
+		const before = await handle.stat();
+		if (!before.isFile()) throw new Error("Expected a regular transcript file");
+		const bytes = await handle.readFile();
+		const after = await handle.stat();
+		const fingerprint = {
+			path: resolvedPath,
+			sha256: sha256(bytes),
+			sizeBytes: bytes.byteLength,
+			mtimeMs: after.mtimeMs,
+		};
+		if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || bytes.byteLength !== after.size) {
+			throw new Error(`transcript source changed while reading: ${resolvedPath}`);
+		}
+		return { raw: bytes.toString("utf8"), fingerprint };
+	} finally {
+		await handle.close();
 	}
-	return { raw: bytes.toString("utf8"), fingerprint };
 }
 
 function inlineBytes(transcript: string, rawTranscript: string | null): number {

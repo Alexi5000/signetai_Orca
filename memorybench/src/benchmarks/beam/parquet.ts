@@ -1,4 +1,4 @@
-import { open, stat } from "node:fs/promises"
+import { open } from "node:fs/promises"
 import type { BeamScale } from "./types"
 
 export type BeamParquetDecoder = (filePath: string, tier: BeamScale) => Promise<unknown[]>
@@ -28,8 +28,8 @@ export async function decodeBeamParquetWithHyparquet(
     throw new Error("Installed hyparquet-compressors package does not export compressors")
   }
 
-  const fileStat = await stat(filePath)
   const handle = await open(filePath, "r")
+  const fileStat = await handle.stat()
   const asyncBuffer = {
     byteLength: fileStat.size,
     slice: async (start: number, end: number): Promise<ArrayBuffer> => {
