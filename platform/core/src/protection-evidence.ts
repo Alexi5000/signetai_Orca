@@ -1,5 +1,15 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync, lstatSync, readdirSync } from "node:fs";
+import {
+	existsSync,
+	readFileSync,
+	statSync,
+	lstatSync,
+	readdirSync,
+	openSync,
+	fstatSync,
+	closeSync,
+	constants,
+} from "node:fs";
 import { join } from "node:path";
 import { resolveWorkspaceLayout } from "./workspace-layout";
 import type { ProtectionComponent, ProtectionComponentId } from "./protection";
@@ -17,7 +27,15 @@ function canonicalDigest(paths: readonly string[]): string {
 			if (lstatSync(path).isSymbolicLink()) return;
 			if (statSync(path).isDirectory()) {
 				for (const name of readdirSync(path).sort()) visit(join(path, name), join(relativePath, name));
-			} else hash.update(`file:${relativePath}:`).update(readFileSync(path)).update("\\0");
+			} else {
+				const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+				try {
+					if (!fstatSync(fd).isFile()) throw new Error("Expected a regular evidence file");
+					hash.update(`file:${relativePath}:`).update(readFileSync(fd)).update("\\0");
+				} finally {
+					closeSync(fd);
+				}
+			}
 		} catch {
 			hash.update(`missing:${relativePath}\\0`);
 		}

@@ -82,7 +82,7 @@ async function downloadPinnedFile(
   }
 
   await mkdir(dirname(destination), { recursive: true })
-  const handle = await open(destination, "wx")
+  const handle = await open(destination, "wx+", 0o600)
   const hash = createHash("sha256")
   let byteSize = 0
   try {
@@ -91,40 +91,39 @@ async function downloadPinnedFile(
       const { done, value } = await reader.read()
       if (done) break
       if (!value || value.byteLength === 0) continue
-      await handle.write(value)
+      let offset = 0
+      while (offset < value.byteLength) {
+        const { bytesWritten } = await handle.write(value, offset, value.byteLength - offset)
+        if (bytesWritten === 0) throw new Error("Unable to write BEAM source")
+        offset += bytesWritten
+      }
       hash.update(value)
       byteSize += value.byteLength
     }
-  } finally {
-    await handle.close()
-  }
 
-  if (byteSize < 8) throw new Error(`Downloaded BEAM source ${sourcePath} is empty or truncated`)
-  const contentLength = response.headers.get("content-length")
-  if (contentLength && Number(contentLength) !== byteSize) {
-    throw new Error(
-      `Downloaded BEAM source ${sourcePath} size mismatch: expected ${contentLength}, got ${byteSize}`
-    )
-  }
-  const sha256 = hash.digest("hex")
-  if (expectedSha256 && sha256 !== expectedSha256) {
-    throw new Error(`Downloaded BEAM source ${sourcePath} SHA-256 mismatch`)
-  }
+    if (byteSize < 8) throw new Error(`Downloaded BEAM source ${sourcePath} is empty or truncated`)
+    const contentLength = response.headers.get("content-length")
+    if (contentLength && Number(contentLength) !== byteSize) {
+      throw new Error(
+        `Downloaded BEAM source ${sourcePath} size mismatch: expected ${contentLength}, got ${byteSize}`
+      )
+    }
+    const sha256 = hash.digest("hex")
+    if (expectedSha256 && sha256 !== expectedSha256) {
+      throw new Error(`Downloaded BEAM source ${sourcePath} SHA-256 mismatch`)
+    }
 
-  const file = await open(destination, "r")
-  try {
     const first = Buffer.alloc(4)
     const last = Buffer.alloc(4)
-    await file.read(first, 0, 4, 0)
-    await file.read(last, 0, 4, byteSize - 4)
+    await handle.read(first, 0, 4, 0)
+    await handle.read(last, 0, 4, byteSize - 4)
     if (first.toString("ascii") !== "PAR1" || last.toString("ascii") !== "PAR1") {
       throw new Error(`Downloaded BEAM source ${sourcePath} is not a complete Parquet file`)
     }
+    return { path: sourcePath, snapshotPath, url, byteSize, sha256, localPath: destination }
   } finally {
-    await file.close()
+    await handle.close()
   }
-
-  return { path: sourcePath, snapshotPath, url, byteSize, sha256, localPath: destination }
 }
 
 async function writeCanonicalFile(

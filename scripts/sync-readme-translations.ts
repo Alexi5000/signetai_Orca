@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { readFileIfExistsSync, writeFileAtomicSync } from "../platform/core/src/secure-fs";
 
 const ROOT = resolve(import.meta.dir, "..");
 const SOURCE = "README.md";
@@ -295,7 +296,8 @@ function readBlob(blob: string): string | null {
 
 async function translate(locale: Locale, english: string, blob: string, full: boolean): Promise<string> {
 	const path = join(ROOT, locale.file);
-	const existing = existsSync(path) ? splitTranslation(readFileSync(path, "utf8"), locale) : null;
+	const previousContent = readFileIfExistsSync(path, "utf8");
+	const existing = previousContent === null ? null : splitTranslation(previousContent, locale);
 	if (!full && existing?.blob === blob) return "current";
 	const previousEnglish = !full && existing?.blob ? readBlob(existing.blob) : null;
 	const previous = existing && previousEnglish ? { english: previousEnglish, translation: existing.body } : null;
@@ -309,7 +311,7 @@ async function translate(locale: Locale, english: string, blob: string, full: bo
 		const output = stripFence(await runPi(systemPrompt(locale), `${userPrompt(english, previous)}${retry}`));
 		errors = validateTranslation(english, output);
 		if (errors.length === 0) {
-			writeFileSync(path, assembleTranslation(output, locale, blob));
+			writeFileAtomicSync(path, assembleTranslation(output, locale, blob));
 			return previous ? "updated" : "translated";
 		}
 	}

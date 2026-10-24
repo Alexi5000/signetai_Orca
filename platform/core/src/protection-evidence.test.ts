@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { buildProtectionEvidence, computeProtectionDigests } from "./protection-evidence";
@@ -77,6 +77,23 @@ describe("protection evidence", () => {
 			expect(deleted.transcripts).not.toBe(before.transcripts);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it.skipIf(process.platform === "win32")("does not digest an external symlink target", () => {
+		const root = mkdtempSync(join(tmpdir(), "protection-symlink-"));
+		const outside = mkdtempSync(join(tmpdir(), "protection-outside-"));
+		try {
+			writeFileSync(join(root, "workspace-layout.json"), JSON.stringify({ version: 2 }));
+			mkdirSync(join(root, "transcripts"));
+			const target = join(outside, "private.jsonl");
+			writeFileSync(target, "private one");
+			symlinkSync(target, join(root, "transcripts", "external.jsonl"));
+			const before = computeProtectionDigests(root).transcripts;
+			writeFileSync(target, "private two");
+			expect(computeProtectionDigests(root).transcripts).toBe(before);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
 		}
 	});
 });
