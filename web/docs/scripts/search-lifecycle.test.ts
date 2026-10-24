@@ -268,10 +268,14 @@ describe("docs search lifecycle", () => {
 			throw new Error("Build web/docs before running the browser regression");
 		}
 
-		const previewProcess = spawn(process.execPath, ["run", "preview", "--", "--host", "127.0.0.1", "--port", "0"], {
-			cwd: DOCS_ROOT,
-			stdio: ["ignore", "pipe", "ignore"],
-		});
+		const previewProcess = spawn(
+			process.execPath,
+			["run", "preview", "--", "--ignore-lock", "--host", "127.0.0.1", "--port", "0"],
+			{
+				cwd: DOCS_ROOT,
+				stdio: ["ignore", "pipe", "ignore"],
+			},
+		);
 		preview = previewProcess;
 		const previewPort = await waitForPreviewPort(previewProcess);
 		const baseUrl = `${PREVIEW_URL}:${previewPort}`;
