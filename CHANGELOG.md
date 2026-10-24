@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-10-24
-- Bug fixes: dedupe escaped PATH profile entries; escape shell metachars in PATH line; print PATH commands after piped install.
+- Bug fixes: keep temporal window fill when vector reads fail; decode owner hex in linear time and bound vector pages; page transcript evidence by bytes; keep paged recall reads in scope and bounded; decode and page traversal vectors; page transcript evidence reads; retry stapler validation on lost Apple connection; dedupe escaped PATH profile entries; escape shell metachars in PATH line; print PATH commands after piped install.
 
 ### 2026-10-23
 - Bug fixes: skip subagent transcripts in recovery scan; forward home overrides to service daemon; send Anthropic auth headers on probe.
@@ -35,6 +35,21 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Docs: note that pass history is scoped; correct the cost model's per-token rate and cache share; add a Dreaming cost model to the benchmarking skill; advise against gpt-6-luna as a Dreaming model for now; add a benchmarking skill with run tooling and a results ledger; sync translations; list Muse Code in README and site.
 
 ## Release Ledger
+
+## [0.237.17] - 2026-10-24
+
+Release summary: 7 bug fixes.
+Tag range: `v0.237.16..v0.237.17`.
+
+### Bug Fixes
+
+- **daemon**: keep temporal window fill when vector reads fail
+- **daemon**: decode owner hex in linear time and bound vector pages
+- **daemon**: page transcript evidence by bytes
+- **daemon**: keep paged recall reads in scope and bounded
+- **daemon**: decode and page traversal vectors
+- **daemon**: page transcript evidence reads
+- **desktop**: retry stapler validation on lost Apple connection
 
 ## [0.237.16] - 2026-10-24
 
