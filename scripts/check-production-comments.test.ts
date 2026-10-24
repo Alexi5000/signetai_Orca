@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import {
 	findAddedProductionComments,
@@ -181,4 +182,16 @@ describe("diff ratchet", () => {
 		);
 		expect(violations.map(({ path, startLine }) => `${path}:${startLine}`)).toEqual(["a.ts:1", "z.ts:1", "z.ts:2"]);
 	});
+});
+
+test("preserves mandatory MIT attribution and tracked database migration directives", () => {
+	const legal =
+		readFileSync(new URL("../surfaces/dashboard/src/lib/graph-scene.ts", import.meta.url), "utf8").split("*/")[0] +
+		"*/";
+	expect(scanTypeScriptComments("graph-scene.ts", legal)[0]?.allowed).toBe(true);
+	expect(
+		scanTypeScriptComments("legacy.ts", "// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withWriteTx migration site")[0]
+			?.allowed,
+	).toBe(true);
+	expect(scanTypeScriptComments("legacy.ts", "// @ts-expect-error arbitrary bypass")[0]?.allowed).toBe(false);
 });

@@ -204,7 +204,7 @@ async function withRepairWriteTx<T>(
 	signal?: AbortSignal,
 ): Promise<T> {
 	if (accessor.withWriteTxAsync) {
-		// DYNAMIC_SITE_TOKEN: each repair action supplies its stable semantic operation ID.
+		// DYNAMIC_SITE_TOKEN
 		return accessor.withWriteTxAsync(fn, { siteToken: operationId, operation: operationId, signal });
 	}
 	throw new Error("async write API is unavailable");

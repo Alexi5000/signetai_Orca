@@ -67,11 +67,23 @@ function isAllowedComment(source: string): boolean {
 		.split("\n")
 		.map((line) =>
 			line
-				.replace(/^\s*(?:\/\/+|\/\*+|\*)\s?/, "")
 				.replace(/\s*\*\/\s*$/, "")
+				.replace(/^\s*(?:\/\/+|\/\*+|\*)\s?/, "")
 				.trim(),
 		)
 		.filter(Boolean);
+	const normalized = lines.join(" ");
+	const mitLicense =
+		normalized.startsWith("MIT License Copyright (c) ") &&
+		normalized.includes("Permission is hereby granted, free of charge, to any person obtaining a copy") &&
+		normalized.endsWith("SOFTWARE.") &&
+		normalized.includes('THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND');
+	if (mitLicense) return true;
+	if (
+		lines.length === 1 &&
+		/^@ts-expect-error LEGACY_SYNC_DB_ACCESS: (?:withWriteTx|withReadDb) migration site$/.test(lines[0])
+	)
+		return true;
 	return (
 		lines.length > 0 &&
 		lines.every((line) => SPDX_HEADER.test(line) || COPYRIGHT_HEADER.test(line) || DYNAMIC_SITE_TOKEN.test(line))
