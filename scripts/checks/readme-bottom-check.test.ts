@@ -10,7 +10,7 @@ describe("readme bottom", () => {
 		expect(md).toContain("surfaces/desktop");
 		expect(md).toContain("surfaces/tray");
 		expect(md).toContain("surfaces/browser-extension");
-		expect(md).toContain("| Goal | Start here |");
+		expect(md).toMatch(/\|\s*Goal\s*\|\s*Start here\s*\|/);
 		expect(md).toContain("## Links");
 		expect(md).not.toContain("star-history.com");
 		expect(md).not.toContain("## Star History");

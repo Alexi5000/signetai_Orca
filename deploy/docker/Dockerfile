@@ -10,6 +10,7 @@ RUN apt-get update \
 
 COPY package.json bun.lock bunfig.toml tsconfig.json biome.json ./
 COPY AGENTS.md CLAUDE.md LICENSE README.md ./
+COPY patches ./patches
 COPY scripts ./scripts
 COPY skills ./skills
 COPY memorybench ./memorybench
