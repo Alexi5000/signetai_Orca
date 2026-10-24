@@ -409,11 +409,16 @@ export async function getCachedDiagnosticsReport(): Promise<DiagnosticsReport> {
 
 	const maintenance = getDbOwnerMaintenance();
 	if (!maintenance) throw new Error("Database owner unavailable");
+	const updateState = getUpdateState();
 	const report = await maintenance.owner.submit<DiagnosticsReport>(
 		{
 			kind: "diagnostics",
 			trackerStats: providerTracker.stats,
-			updateState: getUpdateState(),
+			updateState: {
+				...updateState,
+				lastCheckTime: updateState.lastCheckTime?.toISOString() ?? null,
+				lastAutoUpdateAt: updateState.lastAutoUpdateAt?.toISOString() ?? null,
+			},
 			openclawHealth: buildOpenClawHealth(),
 			options: getDiagnosticsOptions(),
 		},

@@ -1135,13 +1135,22 @@ export function runDbOwnerWorker(): void {
 		}
 		if (job.request.kind === "diagnostics") {
 			const { getDiagnostics } = await import("./diagnostics");
+			const state = job.request.updateState;
+			const updateState =
+				state === undefined
+					? undefined
+					: {
+							...state,
+							lastCheckTime: state.lastCheckTime === null ? null : new Date(state.lastCheckTime),
+							lastAutoUpdateAt: state.lastAutoUpdateAt === null ? null : new Date(state.lastAutoUpdateAt),
+						};
 			return getDiagnostics(
 				db as never,
 				{
 					record: () => {},
 					stats: job.request.trackerStats,
 				},
-				job.request.updateState,
+				updateState,
 				job.request.openclawHealth,
 				job.request.options,
 			);

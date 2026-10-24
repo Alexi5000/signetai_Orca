@@ -18,6 +18,8 @@ import {
 	recordDreamingEpisodicTokenBacklog,
 } from "../pipeline/dreaming-token-cache";
 import { registerPipelineRoutes } from "./pipeline-routes";
+import { createProviderTracker, type DiagnosticsReport } from "../diagnostics";
+import { getUpdateState } from "../update-system";
 
 const originalAgentId = process.env.SIGNET_AGENT_ID;
 
@@ -202,6 +204,25 @@ describe("Dreaming live routes", () => {
 			if (previousOwnerMode === undefined) Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_WORKER");
 			else process.env.SIGNET_DB_OWNER_WORKER = previousOwnerMode;
 		}
+	});
+
+	it("preserves update timestamps across the real diagnostics owner protocol", async () => {
+		const owner = await getDbOwnerForAccessor(getDbAccessor());
+		const state = getUpdateState();
+		const report = await owner.submit<DiagnosticsReport>(
+			{
+				kind: "diagnostics",
+				trackerStats: createProviderTracker().stats,
+				updateState: {
+					...state,
+					lastCheckTime: new Date(Date.now() - 7_200_000).toISOString(),
+					lastAutoUpdateAt: new Date().toISOString(),
+				},
+			},
+			{ operation: "diagnostics.timestamp-regression", lane: "read", deadlineMs: 5_000 },
+		).result;
+		expect(report.update.lastCheckAgeHours).toBeGreaterThanOrEqual(2);
+		expect(report.update.lastCheckAgeHours).toBeLessThan(2.1);
 	});
 
 	it("returns null when no fresh exact backlog measurement exists", async () => {

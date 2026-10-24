@@ -266,7 +266,10 @@ export type DbOwnerRequest =
 	| {
 			readonly kind: "diagnostics";
 			readonly trackerStats: DbOwnerProviderTrackerStats;
-			readonly updateState?: Parameters<typeof import("./diagnostics").getDiagnostics>[2];
+			readonly updateState?: Omit<import("./update-system").UpdateState, "lastCheckTime" | "lastAutoUpdateAt"> & {
+				readonly lastCheckTime: string | null;
+				readonly lastAutoUpdateAt: string | null;
+			};
 			readonly openclawHealth?: Parameters<typeof import("./diagnostics").getDiagnostics>[3];
 			readonly options?: Parameters<typeof import("./diagnostics").getDiagnostics>[4];
 	  }
