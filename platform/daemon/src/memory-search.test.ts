@@ -4,8 +4,13 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { normalizeAndHashContent } from "./content-normalization";
-import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
-import type { DbOwnerJobHandle, DbOwnerRequest, DbOwnerSubmitOptions } from "./db-owner-client";
+import { closeDbAccessor, getDbAccessor, getDbAccessorPath, initDbAccessor } from "./db-accessor";
+import {
+	type DbOwnerJobHandle,
+	type DbOwnerRequest,
+	type DbOwnerSubmitOptions,
+	MAX_DB_OWNER_RESULT_BYTES,
+} from "./db-owner-client";
 import { getDbOwner } from "./db-owner-runtime";
 import { ensureEmbeddingIndexState } from "./embedding-index-state";
 import { type ResolvedMemoryConfig, loadMemoryConfig } from "./memory-config";
@@ -17,8 +22,13 @@ import {
 	hybridRecall,
 	placeTranscriptEvidence,
 	MAX_LEXICAL_FALLBACK_SCAN_ROWS,
+	ownerVectorPageRows,
+	readOwnerVectorsBySource,
+	TRANSCRIPT_EVIDENCE_MAX_PAGES,
+	TRANSCRIPT_PAGE_BYTES,
 	transcriptExcerpt,
 } from "./memory-search";
+import { ownerBytesFromHex, ownerReadAll } from "./db-owner-sql";
 import type { RecallResult } from "./memory-search";
 import { HINT_ONLY_SCORE_CAP } from "./pipeline/structured-evidence";
 import { setActiveTelemetry } from "./telemetry";
@@ -197,7 +207,7 @@ describe("hybridRecall", () => {
 	it("does not classify post-traversal parent reads as graph failures", () => {
 		const source = readFileSync(join(import.meta.dir, "memory-search.ts"), "utf-8");
 		const embeddingStart = source.indexOf("let embRows:");
-		const embeddingEnd = source.indexOf("const qv = queryVecF32", embeddingStart);
+		const embeddingEnd = source.indexOf("const cosineWeight = 0.7", embeddingStart);
 		const embeddingBlock = source.slice(embeddingStart, embeddingEnd);
 		expect(embeddingBlock).toContain("Traversal embedding re-scoring failed");
 		expect(embeddingBlock).not.toContain("recordGraphResult");
@@ -306,18 +316,27 @@ describe("hybridRecall", () => {
 		};
 
 		try {
-			const result = await hybridRecall(
-				{
-					query: "Signet",
-					keywordQuery: "Signet",
-					limit: 5,
-					agentId: "default",
-					readPolicy: "isolated",
-					trackRecallAccess: false,
-				},
-				testCfg({ graph: true, traversal: true }),
-				async () => unitVector(),
-			);
+			const recall = async () =>
+				await hybridRecall(
+					{
+						query: "Signet",
+						keywordQuery: "Signet",
+						limit: 5,
+						agentId: "default",
+						readPolicy: "isolated",
+						trackRecallAccess: false,
+					},
+					testCfg({ graph: true, traversal: true }),
+					async () => unitVector(),
+				);
+			getDbAccessor().withWriteTx((db) => {
+				db.prepare("DELETE FROM embedding_index_state").run();
+			});
+			await recall();
+			expect(injected).toBe(false);
+
+			await markActiveEmbeddingProfileKnown();
+			const result = await recall();
 			expect(result.results.map((row) => row.id)).toContain("graph-owner-failure-memory");
 			expect(injected).toBe(true);
 			expect(result.meta.graphPartial).toBeUndefined();
@@ -983,6 +1002,323 @@ describe("hybridRecall", () => {
 		expect(disabled.results.some((row) => row.id.startsWith("transcript:"))).toBe(false);
 	});
 
+	it("returns transcript evidence from a transcript larger than one DB owner result", async () => {
+		const now = new Date().toISOString();
+		const filler = "user: unrelated planning chatter about other cities and trains. ".repeat(25_000);
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/large-speyer.jsonl",
+				createHash("sha256").update("large-speyer").digest("hex"),
+				"large-speyer",
+				"token-large-speyer",
+				now,
+				`${filler}user: What is the Speyer tourism board phone number? assistant: +49 6232 142.`,
+				now,
+			);
+		});
+
+		const result = await hybridRecall(
+			{
+				query: "Speyer tourism board phone number",
+				limit: 3,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				trackRecallAccess: false,
+			},
+			testCfg(),
+			async () => null,
+		);
+
+		expect(filler.length).toBeGreaterThan(MAX_DB_OWNER_RESULT_BYTES);
+		expect(result.meta.transcriptEvidence).toEqual({ returned: 1, ranking: "keyword" });
+		const transcript = result.results.find((row) => row.id === "transcript:large-speyer");
+		expect(transcript?.content).toContain("+49 6232 142");
+		expect(transcript?.truncated).toBe(true);
+	});
+
+	it("drops transcript evidence whose row leaves the agent scope between reads", async () => {
+		const now = new Date().toISOString();
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/moved-speyer.jsonl",
+				createHash("sha256").update("moved-speyer").digest("hex"),
+				"moved-speyer",
+				"token-moved-speyer",
+				now,
+				"user: What is the Speyer tourism board phone number? assistant: +49 6232 142.",
+				now,
+			);
+		});
+		const owner = await getDbOwner();
+		const originalSubmit = owner.submit.bind(owner);
+		let contentReads = 0;
+		owner.submit = <Result>(request: DbOwnerRequest, options: DbOwnerSubmitOptions): DbOwnerJobHandle<Result> => {
+			if (options.operation === "memory-search.transcript-evidence.content" && contentReads++ === 0) {
+				getDbAccessor().withWriteTx((db) => {
+					db.prepare("UPDATE memory_artifacts SET agent_id = 'agent-b' WHERE session_id = 'moved-speyer'").run();
+				});
+			}
+			return originalSubmit<Result>(request, options);
+		};
+
+		try {
+			const result = await hybridRecall(
+				{
+					query: "Speyer tourism board phone number",
+					limit: 3,
+					agentId: "agent-a",
+					readPolicy: "isolated",
+					trackRecallAccess: false,
+				},
+				testCfg(),
+				async () => null,
+			);
+			expect(contentReads).toBeGreaterThan(0);
+			expect(result.results.some((row) => row.id === "transcript:moved-speyer")).toBe(false);
+			expect(result.meta.transcriptEvidence).toEqual({ returned: 0, ranking: "keyword" });
+		} finally {
+			owner.submit = originalSubmit;
+		}
+	});
+
+	it("reads transcript content past a NUL character", async () => {
+		const now = new Date().toISOString();
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/nul-speyer.jsonl",
+				createHash("sha256").update("nul-speyer").digest("hex"),
+				"nul-speyer",
+				"token-nul-speyer",
+				now,
+				"user: What is the Speyer tourism board phone number?\u0000 assistant: +49 6232 142, café hours 9 to 5.",
+				now,
+			);
+		});
+
+		const result = await hybridRecall(
+			{
+				query: "Speyer tourism board phone number",
+				limit: 3,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				trackRecallAccess: false,
+			},
+			testCfg(),
+			async () => null,
+		);
+
+		const transcript = result.results.find((row) => row.id === "transcript:nul-speyer");
+		expect(transcript?.content).toContain("+49 6232 142, café hours");
+		expect(transcript?.truncated).toBe(false);
+	});
+
+	it("keeps a multibyte character split across transcript pages whole", async () => {
+		const now = new Date().toISOString();
+		const lead = " user: What is the Speyer tourism board phone number? assistant: +49 6232 142, caf";
+		const content = `${"x".repeat(TRANSCRIPT_PAGE_BYTES - 1 - lead.length)}${lead}é hours 9 to 5.`;
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/split-speyer.jsonl",
+				createHash("sha256").update("split-speyer").digest("hex"),
+				"split-speyer",
+				"token-split-speyer",
+				now,
+				content,
+				now,
+			);
+		});
+
+		const result = await hybridRecall(
+			{
+				query: "Speyer tourism board phone number",
+				limit: 3,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+				trackRecallAccess: false,
+			},
+			testCfg(),
+			async () => null,
+		);
+
+		expect(Buffer.byteLength(content.slice(0, content.indexOf("é")))).toBe(TRANSCRIPT_PAGE_BYTES - 1);
+		const transcript = result.results.find((row) => row.id === "transcript:split-speyer");
+		expect(transcript?.content).toContain("+49 6232 142, café hours");
+	});
+
+	it("caps the transcript pages one recall reads", async () => {
+		const now = new Date().toISOString();
+		const filler = " user: unrelated planning chatter about other cities and trains.".repeat(140_000);
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memory_artifacts (
+					agent_id, source_path, source_sha256, source_kind, session_id, session_token,
+					harness, captured_at, content, updated_at, is_deleted
+				) VALUES ('agent-a', ?, ?, 'transcript', ?, ?, 'claude-code', ?, ?, ?, 0)`,
+			).run(
+				"transcripts/huge-speyer.jsonl",
+				createHash("sha256").update("huge-speyer").digest("hex"),
+				"huge-speyer",
+				"token-huge-speyer",
+				now,
+				`user: What is the Speyer tourism board phone number? assistant: +49 6232 142.${filler}`,
+				now,
+			);
+		});
+		const owner = await getDbOwner();
+		const originalSubmit = owner.submit.bind(owner);
+		let contentReads = 0;
+		owner.submit = <Result>(request: DbOwnerRequest, options: DbOwnerSubmitOptions): DbOwnerJobHandle<Result> => {
+			if (options.operation === "memory-search.transcript-evidence.content") contentReads++;
+			return originalSubmit<Result>(request, options);
+		};
+
+		try {
+			const result = await hybridRecall(
+				{
+					query: "Speyer tourism board phone number",
+					limit: 3,
+					agentId: "agent-a",
+					readPolicy: "isolated",
+					trackRecallAccess: false,
+				},
+				testCfg(),
+				async () => null,
+			);
+			expect(filler.length).toBeGreaterThan(TRANSCRIPT_PAGE_BYTES * TRANSCRIPT_EVIDENCE_MAX_PAGES);
+			expect(contentReads).toBe(TRANSCRIPT_EVIDENCE_MAX_PAGES);
+			const transcript = result.results.find((row) => row.id === "transcript:huge-speyer");
+			expect(transcript?.content).toContain("+49 6232 142");
+			expect(transcript?.truncated).toBe(true);
+		} finally {
+			owner.submit = originalSubmit;
+		}
+	});
+
+	it("reads more vectors than one DB owner result holds, decoded", async () => {
+		const now = new Date().toISOString();
+		const vectorFor = (index: number) =>
+			Array.from({ length: 768 }, (_, dim) => (dim === index % 768 ? 1 : dim === 767 ? 0.5 : 0));
+		const sourceIds = Array.from({ length: 400 }, (_, index) => `mem-vector-${index}`);
+		getDbAccessor().withWriteTx((db) => {
+			const insert = db.prepare(
+				`INSERT INTO embeddings (
+					id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id
+				) VALUES (?, ?, ?, 768, 'memory', ?, '', ?, 'default')`,
+			);
+			sourceIds.forEach((sourceId, index) => {
+				insert.run(`emb-${index}`, `hash-${index}`, vectorBlob(vectorFor(index)), sourceId, now);
+			});
+			insert.run("emb-0-chunk-2", "hash-0-chunk-2", vectorBlob(vectorFor(1)), "mem-vector-0", now);
+			db.prepare(
+				`INSERT INTO embeddings (
+					id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id
+				) VALUES (?, ?, ?, ?, ?, ?, '', ?, 'default')`,
+			).run(
+				"emb-1-old-profile",
+				"hash-1-old-profile",
+				vectorBlob(Array(384).fill(1)),
+				384,
+				"memory",
+				"mem-vector-1",
+				now,
+			);
+			db.prepare(
+				`INSERT INTO embeddings (
+					id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id
+				) VALUES (?, ?, ?, 768, 'transcript', ?, '', ?, 'default')`,
+			).run("emb-2-transcript", "hash-2-transcript", vectorBlob(vectorFor(5)), "mem-vector-2", now);
+		});
+		const owner = await getDbOwner(getDbAccessorPath());
+		const pages: number[] = [];
+
+		const vectors = await readOwnerVectorsBySource(sourceIds, 768, async (sql, params, pageRows) => {
+			const rows = await ownerReadAll<{ rowid: number; source_id: string; vector_hex: string | null }>(
+				owner,
+				sql,
+				params,
+				{
+					operation: "test.vector-pages",
+					workloadClass: "foreground",
+					estimatedWorkUnits: pageRows,
+					deadlineMs: 30_000,
+				},
+			);
+			pages.push(rows.length);
+			return rows;
+		});
+
+		expect(400 * 768 * 4).toBeGreaterThan(MAX_DB_OWNER_RESULT_BYTES);
+		expect(vectors).toHaveLength(401);
+		expect(Math.max(...pages)).toBeLessThanOrEqual(ownerVectorPageRows(768));
+		const byId = new Map(vectors.map((row) => [row.source_id, row.vector]));
+		expect(byId.get("mem-vector-399")?.length).toBe(768);
+		expect(byId.get("mem-vector-399")?.[399]).toBe(1);
+		expect(byId.get("mem-vector-399")?.[767]).toBe(0.5);
+		expect(vectors.filter((row) => row.source_id === "mem-vector-0")).toHaveLength(2);
+		expect(vectors.filter((row) => row.source_id === "mem-vector-1")).toHaveLength(1);
+		expect(vectors.filter((row) => row.source_id === "mem-vector-2")).toHaveLength(1);
+		expect(vectors.every((row) => row.vector.length === 768)).toBe(true);
+	});
+
+	it("decodes DB owner hex and rejects malformed hex", () => {
+		const bytes = Uint8Array.from([0, 1, 127, 128, 255]);
+		expect(ownerBytesFromHex(Buffer.from(bytes).toString("hex").toUpperCase())).toEqual(bytes);
+		expect(ownerBytesFromHex("")).toEqual(new Uint8Array(0));
+		expect(() => ownerBytesFromHex("00zz")).toThrow("invalid hex blob");
+		expect(() => ownerBytesFromHex("abc")).toThrow("invalid hex blob");
+	});
+
+	it("skips vector blobs whose size disagrees with their declared dimensions", async () => {
+		const now = new Date().toISOString();
+		const sourceIds = Array.from({ length: 200 }, (_, index) => `mem-oversized-${index}`);
+		getDbAccessor().withWriteTx((db) => {
+			const insert = db.prepare(
+				`INSERT INTO embeddings (
+					id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id
+				) VALUES (?, ?, ?, 768, 'memory', ?, '', ?, 'default')`,
+			);
+			sourceIds.forEach((sourceId, index) => {
+				insert.run(`emb-oversized-${index}`, `hash-oversized-${index}`, vectorBlob(Array(3072).fill(1)), sourceId, now);
+			});
+			insert.run("emb-oversized-valid", "hash-oversized-valid", vectorBlob(Array(768).fill(1)), "mem-oversized-0", now);
+		});
+		const owner = await getDbOwner(getDbAccessorPath());
+
+		const vectors = await readOwnerVectorsBySource(sourceIds, 768, async (sql, params, pageRows) =>
+			ownerReadAll<{ rowid: number; source_id: string; vector_hex: string | null }>(owner, sql, params, {
+				operation: "test.vector-pages",
+				workloadClass: "foreground",
+				estimatedWorkUnits: pageRows,
+				deadlineMs: 30_000,
+			}),
+		);
+
+		expect(ownerVectorPageRows(768) * 3072 * 4 * 2).toBeGreaterThan(MAX_DB_OWNER_RESULT_BYTES);
+		expect(vectors).toHaveLength(1);
+		expect(vectors[0]?.source_id).toBe("mem-oversized-0");
+		expect(vectors[0]?.vector.length).toBe(768);
+	});
+
 	it("places transcript excerpts by cross-encoder relevance against the bottom results", async () => {
 		const row = (id: string, content: string): RecallResult => ({
 			id,
@@ -1552,6 +1888,44 @@ describe("hybridRecall", () => {
 		expect(result.results[0]?.id).toBe("mem-relevant-limit");
 		expect(result.results).toHaveLength(2);
 		expect(result.results[1]?.source).toBe("temporal_window");
+	});
+
+	it("still fills same-window memories when their vectors cannot be read", async () => {
+		await markActiveEmbeddingProfileKnown();
+		const savedAt = "2026-05-24T18:00:00.000Z";
+		getDbAccessor().withWriteTx((db) => {
+			for (const [id, at] of [
+				["mem-window-fill-a", "2026-05-13T09:00:00.000Z"],
+				["mem-window-fill-b", "2026-05-13T10:00:00.000Z"],
+			]) {
+				db.prepare(
+					`INSERT INTO memories (
+						id, content, type, agent_id, visibility, created_at, updated_at, updated_by, is_deleted
+					) VALUES (?, ?, 'fact', 'agent-a', 'global', ?, ?, 'test', 0)`,
+				).run(id, `Same-day temporal candidate ${id}.`, savedAt, savedAt);
+				db.prepare(
+					`INSERT INTO temporal_edges (
+						id, agent_id, subject_type, subject_id, facet, start_at, end_at,
+						confidence, created_at, updated_at
+					) VALUES (?, 'agent-a', 'memory', ?, 'occurred', ?, ?, 1.0, ?, ?)`,
+				).run(`edge-${id}`, id, at, at, savedAt, savedAt);
+			}
+			db.exec("ALTER TABLE embeddings RENAME COLUMN dimensions TO declared_dimensions");
+		});
+
+		const result = await hybridRecall(
+			{
+				query: "2026/05/13 unrelated wording",
+				keywordQuery: "unrelated wording",
+				limit: 2,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+			},
+			testCfg(),
+			async () => unitVector(),
+		);
+
+		expect(result.results.map((row) => row.source)).toEqual(["temporal_window", "temporal_window"]);
 	});
 
 	it("honors explicit timeline mode even when query text is present", async () => {
