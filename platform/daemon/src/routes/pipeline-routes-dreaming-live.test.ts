@@ -1,3 +1,8 @@
+import {
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+	closeRegisteredDbOwnerMaintenance,
+} from "../db-owner-maintenance";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -75,6 +80,7 @@ describe("Dreaming live routes", () => {
 
 	afterEach(async () => {
 		dreamingLiveEvents.reset();
+		await closeRegisteredDbOwnerMaintenance();
 		await closeDbAccessor();
 		rmSync(agentsDir, { recursive: true, force: true });
 		if (originalAgentId === undefined) Reflect.deleteProperty(process.env, "SIGNET_AGENT_ID");
@@ -172,6 +178,8 @@ describe("Dreaming live routes", () => {
 	});
 
 	it("awaits dreaming workload diagnostics in both diagnostics routes", async () => {
+		const owner = await getDbOwnerForAccessor(getDbAccessor());
+		registerDbOwnerMaintenance(createDbOwnerMaintenance({ owner, dbPath: join(agentsDir, "memory", "memories.db") }));
 		const previousOwnerMode = process.env.SIGNET_DB_OWNER_WORKER;
 		process.env.SIGNET_DB_OWNER_WORKER = "1";
 		try {

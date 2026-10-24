@@ -52,7 +52,8 @@ function normalizeSourcePath(path: string): string | null {
 		return `/UNC/${remainder}`;
 	}
 	if (path.includes("\\")) return null;
-	const normalized = path.replace(/\/{2,}/g, "/");
+	if (path.includes("//")) return null;
+	const normalized = path;
 	const remainder = normalized.startsWith("/") ? normalized.slice(1) : normalized;
 	if (/\s/.test(remainder)) return null;
 	return isSafePathRemainder(remainder) ? normalized : null;

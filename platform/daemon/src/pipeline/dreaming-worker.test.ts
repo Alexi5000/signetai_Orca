@@ -851,28 +851,35 @@ describe("dreaming worker agent scope", () => {
 	});
 
 	it("reports scoped Dreaming ages using SQLite UTC timestamps", async () => {
-		db.prepare(
-			`INSERT INTO dreaming_passes (id, agent_id, mode, status, started_at, created_at)
+		const fixture = await createRealOwnerTriggerFixture({
+			seed: (db) => {
+				db.prepare(
+					`INSERT INTO dreaming_passes (id, agent_id, mode, status, started_at, created_at)
 			 VALUES ('active-pass', 'default', 'incremental', 'running', '2026-08-13 10:00:00', '2026-08-13 10:00:00')`,
-		).run();
-		db.prepare(
-			`INSERT INTO dreaming_attention (id, agent_id, kind, subject_ref, details_json, priority, created_at)
+				).run();
+				db.prepare(
+					`INSERT INTO dreaming_attention (id, agent_id, kind, subject_ref, details_json, priority, created_at)
 			 VALUES ('pending-attention', 'default', 'review_due', 'subject', '{}', 50, '2026-08-13 09:00:00')`,
-		).run();
-
-		const nowMs = Date.UTC(2026, 7, 13, 11);
-		expect(await getDreamingWorkloadDiagnostics(accessor, "default", nowMs)).toEqual({
-			activePasses: 1,
-			oldestPassAgeMs: 60 * 60 * 1_000,
-			pendingAttention: 1,
-			oldestAttentionAgeMs: 2 * 60 * 60 * 1_000,
+				).run();
+			},
 		});
-		expect(await getDreamingWorkloadDiagnostics(accessor, "other", nowMs)).toEqual({
-			activePasses: 0,
-			oldestPassAgeMs: null,
-			pendingAttention: 0,
-			oldestAttentionAgeMs: null,
-		});
+		try {
+			const nowMs = Date.UTC(2026, 7, 13, 11);
+			expect(await getDreamingWorkloadDiagnostics(fixture.accessor, "default", nowMs)).toEqual({
+				activePasses: 1,
+				oldestPassAgeMs: 60 * 60 * 1_000,
+				pendingAttention: 1,
+				oldestAttentionAgeMs: 2 * 60 * 60 * 1_000,
+			});
+			expect(await getDreamingWorkloadDiagnostics(fixture.accessor, "other", nowMs)).toEqual({
+				activePasses: 0,
+				oldestPassAgeMs: null,
+				pendingAttention: 0,
+				oldestAttentionAgeMs: null,
+			});
+		} finally {
+			await closeRealOwnerTriggerFixture(fixture);
+		}
 	});
 
 	it("rejects an overlapping manual pass without skipping the active pass", async () => {

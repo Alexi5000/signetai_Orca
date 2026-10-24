@@ -109,7 +109,7 @@ describe("notion-source-provider", () => {
 		previousSignetPath = process.env.SIGNET_PATH;
 		process.env.SIGNET_PATH = dir;
 		mkdirSync(join(dir, "memory"), { recursive: true });
-		closeDbAccessor();
+		await closeDbAccessor();
 		initDbAccessor(join(dir, "memory", "memories.db"));
 		setSecretKeyringAdapterForTests(memoryKeyring());
 		await putSecret("NOTION_TOKEN", TOKEN);

@@ -563,7 +563,7 @@ afterEach(async () => {
 });
 
 describe("db accessor pragmas", () => {
-	test.serial("openDb path sets busy_timeout", () => {
+	test.serial("parent database connection stays nonblocking", () => {
 		createMemoryDb();
 		closeDbAccessor();
 		initDbAccessor(join(TEST_DIR, "memory", "memories.db"));
@@ -571,7 +571,7 @@ describe("db accessor pragmas", () => {
 			const row = db.prepare("PRAGMA busy_timeout").get() as { timeout?: number } | undefined;
 			return row?.timeout ?? 0;
 		});
-		expect(timeout).toBe(5000);
+		expect(timeout).toBe(0);
 	});
 });
 

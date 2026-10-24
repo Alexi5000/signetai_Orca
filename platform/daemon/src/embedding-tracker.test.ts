@@ -1,3 +1,9 @@
+import { startDbOwner } from "./db-owner-runtime";
+import {
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+	closeRegisteredDbOwnerMaintenance,
+} from "./db-owner-maintenance";
 import { describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -100,7 +106,7 @@ describe("startEmbeddingTracker admission", () => {
 	it("embeds never-embedded memories while the re-embed repair budget is spent", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "signet-embedding-tracker-"));
 		mkdirSync(join(dir, "memory"), { recursive: true });
-		initDbAccessor(join(dir, "memory", "memories.db"));
+		initDbAccessor(join(dir, "memory", "memories.db"), { agentsDir: dir });
 		const accessor = getDbAccessor();
 		const trackerCfg = { enabled: true, pollMs: 20, batchSize: 8 };
 		const repairCfg = {
@@ -123,6 +129,9 @@ describe("startEmbeddingTracker admission", () => {
 			insert.run("fresh-b", "Another fresh derived memory.", "hash-fresh-b", now, now, null);
 			insert.run("stale-model", "A memory embedded by an older model.", "hash-stale", now, now, "older-model");
 		});
+		const owner = await startDbOwner(join(dir, "memory", "memories.db"));
+		await owner.initialize(dir);
+		registerDbOwnerMaintenance(createDbOwnerMaintenance({ owner, dbPath: join(dir, "memory", "memories.db") }));
 		const spent = await acquireEmbeddingRepairLease(accessor, 0, 1);
 		if (!spent.allowed || spent.lease === undefined) throw new Error("expected a repair lease");
 		await finishEmbeddingRepairLease(accessor, spent.lease, {
@@ -155,21 +164,30 @@ describe("startEmbeddingTracker admission", () => {
 			await new Promise((resolve) => setTimeout(resolve, 200));
 			expect([...embedded].sort()).toEqual(["A fresh derived memory.", "Another fresh derived memory."]);
 			expect(
-				accessor.withReadDb(
-					(db) =>
-						db.prepare("SELECT batches_started AS n FROM embedding_repair_budget WHERE id = 1").get() as { n: number },
-				),
+				await owner.submit(
+					{
+						kind: "query",
+						statement: {
+							sql: "SELECT batches_started AS n FROM embedding_repair_budget WHERE id = 1",
+							params: [],
+							result: "get",
+							readonly: true,
+						},
+					},
+					{ operation: "test.repair-budget", lane: "read", deadlineMs: 5000 },
+				).result,
 			).toEqual({ n: 1 });
 		} finally {
 			await tracker.stop();
-			closeDbAccessor();
+			await closeRegisteredDbOwnerMaintenance();
+			await closeDbAccessor();
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 	it("drains a backlog of first-time embeddings without waiting a poll interval between full batches", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "signet-embedding-tracker-drain-"));
 		mkdirSync(join(dir, "memory"), { recursive: true });
-		initDbAccessor(join(dir, "memory", "memories.db"));
+		initDbAccessor(join(dir, "memory", "memories.db"), { agentsDir: dir });
 		const accessor = getDbAccessor();
 		const trackerCfg = { enabled: true, pollMs: 2_000, batchSize: 2 };
 		const repairCfg = {
@@ -191,6 +209,9 @@ describe("startEmbeddingTracker admission", () => {
 			for (let index = 0; index < 7; index++)
 				insert.run(`fresh-${index}`, `Fresh memory ${index}.`, `hash-${index}`, now, now);
 		});
+		const owner = await startDbOwner(join(dir, "memory", "memories.db"));
+		await owner.initialize(dir);
+		registerDbOwnerMaintenance(createDbOwnerMaintenance({ owner, dbPath: join(dir, "memory", "memories.db") }));
 		const activeCfg = {
 			provider: "native",
 			model: "nomic-embed-text-v1.5",
@@ -216,7 +237,8 @@ describe("startEmbeddingTracker admission", () => {
 			expect(Date.now() - startedAt).toBeLessThan(3_500);
 		} finally {
 			await tracker.stop();
-			closeDbAccessor();
+			await closeRegisteredDbOwnerMaintenance();
+			await closeDbAccessor();
 			rmSync(dir, { recursive: true, force: true });
 		}
 	}, 15_000);

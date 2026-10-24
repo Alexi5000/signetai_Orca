@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 let readAttempts = 0;
@@ -8,18 +8,51 @@ let readError: Error & { code: string } = Object.assign(new Error("EDEADLK: reso
 });
 let statError: (path: string) => (Error & { code: string }) | null = () => null;
 let readdirError: (path: string) => (Error & { code: string }) | null = () => null;
-afterEach(() => {
-	closeDbAccessor();
+afterEach(async () => {
+	await closeDbAccessor();
 	resetNativeMemoryIndexCache();
 	statError = () => null;
 	readdirError = () => null;
 });
 const realFsPromises = { ...(await import("node:fs/promises")) };
+const realSourceWorker = { ...(await import("./native-memory-source-worker")) };
+mock.module("./native-memory-source-worker", () => ({
+	...realSourceWorker,
+	createNativeSourceWorker: (...args: Parameters<typeof realSourceWorker.createNativeSourceWorker>) => {
+		const worker = realSourceWorker.createNativeSourceWorker(...args);
+		return {
+			...worker,
+			scan: async (input: Parameters<typeof worker.scan>[0]) => {
+				if (readdirError(input.source.root))
+					return {
+						files: [],
+						rejected: [],
+						nextCursor: null,
+						scanned: 0,
+						total: 0,
+						complete: true,
+						frontier: [],
+						permissionDeniedPaths: [input.source.root],
+					};
+				return worker.scan(input);
+			},
+		};
+	},
+}));
 afterAll(() => {
 	mock.module("node:fs/promises", () => realFsPromises);
+	mock.module("./native-memory-source-worker", () => realSourceWorker);
 });
 mock.module("node:fs/promises", () => ({
 	...realFsPromises,
+	open: async (path: string, flags: number) => {
+		const handle = await realFsPromises.open(path, flags);
+		handle.readFile = async () => {
+			readAttempts++;
+			throw readError;
+		};
+		return handle;
+	},
 	lstat: async () => ({ isSymbolicLink: () => false }),
 	stat: async (path: string) => {
 		const error = statError(path);
@@ -73,7 +106,7 @@ describe("dataless / EDEADLK native artifact reads (#1161)", () => {
 		const dir = mkdtempSync(join(tmpdir(), "signet-dataless-"));
 		writeFileSync(join(dir, "agent.yaml"), "name: DatalessTest\n");
 		process.env.SIGNET_PATH = dir;
-		initDbAccessor(join(dir, "memory", "memories.db"));
+		initDbAccessor(join(dir, "memory", "memories.db"), { agentsDir: dir });
 
 		const warnCalls: string[] = [];
 		const originalWarn = logger.warn;
@@ -99,6 +132,7 @@ describe("dataless / EDEADLK native artifact reads (#1161)", () => {
 			expect(datalessWarns[0]).toContain("on obsidian");
 		} finally {
 			logger.warn = originalWarn;
+			await closeDbAccessor();
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -108,7 +142,7 @@ describe("dataless / EDEADLK native artifact reads (#1161)", () => {
 		writeFileSync(join(dir, "agent.yaml"), "name: TccTest\n");
 		const previousSignetPath = process.env.SIGNET_PATH;
 		process.env.SIGNET_PATH = dir;
-		initDbAccessor(join(dir, "memory", "memories.db"));
+		initDbAccessor(join(dir, "memory", "memories.db"), { agentsDir: dir });
 		const originalPlatform = process.platform;
 		Object.defineProperty(process, "platform", { value: "darwin" });
 		const originalError = readError;
@@ -149,6 +183,7 @@ describe("dataless / EDEADLK native artifact reads (#1161)", () => {
 
 	it("classifies protected native source discovery roots and directories", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "signet-tcc-discovery-"));
+		initDbAccessor(join(dir, "memory", "memories.db"), { agentsDir: dir });
 		const source = obsidianNativeMemorySource(dir);
 		const originalPlatform = process.platform;
 		const originalWarn = logger.warn;
@@ -170,8 +205,7 @@ describe("dataless / EDEADLK native artifact reads (#1161)", () => {
 
 			resetNativeMemoryIndexCache();
 			statError = () => null;
-			readdirError = () => null;
-			chmodSync(dir, 0o000);
+			readdirError = (path) => (path === dir ? permissionError() : null);
 			const readdirBridge = startNativeMemoryBridge([source], { agentId: "agent-readdir", pollIntervalMs: 0 });
 			await readdirBridge.syncExisting();
 			await readdirBridge.syncExisting();
@@ -184,7 +218,7 @@ describe("dataless / EDEADLK native artifact reads (#1161)", () => {
 		} finally {
 			logger.warn = originalWarn;
 			Object.defineProperty(process, "platform", { value: originalPlatform });
-			chmodSync(dir, 0o700);
+			await closeDbAccessor();
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});

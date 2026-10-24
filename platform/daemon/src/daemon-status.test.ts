@@ -75,17 +75,27 @@ describe("daemon status contract", () => {
 	it("keeps /health/live responsive while the DB owner is blocked (status genuinely contends, not dropped)", async () => {
 		const { getDbAccessor } = await import("./db-accessor");
 		const accessor = getDbAccessor();
-		const originalWithReadDbAsync = accessor.withReadDbAsync;
+		const { getDbOwnerForAccessor } = await import("./db-owner-runtime");
+		const { createDbOwnerMaintenance, registerDbOwnerMaintenance, closeRegisteredDbOwnerMaintenance } = await import(
+			"./db-owner-maintenance"
+		);
+		const owner = await getDbOwnerForAccessor(accessor);
+		const maintenance = createDbOwnerMaintenance({ owner, dbPath: join(dir, "memory", "memories.db") });
+		const originalProgress = maintenance.embeddingMigrationProgress;
 		let releaseOwner: (() => void) | undefined;
 		const ownerStarted$ = new Promise<void>((resolve) => {
 			releaseOwner = resolve;
 		});
 		let ownerBlocked = false;
-		accessor.withReadDbAsync = async (fn, options) => {
-			ownerBlocked = true;
-			await ownerStarted$;
-			return originalWithReadDbAsync(fn, options);
+		const blockedMaintenance = {
+			...maintenance,
+			embeddingMigrationProgress: async (...args: Parameters<typeof originalProgress>) => {
+				ownerBlocked = true;
+				await ownerStarted$;
+				return originalProgress(...args);
+			},
 		};
+		registerDbOwnerMaintenance(blockedMaintenance);
 
 		try {
 			const statusStartedAt = performance.now();
@@ -122,7 +132,7 @@ describe("daemon status contract", () => {
 			);
 		} finally {
 			releaseOwner?.();
-			accessor.withReadDbAsync = originalWithReadDbAsync;
+			await closeRegisteredDbOwnerMaintenance();
 		}
 	});
 

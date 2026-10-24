@@ -48,11 +48,11 @@ in the development workflow even though they are not runtime imports.
 | `@types/d3-force` | `^3.0.10` | MIT | [DefinitelyTyped](https://github.com/DefinitelyTyped/DefinitelyTyped) |
 | `@types/yaml` | `^1.9.7` | MIT | [yaml](https://github.com/eemeli/yaml) |
 | `@vitejs/plugin-react` | `^5.2.0` | MIT | [Vite React plugin](https://github.com/vitejs/vite-plugin-react) |
-| `happy-dom` | `^20.11.1` | MIT | [Happy DOM](https://github.com/capricorn86/happy-dom) |
+| `happy-dom` | `^21.0.4` | MIT | [Happy DOM](https://github.com/capricorn86/happy-dom) |
 | `tailwindcss` | `^4.2.0` | MIT | [Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) |
 | `tw-animate-css` | `^1.4.0` | MIT | [tw-animate-css](https://github.com/Wombosvideo/tw-animate-css) |
 | `typescript` | `^5.9.3` | Apache-2.0 | [TypeScript](https://github.com/microsoft/TypeScript) |
-| `vite` | `^7.3.6` | MIT | [Vite](https://github.com/vitejs/vite) |
+| `vite` | `^8.3.5` | MIT | [Vite](https://github.com/vitejs/vite) |
 
 ## License texts referenced
 

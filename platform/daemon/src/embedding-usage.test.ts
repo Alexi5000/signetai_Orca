@@ -1,8 +1,14 @@
+import { startDbOwner } from "./db-owner-runtime";
+import {
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+	closeRegisteredDbOwnerMaintenance,
+} from "./db-owner-maintenance";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
-import { recordEmbeddingUsage } from "./embedding-usage";
+import { recordEmbeddingUsage, readEmbeddingUsageSummary } from "./embedding-usage";
 import { type TelemetryCollector, createTelemetryCollector, setActiveTelemetry } from "./telemetry";
 import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
 
@@ -22,7 +28,10 @@ async function resetWorkspace(): Promise<void> {
 	await closeDbAccessor();
 	rmSync(join(dir, "memory"), { recursive: true, force: true });
 	mkdirSync(join(dir, "memory"), { recursive: true });
-	initDbAccessor(join(dir, "memory", "memories.db"));
+	initDbAccessor(join(dir, "memory", "memories.db"), { agentsDir: dir });
+	const owner = await startDbOwner(join(dir, "memory", "memories.db"));
+	await owner.initialize(dir);
+	registerDbOwnerMaintenance(createDbOwnerMaintenance({ owner, dbPath: join(dir, "memory", "memories.db") }));
 }
 
 describe("embedding telemetry (issue #1181)", () => {
@@ -31,9 +40,10 @@ describe("embedding telemetry (issue #1181)", () => {
 		await resetWorkspace();
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		setActiveTelemetry(undefined);
-		closeDbAccessor();
+		await closeRegisteredDbOwnerMaintenance();
+		await closeDbAccessor();
 		cleanupTestTempDir(dir);
 	});
 
@@ -55,6 +65,7 @@ describe("embedding telemetry (issue #1181)", () => {
 		expect(second?.properties.tokens).toBe(42);
 		expect(second?.properties.cost).toBe(0);
 		expect(second?.properties.sourceKind).toBe("dreaming");
+		await readEmbeddingUsageSummary(getDbAccessor());
 		const row = getDbAccessor().withReadDb(
 			(db) => db.prepare("SELECT SUM(tokens) AS tokens FROM embedding_usage").get() as { tokens: number },
 		);

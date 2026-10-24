@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { writeFileExclusiveSync } from "@signet/core";
 import { join } from "node:path";
 import { OpenClawConnector } from "@signet/connector-openclaw";
