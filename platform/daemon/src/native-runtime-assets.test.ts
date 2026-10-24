@@ -77,7 +77,10 @@ describe("native-runtime-assets", () => {
 		const first = materializeEmbeddedNativeLibrary("test-vec-library", "vec0.so");
 		expect(first?.endsWith("/vec0.so")).toBe(true);
 		expect(first ? readFileSync(first, "utf8") : "").toBe("vec-v1");
+		const before = first ? statSync(first) : null;
 		expect(materializeEmbeddedNativeLibrary("test-vec-library", "vec0.so")).toBe(first);
+		expect(first ? statSync(first).ino : null).toBe(before?.ino ?? null);
+		expect(first ? statSync(first).mtimeMs : null).toBe(before?.mtimeMs ?? null);
 
 		registerNativeAssets({
 			nativeAddons: [{ name: "test-vec-library", contentBase64: Buffer.from("vec-v2").toString("base64") }],

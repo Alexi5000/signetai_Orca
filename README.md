@@ -57,6 +57,8 @@ Local first. Your transcripts and imports stay in your workspace database. Dream
 
 ### Install Signet
 
+The shell installer, npm, and Bun install the same compiled Signet binary through a platform-specific native package.
+
 ```bash
 # macOS and Linux
 curl -fsSL https://signetai.sh/install.sh | bash

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { serve } from "@hono/node-server";
+import { createSignetHttpServer } from "./http-server";
 import { Hono } from "hono";
 import { registerGlobalMiddleware } from "./middleware";
 
@@ -15,7 +15,11 @@ test("HTTP origin enforcement rejects browser requests before route side effects
 		return c.json({ writes });
 	});
 	const listening = Promise.withResolvers<number>();
-	const server = serve({ fetch: app.fetch, hostname: "127.0.0.1", port: 0 }, (info) => listening.resolve(info.port));
+	const server = createSignetHttpServer({ fetch: app.fetch });
+	server.listen(0, "127.0.0.1", () => {
+		const address = server.address();
+		listening.resolve(typeof address === "object" && address !== null ? address.port : 0);
+	});
 	try {
 		const url = `http://127.0.0.1:${await listening.promise}/api/origin-proof`;
 		for (const origin of [

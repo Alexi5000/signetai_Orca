@@ -1913,224 +1913,196 @@
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 96,
+      "line": 100,
       "api": "lstatSync",
       "source": "const st = lstatSync(dir);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 110,
+      "line": 114,
       "api": "mkdirSync",
       "source": "mkdirSync(dir, { mode: 0o700 });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 116,
+      "line": 120,
       "api": "createPrivateTempDir",
       "source": "const isolated = createPrivateTempDir(`${name}-`);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 124,
+      "line": 128,
       "api": "existsSync",
       "source": "return existsSync(path) && readFileSync(path).equals(content);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 124,
+      "line": 128,
       "api": "readFileSync",
       "source": "return existsSync(path) && readFileSync(path).equals(content);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 134,
+      "line": 138,
       "api": "writeFileSync",
       "source": "writeFileSync(tempPath, content, { flag: \"wx\", mode: 0o600 });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 138,
+      "line": 142,
       "api": "renameSync",
       "source": "renameSync(tempPath, path);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 147,
+      "line": 151,
       "api": "unlinkSync",
       "source": "unlinkSync(path);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 154,
+      "line": 158,
       "api": "rmSync",
       "source": "rmSync(tempDir, { recursive: true, force: true });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 179,
+      "line": 183,
       "api": "readdirSync",
       "source": "for (const entry of readdirSync(dir)) {",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 185,
+      "line": 189,
       "api": "readFileSync",
       "source": "const entryHash = createHash(\"sha256\").update(readFileSync(entryPath)).digest(\"hex\").slice(0, 16);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 191,
+      "line": 195,
       "api": "unlinkSync",
       "source": "unlinkSync(entryPath);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 195,
+      "line": 199,
       "api": "existsSync",
       "source": "existsSync(path) && createHash(\"sha256\").update(readFileSync(path)).digest(\"hex\").slice(0, 16) === hash;",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 195,
+      "line": 199,
       "api": "readFileSync",
       "source": "existsSync(path) && createHash(\"sha256\").update(readFileSync(path)).digest(\"hex\").slice(0, 16) === hash;",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 200,
+      "line": 204,
       "api": "writeFileSync",
       "source": "writeFileSync(tempPath, content, { flag: \"wx\" });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 204,
+      "line": 208,
       "api": "renameSync",
       "source": "renameSync(tempPath, path);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 213,
+      "line": 217,
       "api": "unlinkSync",
       "source": "unlinkSync(path);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 220,
+      "line": 224,
       "api": "rmSync",
       "source": "rmSync(tempDir, { recursive: true, force: true });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 236,
-      "api": "mkdirSync",
-      "source": "mkdirSync(dir, { recursive: true });",
+      "line": 246,
+      "api": "lstatSync",
+      "source": "const entry = lstatSync(path);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 237,
-      "api": "readdirSync",
-      "source": "for (const entry of readdirSync(root)) {",
-      "category": "hot-path"
-    },
-    {
-      "path": "native-runtime-assets.ts",
-      "line": 240,
-      "api": "rmSync",
-      "source": "rmSync(join(root, entry), { recursive: true, force: true });",
-      "category": "hot-path"
-    },
-    {
-      "path": "native-runtime-assets.ts",
-      "line": 244,
-      "api": "existsSync",
-      "source": "existsSync(path) && createHash(\"sha256\").update(readFileSync(path)).digest(\"hex\").slice(0, 16) === hash;",
-      "category": "hot-path"
-    },
-    {
-      "path": "native-runtime-assets.ts",
-      "line": 244,
+      "line": 253,
       "api": "readFileSync",
-      "source": "existsSync(path) && createHash(\"sha256\").update(readFileSync(path)).digest(\"hex\").slice(0, 16) === hash;",
+      "source": "valid = opened.size === content.length && readFileSync(fd).equals(content);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 248,
-      "api": "writeFileSync",
-      "source": "writeFileSync(tempPath, content);",
+      "line": 259,
+      "api": "writeFileAtomicSync",
+      "source": "if (!valid) writeFileAtomicSync(path, content, { mode: 0o600, followSymlinks: false, fsync: true });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 249,
-      "api": "renameSync",
-      "source": "renameSync(tempPath, path);",
+      "line": 263,
+      "api": "unlinkSync",
+      "source": "unlinkSync(previous);",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 251,
-      "api": "rmSync",
-      "source": "rmSync(tempPath, { force: true });",
-      "category": "hot-path"
-    },
-    {
-      "path": "native-runtime-assets.ts",
-      "line": 267,
+      "line": 279,
       "api": "mkdirSync",
       "source": "mkdirSync(dir, { recursive: true, mode: 0o700 });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 270,
+      "line": 282,
       "api": "writeFileExclusiveSync",
       "source": "writeFileExclusiveSync(path, Buffer.from(asset.contentBase64, \"base64\"));",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 283,
+      "line": 295,
       "api": "mkdirSync",
       "source": "mkdirSync(root, { recursive: true, mode: 0o700 });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 288,
+      "line": 300,
       "api": "mkdirSync",
       "source": "mkdirSync(dirname(path), { recursive: true });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 289,
+      "line": 301,
       "api": "writeFileExclusiveSync",
       "source": "writeFileExclusiveSync(path, Buffer.from(asset.contentBase64, \"base64\"), { mode: asset.mode });",
       "category": "hot-path"
     },
     {
       "path": "native-runtime-assets.ts",
-      "line": 292,
+      "line": 304,
       "api": "writeFileAtomicSync",
       "source": "writeFileAtomicSync(join(root, \".signet-assets.json\"), `${JSON.stringify({ kind, sourceHash }, null, 2)}\\n`, {",
       "category": "hot-path"
@@ -4981,7 +4953,7 @@
     },
     {
       "path": "transcript-capture-worker.ts",
-      "line": 424,
+      "line": 430,
       "api": "withReadDbAsync",
       "source": "return await dbAccessor.withReadDbAsync(",
       "category": "hot-path",
@@ -4989,7 +4961,7 @@
     },
     {
       "path": "transcript-capture-worker.ts",
-      "line": 653,
+      "line": 659,
       "api": "withReadDbAsync",
       "source": "const rows = await dbAccessor.withReadDbAsync(",
       "category": "hot-path",
@@ -4997,21 +4969,21 @@
     },
     {
       "path": "transcript-capture-worker.ts",
-      "line": 680,
+      "line": 686,
       "api": "existsSync",
       "source": "return Boolean(row.has_session_source) || Boolean(path && (existsSync(path) || existsSync(join(basePath, path))));",
       "category": "hot-path"
     },
     {
       "path": "transcript-capture-worker.ts",
-      "line": 680,
+      "line": 686,
       "api": "existsSync",
       "source": "return Boolean(row.has_session_source) || Boolean(path && (existsSync(path) || existsSync(join(basePath, path))));",
       "category": "hot-path"
     },
     {
       "path": "transcript-capture-worker.ts",
-      "line": 829,
+      "line": 835,
       "api": "withReadDbAsync",
       "source": "return await dbAccessor.withReadDbAsync(",
       "category": "hot-path",
@@ -5019,7 +4991,7 @@
     },
     {
       "path": "transcript-capture-worker.ts",
-      "line": 866,
+      "line": 872,
       "api": "withReadDbAsync",
       "source": "return await dbAccessor.withReadDbAsync(",
       "category": "hot-path",

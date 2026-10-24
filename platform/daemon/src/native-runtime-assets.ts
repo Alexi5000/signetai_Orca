@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	closeSync,
+	constants,
 	existsSync,
+	fstatSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
@@ -236,7 +240,23 @@ export function materializeEmbeddedNativeLibrary(name: string, fileName: string)
 	}
 	const dir = ensurePrivateCacheDir(`signet-native-library-${safeName}-${hash}`);
 	const path = join(dir, fileName);
-	writeFileAtomicSync(path, content, { mode: 0o600, followSymlinks: false, fsync: true });
+	let valid = false;
+	let fd: number | undefined;
+	try {
+		const entry = lstatSync(path);
+		if (!entry.isFile() || entry.nlink !== 1) throw new Error("Invalid native library cache entry");
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		const opened = fstatSync(fd);
+		if (!opened.isFile() || opened.nlink !== 1 || opened.ino !== entry.ino || opened.dev !== entry.dev) {
+			throw new Error("Native library cache entry changed");
+		}
+		valid = opened.size === content.length && readFileSync(fd).equals(content);
+	} catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+	if (!valid) writeFileAtomicSync(path, content, { mode: 0o600, followSymlinks: false, fsync: true });
 	const previous = materializedLibraries.get(name);
 	if (previous && previous !== path) {
 		try {
