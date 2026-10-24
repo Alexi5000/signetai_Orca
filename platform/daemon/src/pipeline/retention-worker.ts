@@ -1,6 +1,7 @@
 import type { DbAccessor, WriteDb } from "../db-accessor";
 import type { DbOwnerMaintenance } from "../db-owner-maintenance";
 import { startDependencyHistoryCompaction } from "../dependency-history-compaction";
+import { getDatabaseIntegrityStatus } from "../database-integrity";
 
 async function writeTx<T>(accessor: DbAccessor, fn: (db: WriteDb) => T): Promise<T> {
 	const writer = accessor.withWriteTxAsync;
@@ -390,6 +391,10 @@ export function startRetentionWorker(
 	}
 
 	async function runScheduledSweep(): Promise<void> {
+		if (running && ownerMaintenance && getDatabaseIntegrityStatus().phase !== "complete") {
+			timer = setTimeout(runScheduledSweep, 60_000);
+			return;
+		}
 		if (running && !isSystemPressureHigh()) {
 			await doSweep().catch((e) => {
 				logger.warn("retention", "Sweep error", {
