@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Context } from "hono";
-import { resolveDreamRequestAgentId } from "./pipeline-routes";
+import { getDreamingBlockedBy, getDreamingTriggerBlockReason, resolveDreamRequestAgentId } from "./pipeline-routes";
 
 const originalAgentId = process.env.SIGNET_AGENT_ID;
 
@@ -16,6 +16,57 @@ function makeContext(query: Record<string, string | undefined>, headers: Record<
 		},
 	} as unknown as Context;
 }
+
+describe("dream trigger admission", () => {
+	const open = { enabled: true, paused: false, mutationsFrozen: false };
+
+	it("rejects triggers during pipeline transitions", () => {
+		expect(getDreamingTriggerBlockReason(true, open)).toEqual({
+			status: 409,
+			error: "Pipeline transition already in progress",
+		});
+	});
+
+	it("rejects triggers while disabled, paused, or mutations are frozen", () => {
+		expect(getDreamingTriggerBlockReason(false, { ...open, enabled: false })).toEqual({
+			status: 503,
+			error: "Pipeline is disabled",
+		});
+		expect(getDreamingTriggerBlockReason(false, { ...open, paused: true })).toEqual({
+			status: 503,
+			error: "Pipeline is paused",
+		});
+		expect(getDreamingTriggerBlockReason(false, { ...open, mutationsFrozen: true })).toEqual({
+			status: 503,
+			error: "Mutations are frozen (kill switch active)",
+		});
+	});
+
+	it("allows explicit triggers when automatic Dreaming is disabled", () => {
+		expect(getDreamingTriggerBlockReason(false, open)).toBeNull();
+	});
+});
+
+describe("dreaming status blockedBy", () => {
+	const open = { enabled: true, paused: false, mutationsFrozen: false };
+	const blocked = {
+		status: "blocked",
+		reason: "inference_unavailable",
+		checkedAt: "2026-10-07T00:00:00.000Z",
+	} as const;
+
+	it("reports a missing provider only when the pipeline itself is open", () => {
+		expect(getDreamingBlockedBy(open, blocked)).toBe("no_provider");
+		expect(getDreamingBlockedBy({ ...open, enabled: false }, blocked)).toBe("disabled");
+		expect(getDreamingBlockedBy({ ...open, paused: true }, blocked)).toBe("paused");
+		expect(getDreamingBlockedBy({ ...open, mutationsFrozen: true }, blocked)).toBe("frozen");
+	});
+
+	it("is null when nothing blocks Dreaming", () => {
+		expect(getDreamingBlockedBy(open, null)).toBeNull();
+		expect(getDreamingBlockedBy(open, { status: "deferred", reason: "queue_pressure", checkedAt: null })).toBeNull();
+	});
+});
 
 describe("dream route agent resolution", () => {
 	afterEach(() => {

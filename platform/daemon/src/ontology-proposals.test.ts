@@ -28,6 +28,7 @@ import {
 	rejectOntologyProposal,
 } from "./ontology-proposals";
 import { registerOntologyRoutes } from "./routes/ontology-routes";
+import { resolveTemporalRecall } from "./temporal-recall";
 import { txIngestEnvelope } from "./transactions";
 
 describe("ontology proposals", () => {
@@ -39,8 +40,8 @@ describe("ontology proposals", () => {
 		initDbAccessor(join(dir, "memory", "memories.db"));
 	});
 
-	afterEach(() => {
-		closeDbAccessor();
+	afterEach(async () => {
+		await closeDbAccessor();
 		rmSync(dir, { recursive: true, force: true });
 	});
 
@@ -173,7 +174,7 @@ describe("ontology proposals", () => {
 			content: "Ontology extraction preserves provenance before mutating semantic state.",
 			type: "semantic",
 			memory_kind: "derived",
-			source_type: "dreaming",
+			source_type: "ant",
 			source_id: "transcript:test",
 			mentions: 1,
 		});
@@ -513,8 +514,6 @@ describe("ontology proposals", () => {
 			).c;
 			return { attributeCount, derivedCount };
 		});
-
-		// The dedupe early-return used to apply without revalidating evidence.
 		await expect(
 			applyOntologyProposal(getDbAccessor(), { agentId: "ant", id: pending.id, actor: "test" }),
 		).rejects.toThrow(new OntologyProposalError("Evidence source_ref was not found: memory:dedupe-gone", 409));
@@ -552,9 +551,6 @@ describe("ontology proposals", () => {
 		getDbAccessor().withWriteTx((db) => {
 			db.prepare("UPDATE memories SET is_deleted = 1 WHERE id = ? AND agent_id = ?").run("entity-gone", "ant");
 		});
-
-		// create_entity never materializes attribute memory, so apply-time
-		// revalidation has to happen at the shared seam, not the materializer.
 		await expect(
 			applyOntologyProposal(getDbAccessor(), { agentId: "ant", id: pending.id, actor: "test" }),
 		).rejects.toThrow(new OntologyProposalError("Evidence source_ref was not found: memory:entity-gone", 409));
@@ -583,6 +579,31 @@ describe("ontology proposals", () => {
 				(db) => db.prepare("SELECT COUNT(*) AS count FROM entities WHERE agent_id = ?").get("ant") as { count: number },
 			),
 		).toEqual({ count: 0 });
+	});
+
+	it("creates an unnamed user as a person but not as an untyped label", async () => {
+		await expect(
+			applyOntologyOperation(getDbAccessor(), {
+				agentId: "ant",
+				actor: "test",
+				operation: "create_entity",
+				payload: { name: "User" },
+			}),
+		).rejects.toThrow("Entity name rejected: metadata_role");
+		await applyOntologyOperation(getDbAccessor(), {
+			agentId: "ant",
+			actor: "test",
+			operation: "create_entity",
+			payload: { name: "User", entity_type: "person" },
+		});
+		expect(
+			getDbAccessor().withReadDb(
+				(db) =>
+					db.prepare("SELECT entity_type FROM entities WHERE agent_id = ? AND name = ?").get("ant", "User") as {
+						entity_type: string;
+					},
+			),
+		).toEqual({ entity_type: "person" });
 	});
 
 	it("does not archive an aspect that has an active constraint without force", async () => {
@@ -1233,6 +1254,27 @@ describe("ontology proposals", () => {
 		expect(evidence.items[0]?.excerpt).toBe("This quote still explains the proposal.");
 	});
 
+	it("falls back to an embedded quote when a referenced ontology proposal is missing", async () => {
+		const proposal = await createOntologyProposal(getDbAccessor(), {
+			agentId: "default",
+			operation: "create_entity",
+			payload: { name: "Missing Proposal Evidence" },
+			evidence: [{ proposal_id: "missing-proposal", quote: "The embedded proposal quote." }],
+		});
+
+		const evidence = await getOntologyProposalEvidence(getDbAccessor(), proposal.id, "default");
+
+		expect(evidence.items).toEqual([
+			expect.objectContaining({
+				kind: "provided_quote",
+				found: true,
+				sourceKind: "ontology_proposal",
+				sourceId: "missing-proposal",
+				excerpt: "The embedded proposal quote.",
+			}),
+		]);
+	});
+
 	it("applies supersede_claim_value by preserving old values and adding replacements", async () => {
 		const initial = await createOntologyProposal(getDbAccessor(), {
 			agentId: "ant",
@@ -1568,6 +1610,85 @@ describe("ontology proposals", () => {
 		expect(duplicateEntity).toBeNull();
 		expect(rows.map((row) => row.aspect)).toEqual(["architecture", "identity"]);
 		expect(rows.map((row) => row.content)).toContain("Proposal-first mutation loop");
+	});
+
+	it("carries aliases and assertions through merge_entities without touching unrelated relations", async () => {
+		insertEntity("entity-signet", "Signet", "signet", "ant", 2);
+		insertEntity("entity-signet-ai", "Signet AI", "signet ai", "ant", 1);
+		insertEntity("entity-daemon", "Daemon", "daemon", "ant", 1);
+		insertEntity("entity-dot", "Dot Project", "dot project", "dot", 1);
+		getDbAccessor().withWriteTx((db) => {
+			const alias = db.prepare(
+				`INSERT INTO entity_aliases (id, entity_id, agent_id, alias, canonical_alias, status)
+				 VALUES (?, ?, ?, ?, ?, ?)`,
+			);
+			alias.run("alias-target-active", "entity-signet", "ant", "Sig", "sig", "active");
+			alias.run("alias-target-archived", "entity-signet", "ant", "Old Signet", "old signet", "archived");
+			alias.run("alias-source-active", "entity-signet-ai", "ant", "SAI", "sai", "active");
+			alias.run("alias-source-archived-dup", "entity-signet-ai", "ant", "old signet", "old signet", "archived");
+			alias.run("alias-source-archived", "entity-signet-ai", "ant", "Sig", "sig", "archived");
+			alias.run("alias-dot", "entity-dot", "dot", "SAI", "sai", "active");
+			const assertion = db.prepare(
+				`INSERT INTO epistemic_assertions
+				 (id, agent_id, subject_entity_id, predicate, content, normalized_content, asserted_at)
+				 VALUES (?, ?, ?, 'claims', ?, ?, '2026-05-06T00:00:00.000Z')`,
+			);
+			assertion.run("assertion-target", "ant", "entity-signet", "Target claim", "target claim");
+			assertion.run("assertion-source", "ant", "entity-signet-ai", "Source claim", "source claim");
+			assertion.run("assertion-dot", "dot", "entity-dot", "Dot claim", "dot claim");
+			const relation = db.prepare(
+				`INSERT INTO relations (id, source_entity_id, target_entity_id, relation_type, created_at)
+				 VALUES (?, ?, ?, 'related_to', '2026-05-06T00:00:00.000Z')`,
+			);
+			relation.run("relation-source-target", "entity-signet-ai", "entity-signet");
+			relation.run("relation-target-source", "entity-signet", "entity-signet-ai");
+			relation.run("relation-source-daemon", "entity-signet-ai", "entity-daemon");
+			relation.run("relation-target-self", "entity-signet", "entity-signet");
+			relation.run("relation-dot-self", "entity-dot", "entity-dot");
+		});
+
+		const merge = await createOntologyProposal(getDbAccessor(), {
+			agentId: "ant",
+			operation: "merge_entities",
+			payload: { target_entity_id: "entity-signet", source_entity_ids: ["entity-signet-ai"] },
+		});
+		const applied = await applyOntologyProposal(getDbAccessor(), { agentId: "ant", id: merge.id, actor: "test" });
+
+		expect(applied.status).toBe("applied");
+		const state = getDbAccessor().withReadDb((db) => ({
+			aliases: db.prepare("SELECT id, entity_id, agent_id, status FROM entity_aliases ORDER BY id").all() as Array<{
+				id: string;
+				entity_id: string;
+				agent_id: string;
+				status: string;
+			}>,
+			assertions: db
+				.prepare("SELECT id, subject_entity_id, agent_id FROM epistemic_assertions ORDER BY id")
+				.all() as Array<{ id: string; subject_entity_id: string; agent_id: string }>,
+			relations: db.prepare("SELECT id, source_entity_id, target_entity_id FROM relations ORDER BY id").all() as Array<{
+				id: string;
+				source_entity_id: string;
+				target_entity_id: string;
+			}>,
+		}));
+
+		expect(state.aliases).toEqual([
+			{ id: "alias-dot", entity_id: "entity-dot", agent_id: "dot", status: "active" },
+			{ id: "alias-source-active", entity_id: "entity-signet", agent_id: "ant", status: "active" },
+			{ id: "alias-source-archived", entity_id: "entity-signet", agent_id: "ant", status: "archived" },
+			{ id: "alias-target-active", entity_id: "entity-signet", agent_id: "ant", status: "active" },
+			{ id: "alias-target-archived", entity_id: "entity-signet", agent_id: "ant", status: "archived" },
+		]);
+		expect(state.assertions).toEqual([
+			{ id: "assertion-dot", subject_entity_id: "entity-dot", agent_id: "dot" },
+			{ id: "assertion-source", subject_entity_id: "entity-signet", agent_id: "ant" },
+			{ id: "assertion-target", subject_entity_id: "entity-signet", agent_id: "ant" },
+		]);
+		expect(state.relations).toEqual([
+			{ id: "relation-dot-self", source_entity_id: "entity-dot", target_entity_id: "entity-dot" },
+			{ id: "relation-source-daemon", source_entity_id: "entity-signet", target_entity_id: "entity-daemon" },
+			{ id: "relation-target-self", source_entity_id: "entity-signet", target_entity_id: "entity-signet" },
+		]);
 	});
 
 	it("applies ID-first merge_entities when entity names are ambiguous", async () => {
@@ -2233,6 +2354,65 @@ describe("ontology proposals", () => {
 		expect(restoredMemoryState.find((memory) => memory.id === v3.result?.attributeId)?.superseded_by).toBe(shown?.id);
 	});
 
+	it("records the applying actor on projected claim memories and their history", async () => {
+		const claim = {
+			entity: "Signet",
+			entity_type: "project",
+			aspect: "architecture",
+			group_key: "ontology",
+		};
+		const apply = (operation: string, payload: Record<string, unknown>) =>
+			applyOntologyOperation(getDbAccessor(), { agentId: "ant", actor: "operator", operation, payload });
+
+		const added = await apply("add_claim_value", { ...claim, claim_key: "added", value: "Added value." });
+		const first = await apply("set_claim_value", { ...claim, claim_key: "set", value: "First value." });
+		const second = await apply("set_claim_value", { ...claim, claim_key: "set", value: "Second value." });
+		const superseded = await apply("supersede_claim_value", {
+			...claim,
+			claim_key: "added",
+			attribute_id: added.result?.attributeId,
+			new_value: "Superseding value.",
+		});
+		await apply("restore_claim_version", { attribute_id: first.result?.attributeId });
+		await apply("archive_claim_value", { attribute_id: superseded.result?.replacementAttributeId });
+
+		const memoryIds = [
+			added.result?.attributeId,
+			first.result?.attributeId,
+			second.result?.attributeId,
+			superseded.result?.replacementAttributeId,
+		];
+		expect(memoryIds.every((id) => typeof id === "string")).toBe(true);
+		const placeholders = memoryIds.map(() => "?").join(", ");
+		const memories = getDbAccessor().withReadDb(
+			(db) =>
+				db
+					.prepare(`SELECT who, updated_by, source_type FROM memories WHERE id IN (${placeholders})`)
+					.all(...memoryIds) as Array<{ who: string; updated_by: string; source_type: string }>,
+		);
+		expect(memories).toHaveLength(4);
+		for (const memory of memories) {
+			expect(memory).toEqual({ who: "operator", updated_by: "operator", source_type: "operator" });
+		}
+		const history = getDbAccessor().withReadDb(
+			(db) =>
+				db
+					.prepare(
+						`SELECT memory_id, event, changed_by FROM memory_history
+						 WHERE memory_id IN (${placeholders}) ORDER BY memory_id, event`,
+					)
+					.all(...memoryIds) as Array<{ memory_id: string; event: string; changed_by: string }>,
+		);
+		expect(history.map((row) => row.event).sort()).toEqual([
+			"deleted",
+			"recovered",
+			"superseded",
+			"superseded",
+			"superseded",
+		]);
+		expect(history.every((row) => row.changed_by === "operator")).toBe(true);
+	});
+
 	it("archives claim values and hides them from default active reads", async () => {
 		const applied = await applyOntologyOperation(getDbAccessor(), {
 			agentId: "ant",
@@ -2890,8 +3070,6 @@ describe("ontology proposals", () => {
 			}),
 		).rejects.toThrow("ambiguous");
 	});
-
-	// #1138: write-gate aspect/attribute caps that force supersession and consolidation
 	it("rejects add_claim_value past the attribute cap with a teaching error", async () => {
 		const cap = { maxAspectsPerEntity: 10, maxAttributesPerAspect: 2 };
 		const common = {
@@ -2956,8 +3134,6 @@ describe("ontology proposals", () => {
 
 	it("rejects create_aspect past the aspect cap with a teaching error", async () => {
 		const cap = { maxAspectsPerEntity: 2, maxAttributesPerAspect: 25 };
-
-		// create_entity first so create_aspect can resolve it
 		await applyOntologyOperation(getDbAccessor(), {
 			agentId: "ant",
 			actor: "test",
@@ -2983,7 +3159,7 @@ describe("ontology proposals", () => {
 				payload: { entity: "CappedEnt", entity_type: "project", name: "overflow_aspect" },
 				writeCaps: cap,
 			}),
-		).rejects.toThrow(/aspect cap \(2\/2\).*consolidate or archive/);
+		).rejects.toThrow(/aspect cap \(2\/2\).*merge_aspects.*rename_aspect.*Existing aspects: aspect_0 \(.+\); aspect_1/);
 	});
 
 	it("allows adding to an existing aspect that already exists past the cap (idempotent resolve)", async () => {
@@ -3003,8 +3179,6 @@ describe("ontology proposals", () => {
 			payload: { entity: "Single", entity_type: "project", name: "only_aspect" },
 			writeCaps: cap,
 		});
-
-		// Re-creating the same aspect should not trigger the cap
 		await applyOntologyOperation(getDbAccessor(), {
 			agentId: "ant",
 			actor: "test",
@@ -3030,8 +3204,6 @@ describe("ontology proposals", () => {
 			},
 			writeCaps: cap,
 		});
-
-		// Adding the exact same value+key should dedup, not hit the cap
 		const result = await applyOntologyOperation(getDbAccessor(), {
 			agentId: "ant",
 			actor: "test",
@@ -3047,8 +3219,6 @@ describe("ontology proposals", () => {
 		});
 		expect(result.result?.deduped).toBe(true);
 	});
-
-	// #1138: merge_aspects — consolidation must be possible regardless of caps
 	async function seedAspectClaims(entity: string, aspect: string, count: number): Promise<void> {
 		for (let i = 0; i < count; i++) {
 			await applyOntologyOperation(getDbAccessor(), {
@@ -3110,9 +3280,7 @@ describe("ontology proposals", () => {
 
 		expect(result.result?.targetAspect).toBe("timeline");
 		expect(result.result?.totalAttributesMoved).toBe(4);
-		// All 7 attributes now live on the merged target
 		expect(aspectRowCount("timeline")).toBe(7);
-		// Source aspect is archived
 		const sourceStatus = getDbAccessor().withReadDb((db) =>
 			db.prepare("SELECT status FROM entity_aspects WHERE agent_id = ? AND name = ?").get("ant", "changelog"),
 		);
@@ -3130,9 +3298,6 @@ describe("ontology proposals", () => {
 		});
 		await seedAspectClaims("FatEnt", "a", 5);
 		await seedAspectClaims("FatEnt", "b", 5);
-
-		// Two at-cap aspects merged into one: 10 attributes on the target, cap is 5.
-		// Merging is the consolidation remedy, so it must not be blocked.
 		const result = await applyOntologyOperation(getDbAccessor(), {
 			agentId: "ant",
 			actor: "test",
@@ -3154,8 +3319,6 @@ describe("ontology proposals", () => {
 			}),
 		).rejects.toThrow(/sources is required/);
 	});
-
-	// #1147 adversarial review: cap bypasses via other write ops.
 	it("does not bypass the aspect cap via add_claim_value with a new aspect name (E1)", async () => {
 		const cap = { maxAspectsPerEntity: 2, maxAttributesPerAspect: 25 };
 		await applyOntologyOperation(getDbAccessor(), {
@@ -3173,7 +3336,6 @@ describe("ontology proposals", () => {
 				writeCaps: cap,
 			});
 		}
-		// add_claim_value with a THIRD new aspect name must hit the aspect cap.
 		await expect(
 			applyOntologyOperation(getDbAccessor(), {
 				agentId: "ant",
@@ -3244,9 +3406,6 @@ describe("ontology proposals", () => {
 			operation: "archive_aspect",
 			payload: { entity: "E3Ent", selector: aspect.id },
 		});
-		// Reactivating the archived aspect keeps the active count at 2 (cap)
-		// — the new helper only skips the cap when an ACTIVE row exists, and
-		// the count after reactivation is 2/2, so this is allowed.
 		await applyOntologyOperation(getDbAccessor(), {
 			agentId: "ant",
 			actor: "test",
@@ -3254,7 +3413,6 @@ describe("ontology proposals", () => {
 			payload: { entity: "E3Ent", name: "aspect_1" },
 			writeCaps: cap,
 		});
-		// But a genuinely new third aspect is still rejected at cap.
 		await expect(
 			applyOntologyOperation(getDbAccessor(), {
 				agentId: "ant",
@@ -3264,5 +3422,245 @@ describe("ontology proposals", () => {
 				writeCaps: cap,
 			}),
 		).rejects.toThrow(/aspect cap \(2\/2\)/);
+	});
+	describe("claim event time", () => {
+		const slot = {
+			entity: "User",
+			entity_type: "person",
+			aspect: "events",
+			group_key: "general",
+			claim_key: "charity_walk",
+		};
+
+		function attributeTime(id: string): Record<string, unknown> | undefined {
+			return getDbAccessor().withReadDb((db) =>
+				db
+					.prepare(
+						`SELECT status, superseded_by, occurred_start, occurred_end, valid_from, valid_until, time_precision
+						 FROM entity_attributes WHERE id = ?`,
+					)
+					.get(id),
+			) as Record<string, unknown> | undefined;
+		}
+
+		function edgesFor(memoryId: string): Array<Record<string, unknown>> {
+			return getDbAccessor().withReadDb((db) =>
+				db
+					.prepare(
+						`SELECT facet, start_at, end_at, metadata_json FROM temporal_edges
+						 WHERE subject_type = 'memory' AND subject_id = ? ORDER BY facet`,
+					)
+					.all(memoryId),
+			) as Array<Record<string, unknown>>;
+		}
+
+		it("stores event time on the claim and derives occurred edges that temporal recall can find", async () => {
+			const applied = await applyOntologyOperation(getDbAccessor(), {
+				agentId: "default",
+				actor: "dreaming",
+				operation: "set_claim_value",
+				payload: {
+					...slot,
+					value: "On 2023-03-19 the user completed the Walk for Hunger.",
+					occurred_at: "2023-03-19",
+				},
+			});
+			const id = applied.result?.attributeId;
+			if (typeof id !== "string") throw new Error("attribute id was not returned");
+
+			expect(attributeTime(id)).toMatchObject({
+				status: "active",
+				occurred_start: "2023-03-19T00:00:00.000Z",
+				occurred_end: null,
+				time_precision: "day",
+			});
+			const edges = edgesFor(id);
+			expect(edges).toHaveLength(1);
+			expect(edges[0]).toMatchObject({
+				facet: "occurred",
+				start_at: "2023-03-19T00:00:00.000Z",
+				end_at: "2023-03-19T23:59:59.999Z",
+			});
+			expect(JSON.parse(String(edges[0]?.metadata_json))).toMatchObject({ attributeId: id, precision: "day" });
+
+			const versions = await listClaimVersions(getDbAccessor(), {
+				agentId: "default",
+				entity: "User",
+				aspect: "events",
+				group: "general",
+				claim: "charity_walk",
+			});
+			expect(versions.items[0]?.occurredStart).toBe("2023-03-19T00:00:00.000Z");
+			expect(versions.items[0]?.timePrecision).toBe("day");
+
+			const recalled = resolveTemporalRecall({ query: "which charity event did I do on 2023-03-19?", limit: 10 });
+			expect(recalled.candidateIds).toContain(id);
+		});
+
+		it("spans an approximate claim time across its day so a day query still finds it", async () => {
+			const applied = await applyOntologyOperation(getDbAccessor(), {
+				agentId: "default",
+				actor: "dreaming",
+				operation: "set_claim_value",
+				payload: {
+					...slot,
+					claim_key: "concert",
+					value: "In mid-April 2023 the user saw Queen live with their parents.",
+					occurred_at: "2023-04-15",
+					time_precision: "approximate",
+				},
+			});
+			const id = applied.result?.attributeId;
+			if (typeof id !== "string") throw new Error("attribute id was not returned");
+
+			expect(edgesFor(id)[0]).toMatchObject({
+				facet: "occurred",
+				start_at: "2023-04-15T00:00:00.000Z",
+				end_at: "2023-04-15T23:59:59.999Z",
+			});
+			const recalled = resolveTemporalRecall({ query: "who did I see a concert with on 2023-04-15?", limit: 10 });
+			expect(recalled.candidateIds).toContain(id);
+		});
+
+		it("orders same-day claims by when their sources were captured, not by write order", async () => {
+			getDbAccessor().withWriteTx((db) => {
+				const source = db.prepare(
+					`INSERT INTO memories
+					 (id, content, type, agent_id, visibility, memory_kind, created_at, updated_at)
+					 VALUES (?, ?, 'fact', 'default', 'global', 'episodic', ?, ?)`,
+				);
+				source.run(
+					"morning-source",
+					"I have 1250 followers now.",
+					"2023-05-25T05:26:00.000Z",
+					"2023-05-25T05:26:00.000Z",
+				);
+				source.run(
+					"later-source",
+					"I think I'm close to 1300 now.",
+					"2023-05-25T09:28:00.000Z",
+					"2023-05-25T09:28:00.000Z",
+				);
+			});
+			const followers = { ...slot, aspect: "social media", claim_key: "instagram_followers" };
+			const file = async (sourceId: string, value: string) =>
+				await applyOntologyOperation(getDbAccessor(), {
+					agentId: "default",
+					actor: "dreaming",
+					operation: "set_claim_value",
+					payload: { ...followers, value, valid_from: "2023-05-25" },
+					evidence: [{ source_ref: `memory:${sourceId}`, source_kind: "manual", source_id: sourceId }],
+					sourceKind: "memory",
+					sourceId,
+				});
+			const later = await file("later-source", "As of 2023-05-25 the user had close to 1,300 Instagram followers.");
+			const morning = await file("morning-source", "On 2023-05-25 the user had 1,250 Instagram followers.");
+			const laterId = later.result?.attributeId;
+			const morningId = morning.result?.attributeId;
+			if (typeof laterId !== "string" || typeof morningId !== "string")
+				throw new Error("attribute ids were not returned");
+
+			expect(morning.result?.supersededByNewerEvidence).toBe(laterId);
+			expect(attributeTime(laterId)?.status).toBe("active");
+			expect(attributeTime(morningId)).toMatchObject({ status: "superseded", superseded_by: laterId });
+		});
+
+		it("keeps the newer claim current when an older claim arrives later", async () => {
+			const residence = { ...slot, aspect: "home", claim_key: "city" };
+			const newer = await applyOntologyOperation(getDbAccessor(), {
+				agentId: "default",
+				actor: "dreaming",
+				operation: "set_claim_value",
+				payload: {
+					...residence,
+					value: "The user has lived in Denver since May 2024.",
+					valid_from: "2024-05-01",
+					time_precision: "month",
+				},
+			});
+			const older = await applyOntologyOperation(getDbAccessor(), {
+				agentId: "default",
+				actor: "dreaming",
+				operation: "set_claim_value",
+				payload: {
+					...residence,
+					value: "The user lived in Boston in January 2023.",
+					valid_from: "2023-01-01",
+					time_precision: "month",
+				},
+			});
+			const newerId = newer.result?.attributeId;
+			const olderId = older.result?.attributeId;
+			if (typeof newerId !== "string" || typeof olderId !== "string")
+				throw new Error("attribute ids were not returned");
+
+			expect(older.result?.supersededByNewerEvidence).toBe(newerId);
+			expect(attributeTime(newerId)?.status).toBe("active");
+			expect(attributeTime(olderId)).toMatchObject({ status: "superseded", superseded_by: newerId });
+			const olderMemory = getDbAccessor().withReadDb((db) =>
+				db.prepare("SELECT superseded_by FROM memories WHERE id = ?").get(olderId),
+			) as { superseded_by: string | null } | undefined;
+			expect(olderMemory?.superseded_by).toBe(newerId);
+
+			const latest = await applyOntologyOperation(getDbAccessor(), {
+				agentId: "default",
+				actor: "dreaming",
+				operation: "set_claim_value",
+				payload: { ...residence, value: "The user has lived in Austin since June 2025.", valid_from: "2025-06-01" },
+			});
+			const latestId = latest.result?.attributeId;
+			if (typeof latestId !== "string") throw new Error("attribute id was not returned");
+			expect(attributeTime(latestId)?.status).toBe("active");
+			expect(attributeTime(newerId)).toMatchObject({ status: "superseded", superseded_by: latestId });
+		});
+
+		it("forwards review time and event time through supersede_claim_value", async () => {
+			const plan = { ...slot, aspect: "plans", claim_key: "marathon" };
+			await applyOntologyOperation(getDbAccessor(), {
+				agentId: "default",
+				actor: "dreaming",
+				operation: "set_claim_value",
+				payload: { ...plan, value: "The user plans to run a marathon in 2024." },
+			});
+			const replaced = await applyOntologyOperation(getDbAccessor(), {
+				agentId: "default",
+				actor: "dreaming",
+				operation: "supersede_claim_value",
+				payload: {
+					...plan,
+					old_value: "The user plans to run a marathon in 2024.",
+					new_value: "The user registered for the Denver Marathon on 2024-10-20.",
+					review_after: "2024-10-21T00:00:00.000Z",
+					occurred_at: "2024-10-20",
+					time_precision: "day",
+				},
+			});
+			const id = replaced.result?.replacementAttributeId;
+			if (typeof id !== "string") throw new Error("replacement attribute id was not returned");
+			expect(attributeTime(id)).toMatchObject({ occurred_start: "2024-10-20T00:00:00.000Z", time_precision: "day" });
+			const memory = getDbAccessor().withReadDb((db) =>
+				db.prepare("SELECT review_after FROM memories WHERE id = ?").get(id),
+			) as { review_after: string | null } | undefined;
+			expect(memory?.review_after).toBe("2024-10-21T00:00:00.000Z");
+			expect(edgesFor(id).map((edge) => edge.facet)).toEqual(["occurred"]);
+		});
+
+		it("rejects malformed claim time", async () => {
+			const attempt = (extra: Record<string, unknown>) =>
+				applyOntologyOperation(getDbAccessor(), {
+					agentId: "default",
+					actor: "dreaming",
+					operation: "set_claim_value",
+					payload: { ...slot, value: "The user walked for charity on 2023-03-19.", ...extra },
+				});
+			await expect(attempt({ occurred_at: "not a date" })).rejects.toThrow(/occurred_at must be a valid ISO/);
+			await expect(attempt({ occurred_until: "2023-03-20" })).rejects.toThrow(/occurred_until requires/);
+			await expect(attempt({ occurred_at: "2023-03-19", time_precision: "hourly" })).rejects.toThrow(
+				/time_precision must be one of/,
+			);
+			await expect(attempt({ valid_from: "2023-03-19", valid_until: "2023-03-01" })).rejects.toThrow(
+				/valid_until must be after/,
+			);
+		});
 	});
 });

@@ -7,6 +7,7 @@ import type { EmbeddingConfig } from "./memory-config";
 import {
 	DEFAULT_LLAMACPP_BASE_URL,
 	DEFAULT_LLAMACPP_MAX_INPUT_TOKENS,
+	NATIVE_EMBEDDING_MAX_INPUT_TOKENS,
 	DEFAULT_OLLAMA_BASE_URL,
 	DEFAULT_OPENAI_BASE_URL,
 } from "./memory-config";
@@ -49,6 +50,7 @@ export async function findLlamaCppEmbeddingModel(
 }
 
 let cachedNativeEmbed: ((text: string) => Promise<number[]>) | null = null;
+let nativeProviderInitializedOverride: (() => boolean) | null = null;
 type NativeFallbackProvider = "llama-cpp" | "ollama";
 type NativeFallbackState = NativeFallbackProvider | "unavailable" | null;
 type NativeFallbackProbeResult = {
@@ -72,16 +74,18 @@ export function setNativeFallbackProvider(provider: NativeFallbackState, model?:
 	nativeFallbackProbe = null;
 }
 
-export function setNativeEmbeddingProviderForTest(provider: ((text: string) => Promise<number[]>) | null): void {
+export function setNativeEmbeddingProviderForTest(
+	provider: ((text: string) => Promise<number[]>) | null,
+	initialized?: () => boolean,
+): void {
 	cachedNativeEmbed = provider;
+	nativeProviderInitializedOverride = initialized ?? null;
 }
 
 export type EmbeddingFetchOptions = {
 	readonly signal?: AbortSignal;
 	readonly timeoutMs?: number;
-	/** Optional usage attribution recorded with the fetch (source_kind, agent). */
 	readonly usage?: EmbeddingUsageAttribution;
-	/** Internal operation accounting hook; never serialized into telemetry. */
 	readonly onFailure?: (causeFamily: PipelineCauseFamily) => void;
 };
 
@@ -227,10 +231,14 @@ async function fetchOllamaEmbedding(
 	};
 }
 
-function boundLlamaCppEmbeddingInput(text: string, maxInputTokens: number): { text: string; tokenCount: number } {
+function boundEmbeddingInput(
+	text: string,
+	maxInputTokens: number,
+	truncationMessage: string,
+): { text: string; tokenCount: number } {
 	const tokenCount = countTokens(text);
 	if (tokenCount <= maxInputTokens) return { text, tokenCount };
-	logger.warn("embedding", "Truncating llama.cpp embedding input to physical-batch safety limit", {
+	logger.warn("embedding", truncationMessage, {
 		inputTokens: tokenCount,
 		maxInputTokens,
 	});
@@ -250,7 +258,11 @@ async function fetchLlamaCppEmbedding(
 	readonly tokenCount: number;
 	readonly failureCause?: PipelineCauseFamily;
 }> {
-	const bounded = boundLlamaCppEmbeddingInput(text, maxInputTokens);
+	const bounded = boundEmbeddingInput(
+		text,
+		maxInputTokens,
+		"Truncating llama.cpp embedding input to physical-batch safety limit",
+	);
 	const res = await fetchWithEmbeddingTimeout(
 		`${baseUrl.replace(/\/$/, "")}/v1/embeddings`,
 		{
@@ -336,8 +348,6 @@ async function probeNativeFallback(
 		}
 		observedCause = preferFallbackCause(observedCause, r.failureCause);
 	} catch (error) {
-		// The aggregate warning below is the single actionable diagnostic, while
-		// retaining the most specific observed cause for operation telemetry.
 		observedCause = preferFallbackCause(observedCause, normalizePipelineCause(error));
 	}
 
@@ -433,13 +443,6 @@ export function resolveEmbeddingBaseUrl(cfg: EmbeddingConfig): string {
 	}
 	return cfg.base_url;
 }
-
-/**
- * The llama.cpp fallback target. Unlike {@link resolveEmbeddingBaseUrl}, this
- * is used when the configured provider is anything else (e.g. `native`): the
- * fallback still probes the user's configured llama.cpp base_url and only
- * falls back to the compiled default when it is empty (#1159).
- */
 export function resolveLlamaCppFallbackBaseUrl(cfg: EmbeddingConfig): string {
 	return cfg.base_url.trim() || DEFAULT_LLAMACPP_BASE_URL;
 }
@@ -471,7 +474,6 @@ export function fetchEmbedding(
 	role?: EmbeddingRole,
 	opts?: EmbeddingFetchOptions,
 ): Promise<number[] | null>;
-/** @deprecated Pass the role before options. Kept for callers using the former options position. */
 export function fetchEmbedding(
 	text: string,
 	cfg: EmbeddingConfig,
@@ -484,15 +486,11 @@ export async function fetchEmbedding(
 	roleOrOpts: EmbeddingRole | EmbeddingFetchOptions = "document",
 	optsOrRole: EmbeddingFetchOptions | EmbeddingRole = {},
 ): Promise<number[] | null> {
-	// Ordinary callers always resolve the generation at request time. This
-	// prevents an in-flight writer that captured yesterday's active config from
-	// inserting old-space vectors after an atomic promotion. Only the isolated
-	// migration worker is allowed to address its staging generation directly.
 	const effectiveCfg =
 		cfg.indexGeneration === "staging" || !hasDbAccessor()
 			? cfg
 			: await getDbAccessor().withReadDbAsync((db) => resolveActiveEmbeddingConfig(db, cfg), {
-					siteToken: "embedding-fetch.ts:494",
+					siteToken: "embedding-fetch.ts:492",
 					operation: "embedding.resolve-active-config",
 				});
 	if (effectiveCfg.provider === "none") return null;
@@ -530,23 +528,12 @@ export async function fetchEmbedding(
 		return null;
 	}
 }
-
-/**
- * Dispatch a formatted embedding request to the effective provider and report
- * which provider actually served and how many tokens the sent text carried.
- * The fallback chain (native -> llama.cpp/ollama) resolves the serving
- * provider inside, so the boundary records the true provider rather than the
- * configured one.
- */
 async function serveEmbedding(
 	formattedText: string,
 	effectiveCfg: EmbeddingConfig,
 	opts: EmbeddingFetchOptions,
 ): Promise<EmbeddingServeResult> {
 	if (effectiveCfg.provider === "native") {
-		// Kill-switch (#1073): warmNative: false means native is never
-		// warmed or routed to, even when the active embedding profile is
-		// native. Fall through to the llama.cpp/ollama fallback chain.
 		if (effectiveCfg.warmNative === false) {
 			return resolveNativeFallback(
 				formattedText,
@@ -559,20 +546,41 @@ async function serveEmbedding(
 			return { embedding: null, provider: null, tokenCount: 0, failureCause: "provider_unavailable" };
 		}
 		if (nativeFallbackProvider) return fetchNativeFallback(nativeFallbackProvider, formattedText, effectiveCfg, opts);
+		const bounded = boundEmbeddingInput(
+			formattedText,
+			NATIVE_EMBEDDING_MAX_INPUT_TOKENS,
+			"Truncating native embedding input to the model attention budget",
+		);
+		let nativeProviderInitialized = nativeProviderInitializedOverride ?? (() => false);
 		try {
 			const mod = await import("./native-embedding");
 			mod.configureNativeEmbeddingLifecycle({ idleTtlMs: effectiveCfg.idleTtlMs });
 			if (!cachedNativeEmbed) {
 				cachedNativeEmbed = mod.nativeEmbed;
 			}
-			const embedding = await cachedNativeEmbed(formattedText);
+			if (!nativeProviderInitializedOverride) {
+				nativeProviderInitialized = () => mod.getNativeProviderStatus().initialized;
+			}
+			const embedding = await cachedNativeEmbed(bounded.text);
 			return {
 				embedding: isEmbeddingVector(embedding) ? embedding : null,
 				provider: "native",
-				tokenCount: countTokens(formattedText),
+				tokenCount: bounded.tokenCount,
 				...(isEmbeddingVector(embedding) ? {} : { failureCause: "parse_failure" as const }),
 			};
 		} catch (nativeErr) {
+			if (nativeProviderInitialized()) {
+				logger.warn("embedding", "Native embedding failed for one input; native embedding stays enabled", {
+					inputTokens: bounded.tokenCount,
+					error: nativeErr instanceof Error ? nativeErr.message : String(nativeErr),
+				});
+				return {
+					embedding: null,
+					provider: "native",
+					tokenCount: bounded.tokenCount,
+					failureCause: normalizePipelineCause(nativeErr),
+				};
+			}
 			const fallback = await resolveNativeFallback(
 				formattedText,
 				effectiveCfg,

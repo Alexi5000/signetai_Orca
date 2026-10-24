@@ -167,9 +167,7 @@ function resolveLocalImport(source: URL, specifier: string): URL | null {
 	for (const candidate of candidates) {
 		try {
 			if (statSync(candidate).isFile()) return candidate;
-		} catch {
-			// The import may target a package or a non-TypeScript asset.
-		}
+		} catch {}
 	}
 	return null;
 }
@@ -398,13 +396,13 @@ describe("MemoryBench Dreaming gate", () => {
 						searchEpisodicSources(database, {
 							agentId: session.agentId ?? scenario.agentId,
 							query: quote,
-							kind: "artifact",
 							limit: 10,
 						}),
 					);
-					const source = sources.find((candidate) => candidate.sourceId === sourceSessionId);
-					expect(source).toMatchObject({
-						kind: "artifact",
+					const matches = sources.filter((candidate) => candidate.sourceId === sourceSessionId);
+					expect(matches).toHaveLength(1);
+					expect(matches[0]).toMatchObject({
+						kind: "transcript",
 						sourceId: sourceSessionId,
 						content: expect.stringContaining(quote),
 						completed: true,
@@ -417,5 +415,5 @@ describe("MemoryBench Dreaming gate", () => {
 			else process.env.SIGNET_PATH = previousSignetPath;
 			rmSync(dir, { recursive: true, force: true });
 		}
-	}, 30_000); // Includes owner startup (15s deadline), capture, and awaited shutdown.
+	}, 30_000);
 });

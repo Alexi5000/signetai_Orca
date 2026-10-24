@@ -1,10 +1,3 @@
-/**
- * Regression test for #1118: traverseKnowledgeGraph was fully synchronous and
- * blocked the daemon event loop for the whole walk (~1.7s per session start on
- * a 102k-memory graph), serializing concurrent session starts and tripping the
- * pressure gate. The walk must yield to the event loop between batches.
- */
-
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ReadDb } from "../db-accessor";
@@ -112,11 +105,7 @@ describe("traverseKnowledgeGraph event-loop yields (#1118)", () => {
 
 		const result = await traverseKnowledgeGraph(["e1"], db as unknown as ReadDb, "default", CONFIG);
 		done = true;
-
-		// The old synchronous walk resolved without a single macrotask
-		// opportunity — loopBreaths would be 0 and this test would fail.
 		expect(loopBreaths).toBeGreaterThan(0);
-		// Result identity: the seeded graph still resolves through both phases.
 		expect(result.memoryIds.has("m1")).toBe(true);
 		expect(result.memoryIds.has("m3")).toBe(true);
 		expect(result.entityCount).toBe(2);
@@ -219,14 +208,42 @@ describe("traverseKnowledgeGraph event-loop yields (#1118)", () => {
 	test("passes the traversal deadline budget to every owner query", async () => {
 		const deadlines: number[] = [];
 		const owner = createTestOwner(db, [], deadlines);
+		const deadlineAt = Date.now() + 500;
+		const focal = await resolveFocalEntitiesViaOwner(owner, "default", {
+			checkpointEntityIds: ["e1"],
+			includePinned: false,
+			deadlineAt,
+		});
 		const result = await traverseKnowledgeGraphViaOwner(["e1"], owner, "default", {
 			...CONFIG,
-			timeoutMs: 50,
+			timeoutMs: 500,
+			deadlineAt,
 		});
 
+		expect(focal.entityIds).toEqual(["e1"]);
 		expect(result.memoryIds.has("m1")).toBe(true);
 		expect(deadlines.length).toBeGreaterThan(0);
-		expect(deadlines.every((deadline) => deadline > 0 && deadline <= 50)).toBe(true);
+		expect(deadlines.every((deadline) => deadline > 0 && deadline <= 500)).toBe(true);
+	});
+
+	test("reports an owner deadline as a partial timeout instead of an operational failure", async () => {
+		const owner = createTestOwner(db, []);
+		const originalSubmit = owner.submit.bind(owner);
+		owner.submit = (request, options) => {
+			if (options.operation === "session-start.graph-traversal.table-check") {
+				const error = Object.assign(new Error("owner traversal deadline exceeded"), {
+					code: "DB_OWNER_DEADLINE",
+				});
+				throw error;
+			}
+			return originalSubmit(request, options);
+		};
+
+		const result = await traverseKnowledgeGraphViaOwner(["e1"], owner, "default", CONFIG);
+
+		expect(result.timedOut).toBe(true);
+		expect(result.error).toBeUndefined();
+		expect(result.memoryIds.size).toBe(0);
 	});
 
 	test("falls back to LIKE when the owner FTS index has no matching row", async () => {

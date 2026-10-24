@@ -1,9 +1,8 @@
-import { createOpenAI } from "@ai-sdk/openai"
-import { generateText } from "ai"
 import type { UnifiedSession } from "../types/unified"
+import { addUsage, emptyUsage, generateWithModel, type ModelUsage } from "../utils/llm"
+import { getModelConfig } from "../utils/models"
 
-/** Model used for memory extraction */
-const EXTRACTION_MODEL = process.env.MEMORYBENCH_EXTRACTION_MODEL || "gpt-4o"
+export const EXTRACTION_MODEL = getModelConfig(process.env.MEMORYBENCH_EXTRACTION_MODEL || "gpt-4o")
 
 function readPositiveInt(name: string, fallback: number): number {
   const value = Number.parseInt(process.env[name] || "", 10)
@@ -20,26 +19,6 @@ const STRUCTURED_EXTRACTION_CONTENT_CHARS = readPositiveInt(
   18000
 )
 
-function extractionModelSupportsTemperature(): boolean {
-  const model = EXTRACTION_MODEL.toLowerCase()
-  return !(
-    model.startsWith("inception/mercury") ||
-    model.startsWith("gpt-5") ||
-    model.startsWith("o1") ||
-    model.startsWith("o3") ||
-    model.startsWith("o4")
-  )
-}
-
-function extractionTemperature(): Record<string, number> {
-  return extractionModelSupportsTemperature() ? { temperature: 0 } : {}
-}
-
-/**
- * Build an extraction prompt that instructs the LLM to extract structured
- * memories from a conversation session. Produces MEMORY.md-style markdown
- * with categorized facts, events, preferences, and relationships.
- */
 export function buildExtractionPrompt(session: UnifiedSession): string {
   const speakerA = (session.metadata?.speakerA as string) || "Speaker A"
   const speakerB = (session.metadata?.speakerB as string) || "Speaker B"
@@ -121,41 +100,22 @@ Temporal rules:
 - Never collapse a relative reference to the conversation date itself
 - If unsure of the exact day, use the narrowest range possible (e.g. "June 2023" not "sometime in 2023")`
 }
-
-/**
- * Call LLM to extract structured memories from a conversation session.
- * Returns MEMORY.md-style markdown with categorized facts, events, preferences.
- */
 export async function extractMemories(
-  openai: ReturnType<typeof createOpenAI>,
   session: UnifiedSession
-): Promise<string> {
-  const prompt = buildExtractionPrompt(session)
-
-  const params: Record<string, unknown> = {
-    model: openai(EXTRACTION_MODEL),
-    prompt,
-    maxTokens: EXTRACTION_MAX_TOKENS,
-    ...extractionTemperature(),
-  }
-
-  const { text } = await generateText(params as Parameters<typeof generateText>[0])
-
-  return text.trim()
+): Promise<{ text: string; usage: ModelUsage }> {
+  const { text, usage } = await generateWithModel(
+    EXTRACTION_MODEL,
+    buildExtractionPrompt(session),
+    {
+      maxOutputTokens: EXTRACTION_MAX_TOKENS,
+    }
+  )
+  return { text: text.trim(), usage }
 }
-
-/** Entity types for structured extraction */
 const ENTITY_TYPES =
   "person, organization, place, project, system, service, tool, product, work, event, unknown"
-
-/** Aspect categories for structured extraction */
 const ASPECT_CATEGORIES =
   "preferences, properties, events, activities, perspectives, relationships, background, decision patterns, general"
-
-/**
- * Build a prompt that extracts structured entities, aspects, and hints
- * from already-extracted markdown memory content.
- */
 export function buildStructuredPrompt(content: string): string {
   const bounded = boundStructuredContent(content)
 
@@ -223,9 +183,8 @@ export function boundStructuredContent(content: string): string {
   const tail = trimmed.slice(trimmed.length - tailChars).trimStart()
   return `${head}\n\n[Truncated ${omitted} middle characters to keep structured extraction inside the local model context window.]\n\n${tail}`
 }
-
-/** Structured extraction result */
 interface StructuredExtraction {
+  usage: ModelUsage
   content: string
   structured: {
     entities: Array<{
@@ -481,8 +440,6 @@ export function sanitizeStructuredExtraction(
 
   return { entities, aspects, hints }
 }
-
-/** Parse JSON from LLM output, stripping code fences and surrounding chatter if present */
 export function parseJson(raw: string): unknown {
   const trimmed = raw.trim()
   try {
@@ -501,36 +458,18 @@ export function parseJson(raw: string): unknown {
     }
   }
 }
-
-/**
- * Extract both markdown memories and structured knowledge graph data
- * from a conversation session. Calls the LLM twice: once for markdown
- * extraction, once for structured JSON extraction.
- */
 export async function extractStructuredMemories(
-  openai: ReturnType<typeof createOpenAI>,
   session: UnifiedSession
 ): Promise<StructuredExtraction> {
-  const prompt = buildExtractionPrompt(session)
-
-  const params: Record<string, unknown> = {
-    model: openai(EXTRACTION_MODEL),
-    prompt,
-    maxTokens: EXTRACTION_MAX_TOKENS,
-    ...extractionTemperature(),
-  }
-
-  const { text } = await generateText(params as Parameters<typeof generateText>[0])
-  const content = text.trim()
-
-  const structuredParams: Record<string, unknown> = {
-    model: openai(EXTRACTION_MODEL),
-    prompt: buildStructuredPrompt(content),
-    maxTokens: STRUCTURED_EXTRACTION_MAX_TOKENS,
-    ...extractionTemperature(),
-  }
-
-  const { text: raw } = await generateText(structuredParams as Parameters<typeof generateText>[0])
+  const extracted = await extractMemories(session)
+  const content = extracted.text
+  const structuredResult = await generateWithModel(
+    EXTRACTION_MODEL,
+    buildStructuredPrompt(content),
+    { maxOutputTokens: STRUCTURED_EXTRACTION_MAX_TOKENS }
+  )
+  const usage = addUsage(addUsage(emptyUsage(), extracted.usage), structuredResult.usage)
+  const raw = structuredResult.text
 
   const fallback = { entities: [], aspects: [], hints: [] }
   let structured: StructuredExtraction["structured"]
@@ -545,5 +484,5 @@ export async function extractStructuredMemories(
     structured = fallback
   }
 
-  return { content, structured }
+  return { usage, content, structured }
 }

@@ -1,33 +1,12 @@
-/**
- * Native embedding worker — runs nomic-embed-text ONNX (via
- * @huggingface/transformers WASM runtime) inside a worker_threads Worker.
- *
- * This is the thread that performs the long, partly-synchronous work:
- * first-run model download, WASM compile, and per-call forward passes.
- * Keeping it off the daemon's main event loop is what guarantees that
- * /health and every HTTP handler stay responsive regardless of embedding
- * state. The main-thread adapter (embedding-worker-handle.ts) bounds each
- * RPC with a timeout so callers fail fast even if this worker is grinding.
- *
- * Loaded in the worker via:
- *   - source mode: `new Worker(new URL("./embedding-worker.ts", import.meta.url))`
- *     → resolves @huggingface/transformers from node_modules.
- *   - compiled binary: the worker is bun-bundled into an embedded worker
- *     asset (see scripts/build-native-bun.ts workerEntries) with transformers
- *     inlined, and the main thread passes the materialized wasmDir via
- *     workerData (the worker cannot read the main-thread asset globals).
- */
-
 import { mkdirSync, readFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { type EmbeddingWasmConfig, configureEmbeddingWasm } from "./embedding-wasm-config";
 import type { EmbeddingWorkerInit, MainToWorkerMessage, WorkerToMainMessage } from "./embedding-worker-protocol";
-
-// Lazy, narrow transformers typing — keeps the contract we use without
-// dragging in the library's complex generics (same approach as the prior
-// in-process implementation).
+const TRANSFORMERS_LOG_LEVEL_NONE = 50;
 interface TransformersEnv {
+	logLevel?: number;
 	cacheDir?: string;
 	localModelPath?: string;
 	allowLocalModels?: boolean;
@@ -38,8 +17,30 @@ interface TransformersEnv {
 		};
 	};
 }
+interface RerankInputs {
+	readonly [key: string]: unknown;
+}
+type RerankTokenizer = (
+	texts: string[],
+	opts: { text_pair: string[]; padding: boolean; truncation: boolean; max_length: number },
+) => RerankInputs;
+interface RerankModel {
+	(inputs: RerankInputs): Promise<{ logits: { data: ArrayLike<number>; dims: readonly number[] } }>;
+	dispose?: () => Promise<void>;
+}
+interface PretrainedLoader<T> {
+	from_pretrained(
+		model: string,
+		opts?: {
+			dtype?: "q8";
+			progress_callback?: (progress: { status: string; progress?: number; file?: string }) => void;
+		},
+	): Promise<T>;
+}
 interface TransformersBindings {
 	readonly env: TransformersEnv;
+	readonly AutoTokenizer: PretrainedLoader<RerankTokenizer>;
+	readonly AutoModelForSequenceClassification: PretrainedLoader<RerankModel>;
 	readonly pipeline: (
 		task: string,
 		model: string,
@@ -57,8 +58,6 @@ interface EmbedCallable {
 const workerInit = workerData as EmbeddingWorkerInit | undefined;
 
 if (isMainThread || !parentPort || !workerInit) {
-	// Defensive: should never be imported on the main thread. Bail loudly
-	// rather than silently no-op'ing.
 	throw new Error("embedding-worker.ts must run as a worker_threads Worker with EmbeddingWorkerInit workerData");
 }
 
@@ -74,20 +73,18 @@ function log(level: string, message: string, data?: Record<string, unknown>): vo
 	post({ type: "log", level, message, data });
 }
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-
 let transformers: TransformersBindings | null = null;
 let embedFn: EmbedCallable | null = null;
+let rerankFn: ((query: string, documents: readonly string[]) => Promise<number[]>) | null = null;
+let rerankModel: RerankModel | null = null;
 let initPromise: Promise<void> | null = null;
 let initError: string | null = null;
 let modelCached = false;
 
 function snapshot() {
 	return {
-		initialized: embedFn !== null,
-		initializing: initPromise !== null && embedFn === null,
+		initialized: embedFn !== null || rerankFn !== null,
+		initializing: initPromise !== null && embedFn === null && rerankFn === null,
 		modelCached,
 		error: initError,
 	};
@@ -97,50 +94,20 @@ function pushStatus(): void {
 	post({ type: "status", status: snapshot() });
 }
 
-// ---------------------------------------------------------------------------
-// Transformers loading + init
-// ---------------------------------------------------------------------------
-
 async function loadTransformers(): Promise<TransformersBindings> {
-	// The worker cannot use the compiled binary's main-thread
-	// __SIGNET_NATIVE_TRANSFORMERS_BINDINGS__ global (isolated globalThis),
-	// so load via the bundled runtime entry. In source mode this resolves
-	// @huggingface/transformers from node_modules; in the compiled binary
-	// the worker .mjs has transformers inlined by the bun build.
-	//
-	// In the compiled binary, transformers resolves to the Node entry which
-	// tries to load native onnxruntime .node bindings that don't exist in a
-	// Bun-compiled executable. The main thread registers a WASM runtime via
-	// globalThis[Symbol.for("onnxruntime")], but the worker has an isolated
-	// globalThis so that registration does NOT propagate.
-	//
-	// Fix: when transformersRuntimePath is set (compiled binary mode), import
-	// the materialized WASM runtime first — it registers onnxruntime-web on
-	// the worker's own globalThis and exports env/pipeline from the patched
-	// web entry. Fall back to the standard import in source mode.
 	if (init.transformersRuntimePath) {
-		const mod = (await import(init.transformersRuntimePath)) as {
-			env: TransformersEnv;
-			pipeline: TransformersBindings["pipeline"];
-		};
-		return { env: mod.env, pipeline: mod.pipeline };
+		return (await import(init.transformersRuntimePath)) as TransformersBindings;
 	}
-	const mod = (await import("./transformers-runtime")) as {
-		env: TransformersEnv;
-		pipeline: TransformersBindings["pipeline"];
-	};
-	return { env: mod.env, pipeline: mod.pipeline };
+	return (await import("./transformers-runtime")) as unknown as TransformersBindings;
 }
 
 async function ensureInitialized(): Promise<void> {
-	if (embedFn) return;
+	if (embedFn || rerankFn) return;
 	if (initPromise) return initPromise;
 	initPromise = doInit();
 	try {
 		await initPromise;
 	} finally {
-		// Keep initPromise around only while in-flight; clear on settle so
-		// retries (after cooldown, controlled by the main thread) can re-init.
 		initPromise = null;
 	}
 	return;
@@ -153,13 +120,7 @@ async function doInit(): Promise<void> {
 
 		mkdirSync(init.cacheDir, { recursive: true });
 		transformers = await loadTransformers();
-
-		// Configure cache + LOCAL load path. Setting localModelPath to the
-		// same cacheDir is the fix for the "Unable to load from local path
-		// /models/…" noise: without it transformers defaults localModelPath
-		// to a root "/models" that never exists, so every load pointlessly
-		// probes-and-fails locally before hitting the network. With this, a
-		// cached model loads straight from disk on subsequent starts.
+		transformers.env.logLevel = TRANSFORMERS_LOG_LEVEL_NONE;
 		transformers.env.cacheDir = init.cacheDir;
 		transformers.env.localModelPath = init.cacheDir;
 		transformers.env.allowLocalModels = true;
@@ -167,16 +128,51 @@ async function doInit(): Promise<void> {
 			transformers.env.remoteHost = init.remoteHostOverride;
 		}
 		configureEmbeddingWasm(transformers.env.backends?.onnx?.wasm, init.wasmDir);
+		if (init.task === "rerank" && transformers.env.backends?.onnx?.wasm) {
+			transformers.env.backends.onnx.wasm.numThreads = Math.max(1, Math.min(4, availableParallelism() - 1));
+		}
 		if (init.wasmDir && transformers.env.backends?.onnx?.wasm) {
-			// onnxruntime-web 1.26's emscripten glue fetches the .wasm file
-			// (1.22 read it with fs.readFileSync), which cannot resolve the
-			// materialized filesystem path inside the compiled binary. Load it
-			// here and pass the binary so session creation never fetches it.
 			const wasmBytes = readFileSync(join(init.wasmDir, "ort-wasm-simd-threaded.wasm"));
 			transformers.env.backends.onnx.wasm.wasmBinary = wasmBytes.buffer.slice(
 				wasmBytes.byteOffset,
 				wasmBytes.byteOffset + wasmBytes.byteLength,
 			) as ArrayBuffer;
+		}
+
+		const progress_callback = (progress: { status: string; progress?: number; file?: string }) => {
+			if (progress.status === "download" && typeof progress.progress === "number") {
+				log("info", `Downloading ${progress.file ?? "model"}: ${Math.round(progress.progress)}%`);
+			} else if (progress.status === "ready") {
+				log("info", "Model ready");
+			}
+		};
+		if (init.task === "rerank") {
+			log("info", `Initializing cross-encoder ${init.modelId} (q8 quantization)`, { cachePath: init.cacheDir });
+			const tokenizer = await transformers.AutoTokenizer.from_pretrained(init.modelId, { progress_callback });
+			const model = await transformers.AutoModelForSequenceClassification.from_pretrained(init.modelId, {
+				dtype: "q8",
+				progress_callback,
+			});
+			const score = async (query: string, documents: readonly string[]): Promise<number[]> => {
+				if (documents.length === 0) return [];
+				const inputs = tokenizer(new Array<string>(documents.length).fill(query), {
+					text_pair: [...documents],
+					padding: true,
+					truncation: true,
+					max_length: 512,
+				});
+				const { logits } = await model(inputs);
+				const width = logits.dims.at(-1) ?? 1;
+				return documents.map((_, index) => Number(logits.data[index * width + width - 1]));
+			};
+			const warmup = await score("test", ["test"]);
+			if (warmup.length !== 1 || !Number.isFinite(warmup[0])) throw new Error("Cross-encoder warmup returned no score");
+			rerankModel = model;
+			rerankFn = score;
+			modelCached = true;
+			log("info", "Cross-encoder ready");
+			pushStatus();
+			return;
 		}
 
 		log("info", `Initializing ${init.modelId} (q8 quantization)`, {
@@ -185,19 +181,9 @@ async function doInit(): Promise<void> {
 			remoteHost: transformers.env.remoteHost,
 		});
 
-		const pipe = await transformers.pipeline("feature-extraction", init.modelId, {
-			dtype: "q8",
-			progress_callback: (progress) => {
-				if (progress.status === "download" && typeof progress.progress === "number") {
-					log("info", `Downloading ${progress.file ?? "model"}: ${Math.round(progress.progress)}%`);
-				} else if (progress.status === "ready") {
-					log("info", "Model ready");
-				}
-			},
-		});
+		const pipe = await transformers.pipeline("feature-extraction", init.modelId, { dtype: "q8", progress_callback });
 
 		const embed = toEmbedCallable(pipe);
-		// Warm-up to verify output shape before declaring readiness.
 		const warmup = await embed("test", { pooling: "mean", normalize: true });
 		if (warmup.data.length !== init.expectedDimensions) {
 			throw new Error(`Expected ${init.expectedDimensions} dimensions but got ${warmup.data.length}`);
@@ -210,6 +196,7 @@ async function doInit(): Promise<void> {
 	} catch (err) {
 		initError = err instanceof Error ? err.message : String(err);
 		embedFn = null;
+		rerankFn = null;
 		modelCached = false;
 		log("error", `Init failed: ${initError}`);
 		pushStatus();
@@ -237,10 +224,6 @@ function toEmbedCallable(value: unknown): EmbedCallable {
 	return embed;
 }
 
-// ---------------------------------------------------------------------------
-// RPC
-// ---------------------------------------------------------------------------
-
 async function handleEmbed(id: number, text: string): Promise<void> {
 	try {
 		await ensureInitialized();
@@ -252,10 +235,21 @@ async function handleEmbed(id: number, text: string): Promise<void> {
 	}
 }
 
+async function handleRerank(id: number, query: string, documents: readonly string[]): Promise<void> {
+	try {
+		await ensureInitialized();
+		if (!rerankFn) throw new Error(initError ?? "Cross-encoder not initialized");
+		post({ type: "rerank_result", id, scores: await rerankFn(query, documents) });
+	} catch (err) {
+		post({ type: "rerank_error", id, error: err instanceof Error ? err.message : String(err) });
+	}
+}
+
 async function handleCheckAvailable(id: number): Promise<void> {
 	try {
 		await ensureInitialized();
-		post({ type: "check_result", id, available: embedFn !== null, error: embedFn ? null : (initError ?? "not ready") });
+		const ready = embedFn !== null || rerankFn !== null;
+		post({ type: "check_result", id, available: ready, error: ready ? null : (initError ?? "not ready") });
 	} catch (err) {
 		post({ type: "check_result", id, available: false, error: err instanceof Error ? err.message : String(err) });
 	}
@@ -265,11 +259,16 @@ async function handleShutdown(): Promise<void> {
 	if (embedFn?.dispose) {
 		try {
 			await embedFn.dispose();
-		} catch {
-			// best-effort
-		}
+		} catch {}
+	}
+	if (rerankModel?.dispose) {
+		try {
+			await rerankModel.dispose();
+		} catch {}
 	}
 	embedFn = null;
+	rerankFn = null;
+	rerankModel = null;
 	modelCached = false;
 	initPromise = null;
 	initError = null;
@@ -282,6 +281,9 @@ port.on("message", (msg: MainToWorkerMessage) => {
 			break;
 		case "checkAvailable":
 			void handleCheckAvailable(msg.id);
+			break;
+		case "rerank":
+			void handleRerank(msg.id, msg.query, msg.documents);
 			break;
 		case "shutdown":
 			void handleShutdown();

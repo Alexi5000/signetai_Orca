@@ -10,6 +10,7 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { logger } from "./logger";
 import { deleteSecretFromActiveProvider, getSecret, putSecret } from "./secrets";
 import { registerSignetOAuthFlows } from "./inference-oauth-runtime";
+import { openBoundedSse, type BoundedSseProducer } from "./sse-stream.js";
 
 registerSignetOAuthFlows();
 
@@ -76,9 +77,6 @@ interface OAuthProvider {
 	readonly name: string;
 	readonly oauth: OAuthAuth;
 }
-
-/** Pi's provider catalog is the production OAuth authority. Test registrations
- * exercise the same OAuthAuth contract without mutating process-global Pi state. */
 const testProviders = new Map<string, OAuthProvider>();
 
 function oauthProviders(): readonly OAuthProvider[] {
@@ -167,10 +165,19 @@ export async function loadOAuthCredentials(providerId: string): Promise<OAuthCre
 	return parsed;
 }
 
-export async function storeOAuthCredentials(providerId: string, credentials: OAuthCredentials): Promise<void> {
+export async function storeOAuthCredentials(
+	providerId: string,
+	credentials: OAuthCredentials,
+	signal?: AbortSignal,
+	onKeyringAuthorization?: () => Promise<void>,
+): Promise<void> {
 	if (!oauthProvider(validateProviderId(providerId))) throw new Error(`Unknown OAuth provider: ${providerId}`);
 	if (!isOAuthCredentials(credentials)) throw new Error(`Invalid OAuth credentials for ${providerId}`);
-	await putSecret(secretName(providerId), JSON.stringify(credentials));
+	await putSecret(
+		secretName(providerId),
+		JSON.stringify(credentials),
+		signal ? { allowInteraction: true, signal, onKeyringAuthorization } : undefined,
+	);
 }
 
 export async function disconnectOAuthProvider(providerId: string): Promise<boolean> {
@@ -248,6 +255,7 @@ function cleanupSession(session: OAuthLoginSession, reason?: string): void {
 export function startOAuthLogin(
 	providerId: string,
 	onCredentialsChanged?: () => void,
+	requestSignal?: AbortSignal,
 ): {
 	readonly sessionId: string;
 	readonly stream: ReadableStream<Uint8Array>;
@@ -258,9 +266,9 @@ export function startOAuthLogin(
 	if (activeSessions.size >= MAX_ACTIVE_OAUTH_SESSIONS) throw new Error("Too many active OAuth login sessions");
 
 	const sessionId = randomUUID();
-	const encoder = new TextEncoder();
-	let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
 	let closed = false;
+	let streamProducer: BoundedSseProducer | undefined;
+	let timeout: ReturnType<typeof setTimeout> | undefined;
 	const abortController = new AbortController();
 	const session: OAuthLoginSession = {
 		id: sessionId,
@@ -269,26 +277,32 @@ export function startOAuthLogin(
 		pending: new Map(),
 		expiresAt: Date.now() + OAUTH_SESSION_TTL_MS,
 		emit(event) {
-			if (closed || !controllerRef) return;
-			controllerRef.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+			if (closed || !streamProducer) return;
+			streamProducer.write(event, { event: event.type });
 		},
 		close() {
 			if (closed) return;
 			closed = true;
-			try {
-				controllerRef?.close();
-			} catch {
-				// The consumer may already have cancelled the stream.
-			}
+			streamProducer?.close();
 		},
 	};
 
-	const stream = new ReadableStream<Uint8Array>({
-		start(controller) {
-			controllerRef = controller;
+	const sse = openBoundedSse({
+		requestSignal,
+		highWaterMarkBytes: 512 * 1024,
+		maxFrameBytes: 256 * 1024,
+		onStart(producer) {
+			streamProducer = producer;
 			activeSessions.set(sessionId, session);
+			producer.addDisposer(() => {
+				if (timeout) clearTimeout(timeout);
+			});
+			producer.addDisposer(() => {
+				if (activeSessions.has(sessionId)) abortOAuthLogin(sessionId, "Client disconnected");
+			});
+			if (producer.signal.aborted) return;
 			session.emit({ type: "session", sessionId, providerId: normalized });
-			const timeout = setTimeout(() => abortOAuthLogin(sessionId, "Login session expired"), OAUTH_SESSION_TTL_MS);
+			timeout = setTimeout(() => abortOAuthLogin(sessionId, "Login session expired"), OAUTH_SESSION_TTL_MS);
 			timeout.unref?.();
 
 			const callbacks: ProviderAuthInteraction = {
@@ -334,11 +348,28 @@ export function startOAuthLogin(
 				.login(callbacks)
 				.then(async (credentials) => {
 					if (abortController.signal.aborted) throw new Error("Login cancelled");
-					await storeOAuthCredentials(normalized, {
-						refresh: credentials.refresh,
-						access: credentials.access,
-						expires: credentials.expires,
-					});
+					await storeOAuthCredentials(
+						normalized,
+						{
+							refresh: credentials.refresh,
+							access: credentials.access,
+							expires: credentials.expires,
+						},
+						abortController.signal,
+						async () => {
+							const answer = await callbacks.prompt({
+								type: "select",
+								message:
+									"macOS Keychain authorization is required. Choose Always Allow in the next system prompt for persistent access by this Signet installation. One-time access cannot enable background provider requests.",
+								options: [
+									{ id: "authorize", label: "Authorize this installation" },
+									{ id: "cancel", label: "Cancel" },
+								],
+							});
+							if (answer !== "authorize") throw new Error("Keychain authorization cancelled");
+						},
+					);
+					if (abortController.signal.aborted) throw new Error("Login cancelled");
 					onCredentialsChanged?.();
 					session.emit({ type: "connected", providerId: normalized });
 					session.emit({ type: "done" });
@@ -353,12 +384,9 @@ export function startOAuthLogin(
 					session.close();
 				});
 		},
-		cancel() {
-			abortOAuthLogin(sessionId, "Client disconnected");
-		},
 	});
 
-	return { sessionId, stream };
+	return { sessionId, stream: sse.stream };
 }
 
 export function completeOAuthInteraction(sessionId: string, responseId: string, value: string): void {

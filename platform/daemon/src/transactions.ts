@@ -1,22 +1,8 @@
-/**
- * Transaction wrappers for atomic memory operations.
- *
- * Each function is a pure DB closure — it receives a WriteDb handle and
- * performs all mutations inside the caller's transaction. No async, no
- * external provider calls.
- */
-
-import type { MemoryContentSafetyAssessment } from "@signet/core";
 import type { WriteDb } from "./db-accessor";
 import { syncVecDeleteBySourceExceptHash, syncVecDeleteBySourceId, syncVecInsert, vectorToBlob } from "./db-helpers";
 import { markDerivedMemoriesStaleForSourceInTx } from "./derived-memory-provenance";
 import { isActiveEmbeddingConfig, resolveActiveEmbeddingConfig } from "./embedding-index-state";
 import type { EmbeddingConfig } from "./memory-config";
-import { upsertMemoryContentSafetyInTx } from "./memory-content-safety";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export interface IngestEnvelope {
 	id: string;
@@ -35,9 +21,7 @@ export interface IngestEnvelope {
 	embeddingModel?: string | null;
 	extractionModel?: string | null;
 	updatedBy?: string;
-	/** Evidence vs derived kind. remember writes set 'episodic'. */
 	memoryKind?: string | null;
-	/** Canonical structured payload JSON preserved verbatim as evidence. */
 	evidenceMeta?: string | null;
 	sourceType: string;
 	sourceId: string | null;
@@ -47,11 +31,7 @@ export interface IngestEnvelope {
 	scope?: string | null;
 	agentId?: string;
 	visibility?: "global" | "private" | "archived";
-	/** ISO timestamp; when set, this memory is due for temporal review after
-	 *  this instant (issue #945). The dreaming pass queries it directly. */
 	reviewAfter?: string | null;
-	/** Assessment of the complete source before an oversized memory was chunked. */
-	contentSafety?: MemoryContentSafetyAssessment;
 	createdAt: string;
 }
 
@@ -87,7 +67,6 @@ export interface ModifyMemoryTxInput {
 	extractionModelOnContentChange?: string | null;
 	embeddingModelOnContentChange?: string | null;
 	embeddingVector?: readonly number[] | null;
-	/** Generation that produced embeddingVector, when the caller has one. */
 	embeddingConfig?: EmbeddingConfig;
 	ctx?: MutationContext;
 }
@@ -256,16 +235,6 @@ function invalidateDerivedMemoriesForMemoryInTx(
 		staleAt: changedAt,
 	});
 }
-
-// ---------------------------------------------------------------------------
-// Transaction closures
-// ---------------------------------------------------------------------------
-
-/**
- * Insert a new memory row. Returns the id passed in.
- *
- * Call inside `accessor.withWriteTx(db => txIngestEnvelope(db, envelope))`.
- */
 export function txIngestEnvelope(db: WriteDb, mem: IngestEnvelope): string {
 	db.prepare(
 		`INSERT INTO memories
@@ -306,23 +275,8 @@ export function txIngestEnvelope(db: WriteDb, mem: IngestEnvelope): string {
 		mem.evidenceMeta ?? null,
 		mem.reviewAfter ?? null,
 	);
-	upsertMemoryContentSafetyInTx(db, {
-		agentId: mem.agentId ?? "default",
-		sourceKind: "memory",
-		sourceId: mem.id,
-		content: mem.content,
-		assessment: mem.contentSafety,
-	});
-
-	// FTS sync handled by memories_ai AFTER INSERT trigger (migration 001)
-
 	return mem.id;
 }
-
-/**
- * Modify an existing memory row with optional optimistic concurrency guard.
- * Writes UPDATE history in the same transaction when a mutation is applied.
- */
 export function txModifyMemory(db: WriteDb, input: ModifyMemoryTxInput): ModifyMemoryTxResult {
 	const existing = db
 		.prepare(
@@ -350,11 +304,6 @@ export function txModifyMemory(db: WriteDb, input: ModifyMemoryTxInput): ModifyM
 			currentVersion: existing.version,
 		};
 	}
-
-	// Episodic evidence and compaction recall projections are immutable content.
-	// The latter is intentionally outside Dreaming input, but mirrors immutable
-	// temporal evidence for ordinary recall. Metadata remains editable so
-	// curators can re-rank or re-label without altering what was recorded.
 	const isImmutableEvidence = existing.memory_kind === "episodic" || existing.type === "session_summary";
 	if (
 		isImmutableEvidence &&
@@ -367,15 +316,8 @@ export function txModifyMemory(db: WriteDb, input: ModifyMemoryTxInput): ModifyM
 			currentVersion: existing.version,
 		};
 	}
-
-	// Attribute projections are retrievable views of ontology state. Letting the
-	// generic memory route rewrite their content would silently split the same
-	// semantic claim between `memories` and `entity_attributes`. All claim
-	// content changes therefore stay on the daemon-owned ontology apply path.
 	const isAttributeProjection =
 		existing.memory_kind === "derived" &&
-		// Attribute projections deliberately share the attribute id, so this is a
-		// primary-key lookup rather than a scan across the graph.
 		db
 			.prepare("SELECT 1 FROM entity_attributes WHERE id = ? AND memory_id = ? AND agent_id = ?")
 			.get(existing.id, existing.id, existing.agent_id) !== undefined;
@@ -397,12 +339,6 @@ export function txModifyMemory(db: WriteDb, input: ModifyMemoryTxInput): ModifyM
 
 	let contentChanged = false;
 	let finalContent = existing.content;
-
-	// Re-resolve the active embedding config inside this transaction so the
-	// active-config check cannot race a startup building->ready promotion: the
-	// caller resolves the config before the (slow) model call, and the index can
-	// promote before this write. Strip the pre-resolved profile so it re-reads
-	// the current active state.
 	const activeEmbeddingCfg =
 		input.embeddingConfig === undefined
 			? undefined
@@ -506,15 +442,6 @@ export function txModifyMemory(db: WriteDb, input: ModifyMemoryTxInput): ModifyM
 
 	db.prepare(`UPDATE memories SET ${updates.join(", ")} WHERE id = ?`).run(...args);
 	if (contentChanged) {
-		upsertMemoryContentSafetyInTx(db, {
-			agentId: existing.agent_id ?? "default",
-			sourceKind: "memory",
-			sourceId: input.memoryId,
-			content: finalContent,
-		});
-	}
-
-	if (contentChanged) {
 		invalidateDerivedMemoriesForMemoryInTx(db, input.memoryId, existing.agent_id ?? "default", input.changedAt);
 		const newHash = input.patch.contentHash ?? null;
 		if (newHash) {
@@ -548,8 +475,6 @@ export function txModifyMemory(db: WriteDb, input: ModifyMemoryTxInput): ModifyM
 			).run(embId, newHash, blob, input.embeddingVector.length, input.memoryId, input.patch.content, input.changedAt);
 			syncVecInsert(db, embId, input.embeddingVector);
 		}
-
-		// FTS sync handled by memories_au AFTER UPDATE trigger (migration 004)
 	}
 
 	insertHistoryEvent(db, {
@@ -578,11 +503,6 @@ export function txModifyMemory(db: WriteDb, input: ModifyMemoryTxInput): ModifyM
 		contentChanged,
 	};
 }
-
-/**
- * Soft-delete a memory row with optional optimistic concurrency guard.
- * Writes DELETE history in the same transaction.
- */
 export function txForgetMemory(db: WriteDb, input: ForgetMemoryTxInput): ForgetMemoryTxResult {
 	const existing = db
 		.prepare(
@@ -625,7 +545,6 @@ export function txForgetMemory(db: WriteDb, input: ForgetMemoryTxInput): ForgetM
 			currentVersion: existing.version,
 		};
 	}
-	// Spec 27.2: autonomous agents cannot force-delete pinned memories
 	if (existing.pinned === 1 && input.force && input.ctx?.actorType === "pipeline") {
 		return {
 			status: "autonomous_force_denied",
@@ -643,9 +562,6 @@ export function txForgetMemory(db: WriteDb, input: ForgetMemoryTxInput): ForgetM
 		     version = version + 1
 		 WHERE id = ?`,
 	).run(input.changedAt, input.changedAt, input.changedBy, input.memoryId);
-	// Forgetting withdraws the source from the episodic cursor. Any unfinished
-	// historical extraction job must become terminal with it; no worker may
-	// revive a deleted source after the Dreaming cutover.
 	db.prepare(
 		`UPDATE memory_jobs
 		 SET status = 'dead', result = ?, error = ?, failed_at = ?, updated_at = ?
@@ -737,10 +653,6 @@ export function txSupersedeMemory(db: WriteDb, input: SupersedeMemoryTxInput): S
 			currentSupersededBy: existing.superseded_by,
 		};
 	}
-	// #1147 review (finding 5): a memory already superseded by a DIFFERENT
-	// successor must not be re-superseded — overwriting the link forks the
-	// chain into two live heads (the previous successor keeps superseded_by
-	// NULL). Reject instead of corrupting lineage.
 	if (existing.superseded_by !== null && existing.superseded_by !== input.supersededBy) {
 		return {
 			status: "already_superseded_by_other",
@@ -819,11 +731,6 @@ export function txSupersedeMemory(db: WriteDb, input: SupersedeMemoryTxInput): S
 		currentSupersededBy: existing.superseded_by,
 	};
 }
-
-/**
- * Recover a soft-deleted memory row if still within the retention window.
- * Writes RECOVER history in the same transaction.
- */
 export function txRecoverMemory(db: WriteDb, input: RecoverMemoryTxInput): RecoverMemoryTxResult {
 	const existing = db
 		.prepare(
@@ -914,10 +821,6 @@ export function txRecoverMemory(db: WriteDb, input: RecoverMemoryTxInput): Recov
 		newVersion: existing.version + 1,
 	};
 }
-
-/**
- * Batch-update access metadata for a list of memory ids.
- */
 export function txFinalizeAccessAndHistory(db: WriteDb, updates: ReadonlyArray<AccessUpdate>): void {
 	if (updates.length === 0) return;
 

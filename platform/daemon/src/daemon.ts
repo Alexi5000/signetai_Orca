@@ -1,14 +1,12 @@
 #!/usr/bin/env node
+import { workspaceLayoutStartup } from "./workspace-layout-startup";
+import { stopPiAgentWorkers } from "./pipeline/pi-agent-client";
 import { requestMemoryHead } from "./memory-head";
-/**
- * Signet Daemon
- * Background service for memory, API, and dashboard hosting
- */
 
 import "./bun-socket-polyfill";
 import { spawnHidden as spawn } from "@signet/core";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { realpathSync } from "node:fs";
 import { opendir, readFile as readFileAsync, stat as statAsync, unlink as unlinkAsync } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -31,9 +29,11 @@ import {
 	preflightWorkspace,
 	formatWorkspacePreflightError,
 	resolveDefaultBasePath,
+	resolveWorkspaceLayout,
 	routingTargetLocality,
-	scanMemoryContent,
+	redactCredentials,
 	stripSignetBlock,
+	activeVectorProjectionTable,
 } from "@signet/core";
 import { watch } from "chokidar";
 import { Hono } from "hono";
@@ -82,7 +82,6 @@ import {
 	isVectorRuntimeUsable,
 	pruneMigrationBackupsAfterIntegrity,
 	resolveSqliteRuntimeConfig,
-	registerDbOwnerHealthProvider,
 	setDatabaseIntegrityWritesBlocked,
 } from "./db-accessor";
 import { type VacuumConversionHandle, startVacuumConversionWorker } from "./db-vacuum-worker";
@@ -93,8 +92,10 @@ import {
 	type DbOwnerClientOptions,
 	DbOwnerError,
 } from "./db-owner-client";
+import type { DbOwnerParameter } from "./db-owner-protocol";
 import {
 	type DbOwnerMaintenance,
+	closeRegisteredDbOwnerMaintenance,
 	createDbOwnerMaintenance,
 	ownerQueryAll,
 	ownerQueryOne,
@@ -107,6 +108,12 @@ import {
 	createDeferredRuntimeScheduler,
 	releaseDeferredRuntimeGateIfSafe,
 } from "./deferred-runtime-gate";
+import {
+	closeDbOwnerDuringShutdown,
+	createShutdownRequestGate,
+	forceExitDuringShutdownFlush,
+	runShutdownCleanup,
+} from "./daemon-shutdown";
 import { dbOwnerBatch, dbOwnerQuery, ownerStatement } from "./db-owner-runtime";
 import { ownerReadOne } from "./db-owner-sql";
 import type { QueuePressureSnapshot } from "./diagnostics-queue";
@@ -134,6 +141,7 @@ import {
 	classifyPreviousDaemonExit,
 	previousExitTelemetryProperties,
 	readDaemonLifecycle,
+	terminalLifecycleFields,
 	writeDaemonLifecycle,
 } from "./lifecycle";
 import { closeInferenceProviderResolver, initInferenceProviderResolver } from "./llm";
@@ -157,6 +165,7 @@ import {
 } from "./pipeline";
 import { randomUUID } from "node:crypto";
 import { recordDreamingPassTelemetry } from "./pipeline/dreaming";
+import { importedSourceAttentionUpsert } from "./pipeline/dreaming-evidence-consumption";
 import { dbOwnerTransaction } from "./db-owner-runtime";
 import { startDeferredRuntimeAfterDreaming } from "./dreaming-startup";
 import { type DreamingWorkerHandle, startDreamingWorker } from "./pipeline/dreaming-worker";
@@ -233,7 +242,9 @@ import {
 	markSourceIndexInFlight,
 	markSourceIndexJobRunning,
 	pauseSourceIndexJob,
+	trackSourceIndexRun,
 	updateSourceIndexJobProgress,
+	waitForSourceIndexRuns,
 } from "./source-index-progress";
 import {
 	flushPendingSourceLifecycleTelemetry,
@@ -257,7 +268,13 @@ import {
 import { type TranscriptCaptureWorkerHandle, startTranscriptCaptureWorker } from "./transcript-capture-worker";
 import { type TranscriptRecoveryWorkerHandle, startTranscriptRecoveryWorker } from "./transcript-recovery-worker";
 import { type TranscriptImportWorkerHandle, startTranscriptImportWorker } from "./transcript-import-worker";
+import { MigrationControlBoundary } from "./workspace-writer-barrier";
 import { createOwnerTranscriptImportStore } from "./transcript-import-store";
+import { DbOwnedImportAdmissionLedger } from "./import-admission-ledger";
+import { admitImport } from "./import-inbox";
+import { startManualInboxWorker, type ManualInboxAdmission, type ManualInboxWorkerHandle } from "./manual-inbox-worker";
+import { importDocument } from "./document-import-service";
+import { stageTranscriptImport } from "./transcript-import-admission";
 
 import { resolveDaemonRestartMode } from "./daemon-restart";
 import {
@@ -266,7 +283,6 @@ import {
 	sweepStaleSessions,
 } from "./hooks";
 import { mountMcpRoute } from "./mcp";
-import { mountAppTrayRoutes } from "./routes/app-tray.js";
 import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { mountChangelogRoutes } from "./routes/changelog.js";
 import { stopHarnessHealth } from "./harness-health";
@@ -274,7 +290,6 @@ import { registerHarnessInstallRoutes, stopHarnessInstall } from "./routes/harne
 import { registerConnectorRoutes } from "./routes/connectors-routes.js";
 import { setupDashboardRoutes } from "./routes/dashboard.js";
 import { registerDatabaseDiagnosticsRoutes } from "./routes/database-diagnostics.js";
-import { mountEventBusRoutes } from "./routes/event-bus.js";
 import {
 	ensureWorkspaceGitignore,
 	getGitStatus,
@@ -285,22 +300,20 @@ import {
 	scheduleAutoCommit,
 	startGitSyncTimer,
 	stopGitSyncTimer,
+	setGitMigrationControl,
 } from "./routes/git-sync.js";
 import { registerGraphiqRoutes } from "./routes/graphiq-routes.js";
 import { mountHealthRoutes } from "./routes/health.js";
+import { mountProtectionRoutes } from "./protection.js";
 import { registerHooksRoutes } from "./routes/hooks-routes.js";
 import { registerImportRoutes } from "./routes/import-routes.js";
 import { registerTranscriptImportRoutes } from "./routes/transcript-import-routes.js";
 import { mountInferenceRoutes } from "./routes/inference.js";
 import { registerKnowledgeRoutes } from "./routes/knowledge-routes.js";
 import { mountMarketplaceReviewsRoutes } from "./routes/marketplace-reviews.js";
-import { mountMarketplaceRoutes } from "./routes/marketplace.js";
-import { mountMcpAnalyticsRoutes } from "./routes/mcp-analytics.js";
 import { registerMemoryRoutes } from "./routes/memory-routes.js";
 import { registerMiscRoutes } from "./routes/misc-routes.js";
 import { registerOntologyRoutes } from "./routes/ontology-routes.js";
-import { mountOsAgentRoutes } from "./routes/os-agent.js";
-import { mountOsChatRoutes } from "./routes/os-chat.js";
 import { registerPipelineRoutes } from "./routes/pipeline-routes.js";
 import { registerPluginRoutes } from "./routes/plugins-routes.js";
 import { registerQueueDiagnosticsRoutes } from "./routes/queue-diagnostics.js";
@@ -312,12 +325,12 @@ import { mountSkillAnalyticsRoutes } from "./routes/skill-analytics.js";
 import { mountSkillsRoutes, setFetchEmbedding } from "./routes/skills.js";
 import {
 	cleanupSourceDeletionTombstones,
+	finalizeCancelledSourceIndexJob,
 	registerSourcesRoutes,
 	stopSourceIndexJobs,
 } from "./routes/sources-routes.js";
 import { registerTelemetryRoutes } from "./routes/telemetry-routes.js";
 import { checkEmbeddingProvider } from "./routes/utils.js";
-import { mountWidgetRoutes } from "./routes/widget.js";
 import { isReadyResponse } from "./synthesis-worker-protocol";
 import { initUpdateSystem, startUpdateTimer, stopUpdateTimer } from "./update-system";
 import { createAgentsWatcherIgnoreMatcher } from "./watcher-ignore";
@@ -342,8 +355,7 @@ let skillReconcilerHandle: ReturnType<typeof startReconciler> | null = null;
 let transcriptCaptureWorkerHandle: TranscriptCaptureWorkerHandle | null = null;
 let transcriptRecoveryWorkerHandle: TranscriptRecoveryWorkerHandle | null = null;
 let transcriptImportWorkerHandle: TranscriptImportWorkerHandle | null = null;
-// These are mirrored into state.ts via setters for read access by
-// route modules. Only daemon.ts should assign or clear them.
+let manualInboxWorkerHandle: ManualInboxWorkerHandle | null = null;
 let telemetryRef: TelemetryCollector | undefined;
 let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 let checkpointPruneTimer: ReturnType<typeof setInterval> | undefined;
@@ -449,57 +461,48 @@ async function ownerQueuePressureSnapshot(owner: DbOwnerClient): Promise<QueuePr
 }
 
 async function ownerHasPendingVecBackfill(owner: DbOwnerClient, expectedDimensions: number): Promise<boolean> {
-	const rowidsHandle = owner.submit<{ readonly present?: number } | undefined>(
-		{
-			kind: "query",
-			statement: {
-				sql: "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'vec_embeddings_rowids' LIMIT 1",
-				result: "get",
-				transactional: false,
-				readonly: true,
-			},
-		},
-		{ operation: "maintenance.vec-backfill-probe-schema", lane: "read", deadlineMs: 5_000 },
+	const read = async <Row>(
+		sql: string,
+		params: readonly DbOwnerParameter[],
+		operation: string,
+	): Promise<Row | undefined> =>
+		await owner.awaitResult(
+			owner.submit<Row | undefined>(
+				{ kind: "query", statement: { sql, params: [...params], result: "get", transactional: false, readonly: true } },
+				{ operation, lane: "read", deadlineMs: 5_000 },
+			),
+			5_000,
+		);
+	const indexState = await read<{ readonly active_profile_json?: unknown }>(
+		"SELECT active_profile_json FROM embedding_index_state WHERE id = 1",
+		[],
+		"maintenance.vec-backfill-probe-slot",
+	).catch(() => undefined);
+	const activeTable = activeVectorProjectionTable({ prepare: () => ({ get: () => indexState }) });
+	const rowids = await read<{ readonly present?: number }>(
+		"SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+		[`${activeTable}_rowids`],
+		"maintenance.vec-backfill-probe-schema",
 	);
-	const rowids = await owner.awaitResult(rowidsHandle, 5_000);
-	const targetTable = rowids === undefined ? "vec_embeddings" : "vec_embeddings_rowids";
-	const pendingHandle = owner.submit<{ readonly present?: number } | undefined>(
-		{
-			kind: "query",
-			statement: {
-				sql: `SELECT 1 AS present FROM embeddings e
-				LEFT JOIN ${targetTable} v ON v.id = e.id
-				LEFT JOIN vec_embeddings_quarantine q ON q.rowid = e.id
-				WHERE v.id IS NULL AND q.rowid IS NULL AND e.dimensions = ? LIMIT 1`,
-				params: [expectedDimensions],
-				result: "get",
-				transactional: false,
-				readonly: true,
-			},
-		},
-		{ operation: "maintenance.vec-backfill-probe", lane: "read", deadlineMs: 5_000 },
+	const targetTable = rowids === undefined ? activeTable : `${activeTable}_rowids`;
+	const pending = await read<{ readonly present?: number }>(
+		`SELECT 1 AS present FROM embeddings e
+		 LEFT JOIN ${targetTable} v ON v.id = e.id
+		 LEFT JOIN vec_embeddings_quarantine q ON q.rowid = e.id
+		 WHERE v.id IS NULL AND q.rowid IS NULL AND e.dimensions = ? LIMIT 1`,
+		[expectedDimensions],
+		"maintenance.vec-backfill-probe",
 	);
-	// `undefined` is a successful empty result. Errors must escape so the
-	// bounded retry path can distinguish an operational failure from "no work".
-	return (await owner.awaitResult(pendingHandle, 5_000)) !== undefined;
+	return pending !== undefined;
 }
 
 export function countConnectorsActive(connectors: readonly { readonly status: string }[]): number {
-	// ConnectorStatus is "idle" | "syncing" | "error"; there is no "active"
-	// state. The heartbeat field keeps its historical name, but means
-	// connectors that are registered and not currently errored.
 	return connectors.filter((cn) => cn.status !== "error").length;
 }
 
-// ============================================================================
-// Hono App
-// ============================================================================
-
 export const app = new Hono();
+export const daemonMigrationControl = new MigrationControlBoundary(`daemon:${process.pid}:${randomUUID()}`);
 
-// Once migration verification has confirmed corruption, keep every mutating
-// HTTP surface fail-closed while continuing to serve readonly routes and the
-// existing repair guidance used by /health/ready.
 app.use("*", async (c, next) => {
 	if (["GET", "HEAD", "OPTIONS"].includes(c.req.method)) return await next();
 	if (!migrationIntegrityWritesBlocked) return await next();
@@ -515,22 +518,23 @@ app.use("*", async (c, next) => {
 		503,
 	);
 });
-
-// Resolve the SQLite runtime once for the workspace owner.
 const sqliteRuntime = resolveSqliteRuntimeConfig({ agentsDir: AGENTS_DIR });
 
-export function createRecallDbOwnerOptions(sqlitePath: string | undefined): DbOwnerClientOptions {
-	return { dbPath: MEMORY_DB, sqlitePath };
+export function createRecallDbOwnerOptions(
+	sqlitePath: string | undefined,
+	migrationControl: MigrationControlBoundary = daemonMigrationControl,
+): DbOwnerClientOptions {
+	return { dbPath: MEMORY_DB, sqlitePath, migrationControl };
 }
-
-// Recall, writes, and bounded maintenance share one database owner.
-const recallOwner = createDbOwnerClient(createRecallDbOwnerOptions(sqliteRuntime.choice?.path));
+const recallOwner = createDbOwnerClient(createRecallDbOwnerOptions(sqliteRuntime.choice?.path, daemonMigrationControl));
 recallDbOwner = recallOwner;
 
 registerGlobalMiddleware(app);
+setGitMigrationControl(daemonMigrationControl);
 getOrCreateInferenceRouter(resolveDefaultBasePath());
 
 mountHealthRoutes(app);
+mountProtectionRoutes(app, { workspacePath: process.env.SIGNET_PATH });
 mountMcpRoute(app);
 registerAuthRoutes(app);
 
@@ -546,7 +550,38 @@ registerGraphiqRoutes(app);
 registerSecretRoutes(app);
 registerSessionRoutes(app, { gitConfig, stopGitSyncTimer, startGitSyncTimer, getGitStatus, gitPull, gitPush, gitSync });
 registerSourcesRoutes(app);
-registerImportRoutes(app);
+registerImportRoutes(app, {
+	durableImportAdmission: {
+		admit: async ({ fileName, bytes, idempotencyKey }) => {
+			const layout = resolveWorkspaceLayout(AGENTS_DIR);
+			const row = await admitImport({
+				root: layout.root,
+				layout,
+				fileName,
+				bytes,
+				idempotencyKey,
+				ledger: new DbOwnedImportAdmissionLedger(getDbAccessor(), { agentId: resolveDaemonAgentId() }),
+			});
+			return {
+				key: row.key,
+				originalPath: row.originalPath,
+				sha256: row.sha256,
+				size: row.size,
+				status: row.status,
+				sourceId: row.sourceId,
+				error: row.error,
+			};
+		},
+		begin: async (key) => {
+			const ledger = new DbOwnedImportAdmissionLedger(getDbAccessor(), { agentId: resolveDaemonAgentId() });
+			await ledger.lease(key);
+		},
+		complete: async ({ key, status, sourceId, error }) => {
+			const ledger = new DbOwnedImportAdmissionLedger(getDbAccessor(), { agentId: resolveDaemonAgentId() });
+			await ledger.transition(key, "processing", status, error, { sourceId });
+		},
+	},
+});
 registerTranscriptImportRoutes(app);
 registerPipelineRoutes(app);
 registerReflectionRoutes(app);
@@ -562,48 +597,24 @@ app.use("/api/inference/*", async (c, next) => {
 	if (c.req.method === "GET") return requirePermission("diagnostics", authConfig)(c, next);
 	return requirePermission("admin", authConfig)(c, next);
 });
+app.use("/api/assistant/*", async (c, next) => requirePermission("recall", authConfig)(c, next));
 mountInferenceRoutes(app, {
 	getAuthMode: () => authConfig.mode,
 	getTelemetry: () => telemetryRef,
 });
 
-// ============================================================================
-// Additional route modules (from main)
-// ============================================================================
-
 setFetchEmbedding(fetchEmbedding);
-// Mount the literal /api/skills/analytics before mountSkillsRoutes, whose
-// /api/skills/:name route would otherwise match "analytics" as a skill name.
 mountSkillAnalyticsRoutes(app);
 mountSkillsRoutes(app);
-mountMarketplaceRoutes(app);
-mountMcpAnalyticsRoutes(app);
-mountAppTrayRoutes(app);
-mountWidgetRoutes(app);
-mountEventBusRoutes(app);
 mountMarketplaceReviewsRoutes(app);
 mountChangelogRoutes(app);
-mountOsChatRoutes(app);
-mountOsAgentRoutes(app);
 setupDashboardRoutes(app);
-
-// ============================================================================
-// File Watcher
-// ============================================================================
 
 let watcher: ReturnType<typeof watch> | null = null;
 let nativeMemoryBridge: NativeMemoryBridgeHandle | null = null;
-
-// Fast in-process cache layered on top of the persistent legacy_markdown_imports
-// manifest. The DB manifest is the authoritative restart-safe skip state;
-// this map only avoids duplicate work within a single daemon lifetime.
 const ingestedMemoryFiles = new Map<string, string>();
 const LEGACY_MARKDOWN_IMPORTER_VERSION = 1;
 const MEMORY_IMPORT_POLL_MS = 30_000;
-
-// #1172: harnesses that never signal session-end (closed/abandoned desktop
-// chats) leave live-retained transcripts unclosed; sweep the stale sessions
-// and fire the deferred session-end on a timer.
 const STALE_SESSION_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 const ACP_DELIVERY_RECONCILIATION_INTERVAL_MS = 30_000;
 const STALE_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
@@ -614,12 +625,12 @@ let acpDeliveryReconciliationTimer: ReturnType<typeof setInterval> | null = null
 let memoryImportInFlight = false;
 
 let syncTimer: ReturnType<typeof setTimeout> | null = null;
+let startupSourceSyncTimer: ReturnType<typeof setTimeout> | null = null;
 const SYNC_DEBOUNCE_MS = 2000;
 
 async function syncHarnessConfigs() {
 	const identityMode = loadIdentityMode(AGENTS_DIR);
 	if (!identityModeManagesFiles(identityMode)) {
-		// Clean up stale generated harness identity files when mode is off
 		await cleanupStaleHarnessIdentity();
 		await ensureArchitectureDoc();
 		return;
@@ -676,18 +687,17 @@ ${fileList}
 					if (!fileContent) return "";
 					if (
 						name === "MEMORY.md" &&
-						(!scanMemoryContent(fileContent).contextEligible ||
-							(
-								await requestMemoryHead<{ generated: boolean }>({
-									action: "inspect",
-									agentId: "default",
-									content: fileContent,
-								})
-							).generated)
+						(
+							await requestMemoryHead<{ generated: boolean }>({
+								action: "inspect",
+								agentId: "default",
+								content: fileContent,
+							})
+						).generated
 					)
 						return "";
 					const header = name.replace(".md", "");
-					return `\n## ${header}\n\n${fileContent}`;
+					return `\n## ${header}\n\n${name === "MEMORY.md" ? redactCredentials(fileContent) : fileContent}`;
 				} catch {
 					return "";
 				}
@@ -722,11 +732,6 @@ ${fileList}
 	});
 	await ensureArchitectureDoc();
 }
-
-/**
- * Remove Signet-generated harness identity files when identity mode is off.
- * Only deletes files whose first lines match Signet-generated markers.
- */
 async function cleanupStaleHarnessIdentity(): Promise<void> {
 	const activeHarnesses = new Set(loadConfiguredHarnesses(AGENTS_DIR));
 	const targets: Array<{ path: string; harness: string }> = [];
@@ -735,13 +740,10 @@ async function cleanupStaleHarnessIdentity(): Promise<void> {
 	if (activeHarnesses.has("opencode") && existsSync(opencodeDir)) {
 		targets.push({ path: join(opencodeDir, "AGENTS.md"), harness: "opencode" });
 	}
-
-	// Gemini uses a configurable GEMINI.md path; check the standard and custom locations
 	if (activeHarnesses.has("gemini")) {
 		const geminiDir = join(homedir(), ".gemini");
 		if (existsSync(geminiDir)) {
 			targets.push({ path: join(geminiDir, "GEMINI.md"), harness: "gemini" });
-			// Also check for custom context-file path from settings.json
 			try {
 				const settingsPath = join(geminiDir, "settings.json");
 				if (existsSync(settingsPath)) {
@@ -758,9 +760,7 @@ async function cleanupStaleHarnessIdentity(): Promise<void> {
 						}
 					}
 				}
-			} catch {
-				// Non-fatal — default path already covered
-			}
+			} catch {}
 		}
 	}
 
@@ -778,9 +778,7 @@ async function cleanupStaleHarnessIdentity(): Promise<void> {
 				await unlinkAsync(targetPath);
 				logger.sync.harness(harness, `cleaned stale generated file: ${targetPath}`);
 			}
-		} catch {
-			// Non-fatal
-		}
+		} catch {}
 	}
 }
 
@@ -970,7 +968,6 @@ async function resolveActiveEmbeddingConfigThroughOwner(
 	operation: string,
 ): Promise<ResolvedMemoryConfig["embedding"]> {
 	if (configured.profile) return configured;
-	// Startup must not wait behind FTS/integrity maintenance work.
 	const row = await ownerReadOne<EmbeddingIndexStateRow>(
 		owner,
 		"SELECT active_profile_json, staging_profile_json, state, last_error FROM embedding_index_state WHERE id = 1",
@@ -1018,7 +1015,6 @@ async function readLegacyMarkdownImportState(filePath: string): Promise<{
 		);
 		return row ?? null;
 	} catch {
-		// Older/unmigrated DBs fall back to the legacy importer behavior.
 		return null;
 	}
 }
@@ -1084,9 +1080,7 @@ async function writeLegacyMarkdownImportState(args: {
 			],
 			{ deadlineMs: 5_000 },
 		);
-	} catch {
-		// Non-fatal: importer correctness still falls back to idempotency/source dedupe.
-	}
+	} catch {}
 }
 
 async function legacyMarkdownChunkKnown(filePath: string, chunkHash: string): Promise<boolean> {
@@ -1129,9 +1123,7 @@ async function recordLegacyMarkdownChunk(args: {
 			],
 			{ deadlineMs: 5_000 },
 		);
-	} catch {
-		// Non-fatal.
-	}
+	} catch {}
 }
 
 function memoryIdFromRememberResponse(value: unknown): string | null {
@@ -1254,9 +1246,6 @@ async function ingestMemoryMarkdown(filePath: string): Promise<number> {
 				await recordLegacyMarkdownChunk({ filePath, chunkHash, chunkIndex: i, memoryId, sourceId: chunkKey });
 				imported++;
 			} else if (response.status === 409) {
-				// Existing historical imports can predate this manifest table. A 409 still
-				// proves this deterministic chunk should not be posted again on every
-				// daemon restart, so persist a manifest row without a memory id.
 				await recordLegacyMarkdownChunk({ filePath, chunkHash, chunkIndex: i, memoryId: null, sourceId: chunkKey });
 				imported++;
 				logger.debug("watcher", "Legacy memory chunk already exists", { path: filePath, chunkIndex: i });
@@ -1329,7 +1318,7 @@ async function* legacyMarkdownFiles(memoryDir: string): AsyncGenerator<string> {
 }
 
 async function importExistingMemoryFiles(): Promise<number> {
-	const memoryDir = join(AGENTS_DIR, "memory");
+	const memoryDir = resolveWorkspaceLayout(AGENTS_DIR).transcripts;
 	if (!existsSync(memoryDir)) {
 		logger.debug("daemon", "Memory directory does not exist, skipping initial import");
 		return 0;
@@ -1391,9 +1380,6 @@ function stopMemoryImportPoller(): void {
 function startStaleSessionSweeper(): void {
 	if (staleSessionSweepTimer !== null) return;
 	staleSessionSweepTimer = setInterval(() => {
-		// Keep each timer tick small. The sweep is single-flight and yields
-		// between finalizations, so a large abandoned-session backlog cannot
-		// monopolize the daemon or fan out downstream capture work.
 		sweepStaleSessions({ staleOlderThanMs: STALE_SESSION_TTL_MS, limit: 10 }).catch((e) => {
 			logger.error("daemon", "Stale session sweep failed", undefined, {
 				message: e instanceof Error ? e.message : String(e),
@@ -1444,12 +1430,6 @@ function invalidateInferenceConfigForPath(path: string): void {
 }
 
 function startFileWatcher() {
-	// Do NOT watch the memory/ directory directly — Bun's fs.watch()
-	// opens one O_RDONLY FD per file in a watched directory and never
-	// releases them on close(), leaking ~8 000 FDs with canonical
-	// artifacts present. Canonical artifacts and backups are intentionally
-	// ignored; rare legacy non-artifact memory markdown imports are handled
-	// by the lightweight poller started after daemon readiness.
 	watcher = watch(
 		[
 			join(AGENTS_DIR, "agent.yaml"),
@@ -1481,9 +1461,6 @@ function startFileWatcher() {
 		const isRuntimeConfig = base === "agent.yaml" || base === "AGENT.yaml" || base === "config.yaml";
 		if (isRuntimeConfig) {
 			try {
-				// Keep the accepted runtime state and its derived reload paths intact
-				// when a newly selected config is invalid. In particular, do not
-				// invalidate routing or auto-commit the rejected document.
 				loadMemoryConfig(AGENTS_DIR);
 			} catch (error) {
 				logger.error(
@@ -1576,10 +1553,6 @@ function startFileWatcher() {
 	});
 }
 
-// ============================================================================
-// Pipeline runtime
-// ============================================================================
-
 function readPipelineMode(cfg: ResolvedMemoryConfig["pipelineV2"]): string {
 	if (!cfg.enabled) return "disabled";
 	if (cfg.paused) return "paused";
@@ -1589,10 +1562,6 @@ function readPipelineMode(cfg: ResolvedMemoryConfig["pipelineV2"]): string {
 }
 
 async function stopPipelineRuntime(): Promise<void> {
-	if (vacuumConversionHandle) {
-		vacuumConversionHandle.stop();
-		vacuumConversionHandle = null;
-	}
 	if (skillReconcilerHandle) {
 		try {
 			await Promise.resolve(skillReconcilerHandle.stop());
@@ -1660,9 +1629,6 @@ function restartAfterEmbeddingPromotion(telemetry?: TelemetryCollector): void {
 	if (embeddingPromotionRestart) return;
 	const activePass = dreamingWorkerHandle?.activePass;
 	embeddingPromotionRestart = (async () => {
-		// An embedding-index promotion changes recall infrastructure, not the
-		// evidence window already being reasoned over. Let that bounded pass
-		// finish instead of orphaning it during the broad worker restart.
 		if (activePass) {
 			logger.info("embedding", "Deferring embedding worker restart until Dreaming pass completes");
 			await activePass.catch(() => undefined);
@@ -1758,10 +1724,7 @@ function configuredInferenceMode(agentsDir: string): "local" | "remote" | "unkno
 				if (localities.includes("unknown")) return "unknown";
 				return "local";
 			}
-		} catch {
-			// An invalid router config is reported by the router itself. Do not
-			// infer a mode from retired memory.pipelineV2 provider fields.
-		}
+		} catch {}
 		break;
 	}
 
@@ -1784,7 +1747,6 @@ function buildTelemetryConfigSnapshot(agentsDir: string, memoryCfg: ResolvedMemo
 function initializeDbOwnerMaintenance(): DbOwnerMaintenance {
 	const maintenance = createDbOwnerMaintenance({ dbPath: MEMORY_DB, owner: dbOwnerClient ?? undefined });
 	registerDbOwnerMaintenance(maintenance);
-	registerDbOwnerHealthProvider(maintenance.health);
 	return maintenance;
 }
 
@@ -1800,8 +1762,6 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 				return router.createWorkloadProvider("session_synthesis", defaultAgentId);
 			case "aggregateRecall":
 				return router.createWorkloadProvider("aggregate_recall", defaultAgentId);
-			case "widgetGeneration":
-				return router.createWorkloadProvider("widget_generation", defaultAgentId);
 			case "repair":
 				return router.createWorkloadProvider("repair", defaultAgentId);
 			case "interactive":
@@ -1810,8 +1770,6 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 				return router.createWorkloadProvider("default", defaultAgentId);
 		}
 	});
-	// Surface broken routing references (defaultPolicy, workload targets, etc.) at
-	// boot before any route is attempted (#1005). Never blocks daemon startup.
 	void router.validateConfigReferences();
 
 	if (dbOwnerMaintenanceHandle === null) {
@@ -1819,11 +1777,8 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 	}
 
 	const activeEmbeddingCfg = await startDeferredRuntimeAfterDreaming(
-		// Admit Dreaming before optional startup work. Legacy-job retirement and
-		// embedding resolution both use the DB-owner queue and can reject the
-		// deferred runtime before the worker would otherwise be created.
 		() => {
-			if (memoryCfg.dreaming.enabled && !pipelinePaused && !memoryCfg.pipelineV2.mutationsFrozen) {
+			if (!pipelinePaused) {
 				try {
 					dreamingWorkerHandle = startDreamingWorker(
 						getDbAccessor(),
@@ -1831,6 +1786,17 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 						AGENTS_DIR,
 						defaultAgentId,
 						{
+							enabled: () => {
+								const live = loadMemoryConfig(AGENTS_DIR);
+								return (
+									live.dreaming.enabled &&
+									live.pipelineV2.enabled &&
+									!live.pipelineV2.paused &&
+									!live.pipelineV2.mutationsFrozen
+								);
+							},
+							inferenceAvailable: async (agentId) =>
+								(await router.explain({ agentId, operation: "memory_extraction" })).ok,
 							acpxMcp: {
 								daemonUrl: `http://${INTERNAL_SELF_HOST}:${PORT}`,
 								authorizationTokenForAgent: (agentId) =>
@@ -1861,11 +1827,6 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 		},
 		async () => {
 			logger.info("dreaming", "Dreaming owns all semantic writes; legacy extraction is retired");
-			// Terminalize every pre-existing legacy `extract` job. The source keeps its
-			// provenance and memory kind, so only already-episodic evidence remains
-			// reachable by the Dreaming cursor; derived rows are never reclassified.
-			// Leased rows are terminalized too because no legacy worker remains. Runs on
-			// cold boot and live-reload config transitions (#913).
 			if (!pipelinePaused) {
 				const deadLettered = await retireLegacyExtractionJobsAsync({
 					reason: "Dreaming cutover: legacy extraction worker not started",
@@ -1911,9 +1872,6 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 				synthesisDecision?.ok ? synthesisDecision.value.targetRef : undefined,
 			) as RuntimeSynthesisProviderName | null)) ??
 		(synthesisAvailable ? "inference" : null);
-	// Dreaming owns all semantic writes (#913 hard cutover). Legacy extraction
-	// is always disabled; the memory_extraction workload binding is still
-	// resolved by the router because Dreaming uses it for inference calls.
 	providerRuntimeResolution.extraction = {
 		configured: null,
 		resolved: "none",
@@ -1961,13 +1919,6 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 			telemetry,
 			dbOwnerMaintenanceHandle ?? undefined,
 		);
-
-		// Configure the main thread's own native embedding handle — but ONLY when
-		// the provider is actually native. On x86_64, native ONNX warmup wedges
-		// the event loop for 70+ seconds even when provider is ollama/openai
-		// (#1073). A non-native provider must not trigger native warming, and
-		// warmNative: false kills the native path outright even when the active
-		// embedding profile is native.
 		if (activeEmbeddingCfg.provider === "native" && activeEmbeddingCfg.warmNative !== false) {
 			const { configureNativeEmbeddingAssets } = await import("./native-embedding");
 			configureNativeEmbeddingAssets({
@@ -1988,20 +1939,15 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 			memoryCfg.pipelineV2.repair,
 			fetchEmbedding,
 			checkEmbeddingProvider,
+			defaultAgentId,
 		);
 		setEmbeddingTrackerHandle(embeddingTrackerHandle);
 	}
-
-	// Embedding migration is bounded background work and must not gate the
-	// already-admitted Dreaming worker.
 	if (!pipelinePaused) {
 		try {
 			embeddingIndexMigrationHandle = await startEmbeddingIndexMigration({
 				accessor: getDbAccessor(),
 				configured: memoryCfg.embedding,
-				// Re-read agent.yaml each tick so a mid-build config edit restarts
-				// the build against the new profile instead of spinning on the
-				// stale persisted one (#1160).
 				readConfigured: () => loadMemoryConfig(AGENTS_DIR).embedding,
 				fetchEmbedding,
 				checkProvider: checkEmbeddingProvider,
@@ -2044,12 +1990,14 @@ async function startPipelineRuntime(memoryCfg: ResolvedMemoryConfig, telemetry?:
 
 queueMicrotask(() => setRestartPipelineRuntime(restartPipelineRuntime));
 
-// ============================================================================
-// Shutdown
-// ============================================================================
-
 async function cleanup() {
+	const vacuumConversionWorker = vacuumConversionHandle;
+	vacuumConversionHandle = null;
+	const vacuumConversionStop = vacuumConversionWorker?.stop() ?? Promise.resolve();
 	setShuttingDown(true);
+	daemonMigrationControl.beginDrain();
+	const writerDrain = await daemonMigrationControl.close();
+	if (!writerDrain.closed) logger.warn("daemon", "Workspace writer drain timed out", writerDrain);
 	bindAbort.abort();
 	await stopHarnessInstall();
 	await stopHarnessHealth();
@@ -2077,6 +2025,10 @@ async function cleanup() {
 		clearTimeout(syncTimer);
 		syncTimer = null;
 	}
+	if (startupSourceSyncTimer) {
+		clearTimeout(startupSourceSyncTimer);
+		startupSourceSyncTimer = null;
+	}
 	stopMemoryImportPoller();
 	stopStaleSessionSweeper();
 	stopAcpDeliveryReconciliation();
@@ -2085,6 +2037,7 @@ async function cleanup() {
 		await nativeMemoryBridge.close();
 		nativeMemoryBridge = null;
 	}
+	await waitForSourceIndexRuns();
 
 	if (heartbeatTimer) {
 		clearInterval(heartbeatTimer);
@@ -2096,6 +2049,7 @@ async function cleanup() {
 		checkpointPruneTimer = undefined;
 		setCheckpointPruneTimer(undefined);
 	}
+	await stopPiAgentWorkers(true);
 	stopResourceMonitors();
 	logFdSnapshot("cleanup-start");
 	await flushPendingSourceLifecycleTelemetry();
@@ -2111,8 +2065,10 @@ async function cleanup() {
 	try {
 		await flushPendingCheckpoints();
 	} catch {}
-
-	// Source ingestion survives inference reconfiguration; only daemon shutdown drains it.
+	if (manualInboxWorkerHandle) {
+		await manualInboxWorkerHandle.stop();
+		manualInboxWorkerHandle = null;
+	}
 	if (transcriptImportWorkerHandle) {
 		try {
 			await transcriptImportWorkerHandle.stop();
@@ -2127,16 +2083,31 @@ async function cleanup() {
 	}
 	await stopPipelineRuntime();
 
-	if (dbOwnerMaintenanceHandle !== null) {
-		await dbOwnerMaintenanceHandle.close().catch(() => {});
-		dbOwnerMaintenanceHandle = null;
-		registerDbOwnerMaintenance(null);
-		registerDbOwnerHealthProvider(null);
+	const maintenanceHandle = dbOwnerMaintenanceHandle;
+	const ownerClient = dbOwnerClient;
+	dbOwnerMaintenanceHandle = null;
+	dbOwnerClient = null;
+	if (maintenanceHandle !== null || ownerClient !== null || vacuumConversionWorker !== null) {
+		try {
+			await closeDbOwnerDuringShutdown({
+				stopBackground: () => vacuumConversionStop,
+				closeMaintenance: () => (maintenanceHandle === null ? Promise.resolve() : closeRegisteredDbOwnerMaintenance()),
+				closeOwner: () => (ownerClient === null ? Promise.resolve() : ownerClient.close()),
+			});
+		} catch (error) {
+			logger.error("daemon", "DB owner shutdown failed", undefined, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	try {
 		const { shutdownNativeProvider } = await import("./native-embedding");
 		await shutdownNativeProvider();
+	} catch {}
+	try {
+		const { shutdownNativeReranker } = await import("./native-rerank");
+		await shutdownNativeReranker();
 	} catch {}
 
 	const released = releaseAllSessions();
@@ -2160,10 +2131,6 @@ async function cleanup() {
 		});
 	}
 
-	if (dbOwnerClient !== null) {
-		await dbOwnerClient.close();
-		dbOwnerClient = null;
-	}
 	await recallDbOwner?.close();
 	recallDbOwner = null;
 	closeDbAccessor();
@@ -2191,18 +2158,27 @@ function buildLifecycleRecord(state: DaemonLifecycle["state"], extra: Partial<Da
 		startedAt: lifecycleStartedAt,
 		...(DAEMON_RUNTIME === null ? {} : { runtime: DAEMON_RUNTIME }),
 		systemdUnit: process.env.SIGNET_DAEMON_UNIT || undefined,
+		startAttemptId: process.env.SIGNET_DAEMON_START_ATTEMPT_ID || undefined,
 		...extra,
 	};
 }
 
 let exitFlushInFlight: Promise<void> | null = null;
+const shutdownRequestGate = createShutdownRequestGate();
+let shutdownFatalError: unknown;
+let shutdownCleanupError: Error | null = null;
 
 async function flushAndExit(exitCode: number): Promise<void> {
-	if (exitFlushInFlight) return exitFlushInFlight;
+	if (exitFlushInFlight) {
+		forceExitDuringShutdownFlush(
+			exitFlushInFlight,
+			shutdownRequestGate.exitCode ?? exitCode,
+			() => logger.shutdown(),
+			(code) => process.exit(code),
+		);
+		return exitFlushInFlight;
+	}
 	exitFlushInFlight = (async () => {
-		// Update handoffs and repeated signals bypass normal cleanup. Give the
-		// telemetry collector a bounded final drain before process.exit so a
-		// wedge/crash record is not discarded on those paths.
 		if (telemetryRef) {
 			const timeout = new Promise<void>((resolve) => {
 				const timer = setTimeout(resolve, 2_000);
@@ -2210,54 +2186,54 @@ async function flushAndExit(exitCode: number): Promise<void> {
 			});
 			await Promise.race([telemetryRef.stop(), timeout]).catch(() => {});
 		}
-		// The logger buffers file writes and flushes on a 1s timer; without an
-		// explicit flush the final log lines can be lost on exit.
 		logger.shutdown();
-		process.exit(exitCode);
+		process.exit(shutdownRequestGate.exitCode ?? exitCode);
 	})();
 	return exitFlushInFlight;
 }
 
 function buildTerminalLifecycleRecord(reason: string, exitCode: number, error?: unknown): DaemonLifecycle {
-	return buildLifecycleRecord(error === undefined ? "clean" : "error", {
-		exitedAt: new Date().toISOString(),
-		exitCode,
-		reason,
-		...(error !== undefined ? { error: error instanceof Error ? error.message : String(error) } : {}),
-	});
+	const { state, ...extra } = terminalLifecycleFields(reason, exitCode, error, new Date().toISOString());
+	return buildLifecycleRecord(state, extra);
 }
-
-/** Bounds the draining cleanup so a wedged shutdown can never zombie the daemon. */
+function buildShutdownTerminalRecord(reason: string, exitCode: number, error?: unknown): DaemonLifecycle {
+	const fatalRequest = shutdownRequestGate.fatalRequest;
+	const terminalError =
+		fatalRequest === null ? (error ?? shutdownCleanupError) : (shutdownFatalError ?? new Error(fatalRequest.reason));
+	return buildTerminalLifecycleRecord(
+		shutdownRequestGate.primary?.reason ?? reason,
+		shutdownRequestGate.exitCode ?? exitCode,
+		terminalError,
+	);
+}
 const SHUTDOWN_CLEANUP_DEADLINE_MS = 20_000;
-
-/**
- * Single exit path for every catchable termination (signals and fatal
- * errors). Logs the exit path, records it in the lifecycle file, flushes the
- * logger buffer synchronously so the final lines actually land, then exits.
- * SIGKILL cannot be caught — a kill leaves the lifecycle record stuck at
- * "starting"/"running", which `signet status`/`doctor` report as an
- * unrecorded death instead of silence (issue #1148).
- *
- * The terminal lifecycle record is written only after cleanup completes (or
- * the hard deadline forces the exit): writing it earlier would leave a
- * "clean" record on a process still alive while cleanup hangs.
- *
- * `runCleanup` is disabled only for the update handoff: the replacement
- * daemon is already spawned and needs the port immediately, so the exit is
- * recorded and flushed but skips the draining cleanup.
- */
 function requestShutdown(reason: string, exitCode: number, error?: unknown, runCleanup = true): void {
-	if (shuttingDown) {
-		// A second signal while draining must not wedge the process; flush and
-		// exit immediately so the operator is never stuck with a zombie — and
-		// the final log lines still land.
-		void flushAndExit(exitCode);
+	const disposition = shutdownRequestGate.begin({ reason, exitCode });
+	if (exitCode !== 0 && shutdownFatalError === undefined) shutdownFatalError = error ?? new Error(reason);
+	if (shuttingDown || disposition !== "begin") {
+		const primaryRequest = shutdownRequestGate.primary;
+		if (exitCode !== 0) {
+			logger.error("daemon", "Fatal shutdown request arrived during cleanup; forcing exit", undefined, {
+				reason,
+				exitCode,
+				primaryRequest,
+			});
+			const fatalExitCode = shutdownRequestGate.exitCode ?? exitCode;
+			writeDaemonLifecycle(AGENTS_DIR, buildShutdownTerminalRecord(reason, fatalExitCode, error));
+			void flushAndExit(fatalExitCode);
+		} else {
+			logger.warn("daemon", "Ignoring additional shutdown request while cleanup is in progress", {
+				reason,
+				exitCode,
+				primaryRequest,
+			});
+		}
 		return;
 	}
 	setShuttingDown(true);
 	logger.info("daemon", `Received ${reason}; shutting down`, { exitCode });
 	if (!runCleanup) {
-		writeDaemonLifecycle(AGENTS_DIR, buildTerminalLifecycleRecord(reason, exitCode, error));
+		writeDaemonLifecycle(AGENTS_DIR, buildShutdownTerminalRecord(reason, exitCode, error));
 		void flushAndExit(exitCode);
 		return;
 	}
@@ -2267,16 +2243,19 @@ function requestShutdown(reason: string, exitCode: number, error?: unknown, runC
 			exitCode,
 			deadlineMs: SHUTDOWN_CLEANUP_DEADLINE_MS,
 		});
-		writeDaemonLifecycle(AGENTS_DIR, buildTerminalLifecycleRecord(reason, exitCode, error));
+		writeDaemonLifecycle(AGENTS_DIR, buildShutdownTerminalRecord(reason, exitCode, error));
 		void flushAndExit(exitCode);
 	}, SHUTDOWN_CLEANUP_DEADLINE_MS);
-	cleanup()
-		.catch(() => {})
-		.finally(() => {
-			clearTimeout(cleanupDeadline);
-			writeDaemonLifecycle(AGENTS_DIR, buildTerminalLifecycleRecord(reason, exitCode, error));
-			void flushAndExit(exitCode);
-		});
+	void runShutdownCleanup(cleanup, (cleanupError) => {
+		if (cleanupError !== null) {
+			shutdownCleanupError ??= cleanupError;
+			logger.error("daemon", "Shutdown cleanup failed", cleanupError, { reason });
+		}
+		clearTimeout(cleanupDeadline);
+		const finalExitCode = shutdownRequestGate.exitCode ?? exitCode;
+		writeDaemonLifecycle(AGENTS_DIR, buildShutdownTerminalRecord(reason, finalExitCode, error));
+		void flushAndExit(finalExitCode);
+	});
 }
 
 process.on("SIGINT", () => {
@@ -2289,8 +2268,6 @@ process.on("SIGTERM", () => {
 
 process.on("uncaughtException", (err) => {
 	logger.error("daemon", "Uncaught exception", err);
-	// Sanitized crash report: truncated message, home-stripped stack frames,
-	// uptime. No memory content. Joinable to the install's heartbeat context.
 	telemetryRef?.record("error.occurred", sanitizeCrashError(err, process.uptime() * 1000));
 	requestShutdown("error:uncaughtException", 1, err);
 });
@@ -2302,28 +2279,18 @@ process.on("unhandledRejection", (reason) => {
 		reason instanceof Error ? reason : undefined,
 		reason instanceof Error ? undefined : { reason: String(reason) },
 	);
-	// Sanitized crash report for rejections too (primitives degrade to a
-	// truncated string).
 	telemetryRef?.record("error.occurred", sanitizeCrashError(reason, process.uptime() * 1000));
-	// Survive only the bounded-availability rejections the owner protocol is
-	// designed to absorb: deadline exhaustion cancels the job, queue-full and
-	// work-budget reject admission, and the owner keeps serving. Fire-and-forget
-	// background callers (deferred maintenance, recovery, watchers) legitimately
-	// race these rejections at startup, so killing the process here turns
-	// recoverable queue pressure into a crash loop. Every other DB owner
-	// failure — a dead owner, a startup timeout, a failed job, writes blocked
-	// on integrity, a closed client — means the database is degraded or gone,
-	// and the daemon must shut down instead of running without it. Crash on
-	// unknown rejections.
 	if (reason instanceof DbOwnerError && DB_OWNER_SURVIVABLE_CODES.has(String(reason.code))) return;
 	requestShutdown("error:unhandledRejection", 1, reason);
 });
 
-// ============================================================================
-// Main
-// ============================================================================
-
 async function main() {
+	if (workspaceLayoutStartup.status === "failed") {
+		console.error(`Signet cannot start: workspace layout upgrade failed: ${workspaceLayoutStartup.reason}`);
+		logger.shutdown(false);
+		process.exitCode = 1;
+		return;
+	}
 	const workspace = preflightWorkspace();
 	if (workspace.status === "missing" || workspace.status === "incomplete") {
 		console.error(formatWorkspacePreflightError(workspace));
@@ -2340,11 +2307,6 @@ async function main() {
 		process.exitCode = 1;
 		return;
 	}
-
-	// Validate the selected runtime configuration before acquiring the daemon
-	// lock, running migrations, opening the database, or writing lifecycle/PID
-	// state. The loader intentionally reports only file and field diagnostics;
-	// malformed user content must never be echoed during startup failure.
 	try {
 		readRuntimeConfig(AGENTS_DIR);
 	} catch (error) {
@@ -2362,17 +2324,23 @@ async function main() {
 	logger.info("daemon", "Signet Daemon starting", { runtime: DAEMON_RUNTIME });
 	logger.info("daemon", `File logging to ${logger.logFilePath}`);
 	logger.info("daemon", "Agents directory", { path: AGENTS_DIR });
+	if (workspaceLayoutStartup.status === "upgraded" && workspaceLayoutStartup.cleanup)
+		logger.warn(
+			"daemon",
+			"Workspace upgraded to layout v2, but upgrade cleanup did not finish",
+			workspaceLayoutStartup,
+		);
+	else if (workspaceLayoutStartup.status === "upgraded")
+		logger.info("daemon", "Workspace upgraded in place to layout v2", workspaceLayoutStartup);
+	if (workspaceLayoutStartup.status === "blocked" || workspaceLayoutStartup.status === "skipped")
+		logger.warn("daemon", "Workspace layout upgrade did not run", workspaceLayoutStartup);
 	logger.info("daemon", "Network configured", { port: PORT, host: HOST, bindHost: BIND_HOST });
-
-	// Acquire an exclusive lock to prevent multiple daemon instances from
-	// competing for the SQLite write lock. Without this, a respawn (systemd,
-	// launchd, or a script calling `signet daemon start`) starts a second
-	// instance that fights the first for the DB lock, causing
-	// "SQLiteError: database is locked" crashes on every write.
 	const lock = acquireSingleInstanceLock(join(DAEMON_DIR, "daemon.lock"));
 	if (lock === null) {
 		logger.error("daemon", "Another daemon instance is already running or the lock is unavailable. Exiting.");
-		process.exit(0);
+		logger.shutdown(false);
+		process.exitCode = 1;
+		return;
 	}
 	process.on("exit", () => {
 		releaseSingleInstanceLock(lock);
@@ -2383,9 +2351,6 @@ async function main() {
 	const previousExit = classifyPreviousDaemonExit(previousLifecycle, lifecycleStartedAt);
 	let restartedHeartbeatPending = previousExit !== null && previousExit.classification !== "clean";
 	writeDaemonLifecycle(AGENTS_DIR, buildLifecycleRecord("starting"));
-
-	// Config migrations must precede every initialization path that resolves
-	// memory config, including DB setup below.
 	try {
 		migrateConfig(AGENTS_DIR);
 		migrateInferenceProviders(AGENTS_DIR);
@@ -2399,26 +2364,11 @@ async function main() {
 			error: err instanceof Error ? err.message : String(err),
 		});
 	}
-	// Compatibility migrations translate supported legacy configuration into the
-	// canonical form. Resolve it again before opening the database so migration
-	// output is subject to the same strict runtime validation.
 	const startupMemoryConfig = loadMemoryConfig(AGENTS_DIR);
-	// Apply the validated auth policy before binding the listener. Keeping this
-	// on foreground startup closes the grace period in which middleware could
-	// still hold the module's local-auth default while pipeline workers waited
-	// to start.
 	reloadAuthState(AGENTS_DIR);
-
-	// Expensive schema/FTS initialization must execute in the killable owner
-	// process, not merely behind an async function on this isolate.
 	dbOwnerClient = recallOwner;
 	await dbOwnerClient.start();
 	const owner = dbOwnerClient;
-
-	// Read the retained migration verdict through a strictly read-only owner
-	// query before any mutating database initialization can run. A confirmed
-	// corrupt restart skips initialize() entirely and opens only a readonly
-	// accessor for status and recovery guidance.
 	const retainedMigrationBackupPath = pendingMigrationBackupPath(MEMORY_DB);
 	let retainedMigrationCorrupt = false;
 	let retainedMigrationStatus: string | null = null;
@@ -2443,9 +2393,6 @@ async function main() {
 
 	const initResult =
 		retainedMigrationCorrupt || retainedMigrationReadFailed ? null : await owner.initialize(AGENTS_DIR);
-	// The owner resolves sqlite-vec in its own process. Carry that path across
-	// the protocol so the parent accessor loads the same extension; retained
-	// paths still fall back to local discovery for older owner protocols.
 	const initExtensionPath =
 		initResult?.extensionPath ?? getVectorRuntimeStatus().extensionPath ?? findSqliteVecExtension() ?? "";
 	const deferredMigrationVerification = initResult?.deferredMigrationVerification === true;
@@ -2495,10 +2442,6 @@ async function main() {
 	setSessionClaimStore(createSessionClaimStore(getDbAccessor()));
 	if (!migrationIntegrityWritesBlocked) {
 		startSessionCleanup();
-		// Formal TTL lifecycle (#902): when stale-session cleanup evicts a claim
-		// whose harness never sent session-end, checkpoint the residual continuity
-		// state and mark the retained transcript complete instead of silently
-		// dropping the in-memory lifecycle state.
 		setSessionEvictionHandler(
 			createTtlEvictionHandler({
 				accessor: getDbAccessor(),
@@ -2517,13 +2460,7 @@ async function main() {
 	startFdPollMonitor();
 
 	dbOwnerMaintenanceHandle = initializeDbOwnerMaintenance();
-	// Clean accumulated crash-loop damage through the owner. This remains a
-	// deferred call, so owner startup and the bounded drain never delay readiness.
 	if (!migrationIntegrityWritesBlocked) runStartupRecovery(getDbAccessor(), { owner: dbOwnerClient });
-
-	// Source-deletion cleanup runs in the post-ready deferred lane below. Do not
-	// put it before binding the HTTP server: its lifecycle-state delete uses the
-	// bounded async writer and must not make readiness depend on that queue.
 
 	const { extensionPath } = getVectorRuntimeStatus();
 	const bundled = join(__dirname, "synthesis-render-worker.js");
@@ -2552,9 +2489,6 @@ async function main() {
 			const timer = setTimeout(() => {
 				rej(new Error("synthesis worker init timeout"));
 			}, 10_000);
-			// Attach error/exit handlers during init to prevent unhandled
-			// 'error' events from crashing the main thread (EventEmitter
-			// convention: unhandled 'error' re-throws in the listener context).
 			const onErr = (err: unknown): void => {
 				clearTimeout(timer);
 				rej(err instanceof Error ? err : new Error(String(err)));
@@ -2637,17 +2571,11 @@ async function main() {
 		if (previousExit !== null) {
 			telemetryCollector.record("daemon.previous_exit", previousExitTelemetryProperties(previousExit));
 		}
-
-		// Lifecycle event (issue #1026 Phase 2): version + platform only.
 		telemetryCollector.record("daemon.started", {
 			version: CURRENT_VERSION,
 			platform: process.platform,
 			uptimeMs: 0,
 		});
-		// A daemon restart turns any still-running pass into a failed pass. Wait
-		// for the bounded drain to finish before emitting telemetry. The immediate
-		// compatibility report is deliberately marked "draining" and has no final
-		// orphan count yet.
 		void getStartupRecoveryCompletion().then((recovery) => {
 			if (recovery.recoveryPhase !== "complete") return;
 			for (let index = 0; index < Math.min(recovery.orphanedPassesSwept, 100); index++) {
@@ -2673,7 +2601,6 @@ async function main() {
 		});
 		for (const source of loadSourcesConfig(AGENTS_DIR).sources) {
 			if (source.enabled) {
-				// Server readiness must not wait on best-effort telemetry, but shutdown must drain it.
 				void trackSourceLifecycleWrite(recordSourceConnected(source, resolveDaemonAgentId()));
 			}
 		}
@@ -2737,9 +2664,7 @@ async function main() {
 								recoveryOutcome,
 							});
 							setRuntimePressureEnvelope(runtimePressure);
-						} catch {
-							// Pressure context is best-effort; a slow or unavailable subsystem must never suppress liveness.
-						}
+						} catch {}
 						telemetryRef?.record("daemon.heartbeat", {
 							uptimeMs: Date.now() - daemonStartTime,
 							version: CURRENT_VERSION,
@@ -2753,9 +2678,7 @@ async function main() {
 							...(resourceTelemetry ?? {}),
 						});
 						if (runtimePressure?.recoveryOutcome === "restarted") restartedHeartbeatPending = false;
-					} catch {
-						// Database pressure is diagnostic only; preserve the heartbeat if the owner is unavailable.
-					}
+					} catch {}
 				})();
 			},
 			5 * 60 * 1000,
@@ -2863,17 +2786,12 @@ async function main() {
 								},
 							);
 							await vectorBackfillOwner.awaitResult(backfill, remainingMs);
-							// Yield after every bounded owner batch so health and ready can run
-							// between slices without this isolate executing SQLite writes.
 							await new Promise<void>((resolve) => setImmediate(resolve));
 							if (!(await probePendingVecBackfillWithRetry())) return;
 						}
 					} finally {
 						vecBackfillScheduled = false;
 						if (budgetExpired && !migrationIntegrityWritesBlocked) {
-							// Probe after the bounded slice and give the serialized
-							// maintenance scheduler a short breather before arming the
-							// next slice. Errors are handled by the bounded probe retry.
 							const timer = setTimeout(() => schedulePendingVecBackfill(), 100);
 							timer.unref?.();
 						}
@@ -2886,9 +2804,6 @@ async function main() {
 				});
 			});
 	};
-	// The owner initialization result seeds daemon knowledge, while this probe
-	// remains authoritative so restarts and cross-process drift cannot strand a
-	// pending backfill behind the owner boundary.
 	if (daemonPendingVecBackfill) schedulePendingVecBackfill();
 	else
 		void probePendingVecBackfillWithRetry()
@@ -2900,10 +2815,6 @@ async function main() {
 					error: error instanceof Error ? error.message : String(error),
 				});
 			});
-
-	// Grace period: defer all background workers for 10s after startup so the
-	// event-loop monitor can calibrate and migrations can settle before any
-	// background write work piles on (#1059 thundering-herd prevention).
 	const startPostReadyRuntime = async (): Promise<void> => {
 		await deferredRuntimeGate.waitForIntegrity();
 		if (migrationIntegrityWritesBlocked) {
@@ -2932,27 +2843,79 @@ async function main() {
 				agentId: resolveDaemonAgentId(),
 				workspaceRoot: AGENTS_DIR,
 				onBatch: async (_jobId, sourceId) => {
-					const agentId = resolveDaemonAgentId();
-					const subjectRef = `source:${sourceId}`;
-					const details = JSON.stringify({ sourceId, reason: "transcript-import-committed" });
-					await dbOwnerTransaction(
-						[
-							{
-								sql: `INSERT INTO dreaming_attention
-									(id, agent_id, kind, subject_ref, details_json, priority)
-									VALUES (?, ?, 'evidence_requeue', ?, ?, 50)
-									ON CONFLICT(agent_id, kind, subject_ref) DO UPDATE SET
-									  details_json = excluded.details_json,
-									  priority = MAX(dreaming_attention.priority, excluded.priority),
-									  generation = dreaming_attention.generation + 1,
-									  resolved_at = NULL,
-									  resolved_by_pass_id = NULL`,
-								params: [randomUUID(), agentId, subjectRef, details],
-								result: "run",
-							},
-						],
-						{ operation: "sources.import.dreaming-attention", lane: "write" },
-					);
+					const nudge = importedSourceAttentionUpsert(resolveDaemonAgentId(), sourceId);
+					await dbOwnerTransaction([{ sql: nudge.sql, params: nudge.params, result: "run" }], {
+						operation: "sources.import.dreaming-attention",
+						lane: "write",
+					});
+				},
+			});
+		}
+		if (!manualInboxWorkerHandle) {
+			const agentId = resolveDaemonAgentId();
+			const layout = resolveWorkspaceLayout(AGENTS_DIR);
+			const importLedger = new DbOwnedImportAdmissionLedger(getDbAccessor(), { agentId });
+			const enabledMarker = join(layout.imports, ".manual-inbox-enabled");
+			const manualInboxAdmission: ManualInboxAdmission = {
+				isEnabled: async () => existsSync(enabledMarker),
+				enable: async () => {
+					mkdirSync(layout.imports, { recursive: true });
+					const tmp = `${enabledMarker}.tmp-${process.pid}`;
+					writeFileSync(tmp, "enabled\n", { mode: 0o600 });
+					renameSync(tmp, enabledMarker);
+				},
+				claim: async ({ key, fileName, bytes }) => {
+					const row = await importLedger.find(key);
+					if (row?.status === "imported" || row?.status === "duplicate") return null;
+					if (row?.status === "processing" && row.sourceId) return { ...row, status: "imported" };
+					const admitted =
+						row ??
+						(await admitImport({
+							root: AGENTS_DIR,
+							layout,
+							fileName,
+							bytes,
+							idempotencyKey: key,
+							ledger: importLedger,
+						}));
+					await importLedger.lease(key);
+					const retainedBytes = new Uint8Array(await Bun.file(admitted.originalPath).arrayBuffer());
+					return { key, fileName, originalPath: admitted.originalPath, bytes: retainedBytes, status: "processing" };
+				},
+				record: async (row) => {
+					await importLedger.transition(row.key, "processing", row.status, row.error, { sourceId: row.sourceId });
+				},
+				recordPublication: async (row) => {
+					await importLedger.recordPublication(row);
+				},
+				reconcile: async () => {
+					await importLedger.recoverExpiredLeases();
+				},
+			};
+			manualInboxWorkerHandle = startManualInboxWorker({
+				root: AGENTS_DIR,
+				inboxPath: layout.files,
+				admission: manualInboxAdmission,
+				dispatchDocument: async (row) => {
+					if (!row.bytes) throw new Error("managed import original is unavailable");
+					const result = await importDocument({
+						fileName: row.fileName,
+						bytes: row.bytes,
+						agentId,
+						workspaceRoot: layout.root,
+					});
+					if (result.status.status === "failed") throw new Error(result.status.error);
+					return { status: result.status.status, sourceId: result.status.sourceId };
+				},
+				dispatchTranscript: async (row) => {
+					if (!row.bytes) throw new Error("managed transcript original is unavailable");
+					const staged = await stageTranscriptImport({
+						agentId,
+						fileName: row.fileName,
+						bytes: row.bytes,
+						workspaceRoot: layout.root,
+					});
+					return { status: "imported", sourceId: staged.sourceId };
 				},
 			});
 		}
@@ -3030,8 +2993,6 @@ async function main() {
 		startUpdateTimer();
 	};
 	deferredRuntimeScheduler.schedulePipeline(startPostReadyRuntime);
-	// Cleanup is retryable maintenance. It must not hold up pipeline startup if
-	// the async writer is blocked or unavailable.
 	if (!migrationIntegrityWritesBlocked) {
 		deferredRuntimeScheduler.scheduleMaintenance(async (): Promise<void> => {
 			try {
@@ -3053,9 +3014,6 @@ async function main() {
 
 	const BIND_MAX_DELAY_MS = 30_000;
 	const BIND_RETRY_BASE_MS = 1000;
-	// SQLite's global quick_check is one opaque native operation. Integrity
-	// maintenance therefore advances one table at a time and checkpoints after
-	// every owner job instead of monopolizing the post-ready owner lane.
 	const INCREMENTAL_INTEGRITY_TABLES_PER_RUN = 8;
 	const INCREMENTAL_INTEGRITY_RUN_BUDGET_MS = 5_000;
 	const INCREMENTAL_INTEGRITY_OWNER_DEADLINE_MS = 1_000;
@@ -3080,17 +3038,40 @@ async function main() {
 		}
 		if (!migrationIntegrityWritesBlocked) {
 			deferredRuntimeScheduler.scheduleMaintenance(async (): Promise<void> => {
+				const integrityHealthy = await deferredRuntimeGate.waitForVerifiedIntegrity();
+				const migrationBackupPending = pendingMigrationBackupPath(MEMORY_DB) !== null;
+				if (!integrityHealthy || migrationIntegrityWritesBlocked || migrationBackupPending || shuttingDown) {
+					logger.warn("startup-recovery", "Skipping FTS startup recovery because integrity is not verified healthy", {
+						integrityHealthy,
+						migrationIntegrityWritesBlocked,
+						migrationBackupPending,
+						shuttingDown,
+					});
+					return;
+				}
 				const maintenance = dbOwnerMaintenanceHandle;
 				if (maintenance === null) throw new Error("DB owner maintenance is unavailable for FTS startup recovery");
 				const result = await completeFtsStartupRecovery({
 					backfill: maintenance.backfillFts,
 					backfillOptions: { checkpointKey: "fts.memories.startup" },
-					scheduleContinuation: (callback): void => {
-						const timer = setTimeout(callback, 0);
+					scheduleContinuation: (callback, delayMs): void => {
+						const timer = setTimeout(callback, delayMs);
 						timer.unref?.();
 					},
 				});
 				logger.info("daemon", "FTS startup maintenance finished", { ...result });
+				if (
+					result.status !== "complete" ||
+					migrationIntegrityWritesBlocked ||
+					shuttingDown ||
+					pendingMigrationBackupPath(MEMORY_DB) !== null
+				)
+					return;
+				const owner = dbOwnerClient;
+				if (owner === null) throw new Error("DB owner is unavailable for vacuum conversion");
+				if (vacuumConversionHandle === null) {
+					vacuumConversionHandle = startVacuumConversionWorker(getDbAccessor(), { owner });
+				}
 			});
 		}
 		let retainedCorruptMaintenanceLogged = false;
@@ -3103,6 +3084,7 @@ async function main() {
 						"Skipping all mutating post-ready maintenance because database corruption is retained",
 					);
 				}
+				deferredRuntimeGate.completeVerifiedIntegrity(false);
 				deferredRuntimeGate.completeIntegrity();
 				return;
 			}
@@ -3120,17 +3102,6 @@ async function main() {
 			}
 			const migrationBackupPending = migrationBackupPath !== null;
 			if (owner === null) throw new Error("DB owner is unavailable for incremental integrity maintenance");
-			const startVacuumConversion = (): void => {
-				if (vacuumConversionHandle !== null) return;
-				vacuumConversionHandle = startVacuumConversionWorker(getDbAccessor(), { owner });
-			};
-			if (!migrationBackupPending) startVacuumConversion();
-
-			// ── Migration backup prune gate ──────────────────────────────────
-			// Global `PRAGMA integrity_check` is the ONLY result that may delete
-			// the rollback backup. Each completed backup generation gets its own
-			// checkpoint key, so a parked or failed prior generation cannot suppress
-			// verification of this generation.
 			let integritySliceTimer: ReturnType<typeof setTimeout> | null = null;
 			let integritySlicePending = false;
 			let integrityRetryDelayMs = 0;
@@ -3173,9 +3144,6 @@ async function main() {
 				state: "healthy" | "corrupt" | "degraded",
 				messages?: readonly string[],
 			): void => {
-				// The terminal callback is intentionally injected into the gate so
-				// `if (state === "corrupt") armMigrationIntegrityWriteBlock();` runs
-				// only after the checkpoint and sidecar have been attempted.
 				publishDatabaseIntegrityStatus(state, messages, owner);
 				if (state === "degraded" && !scheduledVerifyRuntimeGateReleased) {
 					scheduledVerifyRuntimeGateReleased = true;
@@ -3251,9 +3219,6 @@ async function main() {
 					try {
 						const result = await runMigrationIntegrityVerifyGate({
 							...migrationVerifyGateOptions,
-							// Do not let the 30-minute continuation race a deadline-abandoned
-							// worker. Scheduling after settlement makes the global latch a true
-							// single-flight guard even when an old worker settles late.
 							scheduleNextAttempt: (callback, delayMs): void => {
 								void workerSettled.then(() => {
 									const timer = setTimeout(callback, delayMs);
@@ -3263,8 +3228,6 @@ async function main() {
 							onWorkerSettled: settleWorker,
 							onAdmissionFailure: () => {
 								settleWorker();
-								// No owner job exists to settle after a synchronous admission
-								// rejection, so the integrity lane can be released now.
 								releaseVerifyLatch();
 							},
 						});
@@ -3277,8 +3240,6 @@ async function main() {
 								setTimeout(() => {
 									requestShutdown("migration-verify-complete-restart", 0, undefined, false);
 								}, 0);
-							} else {
-								startVacuumConversion();
 							}
 						} else if (result.phase === "parked" || result.phase === "failed" || result.phase === "terminal") {
 							logger.warn("startup-recovery", "Migration verification retained the rollback backup; VACUUM deferred", {
@@ -3319,6 +3280,7 @@ async function main() {
 							"Skipping incremental integrity maintenance because database corruption is retained",
 						);
 					}
+					deferredRuntimeGate.completeVerifiedIntegrity(false);
 					integritySlicePending = false;
 					return;
 				}
@@ -3359,6 +3321,9 @@ async function main() {
 						});
 					}
 					scheduleIntegritySlice(integrityRetryDelayMs);
+				}
+				if (result.phase !== "running" && result.phase !== "timed_out" && result.phase !== "unavailable") {
+					deferredRuntimeGate.completeVerifiedIntegrity(result.phase === "complete" && result.failedObjects === 0);
 				}
 				if (!migrationIntegrityGateActive && !integrityGateCompleted) {
 					integrityGateCompleted = true;
@@ -3420,13 +3385,18 @@ async function main() {
 			startStaleSessionSweeper();
 			startAcpDeliveryReconciliation();
 
-			setTimeout(() => {
+			startupSourceSyncTimer = setTimeout(() => {
+				startupSourceSyncTimer = null;
 				if (!nativeMemoryBridge) {
+					const configuredSources = loadSourcesConfig(AGENTS_DIR).sources;
 					const startupSourceJobs = new Map<string, string>();
-					for (const source of loadSourcesConfig(AGENTS_DIR).sources) {
+					const startupSources = new Map<string, (typeof configuredSources)[number]>();
+					const startupLifecycleWrites: Promise<void>[] = [];
+					const startupAgentId = resolveDaemonAgentId();
+					for (const source of configuredSources) {
 						if (!source.enabled || source.kind !== "obsidian") continue;
-						// Startup indexing is asynchronous; keep its lifecycle write in the shutdown drain.
-						void trackSourceLifecycleWrite(recordSourceConnected(source, resolveDaemonAgentId()));
+						startupSources.set(source.id, source);
+						startupLifecycleWrites.push(trackSourceLifecycleWrite(recordSourceConnected(source, startupAgentId)));
 						const job = beginSourceIndexJob(source.id, "source-startup");
 						startupSourceJobs.set(source.id, job.id);
 						markSourceIndexInFlight(source.id);
@@ -3455,8 +3425,8 @@ async function main() {
 							});
 						},
 					});
-					nativeMemoryBridge
-						.syncExisting()
+					const startupRun = Promise.resolve()
+						.then(() => nativeMemoryBridge?.syncExisting())
 						.then(() => {
 							const syncResult = nativeMemoryBridge?.getLastSyncResult?.();
 							for (const [sourceId, jobId] of startupSourceJobs) {
@@ -3474,25 +3444,26 @@ async function main() {
 								const source = loadSourcesConfig(AGENTS_DIR).sources.find((entry) => entry.id === sourceId);
 								const job = getSourceIndexJob(sourceId);
 								if (source) {
-									// Index completion is intentionally fire-and-forget, but tracked until shutdown.
-									void trackSourceLifecycleWrite(
-										recordSourceIndexOperation({
-											source,
-											agentId: resolveDaemonAgentId(),
-											discovered: job?.scanned ?? 0,
-											accepted: job?.indexed ?? 0,
-											durationMs:
-												job?.startedAt && job.finishedAt
-													? Math.max(0, Date.parse(job.finishedAt) - Date.parse(job.startedAt))
-													: 0,
-											outcome: syncResult?.status === "paused" && paused ? "partial" : "success",
-											failureClass:
-												syncResult?.status === "paused" && paused
-													? sourceFailureClass(new Error("network provider unavailable"))
-													: undefined,
-											updateFreshness: syncResult?.status === "paused" && paused ? false : undefined,
-											searchable: syncResult?.status === "paused" && paused ? (job?.indexed ?? 0) > 0 : undefined,
-										}),
+									startupLifecycleWrites.push(
+										trackSourceLifecycleWrite(
+											recordSourceIndexOperation({
+												source,
+												agentId: startupAgentId,
+												discovered: job?.scanned ?? 0,
+												accepted: job?.indexed ?? 0,
+												durationMs:
+													job?.startedAt && job.finishedAt
+														? Math.max(0, Date.parse(job.finishedAt) - Date.parse(job.startedAt))
+														: 0,
+												outcome: syncResult?.status === "paused" && paused ? "partial" : "success",
+												failureClass:
+													syncResult?.status === "paused" && paused
+														? sourceFailureClass(new Error("network provider unavailable"))
+														: undefined,
+												updateFreshness: syncResult?.status === "paused" && paused ? false : undefined,
+												searchable: syncResult?.status === "paused" && paused ? (job?.indexed ?? 0) > 0 : undefined,
+											}),
+										),
 									);
 								}
 							}
@@ -3502,19 +3473,20 @@ async function main() {
 								const source = loadSourcesConfig(AGENTS_DIR).sources.find((entry) => entry.id === sourceId);
 								const job = getSourceIndexJob(sourceId);
 								if (source) {
-									// Failed indexing follows the same tracked best-effort shutdown path.
-									void trackSourceLifecycleWrite(
-										recordSourceIndexOperation({
-											source,
-											agentId: resolveDaemonAgentId(),
-											discovered: job?.scanned ?? 0,
-											accepted: job?.indexed ?? 0,
-											failed: 1,
-											durationMs: job?.startedAt ? Math.max(0, Date.now() - Date.parse(job.startedAt)) : 0,
-											outcome: (job?.indexed ?? 0) > 0 ? "partial" : "failed",
-											failureClass: sourceFailureClass(e),
-											searchable: (job?.indexed ?? 0) > 0,
-										}),
+									startupLifecycleWrites.push(
+										trackSourceLifecycleWrite(
+											recordSourceIndexOperation({
+												source,
+												agentId: startupAgentId,
+												discovered: job?.scanned ?? 0,
+												accepted: job?.indexed ?? 0,
+												failed: 1,
+												durationMs: job?.startedAt ? Math.max(0, Date.now() - Date.parse(job.startedAt)) : 0,
+												outcome: (job?.indexed ?? 0) > 0 ? "partial" : "failed",
+												failureClass: sourceFailureClass(e),
+												searchable: (job?.indexed ?? 0) > 0,
+											}),
+										),
 									);
 								}
 								failSourceIndexJob(sourceId, jobId, e);
@@ -3522,11 +3494,35 @@ async function main() {
 							const errDetails = e instanceof Error ? { message: e.message, stack: e.stack } : { error: String(e) };
 							logger.error("daemon", "Failed to sync native memory sources", undefined, errDetails);
 						})
-						.finally(() => {
-							for (const sourceId of startupSourceJobs.keys()) clearSourceIndexInFlight(sourceId);
+						.finally(async () => {
+							await Promise.allSettled(startupLifecycleWrites);
+							for (const [sourceId, jobId] of startupSourceJobs) {
+								try {
+									const source = startupSources.get(sourceId);
+									if (source) {
+										await finalizeCancelledSourceIndexJob({
+											source,
+											jobId,
+											agentsDir: AGENTS_DIR,
+											agentId: startupAgentId,
+										});
+									}
+								} catch (error) {
+									logger.warn("system", `Startup source-index finalization failed for source ${sourceId}`, {
+										error: error instanceof Error ? error.message : String(error),
+									});
+								} finally {
+									clearSourceIndexInFlight(sourceId);
+								}
+							}
 						});
+					for (const [sourceId, jobId] of startupSourceJobs) {
+						trackSourceIndexRun({ sourceId, jobId, kind: "startup", run: startupRun });
+					}
+					void startupRun;
 				}
 			}, 30_000);
+			startupSourceSyncTimer.unref?.();
 
 			const startupCfg = loadMemoryConfig(AGENTS_DIR);
 			const shouldPreloadNative =
@@ -3572,9 +3568,6 @@ async function main() {
 			createSignetHttpServer({
 				fetch: app.fetch,
 				hostname: BIND_HOST,
-				// Type assertion needed: arrow functions cannot satisfy overloaded
-				// function types. The wrapper passes all args through to nodeCreateServer
-				// so it is correct at runtime for every overload.
 				createServer: nodeCreateServer,
 			}),
 		onBound: (server) => {

@@ -1,16 +1,12 @@
 import { createRequire } from "node:module";
 import { DEFAULT_HYBRID_ALPHA } from "./constants";
-import { scanMemoryContent } from "./memory-content-safety";
+import { redactCredentials } from "./credential-detection";
 import type { Memory } from "./types";
-
-// Try to load native Rust implementation, fall back to pure TS
 let native: typeof import("@signet/native") | null = null;
 try {
 	const esmRequire = createRequire(import.meta.url);
 	native = esmRequire("@signet/native");
-} catch {
-	// Native addon not available — using TypeScript fallback
-}
+} catch {}
 
 function safeParseTags(raw: string | null): string[] {
 	if (!raw) return [];
@@ -24,17 +20,16 @@ function safeParseTags(raw: string | null): string[] {
 export interface SearchOptions {
 	query: string;
 	limit?: number;
-	alpha?: number; // Vector weight (1-alpha = BM25 weight)
+	alpha?: number;
 	type?: string;
 	minScore?: number;
-	topK?: number; // Candidates per source before blending
+	topK?: number;
 }
 
 export interface VectorSearchOptions {
 	limit?: number;
 	type?: string;
 	excludeAggregateRecall?: boolean;
-	/** Maximum canonical embedding rows to inspect when sqlite-vec is unavailable. */
 	maxScanRows?: number;
 }
 
@@ -55,10 +50,6 @@ export interface SearchResult {
 	tags?: string[];
 	confidence?: number;
 }
-
-/**
- * SQLite database interface for raw queries
- */
 interface SQLiteDatabase {
 	exec?(sql: string): void;
 	prepare(sql: string): {
@@ -67,10 +58,6 @@ interface SQLiteDatabase {
 		all(...args: unknown[]): Record<string, unknown>[];
 	};
 }
-
-/**
- * Database wrapper interface (like our Database class)
- */
 interface DatabaseWrapper {
 	db: SQLiteDatabase | null;
 	getMemories(type?: string): Memory[];
@@ -85,48 +72,39 @@ export function buildFtsMatchQuery(query: string): string | null {
 	if (terms.length === 0) return null;
 	return terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(" ");
 }
-
-/**
- * Convert a Blob/Buffer to Float32Array for vector operations.
- * Uses zero-copy typed array view — no FFI needed here.
- */
 function blobToVector(blob: Buffer | ArrayBuffer): Float32Array {
 	if (blob instanceof ArrayBuffer) {
 		return new Float32Array(blob);
 	}
 	return new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
 }
-
-/**
- * Compute cosine similarity between two vectors
- */
 function tsCosineSimilarity(a: Float32Array, b: Float32Array): number {
+	if (a.length === 0 || a.length !== b.length) return 0;
 	let dot = 0;
 	let normA = 0;
 	let normB = 0;
-	const len = Math.min(a.length, b.length);
 
-	for (let i = 0; i < len; i++) {
-		dot += a[i] * b[i];
-		normA += a[i] * a[i];
-		normB += b[i] * b[i];
+	for (let i = 0; i < a.length; i++) {
+		const left = a[i] ?? Number.NaN;
+		const right = b[i] ?? Number.NaN;
+		if (!Number.isFinite(left) || !Number.isFinite(right)) return 0;
+		dot += left * right;
+		normA += left * left;
+		normB += right * right;
 	}
 
 	const denom = Math.sqrt(normA) * Math.sqrt(normB);
-	return denom > 0 ? dot / denom : 0;
+	return Number.isFinite(denom) && denom > 0 ? dot / denom : 0;
 }
 
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+	if (a.length === 0 || a.length !== b.length || !a.every(Number.isFinite) || !b.every(Number.isFinite)) return 0;
 	if (native !== null) {
-		return native.cosineSimilarity(a, b);
+		const score = native.cosineSimilarity(a, b);
+		return Number.isFinite(score) ? Math.max(-1, Math.min(1, score)) : 0;
 	}
 	return tsCosineSimilarity(a, b);
 }
-
-/**
- * Pure vector search using sqlite-vec
- * Uses the active projection slot for efficient similarity search
- */
 interface VectorSearchTables {
 	readonly projection: "vec_embeddings" | "vec_embeddings_staging";
 	readonly embeddings: "embeddings" | "embeddings_staging";
@@ -155,29 +133,35 @@ function withReadTransaction(db: SQLiteDatabase, read: () => void): void {
 	}
 }
 
+export function activeVectorProjectionTable(db: {
+	prepare(sql: string): { get(...args: unknown[]): unknown };
+}): "vec_embeddings" | "vec_embeddings_staging" {
+	try {
+		const row = db.prepare("SELECT active_profile_json FROM embedding_index_state WHERE id = 1").get() as
+			| { active_profile_json?: unknown }
+			| undefined;
+		if (typeof row?.active_profile_json !== "string") return "vec_embeddings";
+		const active = JSON.parse(row.active_profile_json) as { projectionSlot?: unknown };
+		return active.projectionSlot === "staging" ? "vec_embeddings_staging" : "vec_embeddings";
+	} catch {
+		return "vec_embeddings";
+	}
+}
+
 function activeVectorSearchTables(db: SQLiteDatabase): VectorSearchTables {
 	try {
 		const row = db
 			.prepare("SELECT active_profile_json, state, staging_profile_json FROM embedding_index_state WHERE id = 1")
 			.get() as { active_profile_json?: unknown; state?: unknown; staging_profile_json?: unknown } | undefined;
 		if (!row) return { projection: "vec_embeddings", embeddings: "embeddings" };
-		const active =
-			typeof row.active_profile_json === "string"
-				? (JSON.parse(row.active_profile_json) as { projectionSlot?: unknown })
-				: {};
-		const activeProjection = active.projectionSlot === "staging" ? "vec_embeddings_staging" : "vec_embeddings";
+		const activeProjection = activeVectorProjectionTable(db);
 		if (row.state !== "building" || typeof row.staging_profile_json !== "string") {
 			return { projection: activeProjection, embeddings: "embeddings" };
 		}
 		const staging = JSON.parse(row.staging_profile_json) as { projectionRebuild?: unknown };
-		// During the post-swap projection rebuild, the old projection remains
-		// queryable in its old slot. Pair it with the former durable slot instead
-		// of joining a partial new projection to the new embeddings table.
 		if (staging.projectionRebuild === true) return { projection: activeProjection, embeddings: "embeddings_staging" };
 		return { projection: activeProjection, embeddings: "embeddings" };
 	} catch {
-		// Legacy/test databases without the generation-state table use the active
-		// embeddings table, matching the pre-generation search behavior.
 		return { projection: "vec_embeddings", embeddings: "embeddings" };
 	}
 }
@@ -199,9 +183,6 @@ function boundedCosineFallback(
 	if (options.excludeAggregateRecall) {
 		predicates.push("COALESCE(m.source_type, '') != 'aggregate-recall'");
 	}
-	// Fetch one sentinel row so an exact-cap result is distinguishable from a
-	// truncated recent window without a second count query. This keeps the
-	// completeness metadata accurate when the eligible set fits the cap.
 	params.push(maxScanRows + 1);
 
 	const rows = db
@@ -245,17 +226,12 @@ export function vectorSearchWithMetadata(
 	try {
 		withReadTransaction(db, () => {
 			const searchTables = activeVectorSearchTables(db);
-			// sqlite-vec uses MATCH syntax for vector search
-			// The query vector must be serialized as a blob
 			const queryBlob = new Float32Array(queryVector);
 			const maxK = effectiveOptions.excludeAggregateRecall ? Math.max(limit, Math.min(limit * 8, 1000)) : limit;
 			let k = limit;
 
 			while (true) {
-				// vec0 KNN queries require `k = ?` in the WHERE clause
 				const params: unknown[] = [queryBlob, k];
-
-				// Build type filter if specified
 				let typeFilter = "";
 				if (effectiveOptions.type) {
 					typeFilter = " AND m.type = ?";
@@ -264,8 +240,6 @@ export function vectorSearchWithMetadata(
 				if (effectiveOptions.excludeAggregateRecall) {
 					typeFilter += " AND COALESCE(m.source_type, '') != 'aggregate-recall'";
 				}
-
-				// Query vec_embeddings virtual table, join with embeddings to get source_id
 				const rows = db
 					.prepare(`
       SELECT
@@ -280,9 +254,6 @@ export function vectorSearchWithMetadata(
 					.all(...params) as Array<{ source_id: string; distance: number }>;
 
 				results.length = 0;
-				// Convert cosine distance to similarity score
-				// sqlite-vec with distance_metric=cosine returns (1 - similarity)
-				// So similarity = 1 - distance
 				for (const row of rows.slice(0, limit)) {
 					const similarity = 1 - row.distance;
 					results.push({ id: row.source_id, score: Math.max(0, similarity) });
@@ -293,9 +264,6 @@ export function vectorSearchWithMetadata(
 			}
 		});
 	} catch (e) {
-		// macOS Bun may use Apple's SQLite build, which omits loadExtension().
-		// Keep semantic recall functional by scanning a bounded canonical-vector
-		// window instead of silently reducing the request to keyword-only recall.
 		try {
 			let fallbackResponse: VectorSearchResponse | undefined;
 			withReadTransaction(db, () => {
@@ -319,10 +287,6 @@ export function vectorSearch(
 ): Array<{ id: string; score: number }> {
 	return vectorSearchWithMetadata(db, queryVector, options).results;
 }
-
-/**
- * Pure BM25 keyword search using FTS5
- */
 export function keywordSearch(db: SQLiteDatabase, query: string, limit?: number): Array<{ id: string; score: number }> {
 	const effectiveLimit = limit ?? 20;
 	const results: Array<{ id: string; score: number }> = [];
@@ -330,8 +294,6 @@ export function keywordSearch(db: SQLiteDatabase, query: string, limit?: number)
 	if (matchQuery === null) return results;
 
 	try {
-		// FTS5 bm25() returns negative values (lower = better match)
-		// Normalize to 0-1 using 1 / (1 + |score|)
 		const rows = db
 			.prepare(`
       SELECT m.id, bm25(memories_fts) AS raw_score
@@ -344,21 +306,13 @@ export function keywordSearch(db: SQLiteDatabase, query: string, limit?: number)
 			.all(matchQuery, effectiveLimit) as Array<{ id: string; raw_score: number }>;
 
 		for (const row of rows) {
-			// Normalize BM25 score: convert negative to 0-1
 			const normalized = 1 / (1 + Math.abs(row.raw_score));
 			results.push({ id: row.id, score: normalized });
 		}
-	} catch {
-		// FTS may be unavailable or no matches
-	}
+	} catch {}
 
 	return results;
 }
-
-/**
- * Hybrid search combining vector similarity and BM25 keyword search
- * Scores are blended using alpha parameter
- */
 export function hybridSearch(
 	db: SQLiteDatabase,
 	queryVector: Float32Array | null,
@@ -369,12 +323,8 @@ export function hybridSearch(
 	const limit = options?.limit ?? 10;
 	const topK = options?.topK ?? 50;
 	const minScore = options?.minScore ?? 0.1;
-
-	// Run both searches in parallel (conceptually)
 	const vectorResults = queryVector ? vectorSearch(db, queryVector, { limit: topK, type: options?.type }) : [];
 	const keywordResults = keywordSearch(db, queryText, topK);
-
-	// Merge scores from both sources
 	let scored: Array<{
 		id: string;
 		score: number;
@@ -431,18 +381,11 @@ export function hybridSearch(
 
 		scored.sort((a, b) => b.score - a.score);
 	}
-
-	// Fetch full memory rows for candidates, then apply content eligibility before
-	// selecting the final page so an unsafe top hit cannot suppress a safe one.
 	const candidateIds = scored.map((s) => s.id);
 
 	if (candidateIds.length === 0) {
 		return [];
 	}
-
-	// Keep each lookup below SQLite's host-parameter limit. Unsafe candidates are
-	// filtered after hydration, so the final page can still be filled by a safe
-	// lower-ranked row without constructing an unbounded SQL statement.
 	const rowMap = new Map<
 		string,
 		{
@@ -474,12 +417,10 @@ export function hybridSearch(
 		}>;
 		for (const row of rows) rowMap.set(row.id, row);
 	}
-
-	// Build final results preserving score order
 	return scored
 		.filter((s) => {
 			const row = rowMap.get(s.id);
-			return row !== undefined && scanMemoryContent(row.content).contextEligible;
+			return row !== undefined;
 		})
 		.slice(0, limit)
 		.map((s) => {
@@ -487,7 +428,7 @@ export function hybridSearch(
 			if (!r) return null;
 			return {
 				id: s.id,
-				content: r.content,
+				content: redactCredentials(r.content),
 				score: Math.round(s.score * 100) / 100,
 				type: r.type,
 				source: s.source,
@@ -497,44 +438,23 @@ export function hybridSearch(
 		})
 		.filter((r): r is NonNullable<typeof r> => r !== null);
 }
-
-/**
- * Type guard to check if db has a prepare method (is a raw SQLiteDatabase)
- */
 function hasPrepareMethod(db: unknown): db is SQLiteDatabase {
 	return (
 		typeof db === "object" && db !== null && "prepare" in db && typeof (db as SQLiteDatabase).prepare === "function"
 	);
 }
-
-/**
- * Extract raw SQLiteDatabase from either a wrapper or raw db
- */
 function getRawDb(db: SQLiteDatabase | DatabaseWrapper): SQLiteDatabase | null {
-	// Check if it's a DatabaseWrapper with a db property
 	if (typeof db === "object" && db !== null && "db" in db && db.db !== null && hasPrepareMethod(db.db)) {
 		return db.db;
 	}
-	// Check if it's already a raw SQLiteDatabase
 	if (hasPrepareMethod(db)) {
 		return db;
 	}
 	return null;
 }
-
-/**
- * Main search entry point
- * Falls back to simple text matching if hybrid search components unavailable
- */
 export async function search(db: SQLiteDatabase | DatabaseWrapper, options: SearchOptions): Promise<SearchResult[]> {
 	const { query, limit = 10, alpha = DEFAULT_HYBRID_ALPHA, minScore = 0.1, topK = 50 } = options;
-
-	// Get raw SQLite db from Database wrapper if available
 	const rawDb = getRawDb(db);
-
-	// Try hybrid search first (requires FTS5 table)
-	// Note: For full hybrid search, caller should provide queryVector
-	// This falls back to keyword-only if no vector is available
 	if (rawDb) {
 		const results = hybridSearch(rawDb, null, query, {
 			limit,
@@ -543,28 +463,20 @@ export async function search(db: SQLiteDatabase | DatabaseWrapper, options: Sear
 			topK,
 			type: options.type,
 		});
-
-		// If hybrid search found results, return them
 		if (results.length > 0) {
 			return results;
 		}
 	}
-
-	// Fallback: simple substring matching (original behavior)
-	// This handles cases where FTS5 table doesn't exist yet
 	try {
 		const wrapper = db as DatabaseWrapper;
 		const memories = typeof wrapper.getMemories === "function" ? wrapper.getMemories(options.type) : [];
 
 		return memories
-			.filter(
-				(m: Memory) =>
-					scanMemoryContent(m.content).contextEligible && m.content.toLowerCase().includes(query.toLowerCase()),
-			)
+			.filter((m: Memory) => m.content.toLowerCase().includes(query.toLowerCase()))
 			.slice(0, limit)
 			.map((m: Memory) => ({
 				id: m.id,
-				content: m.content,
+				content: redactCredentials(m.content),
 				score: 1.0,
 				type: m.type,
 				source: "keyword" as const,

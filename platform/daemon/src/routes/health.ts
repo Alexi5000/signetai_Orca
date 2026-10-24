@@ -1,23 +1,16 @@
-import type { SQLQueryBindings } from "bun:sqlite";
-import { type MigrationDb, hasPendingMigrations, preflightWorkspace } from "@signet/core";
+import { preflightWorkspace } from "@signet/core";
 import type { Hono } from "hono";
 import { getDatabaseIntegrityStatus } from "../database-integrity";
-import { type ReadDb, type ReadPressure, type WritePressure, getDbAccessor } from "../db-accessor";
+import { type ReadPressure, type WritePressure, getDbAccessor } from "../db-accessor";
 import type { DbOwnerHealth } from "../db-owner-client";
-import { getDbOwnerMaintenance, ownerQueryOne } from "../db-owner-maintenance";
+import { getDbOwnerMaintenanceState, ownerQueryOne, withRegisteredDbOwnerMaintenance } from "../db-owner-maintenance";
 import { getDbRuntimeMetrics, getEventLoopLiveness } from "../db-observability";
-import {
-	QUEUE_MAX_DEAD_RATE,
-	QUEUE_MAX_DEPTH,
-	QUEUE_MAX_OLDEST_AGE_SEC,
-	type QueueHealth,
-	getQueueHealth,
-} from "../diagnostics";
+import { QUEUE_MAX_DEAD_RATE, QUEUE_MAX_DEPTH, QUEUE_MAX_OLDEST_AGE_SEC, type QueueHealth } from "../diagnostics";
 import { getAllFeatureFlags } from "../feature-flags";
 import { loadMemoryConfig } from "../memory-config";
 import { getCachedResourceSnapshot } from "../resource-monitor";
 import { getUpdateState } from "../update-system";
-import { readEmbeddingIndexMigrationProgress } from "../embedding-index-state";
+import type { readEmbeddingIndexMigrationProgress } from "../embedding-index-state";
 import {
 	AGENTS_DIR,
 	CURRENT_VERSION,
@@ -29,47 +22,7 @@ import {
 	shuttingDown,
 } from "./state.js";
 import { checkEmbeddingProvider } from "./utils";
-
-// Native/ollama embedding probes do network or model work; a probe must never
-// block the event loop on the /health path (see
-// .github/workflows/embedding-health-isolation.yml).
 const EMBEDDING_CHECK_TIMEOUT_MS = 2000;
-
-function toRecordOrUndefined(row: unknown): Record<string, unknown> | undefined {
-	return typeof row === "object" && row !== null ? (row as Record<string, unknown>) : undefined;
-}
-
-/**
- * Adapt the accessor's readonly db to the MigrationDb surface.
- * This is read-only: hasPendingMigrations only reads schema_migrations.
- * The exec/run methods exist to satisfy the MigrationDb interface but will
- * throw on the readonly accessor if ever used for writes. Do not add write
- * calls through this adapter.
- */
-function readDbAsMigrationDb(db: ReadDb): MigrationDb {
-	return {
-		exec(sql: string): void {
-			db.prepare(sql).run();
-		},
-		prepare(sql: string) {
-			const stmt = db.prepare(sql);
-			return {
-				run(...args: SQLQueryBindings[]): void {
-					stmt.run(...args);
-				},
-				get(...args: SQLQueryBindings[]): Record<string, unknown> | undefined {
-					return toRecordOrUndefined(stmt.get(...args));
-				},
-				all(...args: SQLQueryBindings[]): Record<string, unknown>[] {
-					return stmt
-						.all(...args)
-						.map((row) => toRecordOrUndefined(row))
-						.filter((row): row is Record<string, unknown> => row !== undefined);
-				},
-			};
-		},
-	};
-}
 
 async function withTimeout<T>(promise: Promise<T>, ms: number, timeoutError: Error): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -93,8 +46,6 @@ interface EmbeddingCheck {
 	readonly checkedAt?: string;
 	readonly migration?: ReturnType<typeof readEmbeddingIndexMigrationProgress>;
 }
-
-/** Embedding gates readiness when a provider is configured; "none" means intentionally disabled. */
 async function checkEmbedding(): Promise<{ ok: boolean; detail: EmbeddingCheck; reason: string | null }> {
 	let cfg: ReturnType<typeof loadMemoryConfig>["embedding"];
 	try {
@@ -109,15 +60,11 @@ async function checkEmbedding(): Promise<{ ok: boolean; detail: EmbeddingCheck; 
 	}
 	let migration: ReturnType<typeof readEmbeddingIndexMigrationProgress> = null;
 	try {
-		const ownerMaintenance = getDbOwnerMaintenance();
-		migration = ownerMaintenance
-			? await ownerMaintenance.embeddingMigrationProgress(cfg.base_url)
-			: await getDbAccessor().withReadDbAsync((db) => readEmbeddingIndexMigrationProgress(db, cfg), {
-					siteToken: "routes/health.ts:115",
-				});
-	} catch {
-		// The provider probe remains useful while the database is initializing.
-	}
+		migration =
+			(await withRegisteredDbOwnerMaintenance((ownerMaintenance) =>
+				ownerMaintenance.embeddingMigrationProgress(cfg.base_url),
+			)) ?? null;
+	} catch {}
 	const migrationDetail = migration === null ? {} : { migration };
 
 	if (cfg.provider === "none") {
@@ -169,8 +116,6 @@ interface InferenceCheck {
 	readonly effective: string;
 	readonly reason: string | null;
 }
-
-/** Inference gates readiness only when the extraction route is fully blocked; degraded still serves. */
 function checkInference(): { ok: boolean; detail: InferenceCheck; reason: string | null } {
 	let cfg: ReturnType<typeof loadMemoryConfig>;
 	try {
@@ -215,43 +160,39 @@ export function mountHealthRoutes(app: Hono): void {
 		try {
 			const accessor = getDbAccessor();
 			try {
-				const owner = getDbOwnerMaintenance()?.owner;
-				if (owner) {
-					await ownerQueryOne(owner, "routes/health.ts:212", "SELECT 1", [], { deadlineMs: 500 });
-					dbOk = true;
-				} else {
-					await accessor.withReadDbAsync(
-						(db: ReadDb) => {
-							db.prepare("SELECT 1").get();
-							dbOk = true;
-						},
-						// /health is a liveness-adjacent probe. Do not let a queued
-						// database-owner/read lease turn a transient DB stall into an
-						// HTTP stall. The structured response below reports db: false.
-						{ siteToken: "routes/health.ts:223", operation: "health", timeoutMs: 500 },
-					);
+				const ownerHealth = await withRegisteredDbOwnerMaintenance(async (ownerMaintenance) => {
+					try {
+						await ownerQueryOne(ownerMaintenance.owner, "routes/health.ts:165", "SELECT 1", [], { deadlineMs: 500 });
+						dbOk = true;
+					} catch {}
+					return ownerMaintenance.health();
+				});
+				if (ownerHealth !== undefined) {
+					dbOwner = ownerHealth;
 				}
-			} catch {
-				// Keep the structured admission outcome visible below.
-			}
+			} catch {}
 			dbWriter = accessor.getWritePressure?.() ?? null;
 			dbReader = accessor.getReadPressure?.() ?? null;
 			dbRuntime = accessor.getDbRuntimePressure?.().runtime ?? dbRuntime;
-			dbOwner = accessor.getDbOwnerHealth?.() ?? null;
 		} catch {}
 
-		const databaseIntegrity = getDatabaseIntegrityStatus();
+		const databaseIntegrity = getDatabaseIntegrityStatus(dbOwner);
 		const eventLoop = getEventLoopLiveness();
+		const ownerState = getDbOwnerMaintenanceState();
 		return c.json({
 			status: shuttingDown
 				? "shutting_down"
-				: workspace.status === "missing" || workspace.status === "incomplete"
+				: ownerState === "closing"
 					? "degraded"
-					: databaseIntegrity.state === "corrupt" ||
-							databaseIntegrity.state === "unavailable" ||
-							databaseIntegrity.state === "degraded"
+					: !dbOk
 						? "degraded"
-						: "healthy",
+						: workspace.status === "missing" || workspace.status === "incomplete"
+							? "degraded"
+							: databaseIntegrity.state === "corrupt" ||
+									databaseIntegrity.state === "unavailable" ||
+									databaseIntegrity.state === "degraded"
+								? "degraded"
+								: "healthy",
 			uptime: process.uptime(),
 			pid: process.pid,
 			version: CURRENT_VERSION,
@@ -277,8 +218,6 @@ export function mountHealthRoutes(app: Hono): void {
 			resources: getCachedResourceSnapshot(),
 		});
 	});
-
-	// Cheap liveness: process is up. Never touches db or subsystems, always 200.
 	app.get("/health/live", (c) => {
 		return c.json({
 			status: shuttingDown ? "shutting_down" : "healthy",
@@ -291,34 +230,32 @@ export function mountHealthRoutes(app: Hono): void {
 			eventLoop: getEventLoopLiveness(),
 		});
 	});
-
-	// Readiness: composed per-check results. 200 only when every gate passes.
 	app.get("/health/ready", async (c) => {
 		const workspace = preflightWorkspace();
 		const reasons: string[] = [];
 		if (workspace.status === "missing" || workspace.status === "incomplete") {
 			reasons.push(...workspace.reasons);
 		}
-
-		// db, migrations, and queue share one readonly connection.
 		let dbResult: { readonly migrationsOk: boolean; readonly queueHealth: QueueHealth } | null = null;
 		let dbReader: ReadPressure | null = null;
 		let dbRuntime = getDbRuntimeMetrics();
+		let dbOwner: DbOwnerHealth | null = null;
 		try {
 			const accessor = getDbAccessor();
-			const ownerMaintenance = getDbOwnerMaintenance();
-			dbResult = ownerMaintenance
-				? await ownerMaintenance.healthReady()
-				: await accessor.withReadDbAsync(
-						(db: ReadDb) => {
-							db.prepare("SELECT 1").get();
-							return {
-								migrationsOk: !hasPendingMigrations(readDbAsMigrationDb(db)),
-								queueHealth: getQueueHealth(db),
-							};
-						},
-						{ siteToken: "routes/health.ts:312", operation: "health.ready" },
-					);
+			const ownerResult = await withRegisteredDbOwnerMaintenance(async (ownerMaintenance) => ({
+				result: await ownerMaintenance.healthReady(),
+				health: ownerMaintenance.health(),
+			}));
+			if (ownerResult !== undefined) {
+				dbResult = ownerResult.result;
+				dbOwner = ownerResult.health;
+			} else {
+				reasons.push(
+					getDbOwnerMaintenanceState() === "closing"
+						? "database owner maintenance is closing"
+						: "database owner maintenance is unavailable",
+				);
+			}
 			dbReader = accessor.getReadPressure?.() ?? null;
 			dbRuntime = accessor.getDbRuntimePressure?.().runtime ?? dbRuntime;
 		} catch (err) {
@@ -327,13 +264,11 @@ export function mountHealthRoutes(app: Hono): void {
 				const accessor = getDbAccessor();
 				dbReader = accessor.getReadPressure?.() ?? null;
 				dbRuntime = accessor.getDbRuntimePressure?.().runtime ?? dbRuntime;
-			} catch {
-				// The accessor may be unavailable while the database check fails.
-			}
+			} catch {}
 		}
 		const dbOk = dbResult !== null;
 		const migrationsOk = dbResult?.migrationsOk ?? false;
-		const databaseIntegrity = getDatabaseIntegrityStatus();
+		const databaseIntegrity = getDatabaseIntegrityStatus(dbOwner);
 		if (databaseIntegrity.state === "corrupt" || databaseIntegrity.state === "unavailable") {
 			reasons.push(
 				databaseIntegrity.repairGuidance ??
@@ -399,13 +334,6 @@ export function mountHealthRoutes(app: Hono): void {
 	app.get("/api/features", (c) => {
 		return c.json(getAllFeatureFlags());
 	});
-
-	// Environment probe (issue #1001): deliberately lightweight and
-	// unauthenticated so the dashboard can distinguish "talking to a real
-	// daemon" (any hostname: localhost, Tailscale, .local, tunnel, LAN IP)
-	// from the marketing site or cloud app. `mode` reflects the daemon's
-	// auth mode; `requiresAuth` reflects whether data endpoints require a
-	// token in that mode.
 	app.get("/api/mode", (c) => {
 		return c.json({ mode: authConfig.mode, requiresAuth: authConfig.mode !== "local" });
 	});

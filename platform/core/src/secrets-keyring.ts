@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
-import { createRequire } from "node:module";
-import type { AsyncEntry } from "@napi-rs/keyring";
-import { execFileSyncHidden } from "./child-process";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnHidden } from "./child-process";
+import { decodeSecretMasterKey } from "./secrets-key.js";
 
 export type SecretKeyringState =
+	| "unchecked"
 	| "found"
 	| "missing"
 	| "locked"
@@ -16,121 +19,218 @@ export interface SecretKeyringResult {
 	readonly state: SecretKeyringState;
 	readonly value?: string;
 	readonly message?: string;
+	readonly backend?: "absent";
+}
+
+export interface SecretKeyringAccessOptions {
+	readonly allowInteraction?: boolean;
+	readonly signal?: AbortSignal;
 }
 
 export interface SecretKeyringAdapter {
 	readonly platform: string;
 	readonly service: string;
 	readonly account: string;
-	get(): Promise<SecretKeyringResult>;
-	set(value: string): Promise<SecretKeyringResult>;
-	getStatus?(): SecretKeyringResult;
+	readonly get: (options?: SecretKeyringAccessOptions) => Promise<SecretKeyringResult>;
+	readonly set: (value: string) => Promise<SecretKeyringResult>;
+	readonly getStatus?: () => Promise<SecretKeyringResult>;
+}
+
+interface SecretKeyringHelperOverride {
+	readonly entryPath: string;
+	readonly deadlineMs: number | undefined;
+}
+
+interface SecretKeyringChildResponse {
+	readonly ok: boolean;
+	readonly result?: SecretKeyringResult;
+	readonly state?: SecretKeyringState;
+	readonly message?: string;
 }
 
 const SERVICE = "ai.signet.secrets";
-const require = createRequire(import.meta.url);
-let modulePromise: Promise<typeof import("@napi-rs/keyring") | null> | null = null;
-let syncModule: typeof import("@napi-rs/keyring") | null | undefined;
+const DEFAULT_DEADLINE_MS = 2_000;
+const MACOS_DEADLINE_MS = 10_000;
+const MAX_ACCOUNTS = 32;
+const MAX_HELPER_OUTPUT_BYTES = 64 * 1024;
+const STATES = new Set<SecretKeyringState>([
+	"unchecked",
+	"found",
+	"missing",
+	"locked",
+	"unavailable",
+	"permission-denied",
+	"corrupt",
+	"unsupported",
+]);
+const reads = new Map<string, Promise<SecretKeyringResult>>();
+const observations = new Map<string, SecretKeyringResult>();
 let adapterForTests: SecretKeyringAdapter | null = null;
+let helperForTests: SecretKeyringHelperOverride | null = null;
+let interactiveRequest = false;
+let mutation: Promise<void> = Promise.resolve();
 
 function workspaceAccount(workspace: string): string {
 	return createHash("sha256").update(workspace).digest("hex").slice(0, 32);
 }
 
 function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	return (error instanceof Error ? error.message : String(error)).replace(/[\r\n\0]/g, " ").slice(0, 500);
 }
 
-function classifyError(error: unknown): SecretKeyringResult {
-	const message = errorMessage(error);
-	const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
-	const detail = `${code} ${message}`.toLowerCase();
-
-	if (/noentry|no entry|no such item|item.*not found|credential.*missing|does not exist/.test(detail)) {
-		return { state: "missing", message };
-	}
-	if (/locked|interaction|required|authfailed|authentication|islocked|prompt/.test(detail)) {
-		return { state: "locked", message };
-	}
-	if (/permission|access denied|denied/.test(detail)) {
-		return { state: "permission-denied", message };
-	}
-	if (/unsupported|not implemented|dbus|secret service|keyutils|connection|unavailable|no such file/.test(detail)) {
-		return { state: "unavailable", message };
-	}
-	return { state: "corrupt", message };
+function sourceHelperPath(): string {
+	const directory = dirname(fileURLToPath(import.meta.url));
+	const built = join(directory, "secrets-keyring-child.js");
+	return existsSync(built) ? built : join(directory, "secrets-keyring-child.ts");
 }
 
-// `@napi-rs/keyring`'s own `createRequire(__filename)` breaks Bun `--compile`
-// bundling; require the `.node` addon by absolute path instead (path set by
-// native-runtime-assets.ts in compiled builds, unset in source/dev runs).
-function tryRequireOverride(): typeof import("@napi-rs/keyring") | null {
-	const override = process.env.SIGNET_KEYRING_NATIVE_MODULE_PATH?.trim();
-	if (!override) return null;
-	// This variable is a compiled-runtime bootstrap contract. A value supplied
-	// by the launcher must never fall back to package resolution: that would
-	// make a broken compiled bundle appear healthy by loading a host addon.
-	const isAbsolute =
-		override.startsWith("/") || /^\\\\[^\\]+\\[^\\]+/.test(override) || /^[A-Za-z]:[\\/]/.test(override);
-	if (!isAbsolute) return null;
-	try {
-		return require(override) as typeof import("@napi-rs/keyring");
-	} catch {
-		return null;
-	}
+function defaultDeadlineMs(): number {
+	return process.platform === "darwin" ? MACOS_DEADLINE_MS : DEFAULT_DEADLINE_MS;
 }
 
-async function loadModule(): Promise<typeof import("@napi-rs/keyring") | null> {
-	modulePromise ??= (async () => {
-		const override = process.env.SIGNET_KEYRING_NATIVE_MODULE_PATH?.trim();
-		if (override) return tryRequireOverride();
-		return await import("@napi-rs/keyring").catch(() => null);
-	})();
-	return modulePromise;
+function observe(account: string, result: SecretKeyringResult): void {
+	if (!observations.has(account) && observations.size >= MAX_ACCOUNTS) {
+		const oldest = observations.keys().next().value;
+		if (oldest !== undefined) observations.delete(oldest);
+	}
+	if (result.state === "found") {
+		try {
+			decodeSecretMasterKey(result.value).fill(0);
+		} catch (error) {
+			observations.set(account, { state: "corrupt", message: errorMessage(error) });
+			return;
+		}
+	}
+	observations.set(account, { state: result.state, message: result.message });
 }
 
-function loadModuleSync(): typeof import("@napi-rs/keyring") | null {
-	if (syncModule !== undefined) return syncModule;
-	if (process.env.SIGNET_KEYRING_NATIVE_MODULE_PATH?.trim()) {
-		syncModule = tryRequireOverride();
-		return syncModule;
-	}
-	const override = tryRequireOverride();
-	if (override) {
-		syncModule = override;
-		return syncModule;
-	}
-	try {
-		syncModule = require("@napi-rs/keyring") as typeof import("@napi-rs/keyring");
-	} catch {
-		syncModule = null;
-	}
-	return syncModule;
-}
-
-function linuxKeyringAvailable(): SecretKeyringResult | null {
-	if (process.platform !== "linux") return null;
-	if (process.env.SIGNET_SECRETS_LINUX_KEYRING === "keyutils") {
-		return { state: "unsupported", message: "Linux keyutils is not an implicit Signet secrets backend" };
-	}
-	if (!process.env.DBUS_SESSION_BUS_ADDRESS) {
+function helperCommand(): { readonly command: string; readonly args: readonly string[]; readonly deadlineMs: number } {
+	if (helperForTests !== null)
 		return {
-			state: "unavailable",
-			message: "Linux Secret Service requires a user D-Bus session; no prompt or desktop session is available",
+			command: process.execPath,
+			args: [helperForTests.entryPath],
+			deadlineMs: helperForTests.deadlineMs ?? defaultDeadlineMs(),
 		};
-	}
+	if (process.env.SIGNET_COMPILED_NATIVE === "1")
+		return { command: process.execPath, args: [], deadlineMs: defaultDeadlineMs() };
+	return {
+		command: process.platform === "darwin" && !process.versions.bun ? "bun" : process.execPath,
+		args: [sourceHelperPath()],
+		deadlineMs: defaultDeadlineMs(),
+	};
+}
+
+function parseChildResponse(output: string, code: number | null): SecretKeyringResult {
 	try {
-		execFileSyncHidden("busctl", ["--user", "status", "org.freedesktop.secrets"], {
-			stdio: "ignore",
-			timeout: 1_000,
+		const parsed = JSON.parse(output) as SecretKeyringChildResponse;
+		if (parsed.ok && parsed.result !== undefined && STATES.has(parsed.result.state)) {
+			const { state, value, message, backend } = parsed.result;
+			return {
+				state,
+				...(typeof value === "string" ? { value } : {}),
+				...(typeof message === "string" ? { message: message.slice(0, 500) } : {}),
+				...(backend === "absent" ? { backend } : {}),
+			};
+		}
+		if (parsed.state !== undefined && STATES.has(parsed.state)) {
+			return {
+				state: parsed.state,
+				...(parsed.message === undefined ? {} : { message: parsed.message.slice(0, 500) }),
+			};
+		}
+	} catch {}
+	return { state: "unavailable", message: `Native keyring helper exited with code ${code ?? "unknown"}` };
+}
+
+async function invoke(
+	op: "get" | "set" | "status",
+	service: string,
+	account: string,
+	value?: string,
+	options: SecretKeyringAccessOptions = {},
+): Promise<SecretKeyringResult> {
+	if (options.signal?.aborted) return { state: "unavailable", message: "Keyring request cancelled" };
+	const interactive = process.platform === "darwin" && options.allowInteraction === true;
+	if (interactive && interactiveRequest)
+		return { state: "unavailable", message: "A keychain authorization request is already in progress" };
+	const helper = helperCommand();
+	const child = spawnHidden(helper.command, helper.args, {
+		stdio: ["pipe", "pipe", "ignore"],
+		env: {
+			...process.env,
+			...(process.env.SIGNET_COMPILED_NATIVE === "1" ? { SIGNET_KEYRING_HELPER: "1" } : {}),
+		},
+	});
+	if (interactive) interactiveRequest = true;
+	const request = `${JSON.stringify({ op, service, account, ...(op === "set" ? { value } : {}), ...(interactive ? { allowInteraction: true } : {}) })}\n`;
+	return await new Promise<SecretKeyringResult>((resolve) => {
+		let output = "";
+		let timedOut = false;
+		let cancelled = false;
+		let outputExceeded = false;
+		let settled = false;
+		const finish = (result: SecretKeyringResult): void => {
+			if (settled) return;
+			settled = true;
+			options.signal?.removeEventListener("abort", cancel);
+			if (interactive) interactiveRequest = false;
+			resolve(result);
+		};
+		const cancel = (): void => {
+			cancelled = true;
+			child.kill("SIGKILL");
+		};
+		options.signal?.addEventListener("abort", cancel, { once: true });
+		if (options.signal?.aborted) cancel();
+		const timer = setTimeout(
+			() => {
+				timedOut = true;
+				child.kill("SIGKILL");
+			},
+			interactive ? 120_000 : helper.deadlineMs,
+		);
+		child.stdout?.setEncoding("utf8");
+		child.stdout?.on("data", (chunk: string) => {
+			if (outputExceeded) return;
+			output += chunk;
+			if (Buffer.byteLength(output, "utf8") > MAX_HELPER_OUTPUT_BYTES) {
+				outputExceeded = true;
+				child.kill("SIGKILL");
+			}
 		});
-		return null;
-	} catch {
-		return {
-			state: "unavailable",
-			message: "Linux Secret Service is not registered on the user D-Bus session",
-		};
-	}
+		child.stdin?.on("error", () => {});
+		child.once("error", (error) => {
+			clearTimeout(timer);
+			finish({
+				state: "unavailable",
+				message:
+					helper.command === "bun" &&
+					typeof error === "object" &&
+					error !== null &&
+					"code" in error &&
+					error.code === "ENOENT"
+						? "The noninteractive macOS keyring helper requires Bun on PATH"
+						: `Native keyring helper could not start: ${errorMessage(error)}`,
+			});
+		});
+		child.once("close", (code) => {
+			clearTimeout(timer);
+			if (cancelled) {
+				finish({ state: "unavailable", message: "Keyring request cancelled" });
+				return;
+			}
+			if (timedOut) {
+				finish({ state: "unavailable", message: "Native keyring helper deadline exceeded" });
+				return;
+			}
+			if (outputExceeded) {
+				finish({ state: "unavailable", message: "Native keyring helper output exceeded its limit" });
+				return;
+			}
+			finish(parseChildResponse(output, code));
+		});
+		child.stdin?.end(request);
+	});
 }
 
 class NativeSecretKeyringAdapter implements SecretKeyringAdapter {
@@ -142,57 +242,47 @@ class NativeSecretKeyringAdapter implements SecretKeyringAdapter {
 		this.account = workspaceAccount(workspace);
 	}
 
-	private async entry(): Promise<AsyncEntry | null> {
-		const mod = await loadModule();
-		if (!mod) return null;
-		return new mod.AsyncEntry(this.service, this.account);
+	get(options: SecretKeyringAccessOptions = {}): Promise<SecretKeyringResult> {
+		if (options.allowInteraction === true)
+			return invoke("get", this.service, this.account, undefined, options).then((result) => {
+				observe(this.account, result);
+				return result;
+			});
+		const pending = reads.get(this.account);
+		if (pending) return pending;
+		if (reads.size >= MAX_ACCOUNTS)
+			return Promise.resolve({ state: "unavailable", message: "Keyring request limit reached" });
+		const result = invoke("get", this.service, this.account)
+			.then((result) => {
+				observe(this.account, result);
+				return result;
+			})
+			.finally(() => reads.delete(this.account));
+		reads.set(this.account, result);
+		return result;
 	}
 
-	async get(): Promise<SecretKeyringResult> {
-		const linuxUnavailable = linuxKeyringAvailable();
-		if (linuxUnavailable) return linuxUnavailable;
-		try {
-			const entry = await this.entry();
-			if (!entry)
-				return { state: "unsupported", message: "The native keyring module is not installed for this platform" };
-			const value = await entry.getPassword();
-			return value === undefined || value === null || value.length === 0
-				? { state: "missing" }
-				: { state: "found", value };
-		} catch (error) {
-			return classifyError(error);
-		}
+	getStatus(): Promise<SecretKeyringResult> {
+		return Promise.resolve(
+			observations.get(this.account) ?? {
+				state: "unchecked",
+				message: "Native keyring access has not been checked; health checks do not unlock secrets",
+			},
+		);
 	}
 
-	async set(value: string): Promise<SecretKeyringResult> {
-		const linuxUnavailable = linuxKeyringAvailable();
-		if (linuxUnavailable) return linuxUnavailable;
-		try {
-			const entry = await this.entry();
-			if (!entry)
-				return { state: "unsupported", message: "The native keyring module is not installed for this platform" };
-			await entry.setPassword(value);
-			return { state: "found", value };
-		} catch (error) {
-			return classifyError(error);
-		}
-	}
-
-	getStatus(): SecretKeyringResult {
-		const linuxUnavailable = linuxKeyringAvailable();
-		if (linuxUnavailable) return linuxUnavailable;
-		try {
-			const mod = loadModuleSync();
-			if (!mod)
-				return { state: "unsupported", message: "The native keyring module is not installed for this platform" };
-			const entry = new mod.Entry(this.service, this.account);
-			const value = entry.getPassword();
-			return value === undefined || value === null || value.length === 0
-				? { state: "missing" }
-				: { state: "found", value };
-		} catch (error) {
-			return classifyError(error);
-		}
+	set(value: string): Promise<SecretKeyringResult> {
+		const result = mutation
+			.then(() => invoke("set", this.service, this.account, value))
+			.then((result) => {
+				observe(this.account, result);
+				return result;
+			});
+		mutation = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
 	}
 }
 
@@ -202,11 +292,14 @@ export function getSecretKeyring(workspace: string): SecretKeyringAdapter {
 
 export function setSecretKeyringForTests(adapter: SecretKeyringAdapter | null): void {
 	adapterForTests = adapter;
-	modulePromise = null;
-	syncModule = undefined;
+}
+
+export function setSecretKeyringHelperForTests(override: SecretKeyringHelperOverride | null): void {
+	helperForTests = override;
 }
 
 export function resetSecretKeyringModuleForTests(): void {
-	modulePromise = null;
-	syncModule = undefined;
+	mutation = Promise.resolve();
+	reads.clear();
+	observations.clear();
 }

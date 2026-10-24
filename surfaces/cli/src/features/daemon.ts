@@ -2,10 +2,17 @@ import type { ChildProcess, DaemonRuntime } from "@signet/core";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { confirm } from "@inquirer/prompts";
-import { detectSchema, ensureUnifiedSchema, resolveDaemonRuntime, runMigrations } from "@signet/core";
+import {
+	detectSchema,
+	ensureUnifiedSchema,
+	resolveDaemonRuntime,
+	resolveWorkspaceLayout,
+	runMigrations,
+} from "@signet/core";
 import chalk from "chalk";
 import ora from "ora";
 import type { LogOptions, PathOptions, RestartOptions, StartOptions } from "../commands/shared.js";
+import type { DaemonFetchResult } from "../lib/daemon.js";
 import { inspectDaemonJsBundle } from "../lib/runtime.js";
 import { daemonAccessLines } from "../lib/network.js";
 import { openUrlWithFallback } from "../lib/open-url.js";
@@ -44,6 +51,16 @@ interface LogPayload {
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+interface DashboardTarget {
+	readonly url: string;
+	readonly localWorkspace: boolean;
+	readonly hasCredential: boolean;
+	readonly fetchDaemonResult: <T>(
+		path: string,
+		opts?: RequestInit & { timeout?: number },
+	) => Promise<DaemonFetchResult<T>>;
+}
+
 interface Deps {
 	readonly agentsDir: string;
 	readonly defaultPort: number;
@@ -55,6 +72,7 @@ interface Deps {
 	readonly signetLogo: () => string;
 	readonly sleep: (ms: number) => Promise<void>;
 	readonly startDaemon: (agentsDir?: string, runtime?: DaemonRuntime, daemonPath?: string) => Promise<boolean>;
+	readonly setupUnconfiguredWorkspace?: (agentsDir: string) => Promise<boolean>;
 	readonly stopDaemon: (agentsDir?: string) => Promise<boolean>;
 	readonly isLaunchdDaemonLoaded?: (agentsDir?: string) => Promise<boolean>;
 	readonly confirmRestartSync?: () => Promise<boolean>;
@@ -62,47 +80,77 @@ interface Deps {
 	readonly isInteractive?: () => boolean;
 	readonly syncTemplates?: (basePath: string) => Promise<void>;
 	readonly openUrl?: (url: string) => Promise<ChildProcess | undefined>;
+	readonly daemonTarget: (agentsDir: string) => DashboardTarget;
 }
 
 export async function launchDashboard(options: PathOptions, deps: Deps): Promise<void> {
 	console.log(deps.signetLogo());
 	const basePath = readPath(options, deps);
-	const before = await deps.getDaemonStatus();
+	const target = deps.daemonTarget(basePath);
+	if (target.localWorkspace) {
+		if (await deps.setupUnconfiguredWorkspace?.(basePath)) return;
+		const before = await deps.getDaemonStatus();
 
-	if (!before.running) {
-		console.log(chalk.yellow("  Daemon is not running. Starting..."));
-		const started = await deps.startDaemon(basePath);
-		const after = await deps.getDaemonStatus();
+		if (!before.running) {
+			console.log(chalk.yellow("  Daemon is not running. Starting..."));
+			const started = await deps.startDaemon(basePath);
+			const after = await deps.getDaemonStatus();
 
-		if (!started || !after.running) {
-			console.error(chalk.red("  Failed to start daemon"));
-			process.exit(1);
-		}
-
-		// The health probe can transiently false-negative (e.g. an event-loop
-		// block) while the daemon process itself was alive the whole time.
-		// startDaemon short-circuits to "already running" in that case, so the
-		// same PID before and after means we did not start anything — do not
-		// claim we did (issue #1045).
-		if (before.pid !== null && before.pid === after.pid) {
-			console.log(chalk.dim("  Daemon is running"));
-		} else {
-			console.log(chalk.green("  Daemon started"));
+			if (!started || !after.running) {
+				console.error(chalk.red("  Failed to start daemon"));
+				process.exit(1);
+			}
+			if (before.pid !== null && before.pid === after.pid) {
+				console.log(chalk.dim("  Daemon is running"));
+			} else {
+				console.log(chalk.green("  Daemon started"));
+			}
 		}
 	}
 
 	console.log();
-	console.log(`  ${chalk.cyan(`http://127.0.0.1:${deps.defaultPort}`)}`);
+	console.log(`  ${chalk.cyan(target.url)}`);
 	console.log();
 
-	await openUrlWithFallback(`http://127.0.0.1:${deps.defaultPort}`, {
+	await openUrlWithFallback(await signedInDashboardUrl(target), {
 		open: deps.openUrl,
 	});
+}
+async function signedInDashboardUrl(target: DashboardTarget): Promise<string> {
+	const mode = await target.fetchDaemonResult<{ mode?: unknown }>("/api/mode");
+	if (!mode.ok) {
+		if (mode.reason === "offline" || mode.reason === "timeout") {
+			const hint = target.localWorkspace
+				? ""
+				: " Start it on that host, or unset SIGNET_DAEMON_URL and daemon.url to use a local daemon.";
+			console.log(chalk.yellow(`  No Signet daemon answered at ${target.url}.${hint}`));
+		} else {
+			const detail = mode.error ?? `HTTP ${mode.status ?? "error"}`;
+			console.log(chalk.dim(`  Could not check how ${target.url} signs in (${detail}). Opening it anyway.`));
+		}
+		return target.url;
+	}
+	if (mode.data.mode === "local" || !target.hasCredential) return target.url;
+	const result = await target.fetchDaemonResult<{ code?: unknown }>("/api/auth/handoff", { method: "POST" });
+	if (result.ok && typeof result.data.code === "string") {
+		return `${target.url}/#signet-handoff=${encodeURIComponent(result.data.code)}`;
+	}
+	const reason = result.ok
+		? "the daemon returned no handoff code"
+		: result.status === 404
+			? "this daemon does not support signed-in handoff"
+			: result.status === 401
+				? `the daemon rejected your credential${result.error ? ` (${result.error})` : ""}`
+				: result.reason === "offline" || result.reason === "timeout"
+					? "the daemon could not be reached"
+					: (result.error ?? `HTTP ${result.status ?? "error"}`);
+	console.log(chalk.dim(`  Could not open the dashboard signed in: ${reason}. Sign in on the page if it asks.`));
+	return target.url;
 }
 
 export async function migrateSchema(options: PathOptions, deps: Deps): Promise<void> {
 	const basePath = readPath(options, deps);
-	const dbPath = join(basePath, "memory", "memories.db");
+	const dbPath = resolveWorkspaceLayout(basePath).database;
 
 	console.log(deps.signetLogo());
 
@@ -210,6 +258,7 @@ export async function showLogs(options: LogOptions, deps: Deps): Promise<void> {
 export async function doStart(options: StartOptions, deps: Deps): Promise<void> {
 	console.log(deps.signetLogo());
 	const basePath = readPath(options, deps);
+	if (await deps.setupUnconfiguredWorkspace?.(basePath)) return;
 	const runtime = readRuntime(options.runtime);
 	const daemonPath = readDaemonJsPath(options.daemonJsPath, runtime);
 	let running = await deps.isDaemonRunning();
@@ -246,9 +295,6 @@ export async function doStop(options: PathOptions, deps: Deps): Promise<void> {
 	const basePath = readPath(options, deps);
 	const running = await deps.isDaemonRunning();
 	const stale = running ? false : await deps.hasDaemonProcess(basePath);
-	// Under launchd KeepAlive the daemon respawns on exit, so an unhealthy
-	// daemon still counts as managed: `stop` must boot the job out or the
-	// reported "stop" is silently undone moments later (#1074).
 	const launchdManaged = running ? false : await (deps.isLaunchdDaemonLoaded?.(basePath) ?? Promise.resolve(false));
 	if (!running && !stale && !launchdManaged) {
 		console.log(chalk.yellow("  Daemon is not running"));
@@ -276,6 +322,7 @@ export async function doStop(options: PathOptions, deps: Deps): Promise<void> {
 export async function doRestart(options: RestartOptions, deps: Deps): Promise<void> {
 	console.log(deps.signetLogo());
 	const basePath = readPath(options, deps);
+	if (await deps.setupUnconfiguredWorkspace?.(basePath)) return;
 	const runtime = readRuntime(options.runtime);
 	const daemonPath = readDaemonJsPath(options.daemonJsPath, runtime);
 	const spinner = ora("Restarting daemon...").start();
@@ -680,13 +727,11 @@ function printLogEventBlock(eventBlock: string): void {
 			return;
 		}
 		console.log(`  ${formatLogEntry(entry)}`);
-	} catch {
-		// Ignore malformed SSE payloads.
-	}
+	} catch {}
 }
 
 function readFileLogs(basePath: string, limit: number, options: LogOptions): void {
-	const logDir = join(basePath, ".daemon", "logs");
+	const logDir = join(resolveWorkspaceLayout(basePath).runtime, "logs");
 	const logFile = join(logDir, `signet-${new Date().toISOString().split("T")[0]}.log`);
 
 	if (!existsSync(logFile)) {

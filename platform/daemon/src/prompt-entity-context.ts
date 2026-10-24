@@ -1,12 +1,11 @@
 import { existsSync } from "node:fs";
-import { cosineSimilarity, scanMemoryContent } from "@signet/core";
+import { cosineSimilarity, redactCredentials } from "@signet/core";
 import { selectWithBudgetSkippingOversized } from "./context-budget";
 import { type ReadDb, getDbAccessor, hasDbAccessor } from "./db-accessor";
 import type { EmbeddingFetchOptions } from "./embedding-fetch";
 import type { EmbeddingRole } from "./embedding-profile";
 import { logger } from "./logger";
 import type { EmbeddingConfig } from "./memory-config";
-import { isMemoryContentContextEligible } from "./memory-content-safety";
 import { countPromptTermOverlap, extractSubstantiveWords, isLowSignalPrompt } from "./prompt-text";
 
 type FetchEmbedding = (
@@ -114,14 +113,6 @@ function promptEntityTermMatches(promptTerm: string, phraseTerm: string): boolea
 		(phraseTerm.length >= 4 && !PROMPT_BARE_POSSESSIVE_DENY_TERMS.has(phraseTerm) && promptTerm === `${phraseTerm}s`)
 	);
 }
-
-/**
- * Locate a phrase's token span inside precomputed prompt terms.
- *
- * Callers tokenize the prompt once and pass the terms in: tokenizing the
- * prompt here would re-run the same regex pass per entity row, making
- * prompt-submit O(rows x prompt length) on large graphs (#1059).
- */
 export function promptPhraseSpan(
 	promptTerms: readonly string[],
 	phrase: string,
@@ -274,8 +265,6 @@ function resolvePromptEntityMatches(db: ReadDb, agentId: string, userMessage: st
 	}>;
 
 	const candidatesByPhrase = new Map<string, PromptEntityCandidate[]>();
-	// Tokenize the prompt once: promptPhraseSpan takes precomputed terms, so
-	// the full-prompt regex pass does not repeat per entity row (#1059).
 	const promptTerms = promptEntityTerms(userMessage);
 	for (const row of rows) {
 		if (!isPromptEntityContextTypeAllowed(row.entity_type)) continue;
@@ -489,26 +478,16 @@ function loadEntityContextLines(
 		memory_id: string | null;
 		version: number;
 	}>;
-	const safeCandidateRows = candidateRows.filter((row) =>
-		row.memory_id
-			? isMemoryContentContextEligible(db, {
-					agentId,
-					sourceKind: "memory",
-					sourceId: row.memory_id,
-					content: row.content,
-				})
-			: scanMemoryContent(row.content).contextEligible,
-	);
 	const semanticScores = loadAttributeSemanticScores(
 		db,
 		agentId,
-		safeCandidateRows
+		candidateRows
 			.filter((row) => !isPromptBroadUncategorizedAttribute(row))
 			.map((row) => ({ attributeId: row.attribute_id, memoryId: row.memory_id })),
 		queryVector,
 	);
 	const genericContextQuery = isPromptGenericContextQuery(promptTerms);
-	const candidates: PromptAttributeCandidate[] = safeCandidateRows
+	const candidates: PromptAttributeCandidate[] = candidateRows
 		.filter((row) => !isPromptBroadUncategorizedAttribute(row))
 		.map((row) => {
 			const lexicalScore = scoreAttributeLexically(row, promptTerms);
@@ -599,25 +578,14 @@ function loadEntityContextLines(
 		version: number;
 	}>;
 	return rows
-		.filter(
-			(row) =>
-				!isPromptBroadUncategorizedAttribute(row) &&
-				(row.memory_id
-					? isMemoryContentContextEligible(db, {
-							agentId,
-							sourceKind: "memory",
-							sourceId: row.memory_id,
-							content: row.content,
-						})
-					: scanMemoryContent(row.content).contextEligible),
-		)
+		.filter((row) => !isPromptBroadUncategorizedAttribute(row))
 		.map((row) => ({
 			entityName: entity.entityName,
 			aspectName: row.aspect_name,
 			groupKey: row.group_key,
 			claimKey: row.claim_key,
 			kind: row.kind,
-			content: row.content,
+			content: redactCredentials(row.content),
 			confidence: row.confidence,
 			importance: row.importance,
 			sourceKind: row.source_kind,
@@ -670,15 +638,12 @@ export async function buildEntityPromptContext({
 	// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
 	const matches: PromptEntityMatch[] = getDbAccessor().withReadDb(
 		(db: import("./db-accessor").ReadDb) => resolvePromptEntityMatches(db, agentId, userMessage),
-		"prompt-entity-context.ts:671",
+		"prompt-entity-context.ts:639",
 	);
 	if (matches.length === 0) return { lines: [], memories: [], memoryCount: 0, engine: "no-entity" };
 
 	const sharedSemanticQuery = queryWithoutPromptEntities(userMessage, matches);
 	if (!sharedSemanticQuery) return { lines: [], memories: [], memoryCount: 0, engine: "no-aspect-hit" };
-	// Embed the invariant query once, not once per matched entity: every match
-	// is scored against the same vector, so per-entity fetches are identical
-	// calls that multiply embedding latency by the match count (#1059).
 	let sharedQueryVector: Float32Array | null = null;
 	try {
 		const vector = await fetchEmbedding(sharedSemanticQuery, embedding, "query", {
@@ -725,7 +690,7 @@ export async function buildEntityPromptContext({
 			memoryCount: selected.length,
 			engine: selected.length > 0 ? "entity-context" : "no-aspect-hit",
 		};
-	}, "prompt-entity-context.ts:698");
+	}, "prompt-entity-context.ts:663");
 }
 
 export function buildEntityContextInject(

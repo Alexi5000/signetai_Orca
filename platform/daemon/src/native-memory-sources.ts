@@ -46,6 +46,7 @@ import { type ObsidianMarkdownPathIndex, sourceIdForObsidianRoot } from "./obsid
 import {
 	createNativeSourceWorker,
 	type NativeSourceWorkerPage,
+	type NativeSourceWorkerRejection,
 	type NativeSourceWorkerSource,
 } from "./native-memory-source-worker";
 
@@ -59,7 +60,6 @@ export interface NativeMemorySource {
 	readonly harness: string;
 	readonly displayName: string;
 	readonly root: string;
-	/** Root used for stable provenance paths when the scan root is a subdirectory. */
 	readonly sourceRoot?: string;
 	readonly sourceId?: string;
 	readonly files: readonly NativeMemoryFilePattern[];
@@ -76,24 +76,25 @@ export interface NativeMemoryFilePattern {
 export interface NativeMemorySyncSourceResult {
 	readonly sourceKey: string;
 	readonly sourceId?: string;
-	readonly status: "complete" | "paused";
+	readonly status: "complete" | "degraded" | "paused";
 	readonly scanned: number;
 	readonly indexed: number;
+	readonly rejected: number;
 	readonly resumeFrontier: string | null;
 	readonly pauseReason?: string;
 }
 
 export interface NativeMemorySyncResult {
-	readonly status: "complete" | "paused";
+	readonly status: "complete" | "degraded" | "paused";
 	readonly scanned: number;
 	readonly indexed: number;
+	readonly rejected: number;
 	readonly pausedSources: readonly NativeMemorySyncSourceResult[];
 }
 
 export interface NativeMemoryBridgeHandle {
 	readonly syncExisting: (options?: NativeMemoryBridgeSyncOptions) => Promise<number>;
 	readonly getLastSyncResult: () => NativeMemorySyncResult;
-	/** Kill the active source worker without taking down the parent or DB owner. */
 	readonly cancel: () => void;
 	readonly close: () => Promise<void>;
 }
@@ -115,22 +116,13 @@ export interface NativeMemoryBridgeOptions {
 	readonly sourceCleanupEnabled?: boolean;
 	readonly shouldCleanupSource?: (source: NativeMemorySource) => boolean;
 	readonly sourceGraphEnabled?: boolean;
-	/** Test and bounded-scan override. Production scans use the 50,000-file cap. */
 	readonly maxFilesPerScan?: number;
-	/** Production native scans route descriptors through the killable DB owner. */
 	readonly workerOwnedIndexing?: boolean;
-	/** Test-only event hook used to kill a source worker during traversal. */
 	readonly onSourceWorkerScanStarted?: () => void;
 	readonly shouldContinue?: (source: NativeMemorySource) => boolean;
 	readonly onEmbeddingStatus?: (status: string | undefined) => void;
 	readonly onFileIndexed?: (event: NativeMemoryFileIndexEvent) => void;
 }
-
-/**
- * Resolve the embeddingConfig/fetchEmbedding bridge options from a memory
- * config, so source providers actually get their content chunked and
- * embedded after sync instead of only writing memory_artifacts rows.
- */
 export function resolveEmbeddingBridgeOptions(
 	embeddingCfg: EmbeddingConfig,
 	fetchEmbedding: SourceEmbeddingFetch,
@@ -162,8 +154,6 @@ interface SharedNativeMemorySourceFlight {
 }
 
 const sharedNativeMemorySourceFlights = new Map<string, SharedNativeMemorySourceFlight>();
-
-/** Test-only: drop the in-process content-hash cache so scans behave like a fresh daemon. */
 export interface NativeMemorySourcePermissionIssue {
 	readonly path: string;
 	readonly guidance: string;
@@ -254,30 +244,15 @@ export function resetNativeMemoryIndexCache(): void {
 	resetObsidianSourceEmbeddingBackoff();
 }
 const DEFAULT_OBSIDIAN_SOURCE_FILE_DELAY_MS = 250;
-/** A scan keeps at most one discovered file awaiting indexing. */
 export const NATIVE_MEMORY_FILE_QUEUE_CAP = 1;
 
 const NATIVE_MEMORY_MAX_FILES_PER_SCAN = 50_000;
-
-// Read failures that are not permanent (ENOENT) enter a per-path cooldown so
-// a failing file cannot monopolize the scan loop. ENOENT drops the path from
-// the index entirely — the file is gone, retrying it is pointless (#1142).
 const READ_FAILURE_BACKOFF_MS = 60_000;
 const readFailureBackoffUntil = new Map<string, number>();
-
-// iCloud / sync-evicted (dataless) files fail every read until the OS
-// materializes them. Track them per harness so the daemon logs ONE
-// consolidated warning per window instead of one line per file per retry
-// (#1161).
 const DATALESS_WARN_INTERVAL_MS = 60_000;
 const datalessReadFailuresByHarness = new Map<string, { count: number; lastLoggedAt: number }>();
 
 export function isDatalessReadError(err: unknown): boolean {
-	// The errno code is authoritative. Message matching is only a fallback
-	// for errors that carry no code: node embeds the file path in the
-	// message, and a path containing "eio" (e.g. "veio", "deionized")
-	// would misclassify an ordinary EACCES as dataless and silently drop
-	// its per-file diagnostic.
 	if (typeof err === "object" && err !== null) {
 		const code = (err as NodeJS.ErrnoException).code;
 		if (code === "EDEADLK" || code === "EIO") return true;
@@ -377,12 +352,6 @@ export function claudeCodeNativeMemorySource(root = claudeCodeRoot()): NativeMem
 		],
 	};
 }
-
-/**
- * Hermes keeps curated, profile-local memory in two files under HERMES_HOME.
- * Scan only that declared memory directory; the profile root remains the
- * provenance boundary for source IDs and relative paths.
- */
 export function hermesNativeMemorySource(root = resolveHermesHomePath()): NativeMemorySource {
 	const profileRoot = hermesProfileRoot(root);
 	return {
@@ -629,14 +598,6 @@ async function nativeArtifactCapturedAt(
 		);
 	}
 }
-
-/**
- * One-shot heal for rows already stamped with a corrupt pre-epoch captured_at
- * (the DOS epoch 1980 sentinel): they are re-stamped with the index time so
- * they stop blocking backlog termination and get a normal lifecycle. New
- * indexes never mint sentinels (the memory-lineage clamp), so this only fires
- * once per legacy row (#1149).
- */
 async function healSentinelCapturedAt(
 	filePath: string,
 	agentId: string,
@@ -839,6 +800,87 @@ async function writeNativeSourceSyncCheckpoint(
 	);
 }
 
+async function persistNativeSourceRejection(
+	agentId: string,
+	sourceKey: string,
+	rejection: NativeSourceWorkerRejection,
+	checkpoint: NativeSourceSyncCheckpoint,
+	scanned: number,
+	signal?: AbortSignal,
+): Promise<void> {
+	const fingerprint = `${Math.trunc(rejection.mtimeMs)}:${rejection.sizeBytes}:${rejection.contentHash}`;
+	await dbOwnerBatch(
+		[
+			ownerStatement(
+				`INSERT INTO source_sync_failures
+				 (agent_id, source_key, phase, item_path, fingerprint, failure_code, terminal,
+				  diagnostic, attempt_count, first_observed_at, last_observed_at, resolved_at)
+				 VALUES (?, ?, 'content', ?, ?, ?, 1, ?, 1, datetime('now'), datetime('now'), NULL)
+				 ON CONFLICT(agent_id, source_key, phase, item_path) DO UPDATE SET
+				 fingerprint = excluded.fingerprint,
+				 failure_code = excluded.failure_code,
+				 terminal = excluded.terminal,
+				 diagnostic = excluded.diagnostic,
+				 attempt_count = CASE
+				   WHEN source_sync_failures.fingerprint = excluded.fingerprint
+				   THEN source_sync_failures.attempt_count
+				   ELSE source_sync_failures.attempt_count + 1
+				 END,
+				 last_observed_at = excluded.last_observed_at,
+				 resolved_at = NULL`,
+				[agentId, sourceKey, rejection.path, fingerprint, rejection.code, rejection.message],
+			),
+			ownerStatement(
+				`INSERT INTO source_sync_checkpoints
+				 (agent_id, source_key, phase, cursor, frontier, scanned, complete, updated_at)
+				 VALUES (?, ?, 'content', ?, ?, ?, ?, datetime('now'))
+				 ON CONFLICT(agent_id, source_key, phase) DO UPDATE SET
+				 cursor = excluded.cursor,
+				 frontier = excluded.frontier,
+				 scanned = excluded.scanned,
+				 complete = excluded.complete,
+				 updated_at = excluded.updated_at`,
+				[
+					agentId,
+					sourceKey,
+					checkpoint.cursor,
+					checkpoint.frontier === null ? null : JSON.stringify(checkpoint.frontier),
+					scanned,
+					checkpoint.complete ? 1 : 0,
+				],
+			),
+		],
+		{
+			operation: "sources.sync-rejection.persist",
+			lane: "write",
+			workloadClass: "maintenance",
+			estimatedWorkUnits: 2,
+			signal,
+		},
+	);
+}
+
+async function resolveNativeSourceFailures(agentId: string, sourceKey: string, signal?: AbortSignal): Promise<void> {
+	await dbOwnerBatch(
+		[
+			ownerStatement(
+				`UPDATE source_sync_failures
+				 SET resolved_at = COALESCE(resolved_at, datetime('now')),
+				     last_observed_at = datetime('now')
+				 WHERE agent_id = ? AND source_key = ? AND phase = 'content' AND resolved_at IS NULL`,
+				[agentId, sourceKey],
+			),
+		],
+		{
+			operation: "sources.sync-rejection.resolve",
+			lane: "write",
+			workloadClass: "maintenance",
+			estimatedWorkUnits: 1,
+			signal,
+		},
+	);
+}
+
 async function activeNativeArtifactPaths(
 	source: NativeMemorySource,
 	agentId: string,
@@ -910,9 +952,6 @@ export async function indexNativeMemoryFile(
 	if (!safeRelativePath(source.root, filePath)) return false;
 	const pattern = matchesPattern(source, filePath);
 	if (!pattern) return false;
-	// Source-worker pages carry the complete descriptor. This fast path is the
-	// production bridge boundary: the parent forwards content/hash/mtime to the
-	// owner and does not perform file reads or preflight indexing queries.
 	const workerDescriptor = options.content !== undefined && options.contentHash !== undefined;
 
 	const key = fingerprintKey(source, filePath, agentId);
@@ -940,10 +979,6 @@ export async function indexNativeMemoryFile(
 			}
 		} catch (err) {
 			if (isEnoentError(err)) {
-				// The file vanished between the scan listing and the read — it is
-				// gone. Drop it from the index so later scans stop retrying the
-				// same ENOENT on every pass instead of accumulating stale
-				// artifact rows that desync the FTS index (#1142).
 				readFailureBackoffUntil.delete(key);
 				permissionDeniedPaths.delete(key);
 				await removeNativeMemoryFile(source, filePath, agentId);
@@ -964,14 +999,9 @@ export async function indexNativeMemoryFile(
 				if (firstDenied) logger.warn("watcher", issue.guidance, { path: filePath });
 				return false;
 			}
-			// Transient failures (locks, permission flaps) back off instead of
-			// being re-attempted on every scan iteration.
 			readFailureBackoffUntil.set(key, Date.now() + READ_FAILURE_BACKOFF_MS);
 			const failureMessage = err instanceof Error ? err.message : String(err);
 			if (isDatalessReadError(err)) {
-				// Dataless/locked-file reads consolidate into a single warning
-				// per harness per window; the files are skipped (with backoff)
-				// until the OS materializes them.
 				const now = Date.now();
 				const prev = datalessReadFailuresByHarness.get(source.harness) ?? { count: 0, lastLoggedAt: 0 };
 				const next = { count: prev.count + 1, lastLoggedAt: prev.lastLoggedAt };
@@ -1052,9 +1082,6 @@ export async function indexNativeMemoryFile(
 		indexed.delete(key);
 	}
 	if (!workerDescriptor && persistedHash === hash && semanticComplete) {
-		// One-shot heal for legacy rows with a corrupt pre-epoch captured_at:
-		// they stay permanently pending otherwise (no watermark can reach
-		// 1980), keeping content passes from ever early-exiting (#1149).
 		const persistedCapturedAt = await nativeArtifactCapturedAt(filePath, agentId, options.signal);
 		if (persistedCapturedAt !== null) {
 			await healSentinelCapturedAt(filePath, agentId, source.harness, persistedCapturedAt, options.signal);
@@ -1352,13 +1379,20 @@ export function startNativeMemoryBridge(
 	});
 	const workerOwnedProviderFailures = new Set<string>();
 	let cancelRequested = false;
-	let lastSyncResult: NativeMemorySyncResult = { status: "complete", scanned: 0, indexed: 0, pausedSources: [] };
+	let lastSyncResult: NativeMemorySyncResult = {
+		status: "complete",
+		scanned: 0,
+		indexed: 0,
+		rejected: 0,
+		pausedSources: [],
+	};
 
 	const runScan = async (signal: AbortSignal): Promise<number> => {
 		signal.throwIfAborted();
 		let count = 0;
 		let totalScanned = 0;
 		let totalIndexed = 0;
+		let totalRejected = 0;
 		const pausedSources: NativeMemorySyncSourceResult[] = [];
 		const yielder = yieldEvery(options.yieldEveryFiles ?? 20);
 		for (const source of activeBridgeSources(sources, options)) {
@@ -1370,6 +1404,7 @@ export function startNativeMemoryBridge(
 				count += joined.indexed;
 				totalScanned += joined.scanned;
 				totalIndexed += joined.indexed;
+				totalRejected += joined.rejected;
 				if (joined.status === "paused") pausedSources.push(joined);
 				continue;
 			}
@@ -1390,6 +1425,7 @@ export function startNativeMemoryBridge(
 			try {
 				let changedCount = 0;
 				let scanned = 0;
+				let rejectedCount = 0;
 				const key = sourceStateKey(source, agentId);
 				const durableKey = nativeSourceSyncKey(source);
 				const rootExists = await pathExists(source.root, source, agentId);
@@ -1417,6 +1453,7 @@ export function startNativeMemoryBridge(
 							status: "paused",
 							scanned: 0,
 							indexed: 0,
+							rejected: 0,
 							resumeFrontier: syncState?.checkpointPath ?? null,
 							pauseReason: "provider_unavailable",
 						};
@@ -1441,6 +1478,7 @@ export function startNativeMemoryBridge(
 							status: "paused",
 							scanned: 0,
 							indexed: 0,
+							rejected: 0,
 							resumeFrontier: syncState?.checkpointPath ?? null,
 							pauseReason: "provider_unavailable",
 						});
@@ -1476,7 +1514,7 @@ export function startNativeMemoryBridge(
 							recordNativeMemoryPermissionDenied(source, path, agentId);
 						}
 						if (cancelRequested) throw new Error("native source sync cancelled");
-						if (page.files.length === 0 && page.complete) {
+						if (page.files.length === 0 && page.rejected.length === 0 && page.complete) {
 							pageComplete = true;
 							cursor = null;
 							if (dbAvailable) {
@@ -1492,6 +1530,42 @@ export function startNativeMemoryBridge(
 							break;
 						}
 						const pageScannedBefore = scanned;
+						for (const rejection of page.rejected) {
+							if (cancelRequested) throw new Error("native source sync cancelled");
+							if (resumePath && rejection.path.replace(/\\/g, "/") <= resumePath.replace(/\\/g, "/")) {
+								current.add(rejection.path);
+								continue;
+							}
+							if (scanned >= maxFilesPerScan) break;
+							scanned++;
+							rejectedCount++;
+							current.add(rejection.path);
+							if (dbAvailable) {
+								await persistNativeSourceRejection(
+									agentId,
+									key,
+									rejection,
+									{
+										cursor: rejection.path.replace(/\\/g, "/"),
+										frontier: page.complete ? null : page.frontier,
+										complete: page.complete,
+									},
+									scanned,
+									signal,
+								);
+							}
+							options.onFileIndexed?.({
+								source,
+								filePath: rejection.path,
+								indexed: false,
+								scanned,
+								total: page.total,
+								changed: changedCount,
+								status: rejection.code,
+							});
+							await yielder();
+							await sleep(fileDelayMs);
+						}
 						for (const [fileIndex, file] of page.files.entries()) {
 							if (cancelRequested) throw new Error("native source sync cancelled");
 							if (resumePath && file.path.replace(/\\/g, "/") <= resumePath.replace(/\\/g, "/")) {
@@ -1620,6 +1694,10 @@ export function startNativeMemoryBridge(
 				}
 				totalScanned += scanned;
 				totalIndexed += changedCount;
+				totalRejected += rejectedCount;
+				if (dbAvailable && scanComplete && rejectedCount === 0) {
+					await resolveNativeSourceFailures(agentId, key, signal);
+				}
 				if (sourcePaused) {
 					sourceResult = {
 						sourceKey: durableKey,
@@ -1627,6 +1705,7 @@ export function startNativeMemoryBridge(
 						status: "paused",
 						scanned,
 						indexed: changedCount,
+						rejected: rejectedCount,
 						resumeFrontier: resumeCheckpointPath,
 						pauseReason: "provider_unavailable",
 					};
@@ -1638,15 +1717,17 @@ export function startNativeMemoryBridge(
 					sourceResult = {
 						sourceKey: durableKey,
 						sourceId: source.sourceId,
-						status: "complete",
+						status: rejectedCount > 0 ? "degraded" : "complete",
 						scanned,
 						indexed: changedCount,
+						rejected: rejectedCount,
 						resumeFrontier: null,
 					};
 				}
 				const cleanupAllowed =
 					sourceCleanupEnabledFor(source, options) &&
 					(!rootExists || scanComplete) &&
+					rejectedCount === 0 &&
 					nativeMemorySourcePermissionHealth(source, agentId).status !== "denied";
 				if (cleanupAllowed) {
 					const currentPaths = new Set([...current].map((file) => file.replace(/\\/g, "/")));
@@ -1665,6 +1746,7 @@ export function startNativeMemoryBridge(
 				if (
 					rootExists &&
 					scanComplete &&
+					rejectedCount === 0 &&
 					source.sourceId &&
 					(!options.shouldContinue || options.shouldContinue(source))
 				) {
@@ -1680,9 +1762,10 @@ export function startNativeMemoryBridge(
 			}
 		}
 		lastSyncResult = {
-			status: pausedSources.length > 0 ? "paused" : "complete",
+			status: pausedSources.length > 0 ? "paused" : totalRejected > 0 ? "degraded" : "complete",
 			scanned: totalScanned,
 			indexed: totalIndexed,
+			rejected: totalRejected,
 			pausedSources,
 		};
 		return count;

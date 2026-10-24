@@ -1,20 +1,23 @@
-import { join } from "node:path";
 import { diagnoseHermesIntegration } from "@signet/connector-hermes-agent";
 import { OpenClawConnector, type OpenClawRuntimeState } from "@signet/connector-openclaw";
 import {
 	type SignetInstallationReport,
+	type SchemaType,
 	detectSchema,
 	detectSignetInstallations,
 	getMissingIdentityFiles,
 	hasValidIdentity,
 	inactivePackageManagerInstallations,
 	loadIdentityMode,
+	resolveWorkspaceLayout,
 } from "@signet/core";
+import { join } from "node:path";
 import chalk from "chalk";
 import { daemonAccessLines } from "../lib/network.js";
 import type { DaemonLastExit, DaemonResourceUsage } from "../lib/runtime.js";
 import { getGitRemoteState, getSnapshotProtection, hasOpenClawWorkspaceLink } from "../lib/workspace-protection.js";
 import Database from "../sqlite.js";
+
 import { getDaemonBaseUrl } from "./repair-queue.js";
 
 interface Existing {
@@ -24,8 +27,20 @@ interface Existing {
 	readonly memoryDb: boolean;
 }
 
+interface OntologyStatusStats {
+	readonly entityCount: number;
+	readonly aspectCount: number;
+	readonly attributeCount: number;
+	readonly claimCount: number;
+	readonly constraintCount: number;
+	readonly dependencyCount: number;
+	readonly unassignedMemoryCount: number;
+	readonly coveragePercent: number;
+}
+
 interface DaemonStatus {
 	readonly running: boolean;
+	readonly workspacePath?: string | null;
 	readonly pid: number | null;
 	readonly uptime: number | null;
 	readonly version: string | null;
@@ -51,6 +66,20 @@ interface DaemonStatus {
 		readonly blockedReason: string | null;
 		readonly hasWorkloadState: boolean;
 	} | null;
+	readonly dreaming?: {
+		readonly enabled: boolean;
+		readonly workerRunning: boolean;
+		readonly blockedBy?: "disabled" | "paused" | "frozen" | "no_provider" | null;
+	} | null;
+	readonly workspaceLayoutUpgrade?: string | null;
+	readonly workspaceStats?: {
+		readonly agentId: string;
+		readonly memoryCount: number;
+		readonly capturedSessionCount: number | null;
+		readonly schema: SchemaType;
+		readonly needsMigration: boolean;
+		readonly ontology: OntologyStatusStats;
+	} | null;
 	readonly transcripts: {
 		readonly pending: number;
 		readonly failed: number;
@@ -62,24 +91,26 @@ interface DaemonStatus {
 	} | null;
 	readonly queue?: {
 		readonly memory: {
-			readonly pending: number;
-			readonly leased: number;
-			readonly completed: number;
-			readonly failed: number;
-			readonly dead: number;
-			readonly oldestAgeSec: number;
-			readonly oldestDeadAgeSec: number;
+			readonly pending: number | null;
+			readonly leased: number | null;
+			readonly completed: number | null;
+			readonly failed: number | null;
+			readonly dead: number | null;
+			readonly oldestAgeSec: number | null;
+			readonly oldestDeadAgeSec: number | null;
 			readonly lastError: string | null;
+			readonly completeness: "exact" | "truncated" | "unknown";
 		} | null;
 		readonly summary: {
-			readonly pending: number;
-			readonly leased: number;
-			readonly completed: number;
-			readonly failed: number;
-			readonly dead: number;
-			readonly oldestAgeSec: number;
-			readonly oldestDeadAgeSec: number;
+			readonly pending: number | null;
+			readonly leased: number | null;
+			readonly completed: number | null;
+			readonly failed: number | null;
+			readonly dead: number | null;
+			readonly oldestAgeSec: number | null;
+			readonly oldestDeadAgeSec: number | null;
 			readonly lastError: string | null;
+			readonly completeness: "exact" | "truncated" | "unknown";
 		} | null;
 	} | null;
 	readonly scheduler?: {
@@ -111,10 +142,11 @@ interface DaemonStatus {
 
 interface DbReport {
 	readonly exists: boolean;
-	readonly schema: string | null;
-	readonly needsMigration: boolean;
+	readonly schema: SchemaType | null;
+	readonly needsMigration: boolean | null;
 	readonly memoryCount: number | null;
-	readonly conversationCount: number | null;
+	readonly capturedSessionCount: number | null;
+	readonly ontology: OntologyStatusStats | null;
 }
 
 interface FileReport {
@@ -139,6 +171,7 @@ interface StatusReport {
 	readonly openclawRuntime: OpenClawRuntimeState;
 	readonly openclawWorkspaceLinked: boolean;
 	readonly openclawWorkspaceUnprotected: boolean;
+	readonly protection?: unknown;
 }
 
 interface DoctorFinding {
@@ -160,9 +193,20 @@ interface StatusDeps {
 	readonly formatUptime: (seconds: number) => string;
 	readonly getDaemonStatus: () => Promise<DaemonStatus>;
 	readonly normalizeAgentPath: (pathValue: string) => string;
-	readonly parseIntegerValue: (value: unknown) => number | null;
 	readonly signetLogo: () => string;
 	readonly detectInstallations?: () => SignetInstallationReport;
+	readonly fetchProtection?: (port: number) => Promise<unknown | null>;
+}
+
+function readCount(db: ReturnType<typeof Database>, sql: string, deps: StatusDeps): number | null {
+	try {
+		const raw = db.prepare(sql).get();
+		return typeof raw === "object" && raw !== null && "count" in raw
+			? deps.parseIntegerValue((raw as Record<string, unknown>).count)
+			: null;
+	} catch {
+		return null;
+	}
 }
 
 export async function getStatusReport(basePath: string, deps: StatusDeps): Promise<StatusReport> {
@@ -173,13 +217,18 @@ export async function getStatusReport(basePath: string, deps: StatusDeps): Promi
 	const files = [
 		...(showIdentityFiles ? [{ name: "AGENTS.md", exists: existing.agentsMd }] : []),
 		{ name: "agent.yaml", exists: existing.agentYaml },
-		{ name: "memories.db", exists: existing.memoryDb },
+		{ name: "database", exists: existing.memoryDb },
 	];
 	const daemon = await deps.getDaemonStatus();
 	const git = getGitRemoteState(basePath);
 	const snapshot = getSnapshotProtection(basePath);
 	const openclawWorkspaceLinked = hasOpenClawWorkspaceLink(basePath);
 	const openclawRuntime = new OpenClawConnector().getRuntimeState();
+	const workspaceStats =
+		typeof daemon.workspacePath === "string" && deps.normalizeAgentPath(daemon.workspacePath) === basePath
+			? (daemon.workspaceStats ?? null)
+			: null;
+	const protection = deps.fetchProtection ? await deps.fetchProtection(deps.defaultPort) : null;
 	const report: StatusReport = {
 		basePath,
 		installed,
@@ -188,10 +237,11 @@ export async function getStatusReport(basePath: string, deps: StatusDeps): Promi
 		files,
 		db: {
 			exists: existing.memoryDb,
-			schema: null,
-			needsMigration: false,
-			memoryCount: null,
-			conversationCount: null,
+			schema: workspaceStats?.schema ?? null,
+			needsMigration: workspaceStats?.needsMigration ?? null,
+			memoryCount: workspaceStats?.memoryCount ?? null,
+			capturedSessionCount: workspaceStats?.capturedSessionCount ?? null,
+			ontology: workspaceStats?.ontology ?? null,
 		},
 		daemon,
 		git: {
@@ -203,30 +253,28 @@ export async function getStatusReport(basePath: string, deps: StatusDeps): Promi
 		openclawRuntime,
 		openclawWorkspaceLinked,
 		openclawWorkspaceUnprotected: openclawWorkspaceLinked && git.origin === null && snapshot === null,
+		...(protection ? { protection } : {}),
 	};
 
-	if (!existing.memoryDb) {
+	if (!existing.memoryDb || workspaceStats !== null) {
 		return report;
 	}
 
 	let db: ReturnType<typeof Database> | null = null;
 	try {
-		db = Database(join(basePath, "memory", "memories.db"), {
+		db = Database(resolveWorkspaceLayout(basePath).database, {
 			readonly: true,
 		});
 		const schema = detectSchema(db);
 		const memoryCount = readCount(db, "SELECT COUNT(*) as count FROM memories", deps);
-		const conversationCount = schema.hasConversations
-			? readCount(db, "SELECT COUNT(*) as count FROM conversations", deps)
-			: null;
 		return {
 			...report,
 			db: {
+				...report.db,
 				exists: true,
-				schema: schema.type,
-				needsMigration: schema.type !== "core" && schema.type !== "unknown",
-				memoryCount,
-				conversationCount,
+				schema: report.db.schema ?? schema.type,
+				needsMigration: report.db.needsMigration ?? (schema.type !== "core" && schema.type !== "unknown"),
+				memoryCount: report.db.memoryCount ?? memoryCount,
 			},
 		};
 	} catch {
@@ -243,7 +291,12 @@ export async function showStatus(options: { path?: string; json?: boolean }, dep
 	const report = await getStatusReport(basePath, deps);
 
 	if (options.json) {
-		console.log(JSON.stringify(report, null, 2));
+		const statusJson = JSON.stringify(
+			report,
+			(key: string, value: unknown) => (key === "openclaw" || key.startsWith("openclaw") ? undefined : value),
+			2,
+		);
+		console.log(statusJson);
 		return;
 	}
 
@@ -304,21 +357,27 @@ export async function showStatus(options: { path?: string; json?: boolean }, dep
 			console.log(colorize(`    ${icon} ${extractionNotice.title}`));
 			console.log(chalk.dim(`      ${extractionNotice.detail}`));
 		}
-		if (report.daemon.openclaw && report.openclawRuntime === "plugin") {
-			const icon =
-				report.daemon.openclaw.status === "connected"
-					? chalk.green("✓")
-					: report.daemon.openclaw.status === "stale"
-						? chalk.yellow("⚠")
-						: chalk.yellow("◐");
-			console.log(`    ${icon} OpenClaw plugin ${report.daemon.openclaw.status}`);
+		if (report.daemon.workspaceLayoutUpgrade) {
+			console.log(chalk.yellow("    ⚠ Workspace layout upgrade blocked; still on layout v1"));
+			console.log(chalk.dim(`      ${report.daemon.workspaceLayoutUpgrade}. Fix it and restart the daemon.`));
+		}
+		const dreaming = report.daemon.dreaming;
+		if (dreaming?.enabled && dreaming.blockedBy === "no_provider") {
+			console.log(chalk.yellow("    ⚠ Memory is paused until you connect a provider"));
+			console.log(
+				chalk.dim("      Connect one under Settings → Inference in the dashboard. Dreaming starts on its own."),
+			);
+		} else if (dreaming) {
+			const mismatch = dreaming.enabled !== dreaming.workerRunning;
+			const summary = `Dreaming: ${dreaming.enabled ? "enabled" : "disabled"} (worker ${dreaming.workerRunning ? "running" : "stopped"})${dreaming.enabled && dreaming.blockedBy ? ` — pipeline ${dreaming.blockedBy}` : ""}`;
+			console.log(
+				mismatch || (dreaming.enabled && dreaming.blockedBy)
+					? chalk.yellow(`    ⚠ ${summary}`)
+					: chalk.dim(`    ${summary}`),
+			);
 		}
 	} else {
 		const probe = report.daemon.probe;
-		// The process can be alive while /health is unreachable (event loop
-		// blocked by a wedged worker). Label that "unresponsive", not
-		// "stopped": a restart often re-triggers the same wedge, and the
-		// operator should look at the logs first (#1074).
 		const unresponsive = probe?.status === "listener-unhealthy" || probe?.status === "process-unhealthy";
 		if (unresponsive) {
 			console.log(`  ${chalk.yellow("◐")} Daemon ${chalk.yellow("unresponsive")}`);
@@ -335,9 +394,6 @@ export async function showStatus(options: { path?: string; json?: boolean }, dep
 			}
 		}
 	}
-
-	// Queue diagnostics include the live memory queue; legacy summary fields
-	// are retained as empty compatibility data for older daemon responses.
 	if (report.daemon.running) {
 		await renderPipelineQueuesBlock(deps, report.daemon.queue ?? undefined);
 		const daemonHealth = report.daemon.health;
@@ -363,12 +419,34 @@ export async function showStatus(options: { path?: string; json?: boolean }, dep
 
 	if (report.db.exists) {
 		console.log();
+		let displayedWorkspaceStats = false;
 		if (typeof report.db.memoryCount === "number") {
 			console.log(chalk.dim(`  Memories: ${report.db.memoryCount}`));
+			displayedWorkspaceStats = true;
 		}
-		if (typeof report.db.conversationCount === "number") {
-			console.log(chalk.dim(`  Conversations: ${report.db.conversationCount}`));
+		if (typeof report.db.capturedSessionCount === "number") {
+			console.log(chalk.dim(`  Captured sessions: ${report.db.capturedSessionCount}`));
+			displayedWorkspaceStats = true;
+		} else if (typeof report.db.memoryCount === "number" || report.db.ontology !== null) {
+			console.log(chalk.dim("  Captured sessions: unavailable"));
+			displayedWorkspaceStats = true;
 		}
+		if (report.db.ontology) {
+			const { entityCount, aspectCount, attributeCount, claimCount, constraintCount, dependencyCount } =
+				report.db.ontology;
+			console.log(
+				chalk.dim(
+					`  Ontology: ${entityCount} entities · ${aspectCount} aspects · ${attributeCount} attributes · ${claimCount} claims · ${constraintCount} constraints · ${dependencyCount} links`,
+				),
+			);
+			console.log(
+				chalk.dim(
+					`  ${report.db.ontology.coveragePercent}% graph-linked coverage · ${report.db.ontology.unassignedMemoryCount} graph-linked memories unassigned`,
+				),
+			);
+			displayedWorkspaceStats = true;
+		}
+		if (!displayedWorkspaceStats) console.log(chalk.dim("  Workspace statistics: unavailable"));
 	}
 
 	if (!report.validIdentity && report.missingIdentityFiles.length > 0) {
@@ -378,17 +456,6 @@ export async function showStatus(options: { path?: string; json?: boolean }, dep
 
 	console.log();
 	console.log(chalk.dim(`  Path: ${report.basePath}`));
-	if (report.openclawWorkspaceUnprotected) {
-		console.log(chalk.red("  ⚠ OpenClaw workspace protection: unprotected"));
-		console.log(chalk.dim("    No origin remote detected for this workspace."));
-	} else if (report.openclawWorkspaceLinked && report.git.snapshot) {
-		console.log(chalk.yellow("  ⚠ OpenClaw workspace protection: local snapshot"));
-		console.log(chalk.dim(`    Snapshot: ${report.git.snapshot}`));
-	}
-	if (report.openclawRuntime === "legacy") {
-		console.log(chalk.yellow("  ⚠ OpenClaw runtime: legacy-only"));
-		console.log(chalk.dim("    Run `signet sync` to migrate to the plugin path and restore full lifecycle capture."));
-	}
 	console.log();
 }
 
@@ -401,13 +468,55 @@ interface QueueCountsForDisplay {
 	readonly oldestAgeSec: number;
 	readonly oldestDeadAgeSec: number;
 	readonly lastError: string | null;
+	readonly completeness: "exact" | "truncated" | "unknown";
 }
 
 interface PipelineQueueDisplayReport {
-	readonly timestamp: string;
 	readonly queues: {
 		readonly memory: QueueCountsForDisplay;
-		readonly summary: QueueCountsForDisplay;
+	};
+}
+
+function parseQueueCountsForDisplay(value: unknown): QueueCountsForDisplay | null {
+	if (!isRecord(value) || Array.isArray(value)) return null;
+	const record = value;
+	const completeness = record.completeness;
+	if (completeness !== "exact" && completeness !== "truncated") return null;
+	const readCount = (key: string): number | null => {
+		const count = record[key];
+		return typeof count === "number" && Number.isSafeInteger(count) && count >= 0 ? count : null;
+	};
+	const pending = readCount("pending");
+	const leased = readCount("leased");
+	const completed = readCount("completed");
+	const failed = readCount("failed");
+	const dead = readCount("dead");
+	const oldestAgeSec = readCount("oldestAgeSec");
+	const oldestDeadAgeSec = readCount("oldestDeadAgeSec");
+	const lastError = record.lastError;
+	const normalizedLastError = typeof lastError === "string" && lastError.trim().length > 0 ? lastError : null;
+	if (
+		pending === null ||
+		leased === null ||
+		completed === null ||
+		failed === null ||
+		dead === null ||
+		oldestAgeSec === null ||
+		oldestDeadAgeSec === null ||
+		(lastError !== undefined && lastError !== null && typeof lastError !== "string")
+	) {
+		return null;
+	}
+	return {
+		pending,
+		leased,
+		completed,
+		failed,
+		dead,
+		oldestAgeSec,
+		oldestDeadAgeSec,
+		lastError: normalizedLastError,
+		completeness,
 	};
 }
 
@@ -417,7 +526,13 @@ async function fetchPipelineQueueReport(baseUrl: string): Promise<PipelineQueueD
 			signal: AbortSignal.timeout(2000),
 		});
 		if (!res.ok) return null;
-		return (await res.json()) as PipelineQueueDisplayReport;
+		const value: unknown = await res.json();
+		if (!isRecord(value) || Array.isArray(value)) return null;
+		const queues = value.queues;
+		if (!isRecord(queues) || Array.isArray(queues)) return null;
+		const memory = parseQueueCountsForDisplay(queues.memory);
+		if (memory === null) return null;
+		return { queues: { memory } };
 	} catch {
 		return null;
 	}
@@ -431,48 +546,53 @@ function formatAge(seconds: number): string {
 	return `${(seconds / 86400).toFixed(1)}d`;
 }
 
-function renderQueueRow(label: string, counts: QueueCountsForDisplay): string {
-	const deadColor = counts.dead > 0 ? chalk.red : chalk.dim;
-	const failColor = counts.failed > 0 ? chalk.yellow : chalk.dim;
-	const cells: string[] = [
-		`p=${counts.pending}`,
-		`l=${counts.leased}`,
-		`c=${counts.completed}`,
-		failColor(`f=${counts.failed}`),
-		deadColor(`d=${counts.dead}`),
-		chalk.dim(`oldest=${formatAge(counts.oldestAgeSec)}`),
-		chalk.dim(`dead=${formatAge(counts.oldestDeadAgeSec)}`),
+function formatQueueCount(count: number, completeness: QueueCountsForDisplay["completeness"]): string {
+	const formatted = count.toLocaleString("en-US");
+	return completeness === "truncated" ? `at least ${formatted}` : formatted;
+}
+
+function renderQueueRow(label: string, counts: QueueCountsForDisplay): readonly string[] {
+	const failed =
+		counts.completeness === "truncated" || counts.failed > 0
+			? chalk.yellow(`${formatQueueCount(counts.failed, counts.completeness)} failed`)
+			: `${counts.failed} failed`;
+	const dead =
+		counts.completeness === "truncated" || counts.dead > 0
+			? chalk.red(`${formatQueueCount(counts.dead, counts.completeness)} dead-lettered (retries exhausted)`)
+			: `${counts.dead} dead-lettered (retries exhausted)`;
+	return [
+		`    ${chalk.bold(label)}: ${formatQueueCount(counts.pending, counts.completeness)} waiting · ${formatQueueCount(counts.leased, counts.completeness)} in progress · ${formatQueueCount(counts.completed, counts.completeness)} completed`,
+		`      ${failed} · ${dead}`,
+		`      Oldest waiting: ${formatAge(counts.oldestAgeSec)} · oldest dead-lettered: ${formatAge(counts.oldestDeadAgeSec)}`,
 	];
-	return `    ${chalk.bold(label.padEnd(10))} ${cells.join(" ")}`;
 }
 
 export async function renderPipelineQueuesBlock(
 	deps: { defaultPort: number },
 	captured?: NonNullable<DaemonStatus["queue"]>,
 ): Promise<void> {
-	// Prefer the daemon's own /api/status queue block (always available when
-	// the daemon is up); fall back to the admin-guarded diagnostics endpoint
-	// for the richer age columns.
-	const report = captured
-		? ({
-				queues: {
-					memory: captured.memory,
-					summary: captured.summary,
-				},
-			} as PipelineQueueDisplayReport)
-		: await fetchPipelineQueueReport(getDaemonBaseUrl(deps.defaultPort));
-	if (!report?.queues) return;
-	const { memory, summary } = report.queues;
-	if (!memory || !summary) return;
-	const deadTotal = memory.dead + summary.dead;
-	const heading = deadTotal > 0 ? chalk.yellow("Pipeline queues (dead jobs present)") : "Pipeline queues";
+	const capturedMemory = captured?.memory;
+	const verifiedCapturedMemory =
+		capturedMemory === null || capturedMemory === undefined ? null : parseQueueCountsForDisplay(capturedMemory);
+	const report =
+		verifiedCapturedMemory !== null
+			? { queues: { memory: verifiedCapturedMemory } }
+			: await fetchPipelineQueueReport(getDaemonBaseUrl(deps.defaultPort));
+	if (!report?.queues) {
+		console.log("");
+		console.log(chalk.dim("  Memory job queue: counts unavailable."));
+		return;
+	}
+	const memory = report.queues.memory;
+	const hasDeadWork = memory.dead > 0;
+	const heading = hasDeadWork ? chalk.yellow("Memory job queue (dead work present)") : "Memory job queue";
 	console.log("");
 	console.log(`  ${heading}`);
-	console.log(renderQueueRow("memory", memory));
-	console.log(renderQueueRow("summary", summary));
-	if (memory.lastError) console.log(chalk.dim(`    memory last error: ${String(memory.lastError).slice(0, 120)}`));
-	if (summary.lastError) console.log(chalk.dim(`    summary last error: ${String(summary.lastError).slice(0, 120)}`));
-	console.log(chalk.dim("    (use 'signet repair queue {requeue|cancel|prune} [--apply]' to clean up)"));
+	for (const line of renderQueueRow("Memory processing", memory)) console.log(line);
+	if (memory.lastError) console.log(chalk.dim(`    Last error: ${memory.lastError.slice(0, 120)}`));
+	if (hasDeadWork || memory.failed > 0) {
+		console.log(chalk.dim("    Review with 'signet repair queue {requeue|cancel|prune} [--apply]'."));
+	}
 }
 
 export { getDaemonBaseUrl };
@@ -481,17 +601,19 @@ export function getExtractionStatusNotice(
 	daemon: DaemonStatus,
 ): { level: "warn" | "error"; title: string; detail: string } | null {
 	const extraction = daemon.extraction;
+	if (
+		extraction &&
+		daemon.running &&
+		extraction.status === "disabled" &&
+		(extraction.reason || daemon.dreaming?.enabled)
+	) {
+		return null;
+	}
 	if (extraction && daemon.running && extraction.hasWorkloadState && !extraction.ready) {
-		// The legacy auto-extraction pipeline was deliberately retired in favor
-		// of Dreaming, which owns all semantic writes. Retired states are not a
-		// fault and are not surfaced as a pipeline notice at all.
-		if (!extraction.enabled && extraction.status === "disabled" && extraction.reason) {
-			return null;
-		}
 		const title = !extraction.enabled
-			? "Pipeline disabled"
+			? "Extraction disabled"
 			: extraction.paused
-				? "Pipeline paused"
+				? "Extraction paused"
 				: extraction.status === "blocked"
 					? "Extraction blocked"
 					: "Extraction unavailable";
@@ -628,15 +750,24 @@ async function showHermesDoctor(options: { json?: boolean }): Promise<void> {
 	console.log();
 }
 
+function daemonLogDirHint(basePath: string): string {
+	try {
+		return join(resolveWorkspaceLayout(basePath).runtime, "logs");
+	} catch {
+		return "the workspace runtime logs directory";
+	}
+}
+
 function addDaemonProbeFindings(report: StatusReport, findings: DoctorFinding[]): void {
 	const probe = report.daemon.probe;
 	if (!probe || probe.status === "healthy") return;
+	const logDir = daemonLogDirHint(report.basePath);
 
 	if (probe.status === "listener-unhealthy") {
 		findings.push({
 			level: "error",
 			message: "Daemon port is listening, but /health is unreachable.",
-			fix: "Run `signet daemon restart`; if it recurs, inspect ~/.agents/.daemon/logs/daemon.err.log.",
+			fix: `Run \`signet daemon restart\`; if it recurs, inspect ${join(logDir, "daemon.err.log")}.`,
 		});
 		return;
 	}
@@ -658,7 +789,7 @@ function addDaemonProbeFindings(report: StatusReport, findings: DoctorFinding[])
 		});
 	}
 
-	addDaemonLifecycleExitFindings(probe, findings);
+	addDaemonLifecycleExitFindings(probe, findings, logDir);
 }
 
 function addReadinessFindings(report: StatusReport, findings: DoctorFinding[]): void {
@@ -673,16 +804,13 @@ function addReadinessFindings(report: StatusReport, findings: DoctorFinding[]): 
 			fix: "Inspect `signet status` and the failing readiness check before relying on automatic maintenance.",
 		});
 	}
-
-	// Readiness is a composite signal. The scheduler alone knows whether its
-	// latest deferred sweep yielded to queue pressure or higher-priority system
-	// pressure, so never infer its cause from readiness reasons or queue counts.
 	const scheduler = report.daemon.scheduler;
 	if (scheduler?.status !== "deferred" || scheduler.reason !== "queue_pressure") return;
 	const memory = report.daemon.queue?.memory;
-	const detail = memory
-		? `: memory queue has ${memory.pending} pending job(s), oldest age ${formatAge(memory.oldestAgeSec)}.${memory.lastError ? ` Last error: ${memory.lastError.slice(0, 160)}` : ""}`
-		: ".";
+	const pendingText = memory?.pending == null ? "pending count unavailable" : `${memory.pending} pending job(s)`;
+	const oldestText = memory?.oldestAgeSec == null ? "" : `, oldest age ${formatAge(memory.oldestAgeSec)}`;
+	const lastErrorText = memory?.lastError ? ` Last error: ${memory.lastError.slice(0, 160)}` : "";
+	const detail = memory ? `: memory queue ${pendingText}${oldestText}.${lastErrorText}` : ".";
 	findings.push({
 		level: "warn",
 		code: "dreaming_deferred_queue_pressure",
@@ -690,15 +818,11 @@ function addReadinessFindings(report: StatusReport, findings: DoctorFinding[]): 
 		fix: "Inspect the queue in `signet status`; repair only identified jobs with `signet repair queue requeue --apply` or retire obsolete jobs with `signet repair queue cancel --apply`.",
 	});
 }
-
-/**
- * Surface the daemon's own last-exit record when it is down. A record stuck at
- * "starting"/"running" means the process died without writing a shutdown
- * marker — SIGKILL, OOM, or a hard crash — which is exactly the silent-death
- * class of issue #1148. The fix pointer routes the operator to the evidence:
- * the daemon log tail and the systemd transient unit's journald exit status.
- */
-function addDaemonLifecycleExitFindings(probe: NonNullable<DaemonStatus["probe"]>, findings: DoctorFinding[]): void {
+function addDaemonLifecycleExitFindings(
+	probe: NonNullable<DaemonStatus["probe"]>,
+	findings: DoctorFinding[],
+	logDir: string,
+): void {
 	const lastExit = probe.lastExit;
 	if (!lastExit) return;
 
@@ -720,11 +844,6 @@ function addDaemonLifecycleExitFindings(probe: NonNullable<DaemonStatus["probe"]
 		});
 		return;
 	}
-
-	// The record says the daemon was starting/running but never wrote a
-	// terminal state. That only means death if the recorded process is
-	// actually gone: a daemon on a custom port or still binding at boot would
-	// otherwise be misreported as "killed or crashed" against a live process.
 	if (isProcessAlive(lastExit.pid)) return;
 
 	findings.push({
@@ -732,8 +851,8 @@ function addDaemonLifecycleExitFindings(probe: NonNullable<DaemonStatus["probe"]
 		code: "daemon_exit_unrecorded",
 		message: `Previous daemon exit was not recorded as clean: the process was killed or crashed (pid ${lastExit.pid}, last marked ${lastExit.state} at ${lastExit.startedAt}). No shutdown marker was written.`,
 		fix: lastExit.systemdUnit
-			? `Check the daemon log tail (~/.agents/.daemon/logs/signet-<date>.log) and the unit exit status: journalctl --user -u ${lastExit.systemdUnit}`
-			: "Check the daemon log tail (~/.agents/.daemon/logs/signet-<date>.log) for where it stopped, and dmesg/journalctl for OOM kills or signals.",
+			? `Check the daemon log tail (${join(logDir, "signet-<date>.log")}) and the unit exit status: journalctl --user -u ${lastExit.systemdUnit}`
+			: `Check the daemon log tail (${join(logDir, "signet-<date>.log")}) for where it stopped, and dmesg/journalctl for OOM kills or signals.`,
 	});
 }
 
@@ -978,15 +1097,6 @@ function getDoctorFindings(report: StatusReport, installations: SignetInstallati
 
 function formatMemory(valueMiB: number): string {
 	return valueMiB >= 1024 ? `${(valueMiB / 1024).toFixed(1)} GiB` : `${valueMiB} MiB`;
-}
-
-function readCount(db: ReturnType<typeof Database>, sql: string, deps: StatusDeps): number | null {
-	try {
-		const raw = db.prepare(sql).get();
-		return isRecord(raw) ? deps.parseIntegerValue(raw.count) : null;
-	} catch {
-		return null;
-	}
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

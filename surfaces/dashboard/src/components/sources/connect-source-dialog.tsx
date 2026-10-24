@@ -1,16 +1,14 @@
-/**
- * Unified source dialog — file imports and connector-backed sources share one
- * centered picker and modal shell. The daemon contracts stay in the api client;
- * this component only chooses the existing transport and submit path.
- */
+import { ModalHeading } from "@/components/ui/modal-heading";
+import { Input, NativeSelect } from "@/components/ui/field";
+import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { sourceLogo } from "@/components/icons";
 import { type ImportSourcesResponse, api } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { FolderOpen, Globe, Loader2, MessageCircle, RotateCcw, Upload, X } from "@/components/mingcute-icons";
-import { useEffect, useRef, useState } from "react";
+import { FolderOpen, Globe, Loader2, MessageCircle, RotateCcw, Upload } from "@/components/mingcute-icons";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-export type SourceKind = "files" | "web" | "transcripts" | "obsidian" | "github" | "discord";
+export type SourceKind = "files" | "web" | "transcripts" | "obsidian" | "github" | "notion" | "discord";
 
 const IMPORT_KINDS: readonly { id: "files" | "web" | "transcripts"; label: string; description: string }[] = [
 	{ id: "files", label: "Files", description: "Import documents and notes" },
@@ -18,9 +16,14 @@ const IMPORT_KINDS: readonly { id: "files" | "web" | "transcripts"; label: strin
 	{ id: "transcripts", label: "Agent transcripts", description: "Import lossless JSONL transcript exports" },
 ];
 
-const CONNECT_KINDS: readonly { id: "obsidian" | "github" | "discord"; label: string; namePlaceholder: string }[] = [
+const CONNECT_KINDS: readonly {
+	id: "obsidian" | "github" | "notion" | "discord";
+	label: string;
+	namePlaceholder: string;
+}[] = [
 	{ id: "obsidian", label: "Obsidian", namePlaceholder: "Research Vault" },
 	{ id: "github", label: "GitHub", namePlaceholder: "Signet GitHub" },
+	{ id: "notion", label: "Notion", namePlaceholder: "Team Notion" },
 	{ id: "discord", label: "Discord", namePlaceholder: "Team Discord" },
 ];
 
@@ -44,6 +47,11 @@ const FIELD: Record<Exclude<SourceKind, "files">, { label: string; placeholder: 
 		label: "Repository",
 		placeholder: "Signet-AI/signetai",
 		hint: "owner/repo — use owner/* for org-wide glob",
+	},
+	notion: {
+		label: "Token secret",
+		placeholder: "NOTION_TOKEN",
+		hint: "Name of the secret holding your internal integration token. Signet indexes the pages you share with that integration.",
 	},
 	discord: {
 		label: "Guild ID",
@@ -75,6 +83,12 @@ function validate(kind: Exclude<SourceKind, "files">, target: string, tokenRef: 
 		if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_*.-]+$/.test(value)) return "Use owner/repo or owner/*";
 		return null;
 	}
+	if (kind === "notion") {
+		if (!value) return "Enter the Notion token secret name";
+		if (/^(?:bearer\s+)?(?:ntn|secret)_[A-Za-z0-9]{20,}$/i.test(value))
+			return "Store the token in Secrets and enter the secret name";
+		return null;
+	}
 	if (!/^\d{17,20}$/.test(value)) return "Enter a 17–20 digit Guild ID";
 	if (!tokenRef.trim()) return "Enter the Discord token secret name";
 	return null;
@@ -97,6 +111,7 @@ function sourceDescription(kind: SourceKind): string {
 	if (kind === "transcripts") return "Import lossless JSONL transcript exports";
 	if (kind === "obsidian") return "Index a local vault";
 	if (kind === "github") return "Index repositories and issues";
+	if (kind === "notion") return "Index pages shared with an integration";
 	return "Index messages from a Discord server";
 }
 
@@ -129,13 +144,55 @@ export function ConnectSourceDialog({
 	const [result, setResult] = useState<ImportSourcesResponse | null>(null);
 	const [transcriptJobId, setTranscriptJobId] = useState<string | null>(null);
 	const [agents, setAgents] = useState<readonly { id: string; name: string }[]>([]);
+	const [agentLoadError, setAgentLoadError] = useState<string | null>(null);
+	const agentLoadRequest = useRef(0);
+
+	const loadAgents = useCallback(async () => {
+		const request = agentLoadRequest.current + 1;
+		agentLoadRequest.current = request;
+		setAgents([]);
+		setAgentLoadError(null);
+		let rosterError = "Unable to load agents. Try again.";
+		try {
+			const response = await api.getAgents();
+			if (request !== agentLoadRequest.current) return;
+			rosterError = response.error ?? rosterError;
+			const roster = Array.isArray(response.data?.agents) ? response.data.agents : [];
+			const available = roster
+				.filter((agent) => typeof agent?.id === "string" && agent.id.length > 0)
+				.map((agent) => ({
+					id: agent.id,
+					name: typeof agent.name === "string" && agent.name.length > 0 ? agent.name : agent.id,
+				}));
+			if (available.length > 0) {
+				setAgents(available);
+				if (available.length === 1) setTarget((current) => current || available[0].id);
+				return;
+			}
+
+			const status = await api.getStatus();
+			if (request !== agentLoadRequest.current) return;
+			const activeAgent = status?.agentId?.trim();
+			if (activeAgent) {
+				setAgents([{ id: activeAgent, name: activeAgent }]);
+				setTarget((current) => current || activeAgent);
+				return;
+			}
+			setAgentLoadError(
+				rosterError === "Unable to load agents. Try again." ? "No agents are available. Try again." : rosterError,
+			);
+		} catch {
+			if (request === agentLoadRequest.current) setAgentLoadError(rosterError);
+		}
+	}, []);
 
 	useEffect(() => {
 		if (!open) return;
-		void api.getAgents().then((response) => {
-			if (response.data) setAgents(response.data.agents.map((agent) => ({ id: agent.id, name: agent.name })));
-		});
-	}, [open]);
+		void loadAgents();
+		return () => {
+			agentLoadRequest.current += 1;
+		};
+	}, [loadAgents, open]);
 
 	useEffect(() => {
 		if (!open) return;
@@ -203,7 +260,7 @@ export function ConnectSourceDialog({
 			setBusy(true);
 			setError(null);
 			const created = transcriptJobId
-				? await api.getSourceImport(transcriptJobId).then((response) => ({
+				? await api.getSourceImport(transcriptJobId, selectedAgent).then((response) => ({
 						...response,
 						data: response.data
 							? { jobId: response.data.job.id, id: response.data.job.id, files: response.data.files }
@@ -236,7 +293,7 @@ export function ConnectSourceDialog({
 					return;
 				}
 			}
-			const started = await api.controlSourceImport(jobId, "start");
+			const started = await api.controlSourceImport(jobId, "start", selectedAgent);
 			setBusy(false);
 			if (!started) {
 				setError(`Job ${jobId}: could not start import`);
@@ -309,7 +366,9 @@ export function ConnectSourceDialog({
 					? { root: target.trim(), name: displayName }
 					: kind === "github"
 						? { repo: target.trim(), name: displayName, tokenRef: tokenRef.trim() || undefined }
-						: { guildId: target.trim(), name: displayName, tokenRef: tokenRef.trim() };
+						: kind === "notion"
+							? { tokenRef: target.trim(), name: displayName }
+							: { guildId: target.trim(), name: displayName, tokenRef: tokenRef.trim() };
 		const response = await api.addSource(kind, body);
 		setBusy(false);
 		if (!response.ok) {
@@ -354,12 +413,7 @@ export function ConnectSourceDialog({
 				aria-modal={embedded ? undefined : true}
 				aria-label="Connect a source"
 			>
-				<header className="cs-head">
-					<span className="cs-title">Add a source</span>
-					<button type="button" className="cs-close" onClick={onClose} disabled={busy} aria-label="Close">
-						<X className="size-4" />
-					</button>
-				</header>
+				<ModalHeading className="cs-head" title="Add a source" onClose={onClose} disabled={busy} />
 				<div className="cs-body cs-body--source">
 					<div className="cs-layout">
 						{!embedded && (
@@ -426,9 +480,16 @@ export function ConnectSourceDialog({
 										</span>
 									</button>
 									{kind === "files" && (
-										<button type="button" className="cs-btn-ghost self-center" onClick={chooseDesktop} disabled={busy}>
+										<Button
+											variant="ghost"
+											size="compact"
+											type="button"
+											className="self-center"
+											onClick={chooseDesktop}
+											disabled={busy}
+										>
 											Choose from desktop
-										</button>
+										</Button>
 									)}
 									<input
 										ref={inputRef}
@@ -443,10 +504,8 @@ export function ConnectSourceDialog({
 										onChange={(event) => choose(event.target.files)}
 									/>
 									{kind === "transcripts" && (
-										<label className="cs-field">
-											<span id="source-target-label" className="cs-field__label">
-												Target agent
-											</span>
+										<label className="ui-field-label">
+											<span id="source-target-label">Target agent</span>
 											<Select value={target} onValueChange={setTarget} disabled={busy}>
 												<SelectTrigger
 													aria-label="Target agent"
@@ -466,11 +525,25 @@ export function ConnectSourceDialog({
 													))}
 												</SelectContent>
 											</Select>
-											<span className="cs-field__hint">{FIELD.transcripts.hint}</span>
+											<span className="ui-field-hint">{FIELD.transcripts.hint}</span>
+											{agentLoadError && (
+												<span className="ui-field-hint flex items-center justify-between gap-2" role="alert">
+													{agentLoadError}
+													<Button
+														variant="ghost"
+														size="compact"
+														type="button"
+														className="shrink-0"
+														onClick={() => void loadAgents()}
+													>
+														Retry agent list
+													</Button>
+												</span>
+											)}
 										</label>
 									)}
 									{embedded && selectedCount > 2 && (
-										<span className="cs-field__hint">{selectedCount} files selected</span>
+										<span className="ui-field-hint">{selectedCount} files selected</span>
 									)}
 									{selectedCount > 0 && (
 										<div className="flex flex-col gap-1 rounded-md bg-[color-mix(in_oklch,var(--foreground)_3%,transparent)] p-2 font-mono text-[10px]">
@@ -487,10 +560,9 @@ export function ConnectSourceDialog({
 										</div>
 									)}
 									{!embedded && (
-										<label className="cs-field">
-											<span className="cs-field__label">If a content hash already exists</span>
-											<select
-												className="cs-field__input"
+										<label className="ui-field-label">
+											<span>If a content hash already exists</span>
+											<NativeSelect
 												value={duplicateMode}
 												onChange={(event) => setDuplicateMode(event.target.value as typeof duplicateMode)}
 												disabled={busy}
@@ -498,22 +570,22 @@ export function ConnectSourceDialog({
 												<option value="skip">Skip duplicate</option>
 												<option value="replace">Replace and re-index</option>
 												<option value="reimport">Import as a new source</option>
-											</select>
+											</NativeSelect>
 										</label>
 									)}
 									{transcriptJobId && (
-										<div className="cs-field__hint" aria-live="polite">
+										<div className="ui-field-hint" aria-live="polite">
 											Import job created: <code>{transcriptJobId}</code>
 										</div>
 									)}
 									{busy && (
-										<div className="cs-field__hint" aria-live="polite">
+										<div className="ui-field-hint" aria-live="polite">
 											Importing {selectedCount} {selectedCount === 1 ? "file" : "files"}…
 										</div>
 									)}
 									{result && (
 										<div className="flex flex-col gap-2" aria-live="polite">
-											<div className="cs-field__hint">
+											<div className="ui-field-hint">
 												Imported {result.imported}; failed {result.failed}.
 											</div>
 											<div className="flex flex-col gap-1 rounded-md bg-[color-mix(in_oklch,var(--foreground)_3%,transparent)] p-2 text-[10px]">
@@ -534,30 +606,37 @@ export function ConnectSourceDialog({
 												))}
 											</div>
 											{result.failed > 0 && (
-												<button type="button" className="cs-btn-ghost self-start" onClick={retryFailed} disabled={busy}>
+												<Button
+													variant="ghost"
+													size="compact"
+													type="button"
+													className="self-start"
+													onClick={retryFailed}
+													disabled={busy}
+												>
 													<RotateCcw className="size-3" />
 													Retry failed imports
-												</button>
+												</Button>
 											)}
 										</div>
 									)}
 								</>
 							) : (
 								<>
-									<div className="cs-field">
-										<span className="cs-field__label">{FIELD[kind].label}</span>
+									<div className="ui-field-label">
+										<span>{FIELD[kind].label}</span>
 										<div className="flex gap-2">
-											<input
-												className="cs-field__input"
+											<Input
 												value={target}
 												onChange={(event) => setTarget(event.target.value)}
 												placeholder={FIELD[kind].placeholder}
 												aria-label={FIELD[kind].label}
 											/>
 											{kind === "obsidian" && (
-												<button
+												<Button
+													variant="outline"
+													size="icon-sm"
 													type="button"
-													className="cs-browse"
 													onClick={browse}
 													disabled={browsing}
 													title="Browse folders"
@@ -568,16 +647,15 @@ export function ConnectSourceDialog({
 													) : (
 														<FolderOpen className="size-3.5" />
 													)}
-												</button>
+												</Button>
 											)}
 										</div>
-										<span className="cs-field__hint">{FIELD[kind].hint}</span>
+										<span className="ui-field-hint">{FIELD[kind].hint}</span>
 									</div>
 									{kind !== "web" && (
-										<div className="cs-field">
-											<span className="cs-field__label">Name</span>
-											<input
-												className="cs-field__input"
+										<div className="ui-field-label">
+											<span>Name</span>
+											<Input
 												value={name}
 												onChange={(event) => setName(event.target.value)}
 												placeholder={CONNECT_KINDS.find((item) => item.id === kind)?.namePlaceholder}
@@ -585,17 +663,16 @@ export function ConnectSourceDialog({
 											/>
 										</div>
 									)}
-									{kind !== "obsidian" && kind !== "web" && (
-										<div className="cs-field">
-											<span className="cs-field__label">Token secret{kind === "github" ? " (optional)" : ""}</span>
-											<input
-												className="cs-field__input"
+									{kind !== "obsidian" && kind !== "web" && kind !== "notion" && (
+										<div className="ui-field-label">
+											<span>Token secret{kind === "github" ? " (optional)" : ""}</span>
+											<Input
 												value={tokenRef}
 												onChange={(event) => setTokenRef(event.target.value)}
 												placeholder={kind === "github" ? "GITHUB_TOKEN" : "DISCORD_BOT_TOKEN"}
 												aria-label="Token secret name"
 											/>
-											<span className="cs-field__hint">Name of the secret holding your token</span>
+											<span className="ui-field-hint">Name of the secret holding your token</span>
 										</div>
 									)}
 								</>
@@ -606,18 +683,18 @@ export function ConnectSourceDialog({
 				</div>
 				<footer className="cs-foot">
 					{!embedded && (
-						<button type="button" className="cs-btn-ghost" onClick={onClose} disabled={busy}>
+						<Button variant="ghost" size="compact" type="button" onClick={onClose} disabled={busy}>
 							Close
-						</button>
+						</Button>
 					)}
-					<button type="button" className="cs-btn-primary" onClick={submit} disabled={submitDisabled}>
+					<Button variant="default" size="compact" type="button" onClick={submit} disabled={submitDisabled}>
 						{busy && <Loader2 className="size-3.5 animate-spin" />}
 						{kind === "files" || kind === "transcripts"
 							? "Import & index"
 							: kind === "web"
 								? "Add & index"
 								: "Connect & index"}
-					</button>
+					</Button>
 				</footer>
 			</Panel>
 		</div>
@@ -628,13 +705,10 @@ function extractionLabel(
 	extraction:
 		| {
 				readonly documentEntityId: string | null;
-				readonly aspectsCreated: number;
-				readonly attributesCreated: number;
 		  }
 		| undefined,
 	base: string,
 ): string {
-	if (!extraction) return `${base}; extraction result unavailable`;
-	const entity = extraction.documentEntityId ? "entity linked" : "no entity linked";
-	return `${base}; ${extraction.aspectsCreated} aspects · ${extraction.attributesCreated} attributes · ${entity}`;
+	if (!extraction) return `${base}; import result unavailable`;
+	return `${base}; ${extraction.documentEntityId ? "document linked" : "no document entity"}`;
 }

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { resolveWorkspaceLayout } from "@signet/core";
 import { closeDbAccessor, getDbAccessor, initDbAccessorAsync } from "./db-accessor";
 import { runTranscriptRecoveryScan, type TranscriptRecoveryScanOptions } from "./transcript-recovery-worker";
 
@@ -9,6 +9,10 @@ interface ChildInput {
 	readonly options: Omit<TranscriptRecoveryScanOptions, "signal">;
 }
 
+function writeLine(stream: NodeJS.WriteStream, line: string): Promise<void> {
+	return new Promise((resolve) => stream.write(`${line}\n`, () => resolve()));
+}
+
 async function main(): Promise<void> {
 	if (process.env.SIGNET_DB_WRITES_BLOCKED === "1") {
 		throw new Error("Transcript recovery child refused writable accessor because database writes are blocked");
@@ -16,18 +20,21 @@ async function main(): Promise<void> {
 	const encoded = process.env.SIGNET_TRANSCRIPT_RECOVERY_INPUT;
 	if (encoded === undefined) throw new Error("Transcript recovery child input is missing");
 	const input = JSON.parse(encoded) as ChildInput;
-	await initDbAccessorAsync(join(input.basePath, "memory", "memories.db"), { agentsDir: input.basePath });
+	await initDbAccessorAsync(resolveWorkspaceLayout(input.basePath).database, { agentsDir: input.basePath });
 	try {
 		const holdFile = process.env.SIGNET_TRANSCRIPT_RECOVERY_TEST_HOLD_FILE;
 		while (holdFile !== undefined && existsSync(holdFile)) await new Promise((resolve) => setTimeout(resolve, 5));
 		const result = await runTranscriptRecoveryScan(getDbAccessor(), input.basePath, input.agentId, input.options);
-		process.stdout.write(`${JSON.stringify({ type: "result", result })}\n`);
+		await writeLine(process.stdout, JSON.stringify({ type: "result", result }));
 	} finally {
-		closeDbAccessor();
+		await closeDbAccessor();
 	}
 }
 
-void main().catch((error: unknown) => {
-	process.stderr.write(`${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
-	process.exitCode = 1;
-});
+void main().then(
+	() => process.exit(0),
+	async (error: unknown) => {
+		await writeLine(process.stderr, error instanceof Error ? (error.stack ?? error.message) : String(error));
+		process.exit(1);
+	},
+);

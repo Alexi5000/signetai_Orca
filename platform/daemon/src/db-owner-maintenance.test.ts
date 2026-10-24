@@ -1,12 +1,31 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDbOwnerMaintenance, runOwnerMaintenanceWithRetry } from "./db-owner-maintenance";
-import { createDbOwnerClient, DbOwnerDeadlineError, DbOwnerDiedError, type DbOwnerClient } from "./db-owner-client";
+import { runMigrations } from "../../core/src/migrations";
+import {
+	closeRegisteredDbOwnerMaintenance,
+	createDbOwnerMaintenance,
+	getDbOwnerMaintenance,
+	isDbOwnerMaintenanceClosing,
+	registerDbOwnerMaintenance,
+	runOwnerMaintenanceWithRetry,
+	submitRegisteredDbOwnerJob,
+	withRegisteredDbOwnerMaintenance,
+} from "./db-owner-maintenance";
+import type { DbOwnerMaintenance } from "./db-owner-maintenance";
+import {
+	createDbOwnerClient,
+	DbOwnerAdmissionError,
+	DbOwnerDeadlineError,
+	DbOwnerDiedError,
+	type DbOwnerClient,
+} from "./db-owner-client";
+import type { DbOwnerVectorRepairInput } from "./db-owner-protocol";
 import { isFtsIndexIncomplete, setFtsIndexIncomplete } from "./fts-index-state";
 import { completeFtsStartupRecovery } from "./fts-startup-recovery";
+import { getDbOwner } from "./db-owner-runtime";
 
 function makeDatabase(memoryCount = 7): { readonly directory: string; readonly path: string } {
 	const directory = mkdtempSync(join(tmpdir(), "signet-fts-owner-"));
@@ -29,10 +48,12 @@ function makeDatabase(memoryCount = 7): { readonly directory: string; readonly p
 			session_id TEXT,
 			request_id TEXT
 		);
-		CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='unicode61');
+		CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='porter unicode61');
 	`);
 	const insert = db.prepare("INSERT INTO memories (content) VALUES (?)");
-	for (let index = 0; index < memoryCount; index++) insert.run(`owner backfill memory ${index}`);
+	db.transaction(() => {
+		for (let index = 0; index < memoryCount; index++) insert.run(`owner backfill memory ${index}`);
+	})();
 	db.close();
 	return { directory, path };
 }
@@ -115,6 +136,83 @@ describe("DB owner FTS maintenance", () => {
 		expect(deadlines).toHaveLength(2);
 		expect(deadlines[1]).toBeLessThan(deadlines[0]);
 		expect(Date.now() - startedAt).toBeLessThan(125);
+	});
+
+	test("waits for a full maintenance queue to admit the job within its deadline", async () => {
+		let attempts = 0;
+		const owner = {
+			start: async (): Promise<void> => {},
+			submit: () => {
+				attempts += 1;
+				if (attempts < 4) {
+					throw new DbOwnerAdmissionError("DB_OWNER_QUEUE_FULL", "DB owner maintenance admission queue is full");
+				}
+				return { job: { enqueuedAt: 0 } as never, result: Promise.resolve("ok"), cancel: (): void => {} };
+			},
+		} as unknown as DbOwnerClient;
+
+		await expect(
+			runOwnerMaintenanceWithRetry(owner, { kind: "sleep", durationMs: 0 }, "test.queue-full", { deadlineMs: 1_000 }),
+		).resolves.toBe("ok");
+		expect(attempts).toBe(4);
+	});
+
+	test("fails with the admission error once a full queue outlasts the deadline", async () => {
+		const owner = {
+			start: async (): Promise<void> => {},
+			submit: () => {
+				throw new DbOwnerAdmissionError("DB_OWNER_QUEUE_FULL", "DB owner maintenance admission queue is full");
+			},
+		} as unknown as DbOwnerClient;
+
+		const startedAt = Date.now();
+		await expect(
+			runOwnerMaintenanceWithRetry(owner, { kind: "sleep", durationMs: 0 }, "test.queue-full", { deadlineMs: 60 }),
+		).rejects.toBeInstanceOf(DbOwnerAdmissionError);
+		expect(Date.now() - startedAt).toBeLessThan(200);
+	});
+
+	test("reports the full queue, not the deadline, when the deadline lapses during the admission wait", async () => {
+		const base = 1_000_000;
+		const clock = [base, base, base + 50];
+		const now = spyOn(Date, "now").mockImplementation(() => clock.shift() ?? base + 61);
+		const owner = {
+			start: async (): Promise<void> => {},
+			submit: () => {
+				throw new DbOwnerAdmissionError("DB_OWNER_QUEUE_FULL", "DB owner maintenance admission queue is full");
+			},
+		} as unknown as DbOwnerClient;
+		try {
+			await expect(
+				runOwnerMaintenanceWithRetry(owner, { kind: "sleep", durationMs: 0 }, "test.queue-full", { deadlineMs: 60 }),
+			).rejects.toBeInstanceOf(DbOwnerAdmissionError);
+		} finally {
+			now.mockRestore();
+		}
+	});
+
+	test("rejects a full queue immediately when the caller backs off itself", async () => {
+		let attempts = 0;
+		let admissionFailures = 0;
+		const owner = {
+			start: async (): Promise<void> => {},
+			submit: () => {
+				attempts += 1;
+				throw new DbOwnerAdmissionError("DB_OWNER_QUEUE_FULL", "DB owner maintenance admission queue is full");
+			},
+		} as unknown as DbOwnerClient;
+
+		await expect(
+			runOwnerMaintenanceWithRetry(owner, { kind: "sleep", durationMs: 0 }, "test.queue-full", {
+				deadlineMs: 1_000,
+				admission: "reject",
+				onOwnerJobAdmissionFailure: () => {
+					admissionFailures += 1;
+				},
+			}),
+		).rejects.toBeInstanceOf(DbOwnerAdmissionError);
+		expect(attempts).toBe(1);
+		expect(admissionFailures).toBe(1);
 	});
 
 	test("waits for a deadline-abandoned owner worker when requested", async () => {
@@ -233,7 +331,7 @@ describe("DB owner FTS maintenance", () => {
 		expect(isFtsIndexIncomplete()).toBe(false);
 		expect(readFtsState(database.path)).toEqual({ memoryCount: 10_001, indexedCount: 10_001, physicalCount: 10_001 });
 		expect(countFtsMatches(database.path, "10000")).toBe(1);
-	});
+	}, 30_000);
 
 	test("converges after deleting a row below the active backfill cursor", async () => {
 		const database = makeDatabase();
@@ -278,7 +376,7 @@ describe("DB owner FTS maintenance", () => {
 		const db = new Database(database.path);
 		db.exec("DROP TABLE memories_fts");
 		db.exec(
-			"CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='unicode61')",
+			"CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='porter unicode61')",
 		);
 		db.close();
 
@@ -300,7 +398,7 @@ describe("DB owner FTS maintenance", () => {
 		const db = new Database(database.path);
 		db.exec("DROP TABLE memories_fts");
 		db.exec(
-			"CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='unicode61')",
+			"CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='porter unicode61')",
 		);
 		db.close();
 
@@ -417,5 +515,316 @@ describe("DB owner FTS maintenance", () => {
 			actor_type: "daemon",
 			request_id: "request-test",
 		});
+	});
+});
+
+describe("registered DB owner maintenance", () => {
+	afterEach(async () => {
+		await closeRegisteredDbOwnerMaintenance();
+	});
+
+	test("clears the registry before awaiting an asynchronous close", async () => {
+		let release: (() => void) | undefined;
+		const closed = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const maintenance = {
+			close: async (): Promise<void> => await closed,
+		} as unknown as DbOwnerMaintenance;
+		registerDbOwnerMaintenance(maintenance);
+
+		const closing = closeRegisteredDbOwnerMaintenance();
+		expect(getDbOwnerMaintenance()).toBeNull();
+		expect(isDbOwnerMaintenanceClosing()).toBe(true);
+		expect(() => registerDbOwnerMaintenance(maintenance)).toThrow("DB owner maintenance is closing");
+
+		release?.();
+		await closing;
+		expect(getDbOwnerMaintenance()).toBeNull();
+		expect(isDbOwnerMaintenanceClosing()).toBe(false);
+	});
+
+	test("requires explicit close before replacing the registered maintenance", async () => {
+		const first = { close: async (): Promise<void> => {} } as unknown as DbOwnerMaintenance;
+		const second = { close: async (): Promise<void> => {} } as unknown as DbOwnerMaintenance;
+		registerDbOwnerMaintenance(first);
+		expect(() => registerDbOwnerMaintenance(second)).toThrow(
+			"DB owner maintenance is already registered; close it before replacement",
+		);
+
+		await closeRegisteredDbOwnerMaintenance();
+		expect(() => registerDbOwnerMaintenance(second)).not.toThrow();
+	});
+
+	test("waits for a registered maintenance lease before closing the owner", async () => {
+		let release: (() => void) | undefined;
+		let signalStarted: (() => void) | undefined;
+		let closeCalls = 0;
+		const started = new Promise<void>((resolve) => {
+			signalStarted = resolve;
+		});
+		const maintenance = {
+			close: async (): Promise<void> => {
+				closeCalls += 1;
+			},
+		} as unknown as DbOwnerMaintenance;
+		registerDbOwnerMaintenance(maintenance);
+
+		const operation = withRegisteredDbOwnerMaintenance(async (current) => {
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			signalStarted?.();
+			await gate;
+			return current;
+		});
+		await started;
+		const closing = closeRegisteredDbOwnerMaintenance();
+		expect(getDbOwnerMaintenance()).toBeNull();
+		expect(closeCalls).toBe(0);
+
+		release?.();
+		await expect(operation).resolves.toBe(maintenance);
+		await closing;
+		expect(closeCalls).toBe(1);
+	});
+
+	test("keeps a submitted owner job leased through worker completion", async () => {
+		let resolveResult: ((value: string) => void) | undefined;
+		let resolveMetrics: ((value: undefined) => void) | undefined;
+		let closeCalls = 0;
+		const owner = {
+			submit: () => ({
+				job: {} as never,
+				result: new Promise<string>((resolve) => {
+					resolveResult = resolve;
+				}),
+				metrics: new Promise<undefined>((resolve) => {
+					resolveMetrics = resolve;
+				}),
+				cancel: (): void => {},
+			}),
+		} as unknown as DbOwnerClient;
+		const maintenance = {
+			owner,
+			close: async (): Promise<void> => {
+				closeCalls += 1;
+			},
+		} as unknown as DbOwnerMaintenance;
+		registerDbOwnerMaintenance(maintenance);
+
+		const handle = submitRegisteredDbOwnerJob<string>(
+			owner,
+			{ kind: "query", statement: { sql: "SELECT 1", result: "get" } },
+			{ operation: "test.registered-submit", lane: "read", deadlineMs: 1_000 },
+		);
+		if (handle === null) throw new Error("registered owner job was not admitted");
+		const closing = closeRegisteredDbOwnerMaintenance();
+		resolveResult?.("ok");
+		await expect(handle.result).resolves.toBe("ok");
+		expect(closeCalls).toBe(0);
+
+		resolveMetrics?.(undefined);
+		await closing;
+		expect(closeCalls).toBe(1);
+	});
+
+	test("keeps active proxy jobs callable while the registry drains", async () => {
+		let resolveResult: ((value: string) => void) | undefined;
+		let resolveMetrics: ((value: undefined) => void) | undefined;
+		let cancelCalls = 0;
+		let closeCalls = 0;
+		const owner = {
+			submit: () => ({
+				job: { id: "active" } as never,
+				result: new Promise<string>((resolve) => {
+					resolveResult = resolve;
+				}),
+				metrics: new Promise<undefined>((resolve) => {
+					resolveMetrics = resolve;
+				}),
+				cancel: (): void => {},
+			}),
+			awaitResult: async <Result>(handle: { result: Promise<Result> }): Promise<Result> => await handle.result,
+			cancel: (): void => {
+				cancelCalls += 1;
+			},
+		} as unknown as DbOwnerClient;
+		registerDbOwnerMaintenance({
+			owner,
+			close: async (): Promise<void> => {
+				closeCalls += 1;
+			},
+		} as unknown as DbOwnerMaintenance);
+
+		const proxy = await getDbOwner();
+		const handle = proxy.submit<string>(
+			{ kind: "query", statement: { sql: "SELECT 1", result: "get" } },
+			{ operation: "test.proxy-submit", lane: "read", deadlineMs: 1_000 },
+		);
+		const closing = closeRegisteredDbOwnerMaintenance();
+		proxy.cancel("active");
+		expect(cancelCalls).toBe(1);
+		resolveResult?.("ok");
+		await expect(proxy.awaitResult(handle)).resolves.toBe("ok");
+		expect(closeCalls).toBe(0);
+
+		resolveMetrics?.(undefined);
+		await closing;
+		expect(closeCalls).toBe(1);
+	});
+
+	test("returns an owner proxy that fails closed after registry retirement", async () => {
+		const owner = {
+			health: () => ({ state: "ready" }),
+		} as unknown as DbOwnerClient;
+		const maintenance = {
+			owner,
+			close: async (): Promise<void> => {},
+		} as unknown as DbOwnerMaintenance;
+		registerDbOwnerMaintenance(maintenance);
+
+		const proxy = await getDbOwner();
+		expect(proxy).not.toBe(owner);
+		expect(proxy.health().state).toBe("ready");
+		await closeRegisteredDbOwnerMaintenance();
+		expect(() => proxy.health()).toThrow("DB owner maintenance is no longer registered");
+		await expect(proxy.close()).rejects.toThrow("DB owner maintenance is no longer registered");
+	});
+
+	test("rejects stale owner proxies after replacement", async () => {
+		const firstOwner = {
+			health: () => ({ state: "ready" }),
+		} as unknown as DbOwnerClient;
+		const secondOwner = {
+			health: () => ({ state: "ready" }),
+		} as unknown as DbOwnerClient;
+		registerDbOwnerMaintenance({
+			owner: firstOwner,
+			close: async (): Promise<void> => {},
+		} as unknown as DbOwnerMaintenance);
+		const firstProxy = await getDbOwner();
+
+		await closeRegisteredDbOwnerMaintenance();
+		registerDbOwnerMaintenance({
+			owner: secondOwner,
+			close: async (): Promise<void> => {},
+		} as unknown as DbOwnerMaintenance);
+
+		await expect(firstProxy.start()).rejects.toThrow("DB owner maintenance is no longer registered");
+		await expect(firstProxy.initialize()).rejects.toThrow("DB owner maintenance is no longer registered");
+		const staleHandle = { job: { id: "retired" } } as never;
+		await expect(firstProxy.awaitResult(staleHandle)).rejects.toThrow("DB owner maintenance is no longer registered");
+		expect(() => firstProxy.cancel("retired")).toThrow("DB owner maintenance is no longer registered");
+	});
+});
+
+function makeVectorRepairDatabase(rowCount: number): { readonly directory: string; readonly path: string } {
+	const directory = mkdtempSync(join(tmpdir(), "signet-vector-repair-owner-"));
+	const path = join(directory, "memory.db");
+	const db = new Database(path);
+	runMigrations(db as never);
+	db.exec("DROP TABLE IF EXISTS vec_embeddings");
+	db.exec("CREATE TABLE vec_embeddings (id TEXT PRIMARY KEY, embedding BLOB NOT NULL)");
+	const now = new Date().toISOString();
+	const insertMemory = db.prepare(
+		`INSERT INTO memories (id, content, content_hash, agent_id, type, created_at, updated_at, updated_by)
+		 VALUES (?, ?, ?, 'default', 'fact', ?, ?, 'test')`,
+	);
+	const insertEmbedding = db.prepare(
+		`INSERT INTO embeddings (id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id)
+		 VALUES (?, ?, ?, 3, 'memory', ?, ?, ?, 'default')`,
+	);
+	for (let index = 0; index < rowCount; index += 1) {
+		const memoryId = `owner-vector-memory-${index}`;
+		insertMemory.run(memoryId, `owner vector memory ${index}`, `owner-vector-hash-${index}`, now, now);
+		insertEmbedding.run(
+			`owner-vector-embedding-${index}`,
+			`owner-vector-hash-${index}`,
+			Buffer.from(new Float32Array([index, index + 1, index + 2]).buffer),
+			memoryId,
+			`owner vector memory ${index}`,
+			now,
+		);
+	}
+	db.prepare("INSERT INTO vec_embeddings (id, embedding) VALUES (?, ?)").run(
+		"owner-vector-orphan",
+		Buffer.from(new Float32Array([9, 9, 9]).buffer),
+	);
+	db.close();
+	return { directory, path };
+}
+
+describe("DB owner vector repair", () => {
+	let maintenance: ReturnType<typeof createDbOwnerMaintenance> | null = null;
+	let directory: string | null = null;
+
+	afterEach(async () => {
+		await maintenance?.close();
+		maintenance = null;
+		if (directory !== null) rmSync(directory, { recursive: true, force: true });
+		directory = null;
+	});
+
+	test("keeps large-corpus owner batches bounded and resumes after owner restart", async () => {
+		const database = makeVectorRepairDatabase(250);
+		directory = database.directory;
+		const request: DbOwnerVectorRepairInput = {
+			operation: "resync",
+			agentId: "default",
+			checkpointId: "compiled-large-corpus-checkpoint",
+			batchSize: 50,
+			maxVectorBytes: 256 * 1024,
+			audit: {
+				action: "resyncVectorIndex",
+				actor: "test-operator",
+				reason: "compiled large-corpus regression",
+				actorType: "operator",
+			},
+		};
+		maintenance = createDbOwnerMaintenance({ dbPath: database.path });
+		const latencies: number[] = [];
+		let measuring = true;
+		const measureLoop = async (): Promise<void> => {
+			while (measuring) {
+				const started = performance.now();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				latencies.push(performance.now() - started);
+			}
+		};
+		const measuringPromise = measureLoop();
+
+		let result = await maintenance.vectorRepair(request);
+		expect(result.batchRows).toBeLessThanOrEqual(50);
+		expect(result.batchBytes).toBeLessThanOrEqual(256 * 1024);
+		await maintenance.close();
+		maintenance = null;
+		maintenance = createDbOwnerMaintenance({ dbPath: database.path });
+		let batches = 1;
+		while (result.status !== "complete") {
+			result = await maintenance.vectorRepair(request);
+			expect(result.batchRows).toBeLessThanOrEqual(50);
+			expect(result.batchBytes).toBeLessThanOrEqual(256 * 1024);
+			batches += 1;
+			if (batches > 20) throw new Error("owner vector repair did not converge");
+		}
+		measuring = false;
+		await measuringPromise;
+
+		expect(result.remaining).toBe(0);
+		expect(result.affected).toBe(250);
+		expect(batches).toBeGreaterThan(3);
+		expect(Math.max(...latencies)).toBeLessThan(500);
+		const finalDb = new Database(database.path, { readonly: true });
+		expect(finalDb.prepare("SELECT COUNT(*) AS n FROM vec_embeddings").get()).toEqual({ n: 251 });
+		expect(finalDb.prepare("SELECT id FROM vec_embeddings WHERE id = 'owner-vector-orphan'").get()).toEqual({
+			id: "owner-vector-orphan",
+		});
+		const audits = finalDb
+			.prepare("SELECT metadata FROM memory_history WHERE metadata LIKE '%operationId%'")
+			.all() as Array<{ metadata: string }>;
+		finalDb.close();
+		expect(audits.length).toBeGreaterThan(1);
+		expect(audits.some((row) => row.metadata.includes("repair.vector-resync.missing-vectors"))).toBe(true);
 	});
 });

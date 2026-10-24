@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, fstatSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { scanMemoryContent, writeFileAtomicSync } from "@signet/core";
+import { writeFileAtomicSync } from "@signet/core";
+import { redactCredentials } from "@signet/core";
 import type { WriteDb } from "./db-accessor";
-import type { MemoryHeadRequest } from "./memory-head";
+import { MEMORY_HEAD_MAX_TOKENS, type MemoryHeadCommitInput, type MemoryHeadRequest } from "./memory-head";
 import { readEpisodicSource } from "./episodic-sources";
 import { renderDreamingEvidence } from "./pipeline/dreaming-evidence";
 import { countTokens } from "./pipeline/tokenizer";
@@ -12,6 +13,32 @@ const hash = (text: string): string => createHash("sha256").update(text).digest(
 const generatedMarker = /^<!-- (?:signet-generated-memory\b[^>]*|generated \d{4}-\d{2}-\d{2}[^>]*) -->\s*/;
 const revisionMarker = /^<!-- signet-generated-memory agent=([a-z0-9-]+) revision=(\d+);/;
 type Head = { revision: number; content: string; content_hash: string; revision_id: string | null; is_current: number };
+
+export function renderMemoryHeadBody(entries: MemoryHeadCommitInput["entries"]): string {
+	return entries.map((entry) => `- ${entry.text.trim()}`).join("\n");
+}
+
+export function memoryHeadInputError(input: MemoryHeadCommitInput): {
+	readonly code: "INVALID_HEAD";
+	readonly error: string;
+	readonly tokens?: number;
+	readonly maxTokens?: number;
+} | null {
+	if (
+		input.entries.length > 200 ||
+		Buffer.byteLength(JSON.stringify(input)) > 262144 ||
+		input.entries.some((entry) => entry.support.length > 8)
+	)
+		return { code: "INVALID_HEAD", error: "head input exceeds its bounded budget" };
+	const tokens = countTokens(renderMemoryHeadBody(input.entries));
+	if (tokens <= MEMORY_HEAD_MAX_TOKENS) return null;
+	return {
+		code: "INVALID_HEAD",
+		error: `head is ${tokens} tokens; it must be at most ${MEMORY_HEAD_MAX_TOKENS}. Shorten or drop entries and resubmit.`,
+		tokens,
+		maxTokens: MEMORY_HEAD_MAX_TOKENS,
+	};
+}
 
 function currentSource(db: WriteDb, agentId: string, from: string) {
 	from = from.replace(/^source:/, "artifact:").replace(/^session:/, "transcript:");
@@ -32,12 +59,15 @@ function currentSource(db: WriteDb, agentId: string, from: string) {
 function knownProjection(db: WriteDb, content: string): boolean {
 	const digest = hash(content.trim().replace(generatedMarker, "").trim());
 	const marker = revisionMarker.exec(content.trim());
-	if (marker)
-		return Boolean(
-			db
-				.prepare("SELECT 1 FROM memory_head_revisions WHERE agent_id=? AND revision=? AND content_hash=? LIMIT 1")
-				.get(marker[1], Number(marker[2]), digest),
+	if (marker) {
+		const revision = db
+			.prepare("SELECT content, content_hash FROM memory_head_revisions WHERE agent_id=? AND revision=? LIMIT 1")
+			.get(marker[1], Number(marker[2])) as { content: string; content_hash: string } | undefined;
+		return (
+			revision !== undefined &&
+			(revision.content_hash === digest || hash(redactCredentials(revision.content)) === digest)
 		);
+	}
 	return (
 		Boolean(db.prepare("SELECT 1 FROM memory_head_revisions WHERE content_hash=? LIMIT 1").get(digest)) ||
 		Boolean(db.prepare("SELECT 1 FROM memory_md_heads WHERE content_hash=? LIMIT 1").get(digest))
@@ -46,8 +76,6 @@ function knownProjection(db: WriteDb, content: string): boolean {
 function isGenerated(db: WriteDb, content: string): boolean {
 	if (knownProjection(db, content)) return true;
 	const marker = revisionMarker.exec(content.trim());
-	// An edit to a known published revision becomes authored text. Unknown legacy
-	// markers remain unverified snapshots, including files left by an aborted commit.
 	if (
 		marker &&
 		db
@@ -78,9 +106,8 @@ function readBoundedProjection(path: string, budget: number): string | null {
 
 /** Called only inside the owner's transaction. Files are projections, never read as the head. */
 function publish(db: WriteDb, root: string, agentId: string, head: Head): void {
-	if (head.is_current !== 1 || !head.content) return;
+	if (head.is_current !== 1) return;
 	const target = agentId === "default" ? join(root, "MEMORY.md") : join(root, "agents", agentId, "MEMORY.md");
-	// A user edit takes custody of the file. Do not read an unbounded authored file.
 	let existing = "";
 	const inspected = readBoundedProjection(target, 262144);
 	if (inspected !== null) {
@@ -88,8 +115,8 @@ function publish(db: WriteDb, root: string, agentId: string, head: Head): void {
 		if (!isGenerated(db, existing))
 			throw new Error("User-authored MEMORY.md preserved; remove or move it to allow generated projection");
 	}
-	const projection = `<!-- signet-generated-memory agent=${agentId} revision=${head.revision}; inspect only, use Signet for current context -->\n\n${head.content}\n`;
-	if (existing !== projection) {
+	const projection = `<!-- signet-generated-memory agent=${agentId} revision=${head.revision}; inspect only, use Signet for current context -->\n\n${redactCredentials(head.content)}\n`;
+	if ((head.content || existing) && existing !== projection) {
 		mkdirSync(dirname(target), { recursive: true });
 		// Exclusive 0o600 sibling temp + rename; the temp is removed on failure.
 		writeFileAtomicSync(target, projection, { fsync: false });
@@ -100,50 +127,37 @@ function publish(db: WriteDb, root: string, agentId: string, head: Head): void {
 	).run(new Date().toISOString(), agentId, head.revision);
 }
 
-export function executeMemoryHead(db: WriteDb, root: string, request: MemoryHeadRequest): Record<string, unknown> {
-	if (!["read", "inspect", "commit"].includes(request.action)) throw new Error("Unsupported memory head action");
-	const agentId = request.action === "commit" ? request.input.agentId : request.agentId;
+export function withContentPassWrites<T>(db: WriteDb, passId: string | undefined, write: () => T): T {
+	const pass =
+		passId === undefined
+			? null
+			: (db
+					.prepare(
+						"SELECT agent_id, head_base_revision FROM dreaming_passes WHERE id=? AND status='running' AND mode='incremental-content'",
+					)
+					.get(passId) as { agent_id: string; head_base_revision: number | null } | null | undefined);
+	if (pass == null) return write();
+	const revision = (): number =>
+		(
+			db.prepare("SELECT revision FROM memory_md_heads WHERE agent_id=?").get(pass.agent_id) as
+				| { revision: number }
+				| null
+				| undefined
+		)?.revision ?? 0;
+	const before = revision();
+	const result = write();
+	const after = revision();
+	if (after !== before && pass.head_base_revision === before)
+		db.prepare("UPDATE dreaming_passes SET head_base_revision=? WHERE id=?").run(after, passId);
+	return result;
+}
+
+export function commitCuratedMemoryHeadInDb(db: WriteDb, input: MemoryHeadCommitInput): Record<string, unknown> {
+	const agentId = input.agentId;
 	if (!/^[a-z0-9][a-z0-9-]*$/.test(agentId)) throw new Error("Invalid memory head agentId");
 	const head = db
 		.prepare("SELECT revision, content, content_hash, revision_id, is_current FROM memory_md_heads WHERE agent_id=?")
 		.get(agentId) as Head | undefined;
-	if (request.action === "inspect") {
-		if (Buffer.byteLength(request.content) > 262144) throw new Error("Memory file exceeds inspection budget");
-		const generated = !request.content.trim() || isGenerated(db, request.content);
-		return {
-			generated,
-			status: generated ? (head?.is_current === 1 ? "current" : "stale") : "authored",
-			content: generated ? (head?.is_current === 1 ? head.content : null) : request.content,
-		};
-	}
-	if (request.action === "read") {
-		let publicationError: string | undefined;
-		if (head?.is_current === 1) {
-			try {
-				publish(db, root, agentId, head);
-			} catch (error) {
-				publicationError = String(error);
-			}
-		}
-		return {
-			agentId,
-			...(publicationError ? { publication: "pending", publicationError } : {}),
-			revision: head?.revision ?? 0,
-			hash: head?.content_hash ?? "",
-			revisionId: head?.revision_id ?? null,
-			content: head?.is_current === 1 ? head.content : null,
-			status: head?.is_current === 1 ? "current" : "stale",
-			entries:
-				head?.is_current === 1
-					? db
-							.prepare(
-								"SELECT entry_id, canonical_text, status FROM memory_head_entries WHERE agent_id=? AND status='active' AND last_revision=? ORDER BY entry_id",
-							)
-							.all(agentId, head.revision)
-					: [],
-		};
-	}
-	const input = request.input;
 	const pass = db
 		.prepare("SELECT status, mode, agent_id, head_base_revision FROM dreaming_passes WHERE id=?")
 		.get(input.passId) as
@@ -157,26 +171,30 @@ export function executeMemoryHead(db: WriteDb, root: string, request: MemoryHead
 		};
 	const revision = head?.revision ?? 0;
 	const currentHash = head?.content_hash ?? "";
-	if (input.baseRevision !== revision || input.baseHash !== currentHash || pass.head_base_revision !== revision)
+	if (pass.head_base_revision !== revision)
 		return {
 			ok: false,
 			code: "STALE_HEAD",
-			error: "evidence or head changed since the content pass started",
+			error: "evidence or head changed outside this content pass since it started",
 			revision,
 			hash: currentHash,
 		};
-	if (
-		input.entries.length > 200 ||
-		Buffer.byteLength(JSON.stringify(input)) > 262144 ||
-		input.entries.some((entry) => entry.support.length > 8)
-	)
-		return { ok: false, code: "INVALID_HEAD", error: "head input exceeds its bounded budget" };
-	const body = input.entries.map((entry) => `- ${entry.text.trim()}`).join("\n");
-	const safety = scanMemoryContent(body);
-	if (!body || !safety.contextEligible || countTokens(body) > 1000)
-		return { ok: false, code: "INVALID_HEAD", error: "head must be nonempty, safe, and at most 1000 tokens" };
+	const invalid = memoryHeadInputError(input);
+	if (invalid !== null) return { ok: false, ...invalid };
+	const body = renderMemoryHeadBody(input.entries);
+	if (input.entries.length === 0 && (head?.content ?? "") === "")
+		return { ok: true, code: "NOOP", revision, hash: currentHash, changed: false, changedIds: [] };
+	if (input.entries.length === 0) {
+		const carried = committedEntries(db, agentId, head?.revision_id ?? null);
+		if (carried.entries.length > 0 || carried.unverifiable)
+			return {
+				ok: false,
+				code: "INVALID_HEAD",
+				error:
+					"committed entries still have valid or unverifiable support; resubmit or replace them instead of clearing the head",
+			};
+	}
 	const contentHash = hash(body);
-	// Re-validating unchanged text after invalidation is a new publication, not a no-op.
 	if (head?.is_current === 1 && currentHash === contentHash)
 		return { ok: true, code: "NOOP", revision, hash: contentHash, changed: false, changedIds: [] };
 	const result = commitEntries(db, input, body, contentHash, revision, currentHash);
@@ -195,22 +213,153 @@ export function executeMemoryHead(db: WriteDb, root: string, request: MemoryHead
 		db.prepare(
 			"INSERT INTO memory_head_publications (agent_id, revision, revision_id, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
 		).run(agentId, revision + 1, revisionId, now);
-
-		const next = db
-			.prepare("SELECT revision, content, content_hash, revision_id, is_current FROM memory_md_heads WHERE agent_id=?")
-			.get(agentId) as Head;
-		try {
-			publish(db, root, agentId, next);
-		} catch (error) {
-			return {
-				...result,
-				ok: false,
-				code: "PUBLICATION_PENDING",
-				error: error instanceof Error ? error.message : String(error),
-			};
-		}
 	}
 	return result;
+}
+
+export function executeMemoryHead(db: WriteDb, root: string, request: MemoryHeadRequest): Record<string, unknown> {
+	if (!["read", "inspect", "commit"].includes(request.action)) throw new Error("Unsupported memory head action");
+	const agentId = request.action === "commit" ? request.input.agentId : request.agentId;
+	if (!/^[a-z0-9][a-z0-9-]*$/.test(agentId)) throw new Error("Invalid memory head agentId");
+	if (request.action === "commit") {
+		const result = commitCuratedMemoryHeadInDb(db, request.input);
+		if (result.ok === true && result.code === "COMMITTED") {
+			const next = db
+				.prepare(
+					"SELECT revision, content, content_hash, revision_id, is_current FROM memory_md_heads WHERE agent_id=?",
+				)
+				.get(agentId) as Head;
+			try {
+				publish(db, root, agentId, next);
+			} catch (error) {
+				return {
+					...result,
+					ok: false,
+					code: "PUBLICATION_PENDING",
+					error: error instanceof Error ? error.message : String(error),
+				};
+			}
+		}
+		return result;
+	}
+	const head = db
+		.prepare("SELECT revision, content, content_hash, revision_id, is_current FROM memory_md_heads WHERE agent_id=?")
+		.get(agentId) as Head | undefined;
+	if (request.action === "inspect") {
+		if (Buffer.byteLength(request.content) > 262144) throw new Error("Memory file exceeds inspection budget");
+		const generated = !request.content.trim() || isGenerated(db, request.content);
+		return {
+			generated,
+			status: generated ? (head?.is_current === 1 ? "current" : "stale") : "authored",
+			content: generated ? (head?.is_current === 1 ? head.content : null) : request.content,
+		};
+	}
+	const pass =
+		request.passId === undefined
+			? null
+			: db
+					.prepare(
+						"SELECT 1 FROM dreaming_passes WHERE id=? AND agent_id=? AND status='running' AND mode='incremental-content'",
+					)
+					.get(request.passId, agentId);
+	let publicationError: string | undefined;
+	if (head?.is_current === 1) {
+		try {
+			publish(db, root, agentId, head);
+		} catch (error) {
+			publicationError = String(error);
+		}
+	}
+	const committed = pass == null ? null : committedEntries(db, agentId, head?.revision_id ?? null).entries;
+	return {
+		agentId,
+		...(publicationError ? { publication: "pending", publicationError } : {}),
+		revision: head?.revision ?? 0,
+		hash: head?.content_hash ?? "",
+		revisionId: head?.revision_id ?? null,
+		content: head?.is_current === 1 ? head.content : null,
+		status: head?.is_current === 1 ? "current" : "stale",
+		entries:
+			head?.is_current === 1
+				? db
+						.prepare(
+							"SELECT entry_id, canonical_text, status FROM memory_head_entries WHERE agent_id=? AND status='active' AND last_revision=? ORDER BY entry_id",
+						)
+						.all(agentId, head.revision)
+				: [],
+		maxTokens: MEMORY_HEAD_MAX_TOKENS,
+		tokens: head?.is_current === 1 ? countTokens(head.content) : 0,
+		...(committed === null
+			? {}
+			: { committedEntries: committed, committedTokens: countTokens(renderMemoryHeadBody(committed)) }),
+	};
+}
+
+type Evidence = Map<string, string | null>;
+
+function committedEntries(
+	db: WriteDb,
+	agentId: string,
+	revisionId: string | null,
+	evidence: Evidence = new Map(),
+): { entries: MemoryHeadCommitInput["entries"]; unverifiable: boolean } {
+	if (revisionId === null) return { entries: [], unverifiable: false };
+	const rows = db
+		.prepare(
+			`SELECT e.entry_id AS entryId, h.canonical_text AS text, e.provenance_json AS support
+			 FROM memory_head_revisions r
+			 JOIN memory_head_revision_entries e ON e.agent_id = r.agent_id AND e.revision = r.revision AND e.operation = 'add'
+			 JOIN memory_head_entries h ON h.agent_id = e.agent_id AND h.entry_id = e.entry_id
+			 WHERE r.id = ? AND r.agent_id = ? ORDER BY e.ordinal`,
+		)
+		.all(revisionId, agentId) as Array<{ entryId: string; text: string; support: string }>;
+	const entries: MemoryHeadCommitInput["entries"][number][] = [];
+	let unverifiable = false;
+	for (const row of rows) {
+		let parsed: unknown = null;
+		try {
+			parsed = JSON.parse(row.support);
+		} catch {}
+		if (
+			!Array.isArray(parsed) ||
+			!parsed.every((item) => typeof item === "object" && item !== null && !Array.isArray(item))
+		) {
+			unverifiable = true;
+			continue;
+		}
+		const support = (parsed as Record<string, unknown>[]).filter(
+			(item) => supportError(db, agentId, row.entryId, item, evidence) === null,
+		);
+		if (support.length > 0) entries.push({ entryId: row.entryId, text: row.text, support });
+	}
+	return { entries, unverifiable };
+}
+
+function supportError(
+	db: WriteDb,
+	agentId: string,
+	entryId: string,
+	support: Record<string, unknown>,
+	evidence: Evidence,
+): { code: string; error: string } | null {
+	const sourceRef =
+		typeof support.source_ref === "string"
+			? support.source_ref
+			: typeof support.sourceRef === "string"
+				? support.sourceRef
+				: "";
+	const quote = typeof support.quote === "string" ? support.quote.trim() : "";
+	if (!quote || sourceRef.startsWith("attention:") || !/^(memory|artifact|transcript|summary):.+$/.test(sourceRef))
+		return { code: "INVALID_PROVENANCE", error: `entry ${entryId} requires scoped exact evidence` };
+	let rendered = evidence.get(sourceRef);
+	if (rendered === undefined) {
+		const source = currentSource(db, agentId, sourceRef);
+		rendered = source === null ? null : renderDreamingEvidence(source);
+		evidence.set(sourceRef, rendered);
+	}
+	if (rendered === null || !rendered.includes(quote))
+		return { code: "INVALID_PROVENANCE", error: `entry ${entryId} quote is not exact scoped evidence` };
+	return null;
 }
 
 function commitEntries(
@@ -221,30 +370,13 @@ function commitEntries(
 	revision: number,
 	currentHash: string,
 ): Record<string, unknown> {
+	const evidence: Evidence = new Map();
 	for (const entry of input.entries) {
 		if (entry.support.length === 0)
 			return { ok: false, code: "MISSING_PROVENANCE", error: `entry ${entry.entryId} has no evidence` };
 		for (const support of entry.support) {
-			const sourceRef =
-				typeof support.source_ref === "string"
-					? support.source_ref
-					: typeof support.sourceRef === "string"
-						? support.sourceRef
-						: "";
-			const quote = typeof support.quote === "string" ? support.quote.trim() : "";
-			if (!quote || sourceRef.startsWith("attention:") || !/^(memory|artifact|transcript|summary):.+$/.test(sourceRef))
-				return {
-					ok: false,
-					code: "INVALID_PROVENANCE",
-					error: `entry ${entry.entryId} requires scoped exact evidence`,
-				};
-			const source = currentSource(db, input.agentId, sourceRef);
-			if (source === null || !renderDreamingEvidence(source).includes(quote))
-				return {
-					ok: false,
-					code: "INVALID_PROVENANCE",
-					error: `entry ${entry.entryId} quote is not exact scoped evidence`,
-				};
+			const invalid = supportError(db, input.agentId, entry.entryId, support, evidence);
+			if (invalid !== null) return { ok: false, ...invalid };
 		}
 	}
 	const nextRevision = revision + 1;
@@ -277,6 +409,7 @@ function commitEntries(
 		.prepare("SELECT entry_id FROM memory_head_entries WHERE agent_id = ? AND status = 'active'")
 		.all(input.agentId) as Array<{ entry_id: string }>;
 	const retained = new Set(input.entries.map((entry) => entry.entryId));
+	let ordinal = input.entries.length;
 	for (const old of activeEntries) {
 		if (retained.has(old.entry_id)) continue;
 		db.prepare(
@@ -284,7 +417,7 @@ function commitEntries(
 		).run(nextRevision, now, input.agentId, old.entry_id);
 		db.prepare(
 			"INSERT INTO memory_head_revision_entries (agent_id, revision, entry_id, ordinal, operation, provenance_json) VALUES (?, ?, ?, ?, 'remove', '[]')",
-		).run(input.agentId, nextRevision, old.entry_id, input.entries.length);
+		).run(input.agentId, nextRevision, old.entry_id, ordinal++);
 	}
 
 	return {

@@ -1,6 +1,6 @@
 {
 	"name": "@signet/opencode-plugin",
-	"version": "0.226.1",
+	"version": "0.237.17",
 	"description": "Signet runtime plugin for OpenCode — memory tools and session lifecycle hooks",
 	"type": "module",
 	"main": "dist/signet.mjs",
@@ -12,7 +12,7 @@
 		}
 	},
 	"scripts": {
-		"build": "bun build src/index.ts --outfile dist/signet.mjs --target node --minify --format esm --external better-sqlite3",
+		"build": "bun build src/index.ts --outfile dist/signet.mjs --target node --minify --format esm --external better-sqlite3 --external @napi-rs/keyring",
 		"typecheck": "tsc --noEmit",
 		"dev": "bun --watch src/index.ts"
 	},
@@ -25,7 +25,7 @@
 	"devDependencies": {
 		"@opencode-ai/plugin": "^1.18.13",
 		"@types/node": "^22.0.0",
-		"bun-types": "latest",
+		"bun-types": "1.4.2",
 		"typescript": "^5.7.0"
 	},
 	"keywords": [

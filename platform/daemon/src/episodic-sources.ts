@@ -1,37 +1,20 @@
 import type { ReadDb } from "./db-accessor";
-import { isMemoryContentContextEligible } from "./memory-content-safety";
-
-/** Immutable evidence available to Dreaming and ontology extraction. */
 export type EpisodicSourceKind = "memory" | "artifact" | "transcript" | "summary";
-
-/**
- * The sane floor for evidence timestamps. Pre-2000 values are corrupt
- * sentinels (the DOS epoch 1980 default from timestamp-stripping
- * filesystems and sync layers): a rolling `since` watermark can never reach
- * them, so a since/cursor-filtered scan must still list them or they fall
- * permanently behind the Dreaming evidence cursor with no catch-up (#1149).
- */
 export const EPISODIC_CAPTURED_AT_FLOOR = "2000-01-01T00:00:00.000Z";
-
-/** Match SQLite julianday's UTC interpretation of timezone-less timestamps. */
-export function timestampMillis(value: string): number {
+export function utcTimestampMs(value: string): number {
 	const normalized = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)
 		? `${value.replace(" ", "T")}Z`
 		: value;
-	const parsed = Date.parse(normalized);
+	return Date.parse(normalized);
+}
+export function timestampMillis(value: string): number {
+	const parsed = utcTimestampMs(value);
 	return Number.isFinite(parsed) ? parsed : 0;
 }
-
-/** A stable resume point across the merged episodic stores. */
 export interface EpisodicCursor {
 	readonly capturedAt: string;
 	readonly kind: EpisodicSourceKind | null;
 	readonly id: string;
-	/**
-	 * A character offset into the canonical rendered evidence for `kind:id`.
-	 * Present only while Dreaming is safely processing an oversized immutable
-	 * record across passes; the source row itself is never changed.
-	 */
 	readonly fragmentOffset?: number;
 }
 
@@ -42,38 +25,23 @@ export interface EpisodicSourceRecord {
 	readonly sourceKind: string;
 	readonly sourceId: string;
 	readonly sourcePath: string | null;
-	/**
-	 * The configured Signet source entry id (memory_artifacts.source_id) that
-	 * owns an artifact, when known. Purge on disconnect matches this id, so
-	 * Dreaming stamps it onto derived semantic rows instead of the episodic
-	 * node/session id in `sourceId`.
-	 */
 	readonly sourceEntryId: string | null;
-	/**
-	 * Stable content revision for the delivery frontier. Artifacts use their
-	 * source hash when available because a path may be re-indexed without a
-	 * different captured_at value; other immutable rows use capturedAt.
-	 */
 	readonly sourceRevision?: string;
 	readonly project: string | null;
 	readonly harness: string | null;
 	readonly capturedAt: string;
-	/**
-	 * Canonical structured evidence metadata (JSON string) preserved verbatim
-	 * from a structured remember save. Present on `memory`-kind records when
-	 * the caller supplied a structured payload; null otherwise. Dreaming reads
-	 * this to reason over structured entities/aspects without direct graph
-	 * writes at save time.
-	 */
 	readonly evidenceMeta: string | null;
-	/**
-	 * Whether the record is a settled, complete capture. Immutable kinds
-	 * (memory, artifact, summary) are always completed; a transcript is
-	 * completed only by the session-end marker on its own retained row. A
-	 * running session's still-growing transcript is not settled evidence: its
-	 * intermediate states may be contradicted by the session's end.
-	 */
 	readonly completed: boolean;
+}
+
+export interface EpisodicSourceCandidateRef {
+	readonly kind: Exclude<EpisodicSourceKind, "summary">;
+	readonly id: string;
+}
+
+export interface EpisodicSourceCandidateScan {
+	readonly refs: readonly EpisodicSourceCandidateRef[];
+	readonly complete: boolean;
 }
 
 export interface ReadEpisodicSourceOptions {
@@ -99,12 +67,6 @@ function cursorPredicate(
 	newerThan: string | null,
 	cursor: EpisodicCursor | null | undefined,
 ): { readonly sql: string; readonly args: readonly (string | null)[] } {
-	// Rows stamped with a corrupt pre-epoch timestamp (EPISODIC_CAPTURED_AT_FLOOR)
-	// bypass a since watermark: no rolling cutoff can ever reach them, so the
-	// first listing must still surface them or they are silently lost to
-	// scan-first ingestion (#1149). Cursor pages do NOT re-admit them — they
-	// were surfaced by the initial page, and re-admitting them on every page
-	// would freeze cursor paging on the pre-2000 block forever.
 	if (cursor) {
 		const cursorRank = cursor.kind === null ? -1 : SOURCE_KIND_RANK[cursor.kind];
 		const rank = SOURCE_KIND_RANK[kind];
@@ -148,6 +110,34 @@ function managedSourcePath(meta: string | null): string | null {
 	}
 }
 
+const ARTIFACT_IS_DREAMING_INPUT = `NOT (
+	ma.source_kind = 'manifest'
+	OR (
+		ma.source_kind = 'transcript' AND ma.session_key IS NOT NULL
+		AND EXISTS (
+			SELECT 1 FROM session_transcripts AS st
+			WHERE st.agent_id = ma.agent_id AND st.session_key = ma.session_key
+		)
+	)
+	OR (
+		ma.source_kind IN ('summary', 'compaction')
+		AND EXISTS (
+			SELECT 1 FROM session_summaries AS ss
+			WHERE ss.agent_id = ma.agent_id
+			  AND ss.depth = 0
+			  AND COALESCE(ss.source_type, 'summary') = ma.source_kind
+			  AND (
+				ss.session_key = ma.session_key
+				OR (
+					ss.session_key IS NULL AND ma.session_key IS NULL
+					AND ss.content = ma.content
+					AND julianday(ss.latest_at) = julianday(ma.captured_at)
+				)
+			  )
+		)
+	)
+)`;
+
 function tableHasColumn(db: ReadDb, table: string, column: string): boolean {
 	try {
 		const rows = db.prepare(`PRAGMA table_info(${table})`).all() as ReadonlyArray<Record<string, unknown>>;
@@ -157,16 +147,44 @@ function tableHasColumn(db: ReadDb, table: string, column: string): boolean {
 	}
 }
 
-function episodicContentIsEligible(
+export function scanEpisodicSourceCandidates(
 	db: ReadDb,
-	input: {
-		readonly sourceKind: "memory" | "artifact" | "transcript" | "summary";
-		readonly sourceId: string;
-		readonly content: string;
-		readonly agentId: string;
-	},
-): boolean {
-	return isMemoryContentContextEligible(db, input);
+	agentId: string,
+	maxCandidates: number,
+): EpisodicSourceCandidateScan {
+	if (!Number.isSafeInteger(maxCandidates) || maxCandidates < 1 || maxCandidates > 50) {
+		throw new RangeError("Episodic source candidate limit must be an integer between 1 and 50");
+	}
+	const rows = selectEpisodicSourceRefs(db, {
+		agentId,
+		query: "",
+		excludeDelivered: true,
+		limit: maxCandidates + 1,
+		order: "none",
+	});
+	const refs = rows.map((candidate): EpisodicSourceCandidateRef => {
+		if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+			throw new Error("Unexpected episodic source candidate row");
+		}
+		const kind = Reflect.get(candidate, "kind");
+		const id = Reflect.get(candidate, "id");
+		if ((kind !== "memory" && kind !== "artifact" && kind !== "transcript") || typeof id !== "string") {
+			throw new Error("Unexpected episodic source candidate row");
+		}
+		return { kind, id };
+	});
+	return { refs, complete: refs.length <= maxCandidates };
+}
+
+function candidateRefFilter(
+	refs: readonly EpisodicSourceCandidateRef[] | undefined,
+	kind: EpisodicSourceKind,
+	column: string,
+): { readonly sql: string; readonly args: readonly string[] } {
+	if (refs === undefined) return { sql: "", args: [] };
+	const ids = refs.filter((ref) => ref.kind === kind).map((ref) => ref.id);
+	if (ids.length === 0) return { sql: "AND 0", args: [] };
+	return { sql: `AND ${column} IN (${ids.map(() => "?").join(", ")})`, args: ids };
 }
 
 export function sourceIdCandidates(value: string): string[] {
@@ -218,9 +236,6 @@ export function readEpisodicMemory(db: ReadDb, agentId: string, id: string): Epi
 		  }
 		| undefined;
 	if (!row) return null;
-	if (!episodicContentIsEligible(db, { agentId, sourceKind: "memory", sourceId: row.id, content: row.content })) {
-		return null;
-	}
 	return {
 		kind: "memory",
 		id: row.id,
@@ -231,12 +246,8 @@ export function readEpisodicMemory(db: ReadDb, agentId: string, id: string): Epi
 		sourcePath: readNonEmptyTrimmed(row.source_path) ?? readNonEmptyTrimmed(row.runtime_path),
 		project: row.project,
 		harness: readNonEmptyTrimmed(row.who),
-		// Order/cursor by immutable creation (capture) time, not updated_at.
-		// Metadata edits (tags/importance/pinned) bump updated_at but must not
-		// re-submit already-processed evidence to Dreaming.
 		capturedAt: row.created_at,
 		evidenceMeta: row.evidence_meta,
-		// A memory is a point-in-time capture: always settled.
 		completed: true,
 	};
 }
@@ -279,11 +290,6 @@ export function readEpisodicArtifact(db: ReadDb, agentId: string, id: string): E
 		  }
 		| undefined;
 	if (!row) return null;
-	if (
-		!episodicContentIsEligible(db, { agentId, sourceKind: "artifact", sourceId: row.source_path, content: row.content })
-	) {
-		return null;
-	}
 	return {
 		kind: "artifact",
 		id: row.source_path,
@@ -297,7 +303,6 @@ export function readEpisodicArtifact(db: ReadDb, agentId: string, id: string): E
 		harness: row.harness,
 		capturedAt: row.captured_at ?? row.updated_at,
 		evidenceMeta: null,
-		// An artifact is a captured file snapshot: always settled.
 		completed: true,
 	};
 }
@@ -347,16 +352,6 @@ export function readEpisodicTranscript(db: ReadDb, agentId: string, id: string):
 		  }
 		| undefined;
 	if (!row) return null;
-	if (
-		!episodicContentIsEligible(db, {
-			agentId,
-			sourceKind: "transcript",
-			sourceId: row.session_key,
-			content: row.content,
-		})
-	) {
-		return null;
-	}
 	return {
 		kind: "transcript",
 		id: row.session_key,
@@ -372,9 +367,6 @@ export function readEpisodicTranscript(db: ReadDb, agentId: string, id: string):
 		harness: row.harness,
 		capturedAt: row.completed_at ?? row.updated_at ?? row.created_at,
 		evidenceMeta: null,
-		// A transcript is settled only after the session-end machinery writes
-		// its completion marker. The marker is independent of any derived
-		// summary, so a failed or retired worker cannot block ingestion.
 		completed: row.completed === 1,
 	};
 }
@@ -382,9 +374,6 @@ export function readEpisodicTranscript(db: ReadDb, agentId: string, id: string):
 export function readEpisodicSummary(db: ReadDb, agentId: string, id: string): EpisodicSourceRecord | null {
 	const ids = sourceIdCandidates(id);
 	const placeholders = ids.map(() => "?").join(", ");
-	// Compaction/checkpoint rows are first-class episodic evidence here. The
-	// Dreaming pass intentionally narrows its own LLM input to primary summaries
-	// to avoid feeding its derived rollups back into consolidation.
 	const row = db
 		.prepare(
 			`SELECT id, content, project, harness, session_key, source_type, source_ref, latest_at
@@ -409,9 +398,6 @@ export function readEpisodicSummary(db: ReadDb, agentId: string, id: string): Ep
 		  }
 		| undefined;
 	if (!row) return null;
-	if (!episodicContentIsEligible(db, { agentId, sourceKind: "summary", sourceId: row.id, content: row.content })) {
-		return null;
-	}
 	return {
 		kind: "summary",
 		id: row.id,
@@ -424,29 +410,24 @@ export function readEpisodicSummary(db: ReadDb, agentId: string, id: string): Ep
 		harness: row.harness,
 		capturedAt: row.latest_at,
 		evidenceMeta: null,
-		// A summary is the session's consolidated end state: always settled.
 		completed: true,
 	};
 }
-
-/**
- * Read evidence across all current episodic stores.
- *
- * `newerThan` is a captured-artifact watermark, not a mutation cursor: the
- * artifacts themselves remain immutable and selectable after a Dreaming pass.
- */
 export function readRecentEpisodicSources(
 	db: ReadDb,
 	agentId: string,
 	limit: number | null,
 	kinds?: readonly EpisodicSourceKind[],
 	newerThan?: string | null,
-	order: "newest" | "oldest" = "newest",
+	order: "newest" | "oldest" | "none" = "newest",
 	cursor?: EpisodicCursor | null,
+	candidateRefs?: readonly EpisodicSourceCandidateRef[],
 ): EpisodicSourceRecord[] {
 	const boundedLimit = limit === null ? -1 : Math.max(1, Math.min(Math.floor(limit), 500));
 	const newer = newerThan?.trim() || null;
 	const direction = order === "oldest" ? "ASC" : "DESC";
+	const sourceOrder = (timestamp: string, tieBreaker: string): string =>
+		order === "none" ? "" : `ORDER BY julianday(${timestamp}) ${direction}, ${tieBreaker} ${direction}`;
 	const memoryCursor = cursorPredicate("created_at", "id", "memory", newer, cursor);
 	const artifactCursor = cursorPredicate("captured_at", "source_path", "artifact", newer, cursor);
 	const transcriptHasUpdated = tableHasColumn(db, "session_transcripts", "updated_at");
@@ -466,7 +447,13 @@ export function readRecentEpisodicSources(
 	const transcriptCursor = cursorPredicate(transcriptTime, "session_key", "transcript", newer, cursor);
 	const summaryCursor = cursorPredicate("latest_at", "id", "summary", newer, cursor);
 	const allowedKinds = kinds ? new Set(kinds) : null;
-	const wants = (kind: EpisodicSourceKind): boolean => allowedKinds === null || allowedKinds.has(kind);
+	const candidateKinds =
+		candidateRefs === undefined ? null : new Set<EpisodicSourceKind>(candidateRefs.map((ref) => ref.kind));
+	const wants = (kind: EpisodicSourceKind): boolean =>
+		(allowedKinds === null || allowedKinds.has(kind)) && (candidateKinds === null || candidateKinds.has(kind));
+	const memoryCandidate = candidateRefFilter(candidateRefs, "memory", "id");
+	const artifactCandidate = candidateRefFilter(candidateRefs, "artifact", "source_path");
+	const transcriptCandidate = candidateRefFilter(candidateRefs, "transcript", "st.session_key");
 	const hasExclusions = (() => {
 		try {
 			return Boolean(
@@ -506,10 +493,11 @@ export function readRecentEpisodicSources(
 				   -- but their temporal-DAG node is the one canonical Dreaming input.
 				   AND COALESCE(type, '') != 'session_summary'
 				   AND (${memoryCursor.sql} OR ${memoryRequeue})
-				 ORDER BY julianday(created_at) ${direction}, id ${direction}
+				   ${memoryCandidate.sql}
+				 ${sourceOrder("created_at", "id")}
 				 LIMIT ?`,
 				)
-				.all(agentId, ...memoryCursor.args, ...requeueArgs, boundedLimit)
+				.all(agentId, ...memoryCursor.args, ...requeueArgs, ...memoryCandidate.args, boundedLimit)
 				.map((row) => {
 					const memory = row as {
 						readonly id: string;
@@ -546,41 +534,13 @@ export function readRecentEpisodicSources(
 			        project, harness, content, captured_at, updated_at
 			 FROM memory_artifacts AS ma
 			 WHERE ma.agent_id = ? AND COALESCE(ma.is_deleted, 0) = 0
-			   -- Canonical session artifacts preserve immutable lineage. When their
-			   -- matching temporal node is present, it is the single Dreaming input;
-			   -- otherwise keep the artifact as the durable recovery fallback.
-			   AND NOT (
-			     ma.source_kind = 'manifest'
-			     OR (
-			       ma.source_kind = 'transcript' AND ma.session_key IS NOT NULL
-			       AND EXISTS (
-			         SELECT 1 FROM session_transcripts AS st
-			         WHERE st.agent_id = ma.agent_id AND st.session_key = ma.session_key
-			       )
-			     )
-			     OR (
-			       ma.source_kind IN ('summary', 'compaction')
-			       AND EXISTS (
-			         SELECT 1 FROM session_summaries AS ss
-			         WHERE ss.agent_id = ma.agent_id
-			           AND ss.depth = 0
-			           AND COALESCE(ss.source_type, 'summary') = ma.source_kind
-			           AND (
-			             ss.session_key = ma.session_key
-			             OR (
-			               ss.session_key IS NULL AND ma.session_key IS NULL
-			               AND ss.content = ma.content
-			               AND julianday(ss.latest_at) = julianday(ma.captured_at)
-			             )
-			           )
-			       )
-			     )
-			   )
-				   AND (${artifactCursor.sql} OR ${artifactRequeue})
-			 ORDER BY julianday(captured_at) ${direction}, source_path ${direction}
-			 LIMIT ?`,
+			   AND ${ARTIFACT_IS_DREAMING_INPUT}
+			   AND (${artifactCursor.sql} OR ${artifactRequeue})
+			   ${artifactCandidate.sql}
+			   ${sourceOrder("captured_at", "source_path")}
+			   LIMIT ?`,
 				)
-				.all(agentId, ...artifactCursor.args, ...requeueArgs, boundedLimit)
+				.all(agentId, ...artifactCursor.args, ...requeueArgs, ...artifactCandidate.args, boundedLimit)
 				.map((row) => {
 					const artifact = row as {
 						readonly source_path: string;
@@ -626,10 +586,11 @@ export function readRecentEpisodicSources(
 				 WHERE st.agent_id = ?
 				   AND ${transcriptCompleted}
 				   AND (${transcriptCursor.sql} OR ${transcriptRequeue})
-				 ORDER BY julianday(${transcriptTime}) ${direction}, st.session_key ${direction}
+				   ${transcriptCandidate.sql}
+				 ${sourceOrder(transcriptTime, "st.session_key")}
 				 LIMIT ?`,
 				)
-				.all(agentId, ...transcriptCursor.args, ...requeueArgs, boundedLimit)
+				.all(agentId, ...transcriptCursor.args, ...requeueArgs, ...transcriptCandidate.args, boundedLimit)
 				.map((row) => {
 					const transcript = row as {
 						readonly session_key: string;
@@ -675,7 +636,7 @@ export function readRecentEpisodicSources(
 			   AND depth = 0
 			   AND COALESCE(source_type, 'summary') IN ('summary', 'compaction', 'checkpoint')
 			   AND (${summaryCursor.sql} OR ${summaryRequeue})
-			 ORDER BY julianday(latest_at) ${direction}, id ${direction}
+			 ${sourceOrder("latest_at", "id")}
 			 LIMIT ?`,
 				)
 				.all(agentId, ...summaryCursor.args, ...requeueArgs, boundedLimit)
@@ -706,20 +667,10 @@ export function readRecentEpisodicSources(
 					} satisfies EpisodicSourceRecord;
 				})
 		: [];
-	return [...memories, ...artifacts, ...transcripts, ...summaries]
-		.filter((source) =>
-			episodicContentIsEligible(db, {
-				agentId,
-				sourceKind: source.kind,
-				sourceId: source.id,
-				content: source.content,
-			}),
-		)
-		.sort((a, b) => compareEpisodicSources(a, b, order))
-		.slice(0, boundedLimit < 0 ? undefined : boundedLimit);
+	const sources = [...memories, ...artifacts, ...transcripts, ...summaries];
+	if (order !== "none") sources.sort((a, b) => compareEpisodicSources(a, b, order));
+	return sources.slice(0, boundedLimit < 0 ? undefined : boundedLimit);
 }
-
-/** Resolve one episodic record without falling back to semantic memory. */
 export function readEpisodicSource(db: ReadDb, options: ReadEpisodicSourceOptions): EpisodicSourceRecord | null {
 	const from = options.from.trim();
 	if (!from) return null;
@@ -740,13 +691,6 @@ export function readEpisodicSource(db: ReadDb, options: ReadEpisodicSourceOption
 		readEpisodicSummary(db, options.agentId, from)
 	);
 }
-
-/**
- * Resolve a canonical immutable source_ref for a proposal write. Unlike the
- * permissive reader above, this accepts only one explicit episodic kind and
- * never guesses across stores. Callers can therefore reject a fabricated or
- * cross-agent reference before persisting derived-memory provenance.
- */
 export function resolveStrictEpisodicSourceRef(
 	db: ReadDb,
 	params: { readonly agentId: string; readonly sourceRef: unknown },
@@ -769,8 +713,6 @@ export function resolveStrictEpisodicSourceRef(
 	}
 	return { status: "not_found", sourceRef: canonicalRef };
 }
-
-/** Find scopes that own a resolvable source without exposing their contents. */
 export function findEpisodicSourceAgentIds(db: ReadDb, from: string): readonly string[] {
 	const trimmed = from.trim();
 	const colon = trimmed.indexOf(":");
@@ -833,45 +775,63 @@ export function findEpisodicSourceAgentIds(db: ReadDb, from: string): readonly s
 	return [...new Set(rows.map((row) => row.agent_id).filter((agentId): agentId is string => Boolean(agentId)))].sort();
 }
 
-/**
- * Search immutable episodic evidence without falling back to semantic memory.
- *
- * This belongs beside the canonical cross-store reader so every Dreaming
- * caller uses the same provenance, deletion, and source-native boundaries.
- * It deliberately returns complete source records. Ordinary callers bound the
- * number of matches, while aggregate metrics may request the complete set;
- * neither path truncates the evidence a model may cite.
- */
-export function searchEpisodicSources(
+const MAX_QUERY_TERMS = 8;
+
+export function foldAsciiCase(value: string): string {
+	return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+export function episodicQueryTerms(query: string): readonly string[] {
+	const raw = query.split(/\s+/).filter((token) => token.length > 0);
+	const worded = raw.filter((token) => /[\p{L}\p{N}]/u.test(token));
+	const significant = worded
+		.map((token) => token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""))
+		.filter((token) => token.length >= 3);
+	const terms = significant.length > 0 ? significant : worded.length > 0 ? worded : raw;
+	const seen = new Set<string>();
+	return terms
+		.filter((term) => {
+			const key = foldAsciiCase(term);
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		})
+		.slice(0, MAX_QUERY_TERMS);
+}
+
+interface EpisodicSourceSearchParams {
+	readonly agentId: string;
+	readonly query: string;
+	readonly since?: string;
+	readonly before?: string;
+	readonly kind?: "memory" | "artifact" | "transcript" | "summary";
+	readonly excludeDelivered?: boolean;
+	readonly excludeSourceRefs?: readonly string[];
+	readonly limit?: number | null;
+	readonly order?: "newest" | "none";
+	readonly candidateRefs?: readonly EpisodicSourceCandidateRef[];
+}
+
+export function searchEpisodicSources(db: ReadDb, params: EpisodicSourceSearchParams): EpisodicSourceRecord[] {
+	return selectEpisodicSourceRefs(db, params)
+		.map((row) => readEpisodicSource(db, { agentId: params.agentId, from: `${row.kind}:${row.id}` }))
+		.filter((source): source is EpisodicSourceRecord => source !== null);
+}
+
+function selectEpisodicSourceRefs(
 	db: ReadDb,
-	params: {
-		readonly agentId: string;
-		readonly query: string;
-		readonly since?: string;
-		readonly before?: string;
-		readonly kind?: "memory" | "artifact" | "transcript" | "summary";
-		/** Scan-first delivery drains only records whose current revision is not complete. */
-		readonly excludeDelivered?: boolean;
-		/** `null` requests the complete matching set instead of a bounded page. */
-		readonly limit?: number | null;
-	},
-): EpisodicSourceRecord[] {
+	params: EpisodicSourceSearchParams,
+): Array<{ readonly kind: EpisodicSourceKind; readonly id: string }> {
 	const query = params.query.trim();
 	const limit = params.limit === null ? null : Math.max(1, Math.min(Math.floor(params.limit ?? 20), 51));
-	// Scheduled backlog probes request one lookahead row to distinguish a
-	// complete full page from a truncated one.
-	// The empty arm avoids LIKE overflow; artifact placeholders remain excluded
-	// by the length predicate below.
-	const contentPredicate = (column: string): string => `((? = '' AND ${column} IS NOT NULL) OR ${column} LIKE ?)`;
-	const contentArgs: unknown[] = [query, `%${query}%`];
-	// Both the `since` and `before` bounds compare via julianday(): the
-	// watermark can now be ISO (`...T11:00:00.000Z` from an artifact) while
-	// rows use SQLite space format (`... 11:00:00`), and a raw string
-	// comparison would lexically misorder the two (0x20 < 0x54), silently
-	// dropping space-format rows captured after an ISO watermark (#1149).
-	// A `since` cutoff also re-lists corrupt pre-epoch rows: no watermark can
-	// reach them, so they must stay listable or they are lost to ingestion
-	// forever.
+	const terms = query === "" ? [] : episodicQueryTerms(query);
+	const matchScore = (column: string): string =>
+		query === ""
+			? `(${column} IS NOT NULL)`
+			: terms.length === 0
+				? "0"
+				: `(${terms.map(() => `(${column} LIKE ? ESCAPE '\\')`).join(" + ")})`;
+	const contentArgs: unknown[] = terms.map((term) => `%${term.replace(/[\\%_]/g, "\\$&")}%`);
 	const sinceArgs: unknown[] = params.since !== undefined ? [params.since, EPISODIC_CAPTURED_AT_FLOOR] : [];
 	const beforeArgs: unknown[] = params.before !== undefined ? [params.before] : [];
 	const deliveredFilterEnabled =
@@ -923,34 +883,64 @@ export function searchEpisodicSources(
 		: transcriptHasUpdatedAt
 			? "COALESCE(session_transcripts.updated_at, session_transcripts.created_at)"
 			: "session_transcripts.created_at";
+	const transcriptEntryId = tableHasColumn(db, "session_transcripts", "source_id")
+		? "COALESCE(session_transcripts.source_id, '')"
+		: "''";
+	const transcriptRevision =
+		transcriptEntryId === "''"
+			? transcriptSearchTime
+			: `CASE WHEN ${transcriptEntryId} = '' THEN ${transcriptSearchTime} ELSE ${
+					tableHasColumn(db, "session_transcripts", "content_hash")
+						? `COALESCE(session_transcripts.content_hash, ${transcriptSearchTime})`
+						: transcriptSearchTime
+				} END`;
 	const transcriptCompleted = transcriptHasCompletedAt ? "session_transcripts.completed_at IS NOT NULL" : "0";
-	const commonArgs = [params.agentId, ...contentArgs, ...sinceArgs, ...beforeArgs, ...deliveredArgs, ...reviewedArgs];
+	const commonArgs = [...contentArgs, params.agentId, ...sinceArgs, ...beforeArgs, ...deliveredArgs, ...reviewedArgs];
+	const candidateKinds =
+		params.candidateRefs === undefined
+			? null
+			: new Set<EpisodicSourceKind>(params.candidateRefs.map((ref) => ref.kind));
+	const wants = (kind: EpisodicSourceKind): boolean =>
+		(kind === "summary" ? params.kind === "summary" : params.kind === undefined || params.kind === kind) &&
+		(candidateKinds === null || candidateKinds.has(kind));
+	const memoryCandidate = candidateRefFilter(params.candidateRefs, "memory", "id");
+	const artifactCandidate = candidateRefFilter(params.candidateRefs, "artifact", "ma.source_path");
+	const transcriptCandidate = candidateRefFilter(params.candidateRefs, "transcript", "session_key");
+	const summaryCandidate = candidateRefFilter(params.candidateRefs, "summary", "id");
+	const excluded = params.excludeSourceRefs ?? [];
+	const excludeRefs = (kind: EpisodicSourceKind, id: string): { readonly sql: string; readonly args: unknown[] } =>
+		excluded.length === 0
+			? { sql: "", args: [] }
+			: { sql: `AND ('${kind}:' || ${id}) NOT IN (SELECT value FROM json_each(?))`, args: [JSON.stringify(excluded)] };
+	const memoryExcluded = excludeRefs("memory", "id");
+	const artifactExcluded = excludeRefs("artifact", "ma.source_path");
+	const transcriptExcluded = excludeRefs("transcript", "session_key");
+	const summaryExcluded = excludeRefs("summary", "id");
 
 	const branches: Array<{ sql: string; args: unknown[] }> = [];
-	if (params.kind === undefined || params.kind === "memory") {
+	if (wants("memory")) {
 		branches.push({
-			sql: `SELECT 'memory' AS kind, id, created_at AS captured_at
+			sql: `SELECT 'memory' AS kind, id, created_at AS captured_at, ${matchScore("content")} AS match_score
 			      FROM memories
 			      WHERE agent_id = ? AND memory_kind = 'episodic'
 			        AND COALESCE(is_deleted, 0) = 0 AND visibility != 'archived' AND scope IS NULL
-			        AND COALESCE(type, '') != 'session_summary' AND ${contentPredicate("content")}
+			        AND COALESCE(type, '') != 'session_summary'
 			        ${params.since ? "AND (julianday(created_at) >= julianday(?) OR julianday(created_at) < julianday(?))" : ""}
 			        ${params.before ? "AND julianday(created_at) <= julianday(?)" : ""}
 			        ${deliveredPredicate("memory", "id", "created_at", "''", "created_at")}
-			        ${reviewedPredicate("memory", "id", "created_at", "''", "created_at")}`,
-			args: commonArgs,
+			        ${reviewedPredicate("memory", "id", "created_at", "''", "created_at")}
+			        ${memoryCandidate.sql}
+			        ${memoryExcluded.sql}`,
+			args: [...commonArgs, ...memoryCandidate.args, ...memoryExcluded.args],
 		});
 	}
-	if (params.kind === undefined || params.kind === "artifact") {
+	if (wants("artifact")) {
 		branches.push({
-			// Artifacts are deduped by content hash within their configured source:
-			// content-identical paths in one source collapse to one canonical row,
-			// but independently imported sources must each retain their own durable
-			// delivery frontier. Empty placeholder artifacts are excluded entirely.
-			sql: `SELECT 'artifact' AS kind, ma.source_path AS id, ma.captured_at AS captured_at
+			sql: `SELECT 'artifact' AS kind, ma.source_path AS id, ma.captured_at AS captured_at, ${matchScore("ma.content")} AS match_score
 			      FROM memory_artifacts ma
 			      WHERE ma.agent_id = ? AND COALESCE(ma.is_deleted, 0) = 0
-			        AND length(ma.content) > 0 AND ${contentPredicate("ma.content")}
+			        AND length(ma.content) > 0
+			        AND ${ARTIFACT_IS_DREAMING_INPUT}
 			        ${params.since ? "AND (julianday(ma.captured_at) >= julianday(?) OR julianday(ma.captured_at) < julianday(?))" : ""}
 			        ${params.before ? "AND julianday(ma.captured_at) <= julianday(?)" : ""}
 			        ${deliveredPredicate("artifact", "ma.source_path", "ma.captured_at", "COALESCE(ma.source_id, '')", "CASE WHEN ma.source_sha256 IS NULL OR ma.source_sha256 = '' THEN ma.captured_at ELSE ma.source_sha256 END")}
@@ -963,52 +953,60 @@ export function searchEpisodicSources(
 			                 AND COALESCE(ma2.source_id, '') = COALESCE(ma.source_id, '')
 			               ORDER BY ma2.captured_at DESC, ma2.source_path ASC
 			               LIMIT 1
-			             ))`,
-			args: commonArgs,
+			             ))
+			        ${artifactCandidate.sql}
+			        ${artifactExcluded.sql}`,
+			args: [...commonArgs, ...artifactCandidate.args, ...artifactExcluded.args],
 		});
 	}
-	if (params.kind === undefined || params.kind === "transcript") {
+	if (wants("transcript")) {
 		branches.push({
-			sql: `SELECT 'transcript' AS kind, session_key AS id, ${transcriptSearchTime} AS captured_at
+			sql: `SELECT 'transcript' AS kind, session_key AS id, ${transcriptSearchTime} AS captured_at,
+			             ${matchScore("session_transcripts.content")} AS match_score
 			      FROM session_transcripts
-			      WHERE agent_id = ? AND ${transcriptCompleted} AND ${contentPredicate("session_transcripts.content")}
+			      WHERE agent_id = ? AND ${transcriptCompleted}
 			        ${params.since ? `AND (julianday(${transcriptSearchTime}) >= julianday(?) OR julianday(${transcriptSearchTime}) < julianday(?))` : ""}
 			        ${params.before ? `AND julianday(${transcriptSearchTime}) <= julianday(?)` : ""}
-			        ${deliveredPredicate("transcript", "session_key", transcriptSearchTime, "''", transcriptSearchTime)}
-			        ${reviewedPredicate("transcript", "session_key", transcriptSearchTime, "''", transcriptSearchTime)}`,
-			args: commonArgs,
+			        ${deliveredPredicate("transcript", "session_key", transcriptSearchTime, transcriptEntryId, transcriptRevision)}
+			        ${reviewedPredicate("transcript", "session_key", transcriptSearchTime, transcriptEntryId, transcriptRevision)}
+			        ${transcriptCandidate.sql}
+			        ${transcriptExcluded.sql}`,
+			args: [...commonArgs, ...transcriptCandidate.args, ...transcriptExcluded.args],
 		});
 	}
-	if (params.kind === "summary") {
+	if (wants("summary")) {
 		branches.push({
-			sql: `SELECT 'summary' AS kind, id, latest_at AS captured_at
+			sql: `SELECT 'summary' AS kind, id, latest_at AS captured_at, ${matchScore("content")} AS match_score
 			      FROM session_summaries
 			      WHERE agent_id = ? AND depth = 0
 			        AND COALESCE(source_type, 'summary') IN ('summary', 'compaction', 'checkpoint')
-			        AND ${contentPredicate("content")}
 			        ${params.since ? "AND (julianday(latest_at) >= julianday(?) OR julianday(latest_at) < julianday(?))" : ""}
 			        ${params.before ? "AND julianday(latest_at) <= julianday(?)" : ""}
 			        ${deliveredPredicate("summary", "id", "latest_at", "''", "latest_at")}
-			        ${reviewedPredicate("summary", "id", "latest_at", "''", "latest_at")}`,
-			args: commonArgs,
+			        ${reviewedPredicate("summary", "id", "latest_at", "''", "latest_at")}
+			        ${summaryCandidate.sql}
+			        ${summaryExcluded.sql}`,
+			args: [...commonArgs, ...summaryCandidate.args, ...summaryExcluded.args],
 		});
 	}
 
+	if (branches.length === 0) return [];
 	const union = branches.map((branch) => branch.sql).join("\nUNION ALL\n");
+	const orderBy =
+		params.order === "none" ? "" : "ORDER BY match_score DESC, julianday(captured_at) DESC, kind ASC, id ASC";
 	const rows = db
 		.prepare(
 			`SELECT kind, id
 			 FROM (
 			 ${union}
 			 )
-			 ORDER BY julianday(captured_at) DESC, kind ASC, id ASC
+			 WHERE match_score > 0
+			 ${orderBy}
 			 LIMIT ${limit === null ? -1 : "?"}`,
 		)
 		.all(...branches.flatMap((branch) => branch.args), ...(limit === null ? [] : [limit])) as Array<{
 		kind: EpisodicSourceKind;
 		id: string;
 	}>;
-	return rows
-		.map((row) => readEpisodicSource(db, { agentId: params.agentId, from: `${row.kind}:${row.id}` }))
-		.filter((source): source is EpisodicSourceRecord => source !== null);
+	return rows;
 }

@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { EXTERNAL_NODE } from "../platform/daemon/build-externals";
+import { NATIVE_BINARY_MAX_BYTES, NATIVE_DAEMON_JS_MAX_BYTES } from "../platform/daemon/src/native-release-limits";
 
 import {
 	collectManifestIssues,
@@ -76,6 +78,18 @@ describe("check-publish-manifests", () => {
 
 		expect(daemonBuild).toContain('const forceNodeBuild = process.env.FORCE_NODE_BUILD === "1";');
 		expect(daemonBuild).toContain('const isBun = typeof Bun !== "undefined" && !forceNodeBuild;');
+		expect(daemonBuild).toContain("external: EXTERNAL_NODE,");
+		expect(EXTERNAL_NODE).toContain("bun:ffi");
+	});
+
+	test("keeps daemon tokenizer assets stable and native keyring external in Node builds", () => {
+		const root = join(import.meta.dir, "..");
+		const daemonBuild = readFileSync(join(root, "platform", "daemon", "build.ts"), "utf-8");
+
+		expect(daemonBuild).toContain('asset: "dist/[name].[ext]"');
+		expect(daemonBuild).toContain('assetNames: "[name]"');
+		expect(daemonBuild).toContain("external: EXTERNAL_NODE,");
+		expect(EXTERNAL_NODE).toContain("@napi-rs/keyring");
 	});
 
 	test("keeps runtime split SQLite loader ESM-safe", () => {
@@ -103,6 +117,8 @@ describe("check-publish-manifests", () => {
 		expect(buildScript).toContain("bun");
 		expect(buildScript).toContain("build");
 		expect(buildScript).toContain("--compile");
+		expect(buildScript).toContain("nativeBinaryNames");
+		expect(buildScript).toContain("rmSync(join(outDir, name), { force: true })");
 		expect(buildScript).toContain("bun-linux-arm64");
 		expect(buildScript).toContain('createRequire(join(root, "platform", "daemon", "package.json"))');
 		expect(buildScript).toContain("surfaces/cli/src/cli.ts");
@@ -203,9 +219,11 @@ describe("check-publish-manifests", () => {
 		expect(workflow).not.toContain("publish_npm_package dist/signetai-darwin-x64");
 		expect(workflow).not.toContain("publish_npm_package dist/signetai-darwin-arm64");
 		expect(workflow).not.toContain("publish_npm_package dist/signetai-win32-x64");
-		expect(workflow).toContain('npm dist-tag add "${package_name}@${NEW_VERSION}" next');
+		expect(workflow).toContain('scripts/advance-npm-dist-tag.sh "${package_name}" "${NEW_VERSION}" next');
+		expect(workflow).not.toContain('npm dist-tag add "${package_name}@${NEW_VERSION}" next');
 		expect(workflow).toContain("NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/.npmrc");
-		expect(workflow).toContain("npm publish --tag next --access public");
+		expect(workflow).toContain("npm publish --tag release-staging --access public");
+		expect(workflow).not.toContain("npm publish --tag next");
 		expect(workflow).toContain('gh release edit "v${NEW_VERSION}" --draft=false');
 		expect(workflow).toContain('bun scripts/stage-npm-publish.ts "${RUNNER_TEMP}/signet-npm-publish"');
 		expect(workflow).toContain('STAGED_NPM_ROOT="${RUNNER_TEMP}/signet-npm-publish"');
@@ -213,6 +231,7 @@ describe("check-publish-manifests", () => {
 		expect(workflow).toContain('publish_npm_package "${STAGED_NPM_ROOT}/connector-gemini"');
 		expect(workflow).toContain('publish_npm_package "${STAGED_NPM_ROOT}/connector-hermes-agent"');
 		expect(workflow).toContain('publish_npm_package "${STAGED_NPM_ROOT}/connector-kimi"');
+		expect(workflow).toContain('publish_npm_package "${STAGED_NPM_ROOT}/connector-muse-code"');
 		expect(workflow).toContain('publish_npm_package "${STAGED_NPM_ROOT}/connector-oh-my-pi"');
 		expect(workflow).toContain('publish_npm_package "${STAGED_NPM_ROOT}/connector-openclaw"');
 		expect(workflow).toContain('publish_npm_package "${STAGED_NPM_ROOT}/connector-opencode"');
@@ -235,6 +254,7 @@ describe("check-publish-manifests", () => {
 		expect(promoteWorkflow).toContain('"@signetai/connector-gemini"');
 		expect(promoteWorkflow).toContain('"@signetai/connector-hermes-agent"');
 		expect(promoteWorkflow).toContain('"@signetai/connector-kimi"');
+		expect(promoteWorkflow).toContain('"@signetai/connector-muse-code"');
 		expect(promoteWorkflow).toContain('"@signetai/connector-oh-my-pi"');
 		expect(promoteWorkflow).toContain('"@signetai/connector-openclaw"');
 		expect(promoteWorkflow).toContain('"@signetai/connector-opencode"');
@@ -307,6 +327,32 @@ describe("check-publish-manifests", () => {
 			reason:
 				"platforms must match npm wrapper support: expected darwin-arm64, darwin-x64, linux-arm64, linux-x64, win32-x64, got linux-x64",
 		});
+
+		expect(
+			collectNativeManifestIssues(
+				{
+					schemaVersion: 1,
+					version: "0.1.0",
+					assets: supportedPlatforms.map((platform) => ({
+						name: platform.startsWith("win32-") ? `signet-${platform}.exe` : `signet-${platform}`,
+						platform,
+						sha256: validSha,
+						size: platform === "linux-x64" ? NATIVE_BINARY_MAX_BYTES + 1 : 1,
+					})),
+					components: { daemonJs: { url: "x.tar.gz", sha256: validSha, size: NATIVE_DAEMON_JS_MAX_BYTES + 1 } },
+				},
+				supportedPlatforms,
+			),
+		).toEqual([
+			{
+				file: "dist/native/native-manifest.json",
+				reason: `asset linux-x64 is ${NATIVE_BINARY_MAX_BYTES + 1} bytes, above the ${NATIVE_BINARY_MAX_BYTES} byte updater limit`,
+			},
+			{
+				file: "dist/native/native-manifest.json",
+				reason: `component daemonJs is ${NATIVE_DAEMON_JS_MAX_BYTES + 1} bytes, above the ${NATIVE_DAEMON_JS_MAX_BYTES} byte updater limit`,
+			},
+		]);
 	});
 
 	test("validates native release package tarball wiring", () => {
@@ -346,7 +392,7 @@ describe("check-publish-manifests", () => {
 			});
 		} finally {
 			if (oldExpect === undefined) {
-				process.env.SIGNET_EXPECT_NATIVE_OPTIONAL_DEPS = undefined;
+				delete process.env.SIGNET_EXPECT_NATIVE_OPTIONAL_DEPS;
 			} else {
 				process.env.SIGNET_EXPECT_NATIVE_OPTIONAL_DEPS = oldExpect;
 			}
@@ -377,10 +423,6 @@ describe("check-publish-manifests", () => {
 	});
 
 	test("wires the signet-mcp stdio bundle into the signetai build", () => {
-		// Guards against the dead-code pattern from PR #816: the meta-package
-		// prebuild must rebuild the stdio bundle, otherwise the npm tarball
-		// ships an empty/missing dist/mcp-stdio.js and the signet-mcp bin
-		// symlink points at nothing (issue #826).
 		const root = join(import.meta.dir, "..");
 		const wrapper = JSON.parse(readFileSync(join(root, "dist", "signetai", "package.json"), "utf-8")) as {
 			scripts?: Record<string, string>;
@@ -388,10 +430,6 @@ describe("check-publish-manifests", () => {
 		const buildScript = readFileSync(join(root, "scripts", "build-signet-mcp.ts"), "utf-8");
 
 		expect(wrapper.scripts?.prebuild).toContain("scripts/build-signet-mcp.ts");
-		// Build must target the same entry the bin ships. Asserting on the
-		// full join() call shape (rather than loose substrings) catches
-		// any drift in the path components — a TS file that just happens
-		// to mention "platform" or "mcp-stdio.ts" wouldn't satisfy these.
 		expect(buildScript).toMatch(/join\(\s*root\s*,\s*"platform"\s*,\s*"daemon"\s*,\s*"src"\s*,\s*"mcp-stdio\.ts"\s*\)/);
 		expect(buildScript).toMatch(/join\(\s*root\s*,\s*"dist"\s*,\s*"signetai"\s*,\s*"dist"\s*,\s*"mcp-stdio\.js"\s*\)/);
 	});
@@ -418,10 +456,6 @@ describe("check-publish-manifests", () => {
 		expect(manifest.files).not.toContain("native/**");
 		expect(manifest.scripts?.postinstall).toContain("scripts/install-native.js");
 		expect(manifest.bin?.signet).toBe("bin/signet.js");
-		// signet-mcp must be the self-contained stdio JSON-RPC bundle
-		// (issue #826) — the previous `bin/signet-mcp.js` shim forwarded
-		// to the native binary's management CLI, which broke the MCP
-		// handshake for every harness using the default connector config.
 		expect(manifest.bin?.["signet-mcp"]).toBe("dist/mcp-stdio.js");
 		expect(manifest.files).toContain("dist/mcp-stdio.js");
 		expect(manifest.files).not.toContain("bin/signet-mcp.js");
@@ -434,9 +468,8 @@ describe("check-publish-manifests", () => {
 		expect(nativePlatforms).toContain('"darwin-arm64"');
 		expect(nativePlatforms).toContain('"win32-x64"');
 		expect(nativePlatforms).toContain("packageName");
-		expect(installer).toContain("linkSync");
 		expect(installer).toContain("require.resolve");
-		expect(installer).toContain("Linked Signet native binary");
+		expect(installer).toContain("Installed verified Signet native binary");
 		expect(installer).toContain("native-manifest.json");
 		expect(installer).toContain("installConnectorAssets");
 		expect(installer).not.toContain("better-sqlite3");
@@ -462,6 +495,7 @@ describe("check-publish-manifests", () => {
 			["integrations/codex/connector/package.json", "@signet/connector-codex", "signet-connector-codex"],
 			["integrations/gemini/connector/package.json", "@signet/connector-gemini", "signet-connector-gemini"],
 			["integrations/kimi/connector/package.json", "@signet/connector-kimi", "signet-connector-kimi"],
+			["integrations/muse-code/connector/package.json", "@signet/connector-muse-code", "signet-connector-muse-code"],
 			[
 				"integrations/hermes-agent/connector/package.json",
 				"@signet/connector-hermes-agent",

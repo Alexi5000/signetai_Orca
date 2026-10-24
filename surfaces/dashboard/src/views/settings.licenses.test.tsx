@@ -1,30 +1,30 @@
-/** Regression coverage for #1718: the Licenses modal must stay reachable and accurately scoped. */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { DASHBOARD_LICENSES } from "@/lib/dashboard-licenses";
 import { Window } from "happy-dom";
+import { installDashboardDomGlobals } from "@/test/dom-globals";
 import { act } from "react";
 import { type Root, createRoot } from "react-dom/client";
-import { LicensesSection } from "./settings";
+import { LicensesSection } from "@/components/settings/licenses";
 
 let domWindow: Window;
+let restoreDomGlobals = () => {};
 
 beforeAll(() => {
-	(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 	domWindow = new Window();
-	for (const key of Object.getOwnPropertyNames(domWindow)) {
-		if (!(key in globalThis)) {
-			(globalThis as Record<string, unknown>)[key] = (domWindow as unknown as Record<string, unknown>)[key];
-		}
-	}
+	restoreDomGlobals = installDashboardDomGlobals(domWindow);
 });
 
 afterAll(() => {
+	restoreDomGlobals();
 	domWindow.close();
 });
 
 const EXPECTED_ATTRIBUTIONS: Record<string, { license: string; href: string }> = {
-	"@fontsource/geist": { license: "OFL-1.1", href: "https://github.com/fontsource/font-files" },
+	streamdown: { license: "Apache-2.0", href: "https://github.com/vercel/streamdown" },
+	"use-stick-to-bottom": { license: "MIT", href: "https://github.com/samdenty/use-stick-to-bottom" },
+	"lucide-react": { license: "ISC", href: "https://github.com/lucide-icons/lucide" },
 	"@fontsource/geist-mono": { license: "OFL-1.1", href: "https://github.com/fontsource/font-files" },
+	"@fontsource/schibsted-grotesk": { license: "OFL-1.1", href: "https://github.com/fontsource/font-files" },
 	"@radix-ui/react-slot": { license: "MIT", href: "https://github.com/radix-ui/primitives" },
 	"@shadcn/react": { license: "MIT", href: "https://github.com/shadcn-ui/ui" },
 	"@mingcute/react": { license: "Apache-2.0", href: "https://github.com/mingcute-design/mingcute-icons" },
@@ -36,12 +36,12 @@ const EXPECTED_ATTRIBUTIONS: Record<string, { license: string; href: string }> =
 	"react-dom": { license: "MIT", href: "https://github.com/facebook/react" },
 	sonner: { license: "MIT", href: "https://github.com/emilkowalski/sonner" },
 	"tailwind-merge": { license: "MIT", href: "https://github.com/dcastil/tailwind-merge" },
-	three: { license: "MIT", href: "https://github.com/mrdoob/three.js" },
+	"d3-force": { license: "ISC", href: "https://github.com/d3/d3-force" },
 	yaml: { license: "ISC", href: "https://github.com/eemeli/yaml" },
 	"@tailwindcss/vite": { license: "MIT", href: "https://github.com/tailwindlabs/tailwindcss" },
 	"@types/react": { license: "MIT", href: "https://github.com/DefinitelyTyped/DefinitelyTyped" },
 	"@types/react-dom": { license: "MIT", href: "https://github.com/DefinitelyTyped/DefinitelyTyped" },
-	"@types/three": { license: "MIT", href: "https://github.com/DefinitelyTyped/DefinitelyTyped" },
+	"@types/d3-force": { license: "MIT", href: "https://github.com/DefinitelyTyped/DefinitelyTyped" },
 	"@types/yaml": { license: "MIT", href: "https://github.com/eemeli/yaml" },
 	"@vitejs/plugin-react": { license: "MIT", href: "https://github.com/vitejs/vite-plugin-react" },
 	"happy-dom": { license: "MIT", href: "https://github.com/capricorn86/happy-dom" },
@@ -133,7 +133,7 @@ describe("dashboard license inventory", () => {
 	});
 });
 
-describe("dashboard Licenses modal layout", () => {
+describe("dashboard Licenses layout", () => {
 	test("keeps every card shrinkable at the failing mobile viewport widths", async () => {
 		for (const viewportWidth of [280, 320]) {
 			const mounted = await mountLicenses(viewportWidth);
@@ -142,9 +142,6 @@ describe("dashboard Licenses modal layout", () => {
 			expect(mounted.container.dataset.viewportWidth).toBe(String(viewportWidth));
 			expect(cards).toHaveLength(DASHBOARD_LICENSES.length);
 			for (const card of cards) {
-				// This is the DOM contract that lets a one-column mobile grid item
-				// shrink below its long-content min-content width. Without it, the
-				// card expands past the modal's scroll body at 280/320px.
 				expect(card.classList.contains("min-w-0")).toBe(true);
 			}
 
@@ -152,23 +149,10 @@ describe("dashboard Licenses modal layout", () => {
 		}
 	});
 
-	test("pins mobile layout, navigation, safe links, and direct-only scope", async () => {
-		const source = await Bun.file(new URL("./settings.tsx", import.meta.url)).text();
-		const licensesStart = source.indexOf("function LicensesSection()");
-		const logsStart = source.indexOf("/* ── Logs ── */", licensesStart);
-		const licensesSource = source.slice(licensesStart, logsStart);
+	test("preserves safe links and direct-only scope", async () => {
+		const licensesSource = await Bun.file(new URL("../components/settings/licenses.tsx", import.meta.url)).text();
 		const normalizedLicensesSource = licensesSource.replace(/\s+/g, " ");
 
-		expect(licensesStart).toBeGreaterThanOrEqual(0);
-		expect(logsStart).toBeGreaterThan(licensesStart);
-		expect(source).toContain("sm:max-w-[calc(100vw-48px)]");
-		expect(source).toContain("lg:max-w-[840px]");
-		expect(source).toContain("max-sm:grid max-sm:grid-cols-5");
-		expect(source).toContain("max-sm:flex-col");
-		expect(source).toContain("max-sm:whitespace-nowrap");
-		expect(source).toContain("flex min-h-0 min-w-0 flex-1 flex-col");
-		expect(source).toContain("min-h-0 flex-1 overflow-y-auto p-5 scrollbar-none");
-		expect(source).toContain('aria-current={section === n.id ? "page" : undefined}');
 		expect(licensesSource).toContain("DASHBOARD_LICENSES.map");
 		expect(licensesSource).toContain('target="_blank"');
 		expect(licensesSource).toContain('rel="noopener noreferrer"');

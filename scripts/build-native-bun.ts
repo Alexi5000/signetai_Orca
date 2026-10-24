@@ -23,12 +23,22 @@ const workerDir = join(buildDir, "workers");
 const platformKey = process.env.SIGNET_NATIVE_PLATFORM ?? `${platform()}-${arch()}`;
 const binaryName = platformKey.startsWith("win32-") ? `signet-${platformKey}.exe` : `signet-${platformKey}`;
 const outfile = join(outDir, binaryName);
+const nativeBinaryNames = [
+	"signet",
+	"signet.exe",
+	"signet-linux-x64",
+	"signet-linux-arm64",
+	"signet-darwin-x64",
+	"signet-darwin-arm64",
+	"signet-win32-x64.exe",
+] as const;
 const daemonRequire = createRequire(join(root, "platform", "daemon", "package.json"));
 const tokenizerWasmPath = daemonRequire.resolve("tiktoken/tiktoken_bg.wasm");
 const rootPackage = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version?: unknown };
 const nativeVersion = typeof rootPackage.version === "string" ? rootPackage.version : "0.0.0";
 
 mkdirSync(outDir, { recursive: true });
+for (const name of nativeBinaryNames) rmSync(join(outDir, name), { force: true });
 rmSync(buildDir, { recursive: true, force: true });
 mkdirSync(workerDir, { recursive: true });
 
@@ -50,8 +60,6 @@ function assertNoUnbundledRelativeRequires(path: string, worker: string): void {
 	for (const match of source.matchAll(pattern)) {
 		const specifier = match[1];
 		const normalized = specifier?.replaceAll("\\", "/");
-		// Bun keeps bundled CommonJS modules in an internal registry keyed by
-		// their node_modules path; those calls are not filesystem lookups.
 		if (
 			specifier !== undefined &&
 			normalized !== undefined &&
@@ -93,6 +101,7 @@ function contentTypeFor(path: string): string {
 	if (path.endsWith(".png")) return "image/png";
 	if (path.endsWith(".ico")) return "image/x-icon";
 	if (path.endsWith(".webp")) return "image/webp";
+	if (path.endsWith(".avif")) return "image/avif";
 	if (path.endsWith(".woff2")) return "font/woff2";
 	if (path.endsWith(".otf")) return "font/otf";
 	return "application/octet-stream";
@@ -134,23 +143,13 @@ const workerEntries = [
 	["native-memory-source-worker", "platform/daemon/src/native-memory-source-worker.ts"],
 	["harness-install-worker", "platform/daemon/src/harness-install-worker.ts"],
 	["harness-health-worker", "platform/daemon/src/harness-health-worker.ts"],
-	// Native ONNX embedding runs in a worker so model download / WASM compile /
-	// inference can never block the daemon's main event loop (see
-	// embedding-worker.ts). Transformers is bundled into this asset; the ONNX
-	// .wasm is embedded separately (wasmAssets) and the main thread passes the
-	// materialized wasmDir to the worker via workerData.
 	["embedding-worker", "platform/daemon/src/embedding-worker.ts"],
 	["dreaming-token-worker", "platform/daemon/src/pipeline/dreaming-token-worker.ts"],
-	// Kept in the compiled asset set so the native smoke can prove that a
-	// materialized Worker entrypoint executes in the parent process.
+	["pi-agent-worker", "platform/daemon/src/pipeline/pi-agent-worker.ts"],
 	["worker-thread-smoke", workerThreadSmokeEntry],
 ] as const;
-const nativeExternalArgs = ["--external", "better-sqlite3"] as const;
-
-// `@napi-rs/keyring` can't be require()'d by name inside a compiled binary
-// (Bun `--compile` can't trace its loader). Embed the platform `.node` file
-// as a runtime asset; cli-native.ts points SIGNET_KEYRING_NATIVE_MODULE_PATH
-// at the materialized copy before anything imports the addon.
+const nativeExternalArgs = ["--external", "better-sqlite3", "--external", "@napi-rs/keyring"] as const;
+const nativeWorkerExternalArgs = [...nativeExternalArgs, "--loader", ".wasm:base64"] as const;
 const coreRequire = createRequire(join(root, "platform", "core", "package.json"));
 const nativeAddonAssets = (() => {
 	const packagePlatformKey = platformKey.startsWith("linux-") ? `${platformKey}-gnu` : platformKey;
@@ -164,17 +163,30 @@ const nativeAddonAssets = (() => {
 		if (!existsSync(nodeFile)) {
 			throw new Error(`Required @napi-rs/keyring native asset is missing for ${platformKey}: ${nodeFile}`);
 		}
-		return [{ name: "napi-rs-keyring", contentBase64: readFileSync(nodeFile).toString("base64") }];
+		return [{ name: "napi-rs-keyring", contentBase64: readFileSync(nodeFile).toString("base64") }, sqliteVecAsset()];
 	} catch (error) {
 		throw new Error(
-			`Required @napi-rs/keyring native asset is not resolvable for ${platformKey}: ${platformPackageName} (${(error as Error).message})`,
+			`Required native asset is not resolvable for ${platformKey}: ${platformPackageName} (${(error as Error).message})`,
 		);
 	}
 })();
 
+function sqliteVecFileName(): string {
+	return platformKey.startsWith("win32-") ? "vec0.dll" : platformKey.startsWith("darwin-") ? "vec0.dylib" : "vec0.so";
+}
+
+function sqliteVecAsset(): { readonly name: string; readonly contentBase64: string } {
+	const packageName = `sqlite-vec-${platformKey.replace(/^win32-/, "windows-")}`;
+	const extension = join(dirname(coreRequire.resolve(`${packageName}/package.json`)), sqliteVecFileName());
+	if (!existsSync(extension)) {
+		throw new Error(`Required sqlite-vec extension is missing for ${platformKey}: ${extension}`);
+	}
+	return { name: "sqlite-vec", contentBase64: readFileSync(extension).toString("base64") };
+}
+
 for (const [name, entry] of workerEntries) {
 	const output = join(workerDir, `${name}.mjs`);
-	runBunBuild(["--target=bun", "--format=esm", "--outfile", output, ...nativeExternalArgs, entry]);
+	runBunBuild(["--target=bun", "--format=esm", "--outfile", output, ...nativeWorkerExternalArgs, entry]);
 	assertNoUnbundledRelativeRequires(output, name);
 }
 
@@ -223,18 +235,9 @@ const onnxRuntimeWebRequire = createRequire(onnxRuntimeWebPackageJson);
 const onnxRuntimeCommonPackageJson = onnxRuntimeWebRequire.resolve("onnxruntime-common/package.json");
 const onnxRuntimeCommonEsmPath = join(dirname(onnxRuntimeCommonPackageJson), "dist", "esm", "index.js");
 const transformersWebRuntimePath = join(transformersDir, "dist", "transformers.web.js");
-
-// Bun's compiled executable reports a Node-like environment, so Transformers.js
-// selects its native ONNX branch even though this release embeds the web/WASM
-// runtime. Patch only the generated build copy, with unique-anchor guards so a
-// dependency upgrade fails loudly instead of silently producing a broken binary.
 let patchedTransformersWebRuntimeSource = readFileSync(transformersWebRuntimePath, "utf8");
 for (const [specifier, resolved] of [
 	["onnxruntime-common", onnxRuntimeCommonEsmPath],
-	// Transformers.js 4.x imports the WebGPU entry ("onnxruntime-web/webgpu")
-	// where 3.x imported the bare "onnxruntime-web" specifier. The compiled
-	// binary runs the custom-runtime branch, so both resolve to the same
-	// embedded WASM bundle.
 	["onnxruntime-web/webgpu", onnxRuntimeWebWasmPath],
 ] as const) {
 	const externalImport = `from ${JSON.stringify(specifier)};`;
@@ -254,22 +257,10 @@ patchedTransformersWebRuntimeSource = patchedTransformersWebRuntimeSource.replac
 	customRuntimeAnchor,
 	`${customRuntimeAnchor}  // The custom-runtime branch does not populate device defaults; pin the\n  // WASM device like the web branch so inference defaults to 'wasm'.\n  supportedDevices.push('wasm');\n  defaultDevices = ['wasm'];\n`,
 );
-// Transformers.js 4.x decides the null-device default through defaultDevices
-// set per runtime branch (no device ?? ternary). The Node branch's 'cpu'
-// default must stay uniquely present so a future restructure of the
-// runtime-selection block fails loudly instead of silently changing the
-// default the custom-runtime branch overrides.
 const nodeDeviceDefault = /defaultDevices = \["cpu"\];/g;
 if ((patchedTransformersWebRuntimeSource.match(nodeDeviceDefault) ?? []).length !== 1) {
 	throw new Error("Unsupported @huggingface/transformers web runtime: Node device default changed");
 }
-// Transformers.js 4.x ALSO decides the null-device default in selectDevice
-// through a module-level DEFAULT_DEVICE const, separate from defaultDevices.
-// The compiled binary reports a Node-like environment, so without this pin
-// selectDevice(null) returns "cpu" and the patched WASM-only runtime throws
-// `Unsupported device: "cpu". Should be one of: wasm.` when the embedding
-// worker initializes a pipeline. Keep the unique-anchor guard so a future
-// restructure of this default fails loudly instead of shipping a broken binary.
 const deviceDefault = /var DEFAULT_DEVICE = apis\.IS_NODE_ENV \? "cpu" : "wasm";/g;
 if ((patchedTransformersWebRuntimeSource.match(deviceDefault) ?? []).length !== 1) {
 	throw new Error("Unsupported @huggingface/transformers web runtime: DEFAULT_DEVICE changed");
@@ -278,14 +269,6 @@ patchedTransformersWebRuntimeSource = patchedTransformersWebRuntimeSource.replac
 	deviceDefault,
 	'var DEFAULT_DEVICE = "wasm";',
 );
-// Transformers.js 4.x web build stubs node:fs/path/url as empty objects
-// (`// ignore-modules:node:fs` + `var node_fs_default = {};`), which forces
-// env.useFS=false and breaks local model loading in the compiled binary:
-// getFile() falls through to fetch() on a bare filesystem path, throwing
-// `ERR_INVALID_URL` and failing pipeline init with "Unable to get model file
-// path or buffer". The 3.8.1 web build shipped real fs modules; wire the
-// Node builtins back in so FileResponse can read the model cache from disk.
-// Unique-anchor guards keep a future stub restructure loud.
 for (const [name, specifier] of [
 	["fs", "node:fs"],
 	["path", "node:path"],
@@ -300,13 +283,6 @@ for (const [name, specifier] of [
 		`import node_${name}_default from ${JSON.stringify(specifier)};`,
 	);
 }
-// Transformers.js 4.x treats a Node-like environment as able to hand model
-// files to onnxruntime by PATH (getCoreModelFile/getModelDataFiles pass
-// return_path = apis.IS_NODE_ENV). onnxruntime-web 1.26's session glue loads
-// a string path with fetch() (1.22 read it with fs.readFileSync), so the
-// compiled binary dies with `fetch() URL is invalid` once the model downloads.
-// Force return_path=false so the model bytes are handed to the session, which
-// never touches the filesystem for the onnx input.
 for (const returnPathAnchor of [
 	"const return_path = apis.IS_NODE_ENV;",
 	"return await getModelFile(pretrained_model_name_or_path, fullPath, true, options, apis.IS_NODE_ENV);",
@@ -325,17 +301,9 @@ const wasmAssets = ["ort-wasm-simd-threaded.mjs", "ort-wasm-simd-threaded.wasm"]
 	name,
 	contentBase64: readFileSync(join(onnxRuntimeWebDir, "dist", name)).toString("base64"),
 }));
-
-// The embedding worker has an isolated globalThis (worker_threads), so the
-// main thread's globalThis[Symbol.for("onnxruntime")] registration does NOT
-// propagate. We generate a standalone runtime that the worker can import to
-// register the WASM ONNX runtime on its own globalThis before transformers
-// loads. This must be bun-bundled separately so onnxruntime-web and the
-// patched transformers.web.js are inlined (the materialized .mjs is imported
-// at runtime and cannot resolve node_modules paths in a compiled binary).
 writeFileSync(
 	join(buildDir, "embedding-worker-transformers-runtime.ts"),
-	`import * as onnxRuntime from ${JSON.stringify(onnxRuntimeWebWasmPath)};\nglobalThis[Symbol.for("onnxruntime")] = onnxRuntime.default ?? onnxRuntime;\nconst transformers = await import(${JSON.stringify(patchedTransformersWebRuntimePath)});\nexport const { env, pipeline } = transformers;\n`,
+	`import * as onnxRuntime from ${JSON.stringify(onnxRuntimeWebWasmPath)};\nglobalThis[Symbol.for("onnxruntime")] = onnxRuntime.default ?? onnxRuntime;\nconst transformers = await import(${JSON.stringify(patchedTransformersWebRuntimePath)});\nexport const { AutoModelForSequenceClassification, AutoTokenizer, env, pipeline } = transformers;\n`,
 );
 runBunBuild([
 	"--target=bun",
@@ -367,13 +335,13 @@ writeFileSync(
 	`import * as onnxRuntime from ${JSON.stringify(onnxRuntimeWebWasmPath)};
 globalThis[Symbol.for("onnxruntime")] = onnxRuntime.default ?? onnxRuntime;
 const transformers = await import(${JSON.stringify(patchedTransformersWebRuntimePath)});
-export const { env, pipeline } = transformers;
+export const { AutoModelForSequenceClassification, AutoTokenizer, env, pipeline } = transformers;
 `,
 );
 
 writeFileSync(
 	join(buildDir, "cli-native.ts"),
-	`import { materializeEmbeddedAssetTree, materializeEmbeddedNativeAddon, registerNativeAssets, registerNativeTransformersBindings } from "../platform/daemon/src/native-runtime-assets";
+	`import { materializeEmbeddedAssetTree, materializeEmbeddedNativeAddon, materializeEmbeddedNativeLibrary, registerNativeAssets, registerNativeTransformersBindings } from "../platform/daemon/src/native-runtime-assets";
 import tokenizerWasmAsset from ${JSON.stringify(tokenizerWasmPath)};
 import { handoffInspectorParent } from "../surfaces/cli/src/lib/inspector-proxy";
 import { connectorAssets, dashboardAssets, graphiqAssets, nativeAddonAssets, skillAssets, templateAssets, wasmAssets, workerAssets } from "./native-assets";
@@ -381,6 +349,7 @@ import * as transformersWebRuntime from "./transformers-web-runtime";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+process.env.SIGNET_COMPILED_NATIVE = "1";
 registerNativeAssets({ connectors: connectorAssets, dashboard: dashboardAssets, graphiq: graphiqAssets, skills: skillAssets, templates: templateAssets, workers: workerAssets, wasm: wasmAssets, nativeAddons: nativeAddonAssets });
 registerNativeTransformersBindings(transformersWebRuntime);
 process.env.SIGNET_TIKTOKEN_WASM_PATH ??= tokenizerWasmAsset;
@@ -388,6 +357,10 @@ process.env.SIGNET_VERSION = process.env.SIGNET_VERSION?.trim() || ${JSON.string
 process.env.SIGNET_TEMPLATES_DIR ??= materializeEmbeddedAssetTree("templates") ?? "";
 process.env.SIGNET_SKILLS_SOURCE ??= materializeEmbeddedAssetTree("skills") ?? "";
 process.env.SIGNET_CONNECTOR_ASSETS_DIR ??= materializeEmbeddedAssetTree("connectors") ?? "";
+if (!process.env.SIGNET_VEC_PATH?.trim()) {
+	const sqliteVecPath = materializeEmbeddedNativeLibrary("sqlite-vec", ${JSON.stringify(sqliteVecFileName())});
+	if (sqliteVecPath) process.env.SIGNET_VEC_PATH = sqliteVecPath;
+}
 if (!process.env.SIGNET_KEYRING_NATIVE_MODULE_PATH?.trim()) {
 	const keyringAddonPath = materializeEmbeddedNativeAddon("napi-rs-keyring");
 	if (keyringAddonPath) process.env.SIGNET_KEYRING_NATIVE_MODULE_PATH = keyringAddonPath;
@@ -413,7 +386,84 @@ if (!process.env.SIGNET_DIR?.trim()) {
 	}
 }
 handoffInspectorParent();
-if (process.env.SIGNET_INSPECTOR_PROXY_PUBLIC || process.env.SIGNET_INSPECTOR_PROXY_TARGET) {
+if (process.env.SIGNET_KEYRING_HELPER) {
+	const { runSecretKeyringChild } = await import("../platform/core/src/secrets-keyring-child");
+	await runSecretKeyringChild();
+} else if (process.env.SIGNET_KEYRING_HELPER_SMOKE) {
+	const { getSecretKeyring } = await import("../platform/core/src/secrets-keyring");
+	const startedAt = Date.now();
+	const keyring = getSecretKeyring("native-keyring-smoke");
+	const result = await keyring.get();
+	process.stdout.write(JSON.stringify({ type: "keyring-helper-smoke", elapsedMs: Date.now() - startedAt, result }) + "\\n");
+} else if (process.env.SIGNET_NATIVE_SOURCE_WORKER_SMOKE) {
+	const { mkdtemp, readdir, rm, writeFile } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { createNativeSourceWorker, NATIVE_SOURCE_WORKER_MAX_MESSAGE_BYTES } = await import("../platform/daemon/src/native-memory-source-worker");
+	const root = await mkdtemp(join(tmpdir(), "signet-native-source-smoke-"));
+	const worker = createNativeSourceWorker();
+	try {
+		await writeFile(join(root, "a-huge.md"), "x".repeat(NATIVE_SOURCE_WORKER_MAX_MESSAGE_BYTES));
+		await writeFile(join(root, "b-ok.md"), "ok");
+		const source = { root, files: [{ glob: "**/*.md" as const, kind: "markdown" as const }] };
+		const first = await worker.scan({ source, cursor: null, frontier: null, pageSize: 100 });
+		const second = await worker.scan({ source, cursor: first.nextCursor, frontier: first.frontier, pageSize: 100 });
+		const countFds = async (): Promise<number | null> => {
+			if (process.platform !== "linux") return null;
+			return (await readdir("/proc/self/fd")).length;
+		};
+		const baselineFds = await countFds();
+		const crashEntry = join(root, "crash-worker.mjs");
+		await writeFile(
+			crashEntry,
+			'import { parentPort } from "node:worker_threads";\\nparentPort.postMessage({ version: 1, type: "ready" });\\nparentPort.on("message", () => process.exit(17));\\n',
+		);
+		const crashing = createNativeSourceWorker({ resolveEmbeddedPath: () => crashEntry, circuitCooldownMs: 1 });
+		let failures = 0;
+		while (failures < 30) {
+			try {
+				await crashing.scan({ source, cursor: null, frontier: null, pageSize: 1 });
+			} catch (error) {
+				if (error instanceof Error && error.message.includes("circuit is open")) {
+					await Bun.sleep(2);
+					continue;
+				}
+				failures++;
+			}
+		}
+		await crashing.close();
+		const hangingEntry = join(root, "hanging-worker.mjs");
+		await writeFile(
+			hangingEntry,
+			'import { parentPort } from "node:worker_threads";\\nparentPort.postMessage({ version: 1, type: "ready" });\\nparentPort.on("message", () => {});\\n',
+		);
+		const hanging = createNativeSourceWorker({ resolveEmbeddedPath: () => hangingEntry });
+		const pending = hanging.scan({ source, cursor: null, frontier: null, pageSize: 1 });
+		await Bun.sleep(20);
+		await hanging.cancel();
+		const cancelled = await pending.then(
+			() => false,
+			(error: unknown) => error instanceof Error && error.message.includes("cancelled"),
+		);
+		await hanging.close();
+		Bun.gc(true);
+		await Bun.sleep(20);
+		const finalFds = await countFds();
+		process.stdout.write(
+			JSON.stringify({
+				type: "native-source-worker-smoke",
+				rejected: first.rejected.map((item) => item.code),
+				continued: second.files.map((file) => file.path),
+				complete: second.complete,
+				failures,
+				cancelled,
+				fdDelta: baselineFds === null || finalFds === null ? null : finalFds - baselineFds,
+			}) + "\\n",
+		);
+	} finally {
+		await worker.close();
+		await rm(root, { recursive: true, force: true });
+	}
+} else if (process.env.SIGNET_INSPECTOR_PROXY_PUBLIC || process.env.SIGNET_INSPECTOR_PROXY_TARGET) {
 	const { runInspectorProxyFromEnvironment } = await import("../surfaces/cli/src/lib/inspector-proxy");
 	await runInspectorProxyFromEnvironment();
 } else if (process.env.SIGNET_DREAMING_MCP_CONFIG_SMOKE) {
@@ -446,6 +496,8 @@ if (process.env.SIGNET_INSPECTOR_PROXY_PUBLIC || process.env.SIGNET_INSPECTOR_PR
 	} finally {
 		cache.stop();
 	}
+} else if (process.env.SIGNET_RUNTIME_VERSION_SMOKE) {
+	process.stdout.write(JSON.stringify({ type: "runtime-version", bun: Bun.version }) + "\\n");
 } else if (process.env.SIGNET_NATIVE_WORKER_THREAD_SMOKE) {
 	const { resolveEmbeddedWorkerPath } = await import("../platform/daemon/src/native-runtime-assets");
 	const workerPath = resolveEmbeddedWorkerPath("worker-thread-smoke");

@@ -6,6 +6,7 @@ import { addObsidianSource, loadSourcesConfig } from "@signet/core";
 import {
 	addDiscordSourceFromCli,
 	addGitHubSourceFromCli,
+	addNotionSourceFromCli,
 	addObsidianVaultSource,
 	exportConfiguredSourceSnapshot,
 	importConfiguredSourceSnapshot,
@@ -143,6 +144,26 @@ describe("sources CLI features", () => {
 		expect(process.exitCode).not.toBe(1);
 	});
 
+	it("adds a Notion source from CLI options", async () => {
+		await addNotionSourceFromCli({ tokenRef: "NOTION_TOKEN", name: "Notion CLI", maxPages: "40" }, { agentsDir: dir });
+
+		const [source] = loadSourcesConfig(dir).sources;
+		expect(source?.kind).toBe("notion");
+		expect(source?.providerSettings).toEqual({ tokenRef: "NOTION_TOKEN", maxPages: 40 });
+		expect(logs.join("\n")).toContain("Added Notion source: Notion CLI");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("rejects raw Notion tokens and malformed max-pages values", async () => {
+		await addNotionSourceFromCli({ tokenRef: "NOTION_TOKEN", maxPages: "40oops" }, { agentsDir: dir });
+		await addNotionSourceFromCli({ tokenRef: `ntn_${"a".repeat(46)}` }, { agentsDir: dir });
+
+		expect(errors.join("\n")).toContain("Notion max-pages must be an integer");
+		expect(errors.join("\n")).toContain("Notion tokenRef must be a secret reference, not a raw token");
+		expect(loadSourcesConfig(dir).sources).toHaveLength(0);
+		expect(process.exitCode).toBe(1);
+	});
+
 	it("rejects malformed GitHub max-items values", async () => {
 		await addGitHubSourceFromCli(
 			{
@@ -213,7 +234,7 @@ describe("sources CLI features", () => {
 				agentsDir: dir,
 				importSourceSnapshotToDaemon: async (sourceId, snapshot, options) => ({
 					ok: true,
-					imported: sourceId === "discord:source" && options.includeLocalDiscord && !!snapshot ? 3 : 0,
+					imported: sourceId === "discord:source" && options.includeLocalDiscord && snapshot ? 3 : 0,
 					skippedLocalDiscordArtifacts: 0,
 				}),
 			},

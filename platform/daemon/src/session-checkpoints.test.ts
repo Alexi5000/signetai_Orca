@@ -22,7 +22,6 @@ import {
 	pruneCheckpoints,
 	queueCheckpointWrite,
 	redactCheckpointRow,
-	redactSecrets,
 	writeCheckpoint,
 	writeCheckpointAsync,
 } from "./session-checkpoints";
@@ -43,8 +42,6 @@ function makeState(overrides: Partial<ContinuityState> = {}): ContinuityState {
 		...overrides,
 	};
 }
-
-// Minimal DbAccessor wrapping a real bun:sqlite Database
 function createTestDbAccessor(dbPath: string): DbAccessor {
 	const db = new Database(dbPath);
 	db.run("PRAGMA journal_mode = WAL");
@@ -154,7 +151,6 @@ describe("session-checkpoints", () => {
 		}
 		const rows = getCheckpointsBySession(dbAcc, "sess-1");
 		expect(rows.length).toBe(3);
-		// newest first
 		expect(rows[0].prompt_count).toBe(4);
 	});
 
@@ -165,15 +161,12 @@ describe("session-checkpoints", () => {
 		const result = getLatestCheckpoint(dbAcc, "/tmp/project", 60_000);
 		expect(result).toBeDefined();
 		expect(result?.project_normalized).toBe("/tmp/project");
-
-		// No match for different project
 		const noMatch = getLatestCheckpoint(dbAcc, "/tmp/missing", 60_000);
 		expect(noMatch).toBeUndefined();
 	});
 
 	test("getLatestCheckpoint returns undefined for expired checkpoints", () => {
 		writeCheckpoint(dbAcc, makeParams(), 50);
-		// Query with 0ms window — everything is "expired"
 		const result = getLatestCheckpoint(dbAcc, "/tmp/project", 0);
 		expect(result).toBeUndefined();
 	});
@@ -252,30 +245,6 @@ describe("session-checkpoints", () => {
 });
 
 describe("redaction", () => {
-	test("redactSecrets catches Bearer tokens", () => {
-		const input = "Using Bearer eyJhbGciOiJIUzI1NiJ9.test for auth";
-		const result = redactSecrets(input);
-		expect(result).not.toContain("eyJhbGci");
-		expect(result).toContain("[REDACTED]");
-	});
-
-	test("redactSecrets catches API key patterns", () => {
-		const input = "Set api_key=sk-1234567890abcdef in config";
-		const result = redactSecrets(input);
-		expect(result).toContain("[REDACTED]");
-	});
-
-	test("redactSecrets catches env var assignments", () => {
-		const input = "Export $OPENAI_API_KEY=sk-abc123xyz";
-		const result = redactSecrets(input);
-		expect(result).toContain("[REDACTED]");
-	});
-
-	test("redactSecrets preserves normal text", () => {
-		const input = "User prefers dark mode and vim keybindings";
-		expect(redactSecrets(input)).toBe(input);
-	});
-
 	test("redactCheckpointRow redacts digest and remembers", () => {
 		const row: CheckpointRow = {
 			id: "test-id",
@@ -284,7 +253,7 @@ describe("redaction", () => {
 			project: "/tmp/p",
 			project_normalized: "/tmp/p",
 			trigger: "periodic",
-			digest: "Used Bearer eyJtoken1234567890abcdef for API call",
+			digest: "Used Bearer eyJtoken1234567890abcdef for API call at commit 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b",
 			prompt_count: 5,
 			memory_queries: null,
 			recent_remembers: JSON.stringify(["api_key=sk-secret1234567890"]),
@@ -297,11 +266,12 @@ describe("redaction", () => {
 		};
 
 		const redacted = redactCheckpointRow(row);
-		expect(redacted.digest).not.toContain("eyJtoken");
-		expect(redacted.digest).toContain("[REDACTED]");
+		expect(redacted.digest).toBe(
+			"Used Bearer [redacted credential] for API call at commit 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b",
+		);
 		if (!redacted.recent_remembers) throw new Error("redacted remembers missing");
 		const remembers = JSON.parse(redacted.recent_remembers);
-		expect(remembers[0]).toContain("[REDACTED]");
+		expect(remembers[0]).toBe("api_key=[redacted credential]");
 	});
 });
 
@@ -317,7 +287,7 @@ describe("formatPeriodicDigest", () => {
 			lastCheckpointAt: Date.now(),
 			pendingQueries: ["typescript", "auth"],
 			pendingPromptSnippets: [],
-			startedAt: Date.now() - 600_000, // 10 min ago
+			startedAt: Date.now() - 600_000,
 			structuralSnapshot: undefined,
 		};
 
@@ -540,15 +510,11 @@ describe("debounce merge", () => {
 		await flushPendingCheckpoints();
 		const rows = getCheckpointsBySession(dbAcc, "merge-test");
 		expect(rows.length).toBe(1);
-		// Prompt counts summed
 		expect(rows[0].prompt_count).toBe(8);
-		// Digest takes latest
 		expect(rows[0].digest).toBe("second digest");
-		// Queries merged
 		if (!rows[0].memory_queries || !rows[0].recent_remembers) throw new Error("merged JSON fields missing");
 		const queries = JSON.parse(rows[0].memory_queries);
 		expect(queries).toEqual(["query-a", "query-b"]);
-		// Remembers merged
 		const remembers = JSON.parse(rows[0].recent_remembers);
 		expect(remembers).toEqual(["rem-a", "rem-b"]);
 	});

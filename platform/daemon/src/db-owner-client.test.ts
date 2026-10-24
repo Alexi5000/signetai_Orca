@@ -27,13 +27,16 @@ import {
 import { shouldRecordDbOwnerCancellation } from "./db-owner-worker";
 import { findSqliteVecExtension } from "@signet/core";
 import { closeDbAccessor, initDbAccessor } from "./db-accessor";
+import { closeDbOwnerDuringShutdown } from "./daemon-shutdown";
 import {
+	closeRegisteredDbOwnerMaintenance,
 	createDbOwnerMaintenance,
 	registerDbOwnerMaintenance,
 	runOwnerMaintenanceWithRetry,
 } from "./db-owner-maintenance";
 import { recallThroughDbOwner } from "./db-owner-recall";
-import { dbOwnerQuery, startDbOwnerWithRole } from "./db-owner-runtime";
+import { dbOwnerQuery, dbOwnerVacuumConversion, getDbOwner, startDbOwnerWithRole } from "./db-owner-runtime";
+import { MigrationControlBoundary, WorkspaceMigrationRetryableError } from "./workspace-writer-barrier";
 
 function makeDb(): { readonly directory: string; readonly path: string } {
 	const directory = mkdtempSync(join(tmpdir(), "signet-db-owner-"));
@@ -87,8 +90,11 @@ describe("DB owner client", () => {
 	let directory: string | null = null;
 
 	afterEach(async () => {
-		registerDbOwnerMaintenance(null);
-		await client?.close();
+		await closeDbOwnerDuringShutdown({
+			stopBackground: () => Promise.resolve(),
+			closeMaintenance: () => closeRegisteredDbOwnerMaintenance(),
+			closeOwner: () => client?.close() ?? Promise.resolve(),
+		});
 		client = null;
 		if (directory !== null)
 			for (let attempt = 0; ; attempt++) {
@@ -128,6 +134,72 @@ describe("DB owner client", () => {
 			throw new Error(`DB owner survivor(s) detected: ${survivors.join(", ")}`);
 		}
 	}
+
+	test("closes the owner during maintenance drain without waiting for the job deadline", async () => {
+		if (process.platform === "win32") return;
+		const database = makeDb();
+		directory = database.directory;
+		const activeFile = join(database.directory, "vacuum-active");
+		const previousPause = process.env.SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS;
+		const previousActiveFile = process.env.SIGNET_TEST_DB_OWNER_VACUUM_ACTIVE_FILE;
+		let restoreEnvironment = (): void => {};
+		try {
+			process.env.SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS = "60000";
+			process.env.SIGNET_TEST_DB_OWNER_VACUUM_ACTIVE_FILE = activeFile;
+			restoreEnvironment = (): void => {
+				if (previousPause === undefined) Reflect.deleteProperty(process.env, "SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS");
+				else process.env.SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS = previousPause;
+				if (previousActiveFile === undefined)
+					Reflect.deleteProperty(process.env, "SIGNET_TEST_DB_OWNER_VACUUM_ACTIVE_FILE");
+				else process.env.SIGNET_TEST_DB_OWNER_VACUUM_ACTIVE_FILE = previousActiveFile;
+			};
+			client = createDbOwnerClient({ dbPath: database.path });
+			const ownerClient = client;
+			await ownerClient.start();
+			const ownerPid = ownerClient.health().pid;
+			if (ownerPid === null) throw new Error("DB owner did not publish its pid");
+			registerDbOwnerMaintenance(createDbOwnerMaintenance({ dbPath: database.path, owner: ownerClient }));
+
+			const owner = await getDbOwner(database.path);
+			const vacuum = dbOwnerVacuumConversion(owner, { deadlineMs: 60_000 });
+			const vacuumOutcome = vacuum.then(
+				(value) => ({ status: "completed" as const, value }),
+				(error: unknown) => ({ status: "rejected" as const, error }),
+			);
+			await waitFor(() => existsSync(activeFile));
+
+			const closingStartedAt = Date.now();
+			await closeDbOwnerDuringShutdown({
+				stopBackground: () => Promise.resolve(),
+				closeMaintenance: () => closeRegisteredDbOwnerMaintenance(),
+				closeOwner: () => ownerClient.close(),
+			});
+			expect(Date.now() - closingStartedAt).toBeLessThan(5_000);
+			expect(ownerClient.health().state).toBe("closed");
+			assertNoSurvivors(new Set([ownerPid]));
+			const outcome = await vacuumOutcome;
+			expect(outcome.status).toBe("rejected");
+			if (outcome.status === "rejected") {
+				if (!(outcome.error instanceof DbOwnerDiedError)) throw new Error("expected an unknown DB owner outcome");
+				expect(outcome.error.message).toContain("outcome may be unknown");
+			}
+
+			client = createDbOwnerClient({ dbPath: database.path });
+			await client.start();
+			const integrity = await client.submit<readonly { readonly integrity_check: string }[]>(
+				{ kind: "query", statement: { sql: "PRAGMA integrity_check", result: "all" } },
+				{ operation: "verify-owner-close-recovery", lane: "read", deadlineMs: 5_000 },
+			).result;
+			expect(integrity).toEqual([{ integrity_check: "ok" }]);
+		} finally {
+			await closeDbOwnerDuringShutdown({
+				stopBackground: () => Promise.resolve(),
+				closeMaintenance: () => closeRegisteredDbOwnerMaintenance(),
+				closeOwner: () => client?.close() ?? Promise.resolve(),
+			});
+			restoreEnvironment();
+		}
+	});
 
 	test("keeps owner IPC clean while running vector backfill slices", async () => {
 		const database = makeDb();
@@ -445,7 +517,6 @@ describe("DB owner client", () => {
 		await client.start();
 		const ownerPid = client.health().pid;
 		if (ownerPid === null) throw new Error("owner did not publish a pid");
-		// Intentionally skip client.close(): this is the leaked-survivor path.
 		client = null;
 		try {
 			const spawnedPids = new Set([ownerPid]);
@@ -1365,6 +1436,9 @@ process.stdin.on("data", (chunk) => {
 			const owner = client;
 			if (owner === null) throw new Error("owner client not created");
 			await owner.start();
+			if (previousCommitMarker === undefined)
+				Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_STARTED");
+			else process.env.SIGNET_DB_OWNER_TEST_COMMIT_STARTED = previousCommitMarker;
 			const run = runOwnerMaintenanceWithRetry<{ readonly changes: number }>(
 				owner,
 				{
@@ -1376,23 +1450,33 @@ process.stdin.on("data", (chunk) => {
 					},
 				},
 				"maintenance.non-idempotent-deadline",
-				{ deadlineMs: 100 },
+				{ deadlineMs: 1_000 },
 			);
+			const outcome = rejected(run);
 			await waitFor(() => existsSync(commitStarted));
-			expect(await rejected(run)).toBeInstanceOf(DbOwnerDeadlineError);
+			expect(await outcome).toBeInstanceOf(DbOwnerDeadlineError);
 			blocker.exec("ROLLBACK");
 			blockerReleased = true;
 			blocker.close(true);
-			const rows = await owner.submit<readonly { readonly count: number }[]>(
-				{
-					kind: "query",
-					statement: {
-						sql: "SELECT COUNT(*) AS count FROM non_idempotent_writes",
-						result: "all",
-					},
-				},
-				{ operation: "maintenance.non-idempotent-deadline-verify", lane: "read", deadlineMs: 1_000 },
-			).result;
+			const verifyUntil = Date.now() + 10_000;
+			let rows: readonly { readonly count: number }[] | undefined;
+			while (rows === undefined) {
+				try {
+					rows = await owner.submit<readonly { readonly count: number }[]>(
+						{
+							kind: "query",
+							statement: {
+								sql: "SELECT COUNT(*) AS count FROM non_idempotent_writes",
+								result: "all",
+							},
+						},
+						{ operation: "maintenance.non-idempotent-deadline-verify", lane: "read", deadlineMs: 1_000 },
+					).result;
+				} catch (error) {
+					if (!(error instanceof WorkspaceMigrationRetryableError) || Date.now() > verifyUntil) throw error;
+					await Bun.sleep(25);
+				}
+			}
 			expect(rows).toEqual([{ count: 1 }]);
 		} finally {
 			if (!blockerReleased) blocker.exec("ROLLBACK");
@@ -1638,3 +1722,39 @@ process.stdin.on("data", (chunk) => {
 		expect(await rejected(handle.result)).toMatchObject({ code: "DB_OWNER_RESULT_TOO_LARGE" });
 	});
 });
+
+test("shares the daemon migration control with DB-owner admissions", () => {
+	const database = makeDb();
+	const control = new MigrationControlBoundary("daemon-generation");
+	const owner = createDbOwnerClient({ dbPath: database.path, migrationControl: control });
+	control.beginDrain();
+	expect(() =>
+		owner.submit(
+			{ kind: "query", statement: { sql: "SELECT 1", params: [], result: "all" } },
+			{ operation: "test.write", lane: "write", deadlineMs: 1_000 },
+		),
+	).toThrow(WorkspaceMigrationRetryableError);
+	expect(control.blockers()).toEqual([]);
+});
+
+test("readonly single-row owner queries finalize before closing their connection", async () => {
+	const directory = mkdtempSync(join(tmpdir(), "signet-owner-readonly-"));
+	const path = join(directory, "memory.db");
+	const db = new Database(path);
+	db.exec("CREATE TABLE items (value TEXT); INSERT INTO items VALUES ('first'), ('second')");
+	db.close(true);
+	const owner = createDbOwnerClient({ dbPath: path });
+	try {
+		await owner.start();
+		for (let index = 0; index < 3; index++) {
+			const handle = owner.submit<{ value: string }>(
+				{ kind: "query", statement: { sql: "SELECT value FROM items", result: "get", readonly: true } },
+				{ operation: "test.readonly-single-row", lane: "read", deadlineMs: 5000 },
+			);
+			expect(await handle.result).toEqual({ value: "first" });
+		}
+	} finally {
+		await owner.close();
+		rmSync(directory, { recursive: true, force: true });
+	}
+}, 20000);

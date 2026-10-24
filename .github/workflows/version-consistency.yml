@@ -18,12 +18,12 @@ jobs:
           fetch-depth: 0
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
 
       - name: Verify bun.lock matches manifests
         shell: bash
         env:
-          # This job validates manifests and the lockfile; it does not run
-          # Electron. Avoid a network-only binary postinstall failure.
           ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
         run: bun install --frozen-lockfile
 

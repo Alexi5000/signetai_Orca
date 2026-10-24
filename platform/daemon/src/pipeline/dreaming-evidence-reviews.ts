@@ -7,6 +7,7 @@ import { enqueueDreamingAttentionInTx } from "./dreaming-attention";
 import {
 	deliveredOffsetForSource,
 	persistedEvidenceDeliveries,
+	resolveStalledEvidenceAttentionInTx,
 	verifiedDreamingEvidenceDelivery,
 } from "./dreaming-evidence-consumption";
 import { renderDreamingEvidence } from "./dreaming-evidence";
@@ -55,8 +56,6 @@ function tableExists(db: ReadDb): boolean {
 		db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get("dreaming_evidence_reviews") != null
 	);
 }
-
-/** Parse the explicit terminal disposition from a persisted runbook. */
 export function parseDreamingReviewedExcludedEvidence(
 	value: unknown,
 ): readonly DreamingReviewedExcludedEvidenceEntry[] | null {
@@ -111,8 +110,6 @@ function wasFullyDelivered(
 	}
 	return matches.length > 0 && offset >= length;
 }
-
-/** Persist only terminal decisions for complete, current source revisions. */
 export function recordDreamingReviewedExcludedEvidenceInTx(
 	db: WriteDb,
 	params: {
@@ -134,6 +131,8 @@ export function recordDreamingReviewedExcludedEvidenceInTx(
 		   pass_id = excluded.pass_id,
 		   reviewed_at = excluded.reviewed_at`,
 	);
+	const attention =
+		db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dreaming_attention'").get() != null;
 	const seen = new Set<string>();
 	let recorded = 0;
 	for (const entry of params.entries) {
@@ -177,6 +176,7 @@ export function recordDreamingReviewedExcludedEvidenceInTx(
 			entry.reason,
 			params.passId,
 		);
+		if (attention) resolveStalledEvidenceAttentionInTx(db, params.passId, agentId, `${source.kind}:${source.id}`);
 		recorded += 1;
 	}
 	return recorded;
@@ -207,8 +207,6 @@ export async function getDreamingReviewedEvidence(
 		{ operation: "dreaming.evidence-reviews-read", workloadClass: "foreground" },
 	);
 }
-
-/** Re-open every reviewed revision for this source and enqueue a normal review. */
 export async function requestDreamingReviewedEvidenceRequeue(
 	accessor: DbAccessor,
 	agentId: string,
@@ -235,6 +233,6 @@ export async function requestDreamingReviewedEvidenceRequeue(
 			});
 			return true;
 		},
-		{ siteToken: "pipeline/dreaming-evidence-reviews.ts:180" },
+		{ siteToken: "pipeline/dreaming-evidence-reviews.ts:236" },
 	);
 }

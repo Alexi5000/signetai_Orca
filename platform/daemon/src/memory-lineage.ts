@@ -5,9 +5,10 @@ import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "nod
 import { basename, join } from "node:path";
 import {
 	type LlmProvider,
-	MEMORY_CONTENT_WITHHELD_NOTICE,
+	currentArtifactRelativePath,
+	redactCredentials,
 	resolveDefaultBasePath,
-	scanMemoryContent,
+	resolveWorkspaceLayout,
 } from "@signet/core";
 import { getAgentScope } from "./agent-id";
 import { yieldEvery } from "./async-yield";
@@ -23,7 +24,6 @@ import {
 } from "./db-owner-runtime";
 import { EPISODIC_CAPTURED_AT_FLOOR, timestampMillis } from "./episodic-sources";
 import { logger } from "./logger";
-import { isMemoryContentContextEligible, upsertMemoryContentSafetyInTx } from "./memory-content-safety";
 import { MEMORY_HEAD_MAX_TOKENS } from "./memory-head";
 import { buildAgentScopeClause } from "./memory-search";
 import { NATIVE_MEMORY_BRIDGE_SOURCE_NODE_ID } from "./native-memory-constants";
@@ -39,7 +39,11 @@ function getAgentsDir(): string {
 }
 
 function getMemoryDir(): string {
-	return join(getAgentsDir(), "memory");
+	return resolveWorkspaceLayout(getAgentsDir()).transcripts;
+}
+
+function memoryRelativePrefix(): string {
+	return resolveWorkspaceLayout(getAgentsDir()).version === 2 ? "transcripts/" : "memory/";
 }
 const HASH_SCOPE = "body-normalized-v1";
 const SANITIZER_VERSION = "sanitize_transcript_v1";
@@ -54,14 +58,12 @@ const REINDEX_BATCH_SIZE = 50;
 
 const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";
 const purgeSeen = new Set<string>();
-
-// Incremental index cache: outer key = agentId or "*" for global, inner key = absolute path, value = stat fingerprint
 const artifactIndexCache = new Map<string, Map<string, string>>();
-
-// Changed manifest paths from last reindexMemoryArtifacts call — read by renderMemoryProjection, keyed by agentId
 const lastChangedManifestsByAgent = new Map<string, Set<string>>();
 
-// Tracks which manifest rel paths were referenced in the previous ledger render per agent
+function reindexStateKey(agentId?: string): string {
+	return `${getAgentsDir()}\0${agentId?.trim() || "*"}`;
+}
 const prevLedgerRefsByAgent = new Map<string, Set<string>>();
 
 export type ArtifactKind = "summary" | "transcript" | "compaction" | "manifest";
@@ -88,6 +90,7 @@ interface ArtifactSeed {
 	readonly sourceNodeId: string | null;
 	readonly memorySentence: MemorySentence;
 	readonly body: string;
+	readonly replaceExisting?: boolean;
 }
 
 interface ManifestState {
@@ -256,13 +259,6 @@ function base32Sha256(input: string): string {
 	}
 	return out;
 }
-
-// Derive a deterministic, agent-scoped token used in artifact file names.
-// Uses sessionId as the identity source so each session-end run (which has
-// a unique derived sessionId) produces a distinct token and artifact path,
-// even when multiple runs share the same sessionKey. For checkpoint-extract
-// where sessionId === sessionKey, the result is unchanged from the old
-// behavior.
 export function deriveSessionToken(agentId: string, sessionId: string): string {
 	const seed = `${agentId}:${sessionId.trim()}`;
 	return base32Sha256(seed).slice(0, 16);
@@ -281,7 +277,11 @@ function artifactPath(capturedAt: string, sessionToken: string, kind: ArtifactKi
 }
 
 function relativeArtifactPath(capturedAt: string, sessionToken: string, kind: ArtifactKind): string {
-	return `memory/${artifactFileName(capturedAt, sessionToken, kind)}`;
+	return `${memoryRelativePrefix()}${artifactFileName(capturedAt, sessionToken, kind)}`;
+}
+
+function storedArtifactRelativePath(path: string): string {
+	return currentArtifactRelativePath(resolveWorkspaceLayout(getAgentsDir()).version, path);
 }
 
 function wikilink(path: string, label?: string): string {
@@ -403,16 +403,9 @@ export async function resolveMemorySentence(
 	provider?: LlmProvider | null,
 ): Promise<MemorySentence> {
 	const generatedAt = new Date().toISOString();
-	if (!scanMemoryContent(body).contextEligible) {
-		return {
-			text: MEMORY_CONTENT_WITHHELD_NOTICE,
-			quality: "fallback",
-			generatedAt,
-		};
-	}
 	if (provider) {
 		try {
-			const raw = await provider.generate(sentencePrompt(body, project, sourceKind), {
+			const raw = await provider.generate(sentencePrompt(redactCredentials(body), project, sourceKind), {
 				maxTokens: 120,
 				timeoutMs: 10_000,
 			});
@@ -425,9 +418,7 @@ export async function resolveMemorySentence(
 					generatedAt,
 				};
 			}
-		} catch {
-			// fall through to deterministic fallback
-		}
+		} catch {}
 	}
 
 	return {
@@ -515,20 +506,16 @@ function writeImmutableArtifact(seed: ArtifactSeed): string {
 		if (declaredHash && declaredHash !== existingBodyHash) {
 			throw new Error(`${IMMUTABLE_ARTIFACT_ERROR_PREFIX} ${path} (checksum mismatch)`);
 		}
-		if (existingBodyHash !== frontmatter.content_sha256) {
+		if (existingBodyHash !== frontmatter.content_sha256 && !seed.replaceExisting) {
 			throw new Error(`${IMMUTABLE_ARTIFACT_ERROR_PREFIX} ${path} (content mismatch)`);
 		}
+		if (existingBodyHash !== frontmatter.content_sha256 && seed.replaceExisting) writeAtomic(path, content);
 		return path;
 	}
 
 	writeAtomic(path, content);
 	return path;
 }
-
-/**
- * Explicit column values for a single memory_artifacts upsert.
- * Values are bound as-is; no derivation or defaults are applied.
- */
 export interface MemoryArtifactUpsertFields {
 	readonly agentId: string;
 	readonly sourcePath: string;
@@ -557,13 +544,6 @@ export interface MemoryArtifactUpsertFields {
 }
 
 export interface MemoryArtifactUpsertOptions {
-	/**
-	 * When true, the ON CONFLICT update only applies when the conflicting row
-	 * already belongs to the same source_id (`WHERE memory_artifacts.source_id
-	 * = excluded.source_id`). Used by source-snapshot restore, which pairs this
-	 * guard with an up-front path-ownership check. Defaults to false
-	 * (unconditional conflict update).
-	 */
 	readonly conflictGuardSourceId?: boolean;
 }
 
@@ -600,13 +580,6 @@ const MEMORY_ARTIFACT_UPSERT_SQL = `INSERT INTO memory_artifacts (
 		source_meta_json = excluded.source_meta_json,
 		is_deleted = 0,
 		deleted_at = NULL`;
-
-/**
- * Canonical memory_artifacts upsert, run inside an existing write
- * transaction. This is the single owner of the 24-column INSERT ... ON
- * CONFLICT statement. Both the frontmatter-derived lineage path and the
- * source-snapshot restore path delegate here so the SQL is not duplicated.
- */
 export function upsertMemoryArtifactInTx(
 	db: Database,
 	fields: MemoryArtifactUpsertFields,
@@ -641,12 +614,6 @@ export function upsertMemoryArtifactInTx(
 		fields.sourceParentPath,
 		fields.sourceMetaJson,
 	);
-	upsertMemoryContentSafetyInTx(db as unknown as WriteDb, {
-		agentId: fields.agentId,
-		sourceKind: "artifact",
-		sourceId: fields.sourcePath,
-		content: fields.content,
-	});
 }
 
 function artifactFieldsFromFrontmatter(
@@ -810,7 +777,7 @@ export async function indexCanonicalTranscriptJsonl(input: {
 	readonly startedAt: string | null;
 	readonly endedAt: string | null;
 	readonly transcript: string;
-	readonly manifestPath: string;
+	readonly manifestPath: string | null;
 }): Promise<void> {
 	const transcriptPath = canonicalTranscriptRelativePath(input.harness);
 	const sessionToken = deriveSessionToken(input.agentId, input.sessionId);
@@ -917,14 +884,11 @@ export async function deleteArtifactRowsForPath(path: string, agentId: string | 
 		estimatedWorkUnits: 2,
 	});
 }
-
-// Coalesce duplicate scoped reindexes, but serialize all scopes. A global
-// reindex and a scoped reindex both mutate shared artifact tables/caches.
 const reindexFlights = new Map<string, Promise<void>>();
 let reindexTail: Promise<void> = Promise.resolve();
 
 export async function reindexMemoryArtifacts(agentId?: string): Promise<void> {
-	const key = agentId?.trim() || "*";
+	const key = reindexStateKey(agentId);
 	const existing = reindexFlights.get(key);
 	if (existing) return existing;
 
@@ -950,7 +914,7 @@ async function doReindex(agentId?: string): Promise<void> {
 	const files = await listCanonicalFiles();
 	const t0 = performance.now();
 	const stopTimer = logger.time("resources", "reindexMemoryArtifacts");
-	const cacheKey = scope ?? "*";
+	const cacheKey = reindexStateKey(scope ?? undefined);
 	const cache = artifactIndexCache.get(cacheKey) ?? new Map<string, string>();
 	const changedPaths = new Set<string>();
 	interface PendingUpsert {
@@ -968,7 +932,6 @@ async function doReindex(agentId?: string): Promise<void> {
 	}
 	const pendingUpserts: PendingUpsert[] = [];
 	const pendingDeletes: PendingDelete[] = [];
-	// Cache-only updates for files that need no DB write (e.g. unreadable).
 	const cacheOnlyUpdates: Array<{ path: string; statKey: string }> = [];
 	const commitBatchCacheUpserts = (batch: readonly PendingUpsert[]): void => {
 		for (const item of batch) {
@@ -1047,19 +1010,20 @@ async function doReindex(agentId?: string): Promise<void> {
 		return;
 	}
 
+	const fileSet = new Set(files);
 	if (cache.size === 0) {
-		// Seed from DB state too so files deleted while daemon was down get
-		// detected, while unchanged files can skip a full reread on restart.
 		const dbPaths = await getDbAccessor().withReadDbAsync(
 			async (db) => {
 				const rows = scope
 					? (db
-							.prepare("SELECT source_path, source_mtime_ms FROM memory_artifacts WHERE agent_id = ?")
+							.prepare("SELECT agent_id, source_path, source_mtime_ms FROM memory_artifacts WHERE agent_id = ?")
 							.all(scope) as Array<{
+							agent_id: string;
 							source_path: string;
 							source_mtime_ms?: number | null;
 						}>)
-					: (db.prepare("SELECT source_path, source_mtime_ms FROM memory_artifacts").all() as Array<{
+					: (db.prepare("SELECT agent_id, source_path, source_mtime_ms FROM memory_artifacts").all() as Array<{
+							agent_id: string;
 							source_path: string;
 							source_mtime_ms?: number | null;
 						}>);
@@ -1069,12 +1033,34 @@ async function doReindex(agentId?: string): Promise<void> {
 		);
 		if (dbPaths.length > 0) {
 			const root = getAgentsDir();
+			const occupied = new Set(dbPaths.map((row) => `${row.agent_id}\0${row.source_path}`));
+			const relocated = dbPaths.flatMap((row) => {
+				const target = storedArtifactRelativePath(row.source_path);
+				if (target === row.source_path) return [];
+				if (occupied.has(`${row.agent_id}\0${target}`)) {
+					throw new Error(`Migrated artifact path already indexed: ${target}`);
+				}
+				if (!fileSet.has(join(root, target))) {
+					throw new Error(`Migrated artifact is missing: ${target}`);
+				}
+				return [
+					ownerStatement("UPDATE memory_artifacts SET source_path = ? WHERE agent_id = ? AND source_path = ?", [
+						target,
+						row.agent_id,
+						row.source_path,
+					]),
+				];
+			});
+			for (let offset = 0; offset < relocated.length; offset += REINDEX_BATCH_SIZE) {
+				await dbOwnerBatch(relocated.slice(offset, offset + REINDEX_BATCH_SIZE), {
+					operation: "sources.reindex.migrated-artifact-paths",
+					lane: "write",
+					workloadClass: "maintenance",
+					estimatedWorkUnits: Math.min(REINDEX_BATCH_SIZE, relocated.length - offset),
+				});
+			}
 			for (const row of dbPaths) {
-				const absPath = join(root, row.source_path);
-				// Cold caches must re-read existing files at least once. Mtime-only
-				// seeding can miss fast local tampering where the frontmatter checksum
-				// no longer matches the body but the timestamp did not advance.
-				cache.set(absPath, "0");
+				cache.set(join(root, storedArtifactRelativePath(row.source_path)), "0");
 			}
 			for (const path of files) {
 				if (!cache.has(path)) cache.set(path, "0");
@@ -1113,8 +1099,7 @@ async function doReindex(agentId?: string): Promise<void> {
 		);
 	}
 
-	const fileSet = new Set(files);
-	const baseYielder = yieldEvery(REINDEX_BATCH_SIZE);
+	const baseYielder = yieldEvery(1);
 	let itemsSinceYield = 0;
 	const yielder = async (): Promise<void> => {
 		itemsSinceYield += 1;
@@ -1210,7 +1195,6 @@ async function doReindex(agentId?: string): Promise<void> {
 	if (await flushDeleteBatch()) {
 		await yielder();
 	}
-	// Commit cache-only items (no DB dependency — safe to apply unconditionally).
 	for (const { path: p, statKey: sk } of cacheOnlyUpdates) {
 		cache.set(p, sk);
 	}
@@ -1251,11 +1235,11 @@ function isValidArtifact(path: string, frontmatter: Record<string, unknown>, bod
 
 	if (kind !== "manifest") {
 		const manifestPath = readString(frontmatter, "manifest_path");
-		if (!manifestPath?.startsWith("memory/")) return false;
+		if (!manifestPath || !storedArtifactRelativePath(manifestPath).startsWith(memoryRelativePrefix())) return false;
 	}
 
 	const rel = relativePath(path);
-	return rel.startsWith("memory/") && rel.endsWith(`--${kind}.md`);
+	return rel.startsWith(memoryRelativePrefix()) && rel.endsWith(`--${kind}.md`);
 }
 
 async function ensureManifestRecord(seed: {
@@ -1337,12 +1321,6 @@ async function saveManifestAsyncUnlocked(
 
 async function findExistingManifest(agentId: string, sessionId: string): Promise<ManifestState | null> {
 	try {
-		// Pre-fix rows stored session_id verbatim from the caller (equal to
-		// session_key). New rows use a derived session_id (e.g. "session-end:
-		// path:…"). Both cases are covered by this single session_id lookup —
-		// a separate session_key fallback is unnecessary because pre-fix rows
-		// match on session_id directly (it was persisted as the session_key
-		// value) and new rows have a unique derived session_id.
 		const row = await getDbAccessor().withReadDbAsync(
 			async (db) =>
 				db
@@ -1357,7 +1335,7 @@ async function findExistingManifest(agentId: string, sessionId: string): Promise
 			{ siteToken: "db:memory.manifest.find" },
 		);
 		if (!row) return null;
-		return loadManifest(join(getAgentsDir(), row.source_path));
+		return loadManifest(join(getAgentsDir(), storedArtifactRelativePath(row.source_path)));
 	} catch {
 		return null;
 	}
@@ -1576,6 +1554,7 @@ export async function writeTranscriptArtifact(params: {
 	readonly endedAt: string | null;
 	readonly transcript: string;
 	readonly summaryStatus?: "pending" | "skipped" | "not_requested";
+	readonly replaceExisting?: boolean;
 }): Promise<{ readonly manifestPath: string; readonly transcriptPath: string }> {
 	const manifest = await ensureCanonicalManifest(params);
 	const sessionToken = deriveSessionToken(params.agentId, params.sessionId);
@@ -1600,6 +1579,7 @@ export async function writeTranscriptArtifact(params: {
 		sourceNodeId: null,
 		memorySentence: sentence,
 		body,
+		replaceExisting: params.replaceExisting,
 	});
 	const parsed = parseFrontmatterDocument(readFileSync(fullPath, "utf8"));
 	await upsertArtifactRow(fullPath, parsed.frontmatter, normalizeMarkdownBody(parsed.body));
@@ -1614,8 +1594,6 @@ export async function writeTranscriptArtifact(params: {
 			transcript_path: relativePath(fullPath),
 			transcript_status: "completed",
 			canonical_transcript_path: params.harness ? canonicalTranscriptRelativePath(params.harness) : null,
-			// New direct captures do not request a summary. Preserve terminal
-			// historical status values so provenance is not rewritten.
 			summary_status: frontmatter.summary_path
 				? "completed"
 				: terminalSummaryStatus
@@ -1688,10 +1666,6 @@ export async function writeCompactionArtifact(params: {
 	readonly provider?: LlmProvider | null;
 }): Promise<{ readonly manifestPath: string; readonly compactionPath: string }> {
 	const manifest = await ensureCanonicalManifest(params);
-	// A compaction is a new immutable event even when it belongs to an existing
-	// session. Its path must use this event's capture time, not the session
-	// manifest's original capture time, or a later compaction would attempt to
-	// overwrite the first one.
 	const capturedAt = params.capturedAt;
 	const sessionToken = deriveSessionToken(params.agentId, params.sessionId);
 	const body = normalizeMarkdownBody(params.summary);
@@ -1764,7 +1738,7 @@ async function readThreadHeads(agentId: string): Promise<
 	try {
 		const rows = await getDbAccessor().withReadDbAsync(
 			async (db) => {
-				const queried = db
+				return db
 					.prepare(
 						`SELECT label, source_type, latest_at, sample, node_id, project, session_key, harness
 				 FROM memory_thread_heads
@@ -1782,14 +1756,6 @@ async function readThreadHeads(agentId: string): Promise<
 					session_key: string | null;
 					harness: string | null;
 				}>;
-				return queried.filter((row) =>
-					isMemoryContentContextEligible(db, {
-						agentId,
-						sourceKind: "summary",
-						sourceId: row.node_id,
-						content: row.sample,
-					}),
-				);
 			},
 			{ siteToken: "db:memory.projection.thread-heads" },
 		);
@@ -1820,7 +1786,7 @@ async function readTopMemories(agentId: string): Promise<
 		const clause = buildAgentScopeClause(agentId, scope.readPolicy, scope.policyGroup);
 		const rows = await getDbAccessor().withReadDbAsync(
 			async (db) => {
-				const queried = db
+				return db
 					.prepare(
 						`SELECT m.id, m.content, m.type, m.importance, m.project
 				 FROM memories m
@@ -1835,14 +1801,6 @@ async function readTopMemories(agentId: string): Promise<
 					importance: number;
 					project: string | null;
 				}>;
-				return queried.filter((row) =>
-					isMemoryContentContextEligible(db, {
-						agentId,
-						sourceKind: "memory",
-						sourceId: row.id,
-						content: row.content,
-					}),
-				);
 			},
 			{ siteToken: "db:memory.projection.top-memories" },
 		);
@@ -1868,7 +1826,7 @@ async function readTemporalNodes(agentId: string): Promise<
 	try {
 		const rows = await getDbAccessor().withReadDbAsync(
 			async (db) => {
-				const queried = db
+				return db
 					.prepare(
 						`SELECT id, kind, COALESCE(source_type, kind) AS source_type, depth, latest_at,
 				        project, session_key, source_ref, content
@@ -1888,14 +1846,6 @@ async function readTemporalNodes(agentId: string): Promise<
 					source_ref: string | null;
 					content: string;
 				}>;
-				return queried.filter((row) =>
-					isMemoryContentContextEligible(db, {
-						agentId,
-						sourceKind: "summary",
-						sourceId: row.id,
-						content: row.content,
-					}),
-				);
 			},
 			{ siteToken: "db:memory.projection.temporal-nodes" },
 		);
@@ -1915,9 +1865,6 @@ async function readTemporalNodes(agentId: string): Promise<
 function chooseSentence(rows: ReadonlyArray<ArtifactRow>): ArtifactRow | null {
 	const ranked = [...rows].sort((a, b) => {
 		const rank = (row: ArtifactRow): number => {
-			// Direct completed transcripts are the canonical session projection.
-			// Keep historical summaries as lower-priority provenance so an old
-			// artifact cannot override a newly sanitized transcript view.
 			if (row.source_kind === "transcript") return 3;
 			if (row.source_kind === "compaction") return 2;
 			if (row.source_kind === "summary") return 1;
@@ -1959,26 +1906,17 @@ async function buildLedger(agentId: string): Promise<ReadonlyArray<LedgerSession
 	try {
 		rows = await getDbAccessor().withReadDbAsync(
 			async (db) =>
-				(
-					db
-						.prepare(
-							`SELECT agent_id, source_path, source_sha256, source_kind, session_id, session_key,
+				db
+					.prepare(
+						`SELECT agent_id, source_path, source_sha256, source_kind, session_id, session_key,
 					        session_token, project, harness, captured_at, started_at, ended_at,
 					        manifest_path, source_node_id, memory_sentence, memory_sentence_quality, content
 					 FROM memory_artifacts
 					 WHERE agent_id = ?
 					   AND source_kind IN ('summary', 'transcript', 'compaction')
 					 ORDER BY COALESCE(ended_at, captured_at) DESC, captured_at DESC`,
-						)
-						.all(agentId) as ArtifactRow[]
-				).filter((row) =>
-					isMemoryContentContextEligible(db, {
-						agentId,
-						sourceKind: "artifact",
-						sourceId: row.source_path,
-						content: row.content,
-					}),
-				),
+					)
+					.all(agentId) as ArtifactRow[],
 			{ siteToken: "db:memory.projection.ledger" },
 		);
 	} catch {
@@ -2084,10 +2022,6 @@ function renderLedgerSection(
 			lines,
 		});
 	}
-
-	// renderCount is not monotone at the full-length boundary because dropping
-	// one row adds the clipping notice. Check the unclipped case up front before
-	// binary-searching clipped prefixes.
 	if (fitsBudget([...base, renderCount(sessions.length)])) {
 		const refs = sessions
 			.map((session) => session.manifestPath)
@@ -2227,8 +2161,8 @@ export async function renderMemoryProjection(agentId = "default"): Promise<{
 	indexBlock: string;
 }> {
 	await reindexMemoryArtifacts(agentId);
-	const changedManifests = lastChangedManifestsByAgent.get(agentId);
-	lastChangedManifestsByAgent.delete(agentId);
+	const changedManifests = lastChangedManifestsByAgent.get(reindexStateKey(agentId));
+	lastChangedManifestsByAgent.delete(reindexStateKey(agentId));
 	const memories = await readTopMemories(agentId);
 	const threadHeads = await readThreadHeads(agentId);
 	const nodes = await readTemporalNodes(agentId);
@@ -2280,15 +2214,10 @@ export async function renderMemoryProjection(agentId = "default"): Promise<{
 		parts.push(trimmedIndex);
 	}
 
-	const content = joinParts(parts);
-	const safeIndexBlock = scanMemoryContent(trimmedIndex).contextEligible ? trimmedIndex : "";
-	const safeContent = scanMemoryContent(content).contextEligible
-		? content
-		: joinParts(["# Working Memory Summary", `- ${MEMORY_CONTENT_WITHHELD_NOTICE}`]);
 	return {
-		content: safeContent,
+		content: redactCredentials(joinParts(parts)),
 		fileCount: memories.length + threadHeads.length + ledgerBlock.count + nodes.length,
-		indexBlock: safeIndexBlock,
+		indexBlock: redactCredentials(trimmedIndex),
 	};
 }
 
@@ -2325,7 +2254,7 @@ export async function removeCanonicalSession(agentId: string, sessionToken: stri
 		db.prepare("DELETE FROM memory_artifacts WHERE agent_id = ? AND session_token = ?").run(agentId, sessionToken);
 	});
 	for (const path of paths) {
-		rmSync(join(getAgentsDir(), path), { force: true });
+		rmSync(join(getAgentsDir(), storedArtifactRelativePath(path)), { force: true });
 	}
 }
 

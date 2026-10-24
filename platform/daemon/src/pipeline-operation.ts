@@ -117,6 +117,10 @@ export function normalizePipelineCause(error: unknown): PipelineCauseFamily {
 	return "internal_error";
 }
 
+export function pipelineErrorStatus(error: unknown): number | undefined {
+	return pipelineErrorDetails(error).status;
+}
+
 export function pipelineCauseFromHttpFailure(status: number, responseText = ""): PipelineCauseFamily {
 	return normalizePipelineCause({ status, message: responseText });
 }
@@ -132,8 +136,6 @@ export interface PipelineOperationSummary {
 	readonly queueAgeMs: number;
 	readonly causeFamily?: PipelineCauseFamily;
 }
-
-/** Emit one bounded operation summary. Never include ids, paths, content, or provider messages. */
 export function recordPipelineOperation(summary: PipelineOperationSummary): void {
 	const durationMs =
 		Number.isFinite(summary.durationMs) && summary.durationMs >= 0 ? Math.round(summary.durationMs) : 0;

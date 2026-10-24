@@ -1,8 +1,21 @@
 import { spawnSyncHidden as spawnSync } from "@signet/core";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	constants,
+	existsSync,
+	fstatSync,
+	ftruncateSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+	writeSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BaseConnector, type InstallResult, type UninstallResult, resolveSignetApiKey } from "@signet/connector-base";
 import {
@@ -15,28 +28,16 @@ import {
 } from "@signet/core";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// ---------------------------------------------------------------------------
-// Plugin file management
-// ---------------------------------------------------------------------------
-
-/** Path to the bundled hermes-plugin directory shipped alongside this connector. */
 function getPluginSourceDir(): string {
-	// In the built package, hermes-plugin/ is sibling to dist/
 	const fromDist = join(__dirname, "..", "hermes-plugin");
 	if (existsSync(fromDist)) return fromDist;
-	// In development, hermes-plugin/ is at package root
 	const fromSrc = join(__dirname, "..", "..", "hermes-plugin");
 	if (existsSync(fromSrc)) return fromSrc;
-	// Native binaries materialize embedded connector assets into a stable,
-	// content-addressed tree before loading the CLI.
 	const connectorAssetsDir = process.env.SIGNET_CONNECTOR_ASSETS_DIR?.trim();
 	if (connectorAssetsDir) {
 		const fromEmbeddedAssets = join(connectorAssetsDir, "hermes-agent", "hermes-plugin");
 		if (existsSync(fromEmbeddedAssets)) return fromEmbeddedAssets;
 	}
-	// In the native bundle (SIGNET_DIR), hermes-plugin/ lives inside the
-	// connectors directory alongside the connector JS output.
 	const signetDir = process.env.SIGNET_DIR?.trim();
 	if (signetDir) {
 		const fromConnectors = join(signetDir, "runtime", "connectors", "hermes-agent", "hermes-plugin");
@@ -55,9 +56,6 @@ const REQUIRED_TOOL_NAMES = [
 	"memory_list",
 	"memory_modify",
 	"memory_forget",
-	// `session_search` shadows Hermes's built-in core tool of the same
-	// name and gets dropped at registration time, so the Signet provider
-	// surfaces it under the namespace instead.
 	"signet_session_search",
 	"recall",
 	"remember",
@@ -117,9 +115,557 @@ interface HermesProbeResult {
 	readonly error: string | null;
 }
 
+const DESCRIPTOR_ROOT =
+	process.platform === "linux" ? "/proc/self/fd" : process.platform === "darwin" ? "/dev/fd" : null;
+const DESCRIPTOR_WRITES_SUPPORTED =
+	DESCRIPTOR_ROOT !== null && typeof constants.O_DIRECTORY === "number" && typeof constants.O_NOFOLLOW === "number";
+const DESCRIPTOR_WRITE_UNAVAILABLE_ERROR =
+	"Targeted Hermes profile writes require descriptor-backed no-follow filesystem support";
+
+function pathEntryExists(path: string): boolean {
+	try {
+		lstatSync(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function descriptorPath(fd: number): string {
+	if (DESCRIPTOR_ROOT === null) throw new Error(DESCRIPTOR_WRITE_UNAVAILABLE_ERROR);
+	return join(DESCRIPTOR_ROOT, String(fd));
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+	const rel = relative(root, candidate);
+	return !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+function openDirectoryNoFollow(path: string): number {
+	if (!DESCRIPTOR_WRITES_SUPPORTED) throw new Error(DESCRIPTOR_WRITE_UNAVAILABLE_ERROR);
+	return openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+}
+
+function closeDirectory(fd: number): void {
+	try {
+		closeSync(fd);
+	} catch {}
+}
+
+const SECURE_REMOVAL_CHANGED_STATUS = 75;
+const SECURE_REMOVAL_SCRIPT = [
+	"import ctypes, os, secrets, stat, sys",
+	"expected_dev = int(sys.argv[1])",
+	"expected_ino = int(sys.argv[2])",
+	"operation = sys.argv[3]",
+	"name = sys.argv[4]",
+	"expected_parent = sys.argv[5]",
+	"expected_parent_stat = os.stat(expected_parent, follow_symlinks=False)",
+	"if os.path.realpath(expected_parent) != expected_parent:",
+	"    raise SystemExit(75)",
+	"opened_parent_stat = os.fstat(3)",
+	"if (opened_parent_stat.st_dev, opened_parent_stat.st_ino) != (expected_parent_stat.st_dev, expected_parent_stat.st_ino):",
+	"    raise SystemExit(75)",
+	"try:",
+	"    current = os.stat(name, dir_fd=3, follow_symlinks=False)",
+	"except FileNotFoundError:",
+	"    raise SystemExit(75)",
+	"if current.st_dev != expected_dev or current.st_ino != expected_ino:",
+	"    raise SystemExit(75)",
+	"if operation == 'verify':",
+	"    raise SystemExit(0)",
+	"if operation not in ('directory', 'file'):",
+	"    raise SystemExit(76)",
+	"libc = ctypes.CDLL(None, use_errno=True)",
+	"if sys.platform == 'darwin':",
+	"    rename_function = getattr(libc, 'renameatx_np', None)",
+	"    rename_flags = 4",
+	"elif sys.platform.startswith('linux'):",
+	"    rename_function = getattr(libc, 'renameat2', None)",
+	"    rename_flags = 1",
+	"else:",
+	"    rename_function = None",
+	"    rename_flags = 0",
+	"if rename_function is None:",
+	"    raise OSError('exclusive descriptor-relative rename is unavailable')",
+	"rename_function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]",
+	"rename_function.restype = ctypes.c_int",
+	"def rename_exclusive(source_fd, source_name, destination_fd, destination_name):",
+	"    result = rename_function(source_fd, os.fsencode(source_name), destination_fd, os.fsencode(destination_name), rename_flags)",
+	"    if result != 0:",
+	"        error = ctypes.get_errno()",
+	"        raise OSError(error, os.strerror(error), source_name)",
+	"quarantine = None",
+	"for attempt in range(8):",
+	"    candidate = '.signet-remove-' + secrets.token_hex(16)",
+	"    try:",
+	"        os.mkdir(candidate, 0o700, dir_fd=3)",
+	"        quarantine = candidate",
+	"        break",
+	"    except FileExistsError:",
+	"        pass",
+	"if quarantine is None:",
+	"    raise OSError('could not allocate a private removal directory')",
+	"quarantine_fd = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=3)",
+	"changed = False",
+	"entry_moved = False",
+	"try:",
+	"    os.fchmod(quarantine_fd, 0o700)",
+	"    try:",
+	"        rename_exclusive(3, name, quarantine_fd, 'entry')",
+	"        entry_moved = True",
+	"    except FileNotFoundError:",
+	"        changed = True",
+	"    if not changed:",
+	"        moved = os.stat('entry', dir_fd=quarantine_fd, follow_symlinks=False)",
+	"        if moved.st_dev != expected_dev or moved.st_ino != expected_ino:",
+	"            try:",
+	"                rename_exclusive(quarantine_fd, 'entry', 3, name)",
+	"                entry_moved = False",
+	"            except OSError as restore_error:",
+	"                print(f'recovery entry retained at {expected_parent}/{quarantine}/entry: {restore_error}', file=sys.stderr)",
+	"            changed = True",
+	"        elif operation == 'directory':",
+	"            if not stat.S_ISDIR(moved.st_mode):",
+	"                try:",
+	"                    rename_exclusive(quarantine_fd, 'entry', 3, name)",
+	"                    entry_moved = False",
+	"                except OSError as restore_error:",
+	"                    print(f'recovery entry retained at {expected_parent}/{quarantine}/entry: {restore_error}', file=sys.stderr)",
+	"                changed = True",
+	"            else:",
+	"                os.rmdir('entry', dir_fd=quarantine_fd)",
+	"                entry_moved = False",
+	"        elif stat.S_ISDIR(moved.st_mode):",
+	"            try:",
+	"                rename_exclusive(quarantine_fd, 'entry', 3, name)",
+	"                entry_moved = False",
+	"            except OSError as restore_error:",
+	"                print(f'recovery entry retained at {expected_parent}/{quarantine}/entry: {restore_error}', file=sys.stderr)",
+	"            changed = True",
+	"        else:",
+	"            os.unlink('entry', dir_fd=quarantine_fd)",
+	"            entry_moved = False",
+	"except Exception as error:",
+	"    if entry_moved:",
+	"        print(f'recovery entry retained at {expected_parent}/{quarantine}/entry: {error}', file=sys.stderr)",
+	"    else:",
+	"        try:",
+	"            os.rmdir(quarantine, dir_fd=3)",
+	"        except OSError:",
+	"            pass",
+	"    raise",
+	"finally:",
+	"    os.close(quarantine_fd)",
+	"if changed:",
+	"    try:",
+	"        os.rmdir(quarantine, dir_fd=3)",
+	"    except OSError:",
+	"        pass",
+	"    raise SystemExit(75)",
+	"os.rmdir(quarantine, dir_fd=3)",
+].join("\n");
+
+const SECURE_CREATE_DIRECTORIES_SCRIPT = [
+	"import os, sys",
+	"expected = os.stat(sys.argv[1], follow_symlinks=False)",
+	"opened = os.fstat(3)",
+	"if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):",
+	"    raise SystemExit(75)",
+	"fd = os.dup(3)",
+	"try:",
+	"    for name in sys.argv[2:]:",
+	"        try:",
+	"            os.mkdir(name, dir_fd=fd)",
+	"        except FileExistsError:",
+	"            pass",
+	"        entry = os.stat(name, dir_fd=fd, follow_symlinks=False)",
+	"        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)",
+	"        opened = os.fstat(child)",
+	"        if (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):",
+	"            os.close(child)",
+	"            raise SystemExit(75)",
+	"        os.close(fd)",
+	"        fd = child",
+	"finally:",
+	"    os.close(fd)",
+].join("\n");
+const SECURE_WRITE_FILE_SCRIPT = [
+	"import os, stat, sys, secrets",
+	"expected = os.stat(sys.argv[1], follow_symlinks=False)",
+	"opened = os.fstat(3)",
+	"if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):",
+	"    raise SystemExit(75)",
+	'exclusive = sys.argv[2] == "1"',
+	"fd = os.dup(3)",
+	"try:",
+	"    for name in sys.argv[3:-1]:",
+	"        entry = os.stat(name, dir_fd=fd, follow_symlinks=False)",
+	"        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)",
+	"        opened = os.fstat(child)",
+	"        if (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):",
+	"            os.close(child)",
+	"            raise SystemExit(75)",
+	"        os.close(fd)",
+	"        fd = child",
+	"    name = sys.argv[-1]",
+	"    try:",
+	"        entry = os.stat(name, dir_fd=fd, follow_symlinks=False)",
+	"        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:",
+	"            raise SystemExit(76)",
+	"    except FileNotFoundError:",
+	"        pass",
+	"    temp = '.signet-write-' + secrets.token_hex(16)",
+	"    file_fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)",
+	"    try:",
+	"        try:",
+	"            view = memoryview(sys.stdin.buffer.read())",
+	"            while view:",
+	"                written = os.write(file_fd, view)",
+	"                if written <= 0:",
+	"                    raise OSError('write made no progress')",
+	"                view = view[written:]",
+	"            os.fsync(file_fd)",
+	"        finally:",
+	"            os.close(file_fd)",
+	"        if exclusive:",
+	"            try:",
+	"                os.link(temp, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)",
+	"            except FileExistsError:",
+	"                print('exists')",
+	"        else:",
+	"            os.replace(temp, name, src_dir_fd=fd, dst_dir_fd=fd)",
+	"        os.fsync(fd)",
+	"    finally:",
+	"        try:",
+	"            os.unlink(temp, dir_fd=fd)",
+	"        except FileNotFoundError:",
+	"            pass",
+	"finally:",
+	"    os.close(fd)",
+].join("\n");
+const SECURE_READ_FILE_SCRIPT = [
+	"import os, stat, sys",
+	"try:",
+	"    fd = os.open(sys.argv[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=3)",
+	"except FileNotFoundError:",
+	"    raise SystemExit(0)",
+	"try:",
+	"    if not stat.S_ISREG(os.fstat(fd).st_mode):",
+	"        raise SystemExit(0)",
+	"    content = bytearray()",
+	"    while len(content) <= 65536:",
+	"        chunk = os.read(fd, min(4096, 65537 - len(content)))",
+	"        if not chunk:",
+	"            break",
+	"        content.extend(chunk)",
+	"    if len(content) <= 65536:",
+	"        sys.stdout.buffer.write(content)",
+	"finally:",
+	"    os.close(fd)",
+].join("\n");
+
+function getPythonCandidates(): readonly { readonly command: string; readonly args: readonly string[] }[] {
+	const configuredPython = process.env.PYTHON?.trim();
+	if (configuredPython) return [{ command: configuredPython, args: [] }];
+	return process.platform === "win32"
+		? [
+				{ command: "py", args: ["-3"] },
+				{ command: "python", args: [] },
+			]
+		: [
+				{ command: "python3", args: [] },
+				{ command: "python", args: [] },
+			];
+}
+
+function runSecureFilesystemOperation(
+	fd: number,
+	rootPath: string,
+	script: string,
+	args: readonly string[],
+	input?: string | Uint8Array,
+): string {
+	if (DESCRIPTOR_ROOT === null) throw new Error(DESCRIPTOR_WRITE_UNAVAILABLE_ERROR);
+	const errors: string[] = [];
+	for (const candidate of getPythonCandidates()) {
+		const result = spawnSync(candidate.command, [...candidate.args, "-c", script, rootPath, ...args], {
+			encoding: "utf-8",
+			input: input === undefined ? undefined : Buffer.from(input),
+			stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe", fd],
+			timeout: 5_000,
+		});
+		if (result.error) {
+			errors.push(`${candidate.command}: ${result.error.message}`);
+			continue;
+		}
+		if (result.status === 0) return result.stdout;
+		if (result.status === 75) throw new Error("Hermes directory entry changed during secure write");
+		const detail = result.stderr.trim();
+		errors.push(`${candidate.command}: ${detail || `exited ${result.status ?? "without a status"}`}`);
+	}
+	throw new Error(`${DESCRIPTOR_WRITE_UNAVAILABLE_ERROR}: ${errors.join("; ") || "No Python interpreter found"}`);
+}
+
+function runSecureEntryOperation(
+	parentFd: number,
+	parentPath: string,
+	name: string,
+	expectedDev: number,
+	expectedIno: number,
+	operation: "verify" | "directory" | "file",
+): void {
+	if (DESCRIPTOR_ROOT === null) throw new Error(DESCRIPTOR_WRITE_UNAVAILABLE_ERROR);
+	const errors: string[] = [];
+	for (const candidate of getPythonCandidates()) {
+		const result = spawnSync(
+			candidate.command,
+			[
+				...candidate.args,
+				"-c",
+				SECURE_REMOVAL_SCRIPT,
+				String(expectedDev),
+				String(expectedIno),
+				operation,
+				name,
+				parentPath,
+			],
+			{
+				encoding: "utf-8",
+				stdio: ["ignore", "pipe", "pipe", parentFd],
+				timeout: 5_000,
+			},
+		);
+
+		if (result.error) {
+			errors.push(`${candidate.command}: ${result.error.message}`);
+			continue;
+		}
+		if (result.status === 0) return;
+		if (result.status === SECURE_REMOVAL_CHANGED_STATUS) {
+			const detail = result.stderr.trim();
+			throw new Error(`Hermes directory entry changed during secure removal: ${name}${detail ? ` (${detail})` : ""}`);
+		}
+		const detail = result.stderr.trim();
+		errors.push(`${candidate.command}: ${detail || `exited ${result.status ?? "without a status"}`}`);
+	}
+	throw new Error(`${DESCRIPTOR_WRITE_UNAVAILABLE_ERROR}: ${errors.join("; ") || "No Python interpreter found"}`);
+}
+
+function assertEntryIdentityNoFollow(
+	parentFd: number,
+	parentPath: string,
+	name: string,
+	expectedDev: number,
+	expectedIno: number,
+): void {
+	runSecureEntryOperation(parentFd, parentPath, name, expectedDev, expectedIno, "verify");
+}
+
+function removeEntryNoFollow(
+	parentFd: number,
+	parentPath: string,
+	name: string,
+	expectedDev: number,
+	expectedIno: number,
+	directory: boolean,
+): void {
+	runSecureEntryOperation(parentFd, parentPath, name, expectedDev, expectedIno, directory ? "directory" : "file");
+}
+
+function sameStatIdentity(
+	left: { readonly dev: number; readonly ino: number },
+	right: { readonly dev: number; readonly ino: number },
+): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertDescriptorPathIdentity(fd: number, path: string, message: string): void {
+	const pathStat = lstatSync(path);
+	if (realpathSync(path) !== path || pathStat.isSymbolicLink() || !sameStatIdentity(fstatSync(fd), pathStat)) {
+		throw new Error(message);
+	}
+}
+
+function ensureContainedDirectory(directory: string, targetRoot: string): void {
+	const safeDirectory = resolveContainedWritePath(directory, targetRoot);
+	if (!DESCRIPTOR_WRITES_SUPPORTED) {
+		throw new Error(DESCRIPTOR_WRITE_UNAVAILABLE_ERROR);
+	}
+
+	const absoluteDirectory = resolvePath(directory);
+	const rootPath = resolvePath(targetRoot);
+	if (!isPathWithin(rootPath, safeDirectory)) {
+		throw new Error(`Hermes target directory escapes validated root: ${directory}`);
+	}
+
+	let existing = absoluteDirectory;
+	const missing: string[] = [];
+	while (!pathEntryExists(existing)) {
+		const parent = dirname(existing);
+		if (parent === existing) throw new Error(`Hermes target directory has no existing ancestor: ${directory}`);
+		missing.unshift(existing.slice(parent.length + 1));
+		existing = parent;
+	}
+	const existingReal = realpathSync(existing);
+	if (existingReal !== existing) {
+		throw new Error(`Hermes target directory is symlinked and cannot be used for writes: ${directory}`);
+	}
+	if (process.platform === "darwin") {
+		const fd = openDirectoryNoFollow(existing);
+		try {
+			runSecureFilesystemOperation(fd, existingReal, SECURE_CREATE_DIRECTORIES_SCRIPT, missing);
+		} finally {
+			closeDirectory(fd);
+		}
+		return;
+	}
+
+	let fd = openDirectoryNoFollow(existing);
+	let expected = existingReal;
+	try {
+		for (const component of missing) {
+			const childPath = join(descriptorPath(fd), component);
+			try {
+				mkdirSync(childPath);
+			} catch (error) {
+				const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+				if (code !== "EEXIST") throw error;
+			}
+			const childFd = openDirectoryNoFollow(childPath);
+			try {
+				expected = join(expected, component);
+				if (realpathSync(descriptorPath(childFd)) !== expected) {
+					throw new Error(`Hermes target directory changed during secure creation: ${directory}`);
+				}
+			} catch (error) {
+				closeDirectory(childFd);
+				throw error;
+			}
+			closeDirectory(fd);
+			fd = childFd;
+		}
+	} finally {
+		closeDirectory(fd);
+	}
+}
+
+function writeContainedFile(
+	targetPath: string,
+	content: string | Uint8Array,
+	targetRoot: string,
+	exclusive = false,
+): boolean {
+	const safePath = resolveContainedWritePath(targetPath, targetRoot);
+	if (!DESCRIPTOR_WRITES_SUPPORTED) {
+		throw new Error(DESCRIPTOR_WRITE_UNAVAILABLE_ERROR);
+	}
+
+	const rootPath = resolvePath(targetRoot);
+	ensureContainedDirectory(dirname(safePath), targetRoot);
+	if (process.platform === "darwin") {
+		const relativePath = relative(rootPath, safePath);
+		if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+			throw new Error(`Hermes target file escapes validated root: ${targetPath}`);
+		}
+		const components = relativePath.split(sep);
+		const fileName = components.pop();
+		if (!fileName || components.some((component) => component === "" || component === "." || component === "..")) {
+			throw new Error(`Hermes target file has an invalid relative path: ${targetPath}`);
+		}
+		const fd = openDirectoryNoFollow(rootPath);
+		try {
+			const result = runSecureFilesystemOperation(
+				fd,
+				rootPath,
+				SECURE_WRITE_FILE_SCRIPT,
+				[exclusive ? "1" : "0", ...components, fileName],
+				content,
+			);
+			return result.trim() !== "exists";
+		} finally {
+			closeDirectory(fd);
+		}
+	}
+	const relativePath = relative(rootPath, safePath);
+	if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+		throw new Error(`Hermes target file escapes validated root: ${targetPath}`);
+	}
+	const components = relativePath.split(sep);
+	const fileName = components.pop();
+	if (!fileName || components.some((component) => component === "" || component === "." || component === "..")) {
+		throw new Error(`Hermes target file has an invalid relative path: ${targetPath}`);
+	}
+
+	let parentFd = openDirectoryNoFollow(rootPath);
+	try {
+		if (realpathSync(descriptorPath(parentFd)) !== rootPath) {
+			throw new Error(`Hermes target root changed during secure write: ${targetRoot}`);
+		}
+		let expected = rootPath;
+		for (const component of components) {
+			const childFd = openDirectoryNoFollow(join(descriptorPath(parentFd), component));
+			try {
+				expected = join(expected, component);
+				if (realpathSync(descriptorPath(childFd)) !== expected) {
+					throw new Error(`Hermes target directory changed during secure write: ${targetPath}`);
+				}
+			} catch (error) {
+				closeDirectory(childFd);
+				throw error;
+			}
+			closeDirectory(parentFd);
+			parentFd = childFd;
+		}
+
+		const filePath = join(descriptorPath(parentFd), fileName);
+		let existingFileIdentity: { readonly dev: number; readonly ino: number } | undefined;
+		try {
+			const existing = lstatSync(filePath);
+			if (existing.isSymbolicLink()) {
+				throw new Error(`Hermes target file is symlinked and cannot be used for writes: ${targetPath}`);
+			}
+			existingFileIdentity = { dev: existing.dev, ino: existing.ino };
+		} catch (error) {
+			const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+			if (code !== "ENOENT") throw error;
+		}
+
+		if (exclusive) return writeFileExclusiveSync(filePath, content, { mode: 0o600, fsync: true });
+		writeFileAtomicSync(filePath, content, { followSymlinks: false, mode: 0o600, fsync: true });
+		return true;
+	} finally {
+		closeDirectory(parentFd);
+	}
+}
+
+function ensureTargetDirectory(directory: string, targetRoot: string): void {
+	ensureContainedDirectory(directory, targetRoot);
+}
+
+function writeTargetFile(path: string, content: string | Uint8Array, targetRoot: string): void {
+	writeContainedFile(path, content, targetRoot);
+}
+
+function rejectSymlinkedPathComponents(path: string, root: string, targetPath: string): void {
+	if (!isPathWithin(root, path)) {
+		throw new Error(`Hermes target path escapes validated root: ${targetPath}`);
+	}
+	let current = path;
+	while (true) {
+		if (lstatSync(current).isSymbolicLink()) {
+			throw new Error(`Hermes target path is symlinked and cannot be used for writes: ${targetPath}`);
+		}
+		if (current === root) return;
+		const parent = dirname(current);
+		if (parent === current) throw new Error(`Hermes target path escapes validated root: ${targetPath}`);
+		current = parent;
+	}
+}
+
 function resolveContainedWritePath(targetPath: string, targetRoot: string): string {
-	let rootPath = targetRoot;
-	while (!existsSync(rootPath)) {
+	let rootPath = resolvePath(targetRoot);
+	while (!pathEntryExists(rootPath)) {
 		const parent = dirname(rootPath);
 		if (parent === rootPath) throw new Error(`Hermes target root does not exist: ${targetRoot}`);
 		rootPath = parent;
@@ -128,20 +674,184 @@ function resolveContainedWritePath(targetPath: string, targetRoot: string): stri
 		throw new Error(`Hermes target root is symlinked and cannot be used for writes: ${targetRoot}`);
 	}
 	const root = realpathSync(rootPath);
-	let existing = targetPath;
+	let existing = resolvePath(targetPath);
 	const missing: string[] = [];
-	while (!existsSync(existing)) {
+	while (!pathEntryExists(existing)) {
 		const parent = dirname(existing);
 		if (parent === existing) throw new Error(`Hermes target path does not have an existing ancestor: ${targetPath}`);
 		missing.unshift(existing.slice(parent.length + 1));
 		existing = parent;
 	}
-	const candidate = join(realpathSync(existing), ...missing);
+	rejectSymlinkedPathComponents(existing, rootPath, targetPath);
+	const candidate = join(existing, ...missing);
 	const rel = relative(root, candidate);
 	if (rel.startsWith("..") || isAbsolute(rel)) {
 		throw new Error(`Hermes target path escapes validated root: ${targetPath}`);
 	}
 	return candidate;
+}
+
+function removeDirectoryContentsNoFollow(directoryFd: number, expectedDirectoryPath: string): void {
+	assertDescriptorPathIdentity(
+		directoryFd,
+		expectedDirectoryPath,
+		`Hermes target directory changed during secure removal: ${expectedDirectoryPath}`,
+	);
+	const directoryEntriesPath = process.platform === "darwin" ? expectedDirectoryPath : descriptorPath(directoryFd);
+	const entries = readdirSync(directoryEntriesPath, { withFileTypes: true });
+	entries.sort((left, right) => {
+		if (left.name === INSTALL_MARKER_FILE) return 1;
+		if (right.name === INSTALL_MARKER_FILE) return -1;
+		if (left.name < right.name) return -1;
+		if (left.name > right.name) return 1;
+		return 0;
+	});
+	for (const entry of entries) {
+		const childPath =
+			process.platform === "darwin"
+				? join(expectedDirectoryPath, entry.name)
+				: join(descriptorPath(directoryFd), entry.name);
+		const expectedChildPath = join(expectedDirectoryPath, entry.name);
+		if (entry.isDirectory() && !entry.isSymbolicLink()) {
+			const childFd = openDirectoryNoFollow(childPath);
+			try {
+				const childIdentity = fstatSync(childFd);
+				assertDescriptorPathIdentity(
+					childFd,
+					expectedChildPath,
+					`Hermes target directory changed during secure removal: ${expectedChildPath}`,
+				);
+				assertEntryIdentityNoFollow(
+					directoryFd,
+					expectedDirectoryPath,
+					entry.name,
+					childIdentity.dev,
+					childIdentity.ino,
+				);
+				removeDirectoryContentsNoFollow(childFd, expectedChildPath);
+				removeEntryNoFollow(directoryFd, expectedDirectoryPath, entry.name, childIdentity.dev, childIdentity.ino, true);
+			} finally {
+				closeDirectory(childFd);
+			}
+			continue;
+		}
+		const childIdentity = lstatSync(childPath);
+		removeEntryNoFollow(directoryFd, expectedDirectoryPath, entry.name, childIdentity.dev, childIdentity.ino, false);
+	}
+}
+
+function removeContainedDirectory(
+	targetPath: string,
+	targetRoot: string,
+	targetKind: InstallMarker["targetKind"],
+	unownedTargetBehavior: "throw" | "skip",
+): boolean {
+	if (!DESCRIPTOR_WRITES_SUPPORTED) throw new Error(DESCRIPTOR_WRITE_UNAVAILABLE_ERROR);
+	const safeTargetDir = resolveContainedWritePath(targetPath, targetRoot);
+	const rootPath = resolvePath(targetRoot);
+	const relativePath = relative(rootPath, safeTargetDir);
+	if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+		throw new Error(`Hermes target directory escapes validated root: ${targetPath}`);
+	}
+	const components = relativePath.split(sep);
+	const targetName = components.pop();
+	if (!targetName || components.some((component) => component === "" || component === "." || component === "..")) {
+		throw new Error(`Hermes target directory has an invalid relative path: ${targetPath}`);
+	}
+
+	let parentFd = openDirectoryNoFollow(rootPath);
+	try {
+		let expected = rootPath;
+		for (const component of components) {
+			const childPath =
+				process.platform === "darwin" ? join(expected, component) : join(descriptorPath(parentFd), component);
+			const childFd = openDirectoryNoFollow(childPath);
+			try {
+				expected = join(expected, component);
+				assertDescriptorPathIdentity(
+					childFd,
+					expected,
+					`Hermes target directory changed during secure removal: ${targetPath}`,
+				);
+			} catch (error) {
+				closeDirectory(childFd);
+				throw error;
+			}
+			closeDirectory(parentFd);
+			parentFd = childFd;
+		}
+
+		const expectedTarget = join(expected, targetName);
+		const targetEntryPath = process.platform === "darwin" ? expectedTarget : join(descriptorPath(parentFd), targetName);
+		const targetFd = openDirectoryNoFollow(targetEntryPath);
+		try {
+			const targetIdentity = fstatSync(targetFd);
+			assertDescriptorPathIdentity(
+				targetFd,
+				expectedTarget,
+				`Hermes target directory changed during secure removal: ${targetPath}`,
+			);
+			const marker = readInstallMarkerFromDirectory(targetFd, expectedTarget);
+			if (marker === null || marker.targetKind !== targetKind) {
+				if (unownedTargetBehavior === "skip") return false;
+				throw new Error(
+					`Refusing to uninstall unowned Hermes plugin path: ${targetPath} (missing or invalid ${INSTALL_MARKER_FILE})`,
+				);
+			}
+			assertEntryIdentityNoFollow(parentFd, expected, targetName, targetIdentity.dev, targetIdentity.ino);
+			removeDirectoryContentsNoFollow(targetFd, expectedTarget);
+			removeEntryNoFollow(parentFd, expected, targetName, targetIdentity.dev, targetIdentity.ino, true);
+			return true;
+		} finally {
+			closeDirectory(targetFd);
+		}
+	} finally {
+		closeDirectory(parentFd);
+	}
+}
+
+function removeContainedFile(targetPath: string, targetRoot: string): void {
+	if (!DESCRIPTOR_WRITES_SUPPORTED) throw new Error(DESCRIPTOR_WRITE_UNAVAILABLE_ERROR);
+	const safeTargetPath = resolveContainedWritePath(targetPath, targetRoot);
+	const rootPath = resolvePath(targetRoot);
+	const relativePath = relative(rootPath, safeTargetPath);
+	if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+		throw new Error(`Hermes target file escapes validated root: ${targetPath}`);
+	}
+	const components = relativePath.split(sep);
+	const fileName = components.pop();
+	if (!fileName || components.some((component) => component === "" || component === "." || component === "..")) {
+		throw new Error(`Hermes target file has an invalid relative path: ${targetPath}`);
+	}
+
+	let parentFd = openDirectoryNoFollow(rootPath);
+	try {
+		let expected = rootPath;
+		for (const component of components) {
+			const childPath =
+				process.platform === "darwin" ? join(expected, component) : join(descriptorPath(parentFd), component);
+			const childFd = openDirectoryNoFollow(childPath);
+			try {
+				expected = join(expected, component);
+				assertDescriptorPathIdentity(
+					childFd,
+					expected,
+					`Hermes target file changed during secure removal: ${targetPath}`,
+				);
+			} catch (error) {
+				closeDirectory(childFd);
+				throw error;
+			}
+			closeDirectory(parentFd);
+			parentFd = childFd;
+		}
+		const filePath =
+			process.platform === "darwin" ? join(expected, fileName) : join(descriptorPath(parentFd), fileName);
+		const targetFile = lstatSync(filePath);
+		removeEntryNoFollow(parentFd, expected, fileName, targetFile.dev, targetFile.ino, false);
+	} finally {
+		closeDirectory(parentFd);
+	}
 }
 
 function getRepoPluginTargetDir(hermesRepo: string): string {
@@ -155,45 +865,36 @@ function getUserPluginTargetDir(hermesHome: string): string {
 function getProviderBackupPath(hermesHome: string): string {
 	return join(hermesHome, PROVIDER_BACKUP_FILE);
 }
-
-/** Copy the Signet memory plugin into a Hermes plugin directory. */
-function installPlugin(targetDir: string, targetKind: InstallMarker["targetKind"], targetRoot?: string): string[] {
-	const writeDir = targetRoot ? resolveContainedWritePath(targetDir, targetRoot) : targetDir;
+function installPlugin(targetDir: string, targetKind: InstallMarker["targetKind"], targetRoot: string): string[] {
+	const writeDir = resolveContainedWritePath(targetDir, targetRoot);
 	const sourceDir = getPluginSourceDir();
 
-	mkdirSync(writeDir, { recursive: true });
+	ensureTargetDirectory(writeDir, targetRoot);
 
 	const written: string[] = [];
 
 	for (const file of PLUGIN_FILES) {
 		const src = join(sourceDir, file);
-		const dst = targetRoot ? resolveContainedWritePath(join(writeDir, file), targetRoot) : join(writeDir, file);
+		const dst = resolveContainedWritePath(join(writeDir, file), targetRoot);
 		if (existsSync(src)) {
-			writeFileSync(dst, readFileSync(src));
+			writeTargetFile(dst, readFileSync(src), targetRoot);
 			written.push(dst);
 		}
 	}
-	written.push(writeInstallMarker(writeDir, targetKind));
+	written.push(writeInstallMarker(writeDir, targetKind, targetRoot));
 
 	return written;
 }
-
-/** Remove the Signet memory plugin from the Hermes plugins directory. */
-function uninstallPlugin(targetDir: string, targetRoot?: string): string[] {
-	if (!existsSync(targetDir)) return [];
-	const safeTargetDir = targetRoot ? resolveContainedWritePath(targetDir, targetRoot) : targetDir;
-	if (!readInstallMarker(safeTargetDir)) {
-		throw new Error(
-			`Refusing to uninstall unowned Hermes plugin path: ${targetDir} (missing or invalid ${INSTALL_MARKER_FILE})`,
-		);
-	}
-	rmSync(safeTargetDir, { recursive: true, force: true });
+function uninstallPlugin(
+	targetDir: string,
+	targetKind: InstallMarker["targetKind"],
+	targetRoot: string,
+	unownedTargetBehavior: "throw" | "skip" = "throw",
+): string[] {
+	if (!pathEntryExists(targetDir)) return [];
+	if (!removeContainedDirectory(targetDir, targetRoot, targetKind, unownedTargetBehavior)) return [];
 	return [targetDir];
 }
-
-// ---------------------------------------------------------------------------
-// Config patching
-// ---------------------------------------------------------------------------
 
 function getConfigCandidates(hermesHome: string, targetRoot?: string): string[] {
 	const candidates = [join(hermesHome, "config.yaml"), join(hermesHome, "cli-config.yaml")];
@@ -327,9 +1028,10 @@ function writeProviderBackup(
 	configPath: string,
 	providerKind: ProviderBackup["providerKind"],
 	previousProvider: string,
+	targetRoot: string,
 ): string | null {
 	if (previousProvider === "signet") return null;
-	const backupPath = getProviderBackupPath(hermesHome);
+	const backupPath = resolveContainedWritePath(getProviderBackupPath(hermesHome), targetRoot);
 	const backup: ProviderBackup = {
 		schemaVersion: 1,
 		configPath,
@@ -337,15 +1039,15 @@ function writeProviderBackup(
 		previousProvider,
 		createdAt: new Date().toISOString(),
 	};
-	mkdirSync(dirname(backupPath), { recursive: true });
-	// Never replace the first backup: create it exclusively instead of
-	// checking for it and writing later.
-	if (!writeFileExclusiveSync(backupPath, `${JSON.stringify(backup, null, 2)}\n`)) return null;
+	ensureTargetDirectory(dirname(backupPath), targetRoot);
+	if (!writeContainedFile(backupPath, `${JSON.stringify(backup, null, 2)}\n`, targetRoot, true)) return null;
 	return backupPath;
 }
 
-function readProviderBackup(hermesHome: string): ProviderBackup | null {
-	const backupPath = getProviderBackupPath(hermesHome);
+function readProviderBackup(hermesHome: string, targetRoot?: string): ProviderBackup | null {
+	const backupPath = targetRoot
+		? resolveContainedWritePath(getProviderBackupPath(hermesHome), targetRoot)
+		: getProviderBackupPath(hermesHome);
 	if (!existsSync(backupPath)) return null;
 	try {
 		const parsed = JSON.parse(readFileSync(backupPath, "utf-8")) as Partial<ProviderBackup>;
@@ -364,12 +1066,16 @@ function readProviderBackup(hermesHome: string): ProviderBackup | null {
 	}
 }
 
-function removeProviderBackup(hermesHome: string, targetRoot?: string): string | null {
-	const backupPath = targetRoot
-		? resolveContainedWritePath(getProviderBackupPath(hermesHome), targetRoot)
-		: getProviderBackupPath(hermesHome);
-	if (!existsSync(backupPath)) return null;
-	rmSync(backupPath, { force: true });
+function removeProviderBackup(hermesHome: string, targetRoot: string): string | null {
+	const backupPath = resolveContainedWritePath(getProviderBackupPath(hermesHome), targetRoot);
+	if (!pathEntryExists(backupPath)) return null;
+	try {
+		removeContainedFile(backupPath, targetRoot);
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+		if (code !== "ENOENT") throw error;
+		return null;
+	}
 	return backupPath;
 }
 
@@ -381,8 +1087,8 @@ function trimTrailingSlashes(value: string): string {
 	return value.slice(0, end);
 }
 
-function isProviderConfigured(hermesHome: string): boolean {
-	const config = readConfigYaml(hermesHome);
+function isProviderConfigured(hermesHome: string, targetRoot?: string): boolean {
+	const config = readConfigYaml(hermesHome, targetRoot);
 	if (!config) return false;
 	const lines = config.content.split(/\r?\n/);
 	const dottedProvider = findDottedProvider(lines);
@@ -403,7 +1109,7 @@ function isProviderConfigured(hermesHome: string): boolean {
 function configureProvider(
 	hermesHome: string,
 	warnings: string[],
-	targetRoot?: string,
+	targetRoot: string,
 ): { configPath: string | null; backupPath: string | null } {
 	const configPath = resolveConfigPath(hermesHome, targetRoot);
 	let content = "";
@@ -430,6 +1136,7 @@ function configureProvider(
 				configPath,
 				"dotted",
 				parseDottedProviderLine(lines[dottedProvider] ?? "") ?? "",
+				targetRoot,
 			);
 			setDottedProviderLine(lines, dottedProvider, "signet");
 			changed = true;
@@ -441,6 +1148,7 @@ function configureProvider(
 					configPath,
 					"nested",
 					parseProviderLine(lines[block.provider] ?? "") ?? "",
+					targetRoot,
 				);
 				backupPath = nestedBackupPath ?? backupPath;
 			}
@@ -448,8 +1156,8 @@ function configureProvider(
 			changed = true;
 		}
 		if (!changed) return { configPath: null, backupPath: null };
-		mkdirSync(dirname(configPath), { recursive: true });
-		writeFileAtomicSync(configPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
+		ensureTargetDirectory(dirname(configPath), targetRoot);
+		writeTargetFile(configPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`, targetRoot);
 		return { configPath, backupPath };
 	}
 	if (content && block === null) {
@@ -466,6 +1174,7 @@ function configureProvider(
 			configPath,
 			"nested",
 			parseProviderLine(lines[block.provider] ?? "") ?? "",
+			targetRoot,
 		);
 		lines[block.provider] = `${(lines[block.provider] ?? "").match(/^\s*/)?.[0] ?? "  "}provider: signet`;
 	} else if (block !== null && typeof block === "object") {
@@ -475,25 +1184,22 @@ function configureProvider(
 		lines.push("memory:", "  provider: signet");
 	}
 
-	mkdirSync(dirname(configPath), { recursive: true });
-	writeFileAtomicSync(configPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
+	ensureTargetDirectory(dirname(configPath), targetRoot);
+	writeTargetFile(configPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`, targetRoot);
 	return { configPath, backupPath };
 }
 
 function restoreOrClearProvider(
 	hermesHome: string,
-	targetRoot?: string,
+	targetRoot: string,
 ): { configPath: string | null; backupPath: string | null } {
-	const safeConfigPath = targetRoot
-		? resolveContainedWritePath(resolveConfigPath(hermesHome), targetRoot)
-		: resolveConfigPath(hermesHome);
-	const config = readConfigYaml(hermesHome);
+	const safeConfigPath = resolveContainedWritePath(resolveConfigPath(hermesHome), targetRoot);
+	const config = readConfigYaml(hermesHome, targetRoot);
 	if (!config) return { configPath: null, backupPath: removeProviderBackup(hermesHome, targetRoot) };
-	if (targetRoot) resolveContainedWritePath(config.path, targetRoot);
 	const lines = config.content.replace(/\r\n/g, "\n").split("\n");
 	const block = findMemoryBlock(lines);
 	const dottedProvider = findDottedProvider(lines);
-	const backup = readProviderBackup(hermesHome);
+	const backup = readProviderBackup(hermesHome, targetRoot);
 	let configChanged = false;
 	if (dottedProvider !== null && dottedProviderLineIsSignet(lines[dottedProvider] ?? "")) {
 		setDottedProviderLine(lines, dottedProvider, backup?.providerKind === "dotted" ? backup.previousProvider : "''");
@@ -519,7 +1225,7 @@ function restoreOrClearProvider(
 		configChanged = true;
 	}
 	if (configChanged) {
-		writeFileAtomicSync(safeConfigPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`);
+		writeTargetFile(safeConfigPath, `${lines.join("\n").replace(/\n+$/g, "")}\n`, targetRoot);
 	}
 	return {
 		configPath: configChanged ? safeConfigPath : null,
@@ -574,8 +1280,8 @@ function computePluginSourceHash(): string {
 	return hash.digest("hex");
 }
 
-function writeInstallMarker(targetDir: string, targetKind: InstallMarker["targetKind"]): string {
-	const markerPath = join(targetDir, INSTALL_MARKER_FILE);
+function writeInstallMarker(targetDir: string, targetKind: InstallMarker["targetKind"], targetRoot: string): string {
+	const markerPath = resolveContainedWritePath(join(targetDir, INSTALL_MARKER_FILE), targetRoot);
 	const marker: InstallMarker = {
 		connector: "@signet/connector-hermes-agent",
 		schemaVersion: 1,
@@ -584,15 +1290,13 @@ function writeInstallMarker(targetDir: string, targetKind: InstallMarker["target
 		targetKind,
 		installedAt: new Date().toISOString(),
 	};
-	writeFileSync(markerPath, `${JSON.stringify(marker, null, 2)}\n`);
+	writeTargetFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, targetRoot);
 	return markerPath;
 }
 
-function readInstallMarker(targetDir: string): InstallMarker | null {
-	const markerPath = join(targetDir, INSTALL_MARKER_FILE);
-	if (!existsSync(markerPath)) return null;
+function parseInstallMarker(content: string): InstallMarker | null {
 	try {
-		const parsed = JSON.parse(readFileSync(markerPath, "utf-8")) as Partial<InstallMarker>;
+		const parsed = JSON.parse(content) as Partial<InstallMarker>;
 		if (
 			parsed.connector === "@signet/connector-hermes-agent" &&
 			parsed.schemaVersion === 1 &&
@@ -603,9 +1307,36 @@ function readInstallMarker(targetDir: string): InstallMarker | null {
 		) {
 			return parsed as InstallMarker;
 		}
-		return null;
+	} catch {}
+	return null;
+}
+
+function readInstallMarker(targetDir: string): InstallMarker | null {
+	const markerPath = join(targetDir, INSTALL_MARKER_FILE);
+	if (!existsSync(markerPath)) return null;
+	try {
+		return parseInstallMarker(readFileSync(markerPath, "utf-8"));
 	} catch {
 		return null;
+	}
+}
+
+function readInstallMarkerFromDirectory(directoryFd: number, directoryPath: string): InstallMarker | null {
+	let markerFd: number | undefined;
+	try {
+		if (process.platform === "darwin") {
+			const content = runSecureFilesystemOperation(directoryFd, directoryPath, SECURE_READ_FILE_SCRIPT, [
+				INSTALL_MARKER_FILE,
+			]);
+			return parseInstallMarker(content);
+		}
+		const markerPath = join(descriptorPath(directoryFd), INSTALL_MARKER_FILE);
+		markerFd = openSync(markerPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		return parseInstallMarker(readFileSync(markerFd, "utf-8"));
+	} catch {
+		return null;
+	} finally {
+		if (markerFd !== undefined) closeDirectory(markerFd);
 	}
 }
 
@@ -614,8 +1345,16 @@ function pluginMarkerIsFresh(targetDir: string): boolean {
 	return marker !== null && marker.sourceHash === computePluginSourceHash();
 }
 
-function pluginLooksCurrent(targetDir: string): boolean {
-	return pluginHasStaticToolSchemas(join(targetDir, "__init__.py")) && pluginMarkerIsFresh(targetDir);
+function pluginLooksCurrent(targetDir: string, targetRoot?: string): boolean {
+	let safeTargetDir = targetDir;
+	if (targetRoot) {
+		try {
+			safeTargetDir = resolveContainedWritePath(targetDir, targetRoot);
+		} catch {
+			return false;
+		}
+	}
+	return pluginHasStaticToolSchemas(join(safeTargetDir, "__init__.py")) && pluginMarkerIsFresh(safeTargetDir);
 }
 
 function probeHermesProvider(hermesRepo: string): HermesProbeResult {
@@ -728,16 +1467,6 @@ function configuredAgentReadPolicy(warnings: string[], options: HermesConnectorO
 	warnings.push(`Ignoring unsupported SIGNET_AGENT_READ_POLICY '${raw}'. Expected one of: isolated, shared, group.`);
 	return "shared";
 }
-
-/**
- * Resolve the daemon's configured agent id from `/api/status`.
- *
- * The daemon resolves its agent id from its own `SIGNET_AGENT_ID`, falling
- * back to `default` (see `platform/daemon/src/agent-id.ts`). This is the
- * workspace's real agent scope, which is what the plugin inherits when no
- * explicit agent id is set. Returns null when the daemon is unreachable or
- * reports none, so callers fall back to `default`.
- */
 async function resolveDaemonAgentId(daemonUrl: string): Promise<string | null> {
 	try {
 		const baseUrl = trimTrailingSlashes(daemonUrl);
@@ -755,7 +1484,6 @@ async function resolveDaemonAgentId(daemonUrl: string): Promise<string | null> {
 		const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
 		return agentId || null;
 	} catch {
-		// Daemon offline or still starting — caller falls back to "default".
 		return null;
 	}
 }
@@ -788,9 +1516,7 @@ async function ensureNamedAgentRegistered(
 			);
 			return null;
 		}
-	} catch {
-		// Daemon may be offline; the POST below will produce the user-facing warning.
-	}
+	} catch {}
 
 	const readPolicy = configuredAgentReadPolicy(warnings, options);
 	const policyGroup =
@@ -826,10 +1552,6 @@ async function ensureNamedAgentRegistered(
 	return null;
 }
 
-// ---------------------------------------------------------------------------
-// Connector
-// ---------------------------------------------------------------------------
-
 export class HermesAgentConnector extends BaseConnector {
 	readonly name = "Hermes Agent";
 	readonly harnessId = "hermes-agent";
@@ -850,9 +1572,9 @@ export class HermesAgentConnector extends BaseConnector {
 			if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(this.target.profile)) {
 				throw new Error("Invalid Hermes profile name; use 1-64 letters, numbers, '.', '_' or '-'.");
 			}
-			const userHome = process.env.HOME?.trim() || homedir();
-			const profileHome = join(userHome, ".hermes", "profiles", this.target.profile);
-			return resolveContainedWritePath(profileHome, join(userHome, ".hermes", "profiles"));
+			const hermesHome = resolveHermesHomePath();
+			const profileHome = join(hermesHome, "profiles", this.target.profile);
+			return resolveContainedWritePath(profileHome, join(hermesHome, "profiles"));
 		}
 		return resolveHermesHomePath();
 	}
@@ -863,7 +1585,8 @@ export class HermesAgentConnector extends BaseConnector {
 	}
 
 	getConfigPath(): string {
-		return resolveConfigPath(this.getHermesHome());
+		const hermesHome = this.getHermesHome();
+		return resolveConfigPath(hermesHome, this.target?.profile ? hermesHome : undefined);
 	}
 
 	async install(basePath: string, options: HermesConnectorOptions = {}): Promise<InstallResult> {
@@ -878,29 +1601,20 @@ export class HermesAgentConnector extends BaseConnector {
 
 		const hermesHome = this.getHermesHome();
 		const hermesRepo = this.getHermesRepo();
+		const targetRoot = hermesHome;
 		let userPluginInstalled = false;
 		let repoPluginInstalled = false;
-
-		// 1. Install the Python plugin into the current user-plugin location.
 		try {
-			const pluginFiles = installPlugin(
-				getUserPluginTargetDir(hermesHome),
-				"user",
-				options.profile ? hermesHome : undefined,
-			);
+			const pluginFiles = installPlugin(getUserPluginTargetDir(hermesHome), "user", targetRoot);
 			filesWritten.push(...pluginFiles);
 			userPluginInstalled = true;
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			warnings.push(`Failed to install Hermes user plugin files: ${msg}`);
 		}
-
-		// Bundled repo providers take precedence over user plugins in Hermes.
-		// Refresh that copy too when the repo is discoverable so stale schemas
-		// cannot shadow the fixed Signet provider.
 		if (hermesRepo) {
 			try {
-				const pluginFiles = installPlugin(getRepoPluginTargetDir(hermesRepo), "repo");
+				const pluginFiles = installPlugin(getRepoPluginTargetDir(hermesRepo), "repo", hermesRepo);
 				filesWritten.push(...pluginFiles);
 				repoPluginInstalled = true;
 			} catch (e) {
@@ -921,9 +1635,7 @@ export class HermesAgentConnector extends BaseConnector {
 			};
 		}
 
-		const envPath = options.profile
-			? resolveContainedWritePath(join(hermesHome, ".env"), hermesHome)
-			: join(hermesHome, ".env");
+		const envPath = resolveContainedWritePath(join(hermesHome, ".env"), targetRoot);
 		let configuredSignetAgentId = "default";
 		const configuredDaemonUrl = (process.env.SIGNET_DAEMON_URL?.trim() || "http://127.0.0.1:3850").replace(
 			/[\r\n]+/g,
@@ -940,11 +1652,6 @@ export class HermesAgentConnector extends BaseConnector {
 			if (process.env.SIGNET_TRUSTED_DAEMON_ORIGINS) {
 				signetVars.SIGNET_TRUSTED_DAEMON_ORIGINS = sanitizedEnv("SIGNET_TRUSTED_DAEMON_ORIGINS");
 			}
-			// Always write SIGNET_AGENT_ID. Resolution order: explicit env, then
-			// the daemon's configured agent (its own SIGNET_AGENT_ID or "default"),
-			// then "default" for the default workspace. The harness name
-			// ("hermes-agent") is provenance, never an agent id — a stale value
-			// from an older install is healed instead of honored.
 			let signetAgentId = sanitizedEnv("SIGNET_AGENT_ID");
 			if (signetAgentId === "hermes-agent") {
 				warnings.push(
@@ -967,9 +1674,6 @@ export class HermesAgentConnector extends BaseConnector {
 					signetVars.SIGNET_AGENT_WORKSPACE = agentWorkspace;
 				}
 			}
-
-			// Persist auth token so Hermes can reach a non-localhost daemon.
-			// Warn if absent and SIGNET_DAEMON_URL points to a remote host.
 			const authToken = sanitizedAuthTokenEnv();
 			if (authToken) {
 				signetVars.SIGNET_API_KEY = authToken;
@@ -1006,8 +1710,8 @@ export class HermesAgentConnector extends BaseConnector {
 			}
 
 			if (changed) {
-				mkdirSync(hermesHome, { recursive: true });
-				writeFileAtomicSync(envPath, envContent);
+				ensureTargetDirectory(hermesHome, targetRoot);
+				writeTargetFile(envPath, envContent, targetRoot);
 				configsPatched.push(envPath);
 			}
 		} catch (e) {
@@ -1025,15 +1729,14 @@ export class HermesAgentConnector extends BaseConnector {
 			return { success: false, message: registrationError, filesWritten, configsPatched, warnings };
 		}
 
-		// 3. Activate Signet as the external Hermes memory provider.
-		const providerConfig = configureProvider(hermesHome, warnings, options.profile ? hermesHome : undefined);
+		const providerConfig = configureProvider(hermesHome, warnings, targetRoot);
 		if (providerConfig.configPath) {
 			configsPatched.push(providerConfig.configPath);
 		}
 		if (providerConfig.backupPath) {
 			filesWritten.push(providerConfig.backupPath);
 		}
-		if (!isProviderConfigured(hermesHome)) {
+		if (!isProviderConfigured(hermesHome, targetRoot)) {
 			return {
 				success: false,
 				message:
@@ -1074,19 +1777,22 @@ export class HermesAgentConnector extends BaseConnector {
 
 		const hermesRepo = this.getHermesRepo();
 		if (hermesRepo) {
-			const removed = uninstallPlugin(getRepoPluginTargetDir(hermesRepo));
+			const removed = uninstallPlugin(getRepoPluginTargetDir(hermesRepo), "repo", hermesRepo);
 			filesRemoved.push(...removed);
 		}
 
 		const hermesHome = this.getHermesHome();
 		const userPluginTarget = getUserPluginTargetDir(hermesHome);
-		if (this.target?.profile && (!existsSync(userPluginTarget) || readInstallMarker(userPluginTarget) === null)) {
+		const targetRoot = hermesHome;
+		const safeUserPluginTarget = resolveContainedWritePath(userPluginTarget, targetRoot);
+		if (!pathEntryExists(safeUserPluginTarget)) {
 			return { filesRemoved, configsPatched };
 		}
-		const userPluginRemoved = uninstallPlugin(userPluginTarget, this.target?.profile ? hermesHome : undefined);
+		const userPluginRemoved = uninstallPlugin(userPluginTarget, "user", targetRoot, "skip");
+		if (userPluginRemoved.length === 0) return { filesRemoved, configsPatched };
 		filesRemoved.push(...userPluginRemoved);
 
-		const providerConfig = restoreOrClearProvider(hermesHome, this.target?.profile ? hermesHome : undefined);
+		const providerConfig = restoreOrClearProvider(hermesHome, targetRoot);
 		if (providerConfig.configPath) {
 			configsPatched.push(providerConfig.configPath);
 		}
@@ -1094,9 +1800,7 @@ export class HermesAgentConnector extends BaseConnector {
 			filesRemoved.push(providerConfig.backupPath);
 		}
 
-		const envPath = this.target?.profile
-			? resolveContainedWritePath(join(hermesHome, ".env"), hermesHome)
-			: join(hermesHome, ".env");
+		const envPath = resolveContainedWritePath(join(hermesHome, ".env"), targetRoot);
 		if (existsSync(envPath)) {
 			try {
 				let envContent = readFileSync(envPath, "utf-8");
@@ -1116,11 +1820,10 @@ export class HermesAgentConnector extends BaseConnector {
 					}
 				}
 				if (changed) {
-					writeFileAtomicSync(envPath, `${envContent.replace(/\n{3,}/g, "\n\n").trimEnd()}\n`);
+					writeTargetFile(envPath, `${envContent.replace(/\n{3,}/g, "\n\n").trimEnd()}\n`, targetRoot);
 					configsPatched.push(envPath);
 				}
 			} catch (e) {
-				// Best effort — log but don't fail the uninstall
 				console.warn(`[hermes-agent] Failed to clean up .env: ${e instanceof Error ? e.message : String(e)}`);
 			}
 		}
@@ -1131,9 +1834,10 @@ export class HermesAgentConnector extends BaseConnector {
 	isInstalled(): boolean {
 		const hermesHome = this.getHermesHome();
 		const hermesRepo = this.getHermesRepo();
-		if (!isProviderConfigured(hermesHome)) return false;
+		const targetRoot = this.target?.profile ? hermesHome : undefined;
+		if (!isProviderConfigured(hermesHome, targetRoot)) return false;
 		if (hermesRepo) return pluginLooksCurrent(getRepoPluginTargetDir(hermesRepo));
-		return pluginLooksCurrent(getUserPluginTargetDir(hermesHome));
+		return pluginLooksCurrent(getUserPluginTargetDir(hermesHome), targetRoot);
 	}
 
 	async diagnose(): Promise<HermesDoctorReport> {
@@ -1142,6 +1846,7 @@ export class HermesAgentConnector extends BaseConnector {
 		return diagnoseHermesIntegration({
 			hermesHome,
 			hermesRepo,
+			targetRoot: this.target?.profile ? hermesHome : undefined,
 			daemonUrl: (process.env.SIGNET_DAEMON_URL?.trim() || "http://127.0.0.1:3850").replace(/[\r\n]+/g, ""),
 		});
 	}
@@ -1150,12 +1855,14 @@ export class HermesAgentConnector extends BaseConnector {
 export async function diagnoseHermesIntegration(opts?: {
 	readonly hermesHome?: string;
 	readonly hermesRepo?: string | null;
+	readonly targetRoot?: string;
 	readonly daemonUrl?: string;
 }): Promise<HermesDoctorReport> {
 	const hermesHome = opts?.hermesHome ?? resolveHermesHomePath();
 	const hermesRepo = opts && "hermesRepo" in opts ? (opts.hermesRepo ?? null) : resolveHermesRepoPath();
+	const targetRoot = opts?.targetRoot;
 	const daemonUrl = opts?.daemonUrl ?? (process.env.SIGNET_DAEMON_URL?.trim() || "http://127.0.0.1:3850");
-	const configPath = resolveConfigPath(hermesHome);
+	const configPath = resolveConfigPath(hermesHome, targetRoot);
 	const userPluginDir = getUserPluginTargetDir(hermesHome);
 	const repoPluginDir = hermesRepo ? getRepoPluginTargetDir(hermesRepo) : null;
 	const checks: HermesDiagnosticCheck[] = [];
@@ -1167,7 +1874,7 @@ export async function diagnoseHermesIntegration(opts?: {
 	} catch (error) {
 		pluginSourceError = error instanceof Error ? error.message : String(error);
 	}
-	const userPluginCurrent = pluginSourceDir !== null && pluginLooksCurrent(userPluginDir);
+	const userPluginCurrent = pluginSourceDir !== null && pluginLooksCurrent(userPluginDir, targetRoot);
 	const repoPluginCurrent = pluginSourceDir !== null && repoPluginDir ? pluginLooksCurrent(repoPluginDir) : false;
 	const probe = hermesRepo
 		? probeHermesProvider(hermesRepo)
@@ -1193,11 +1900,11 @@ export async function diagnoseHermesIntegration(opts?: {
 	checks.push({
 		id: "provider-config",
 		label: "Hermes memory provider",
-		ok: isProviderConfigured(hermesHome),
+		ok: isProviderConfigured(hermesHome, targetRoot),
 		detail: existsSync(configPath)
-			? `${configPath} ${isProviderConfigured(hermesHome) ? "sets" : "does not set"} memory.provider=signet`
+			? `${configPath} ${isProviderConfigured(hermesHome, targetRoot) ? "sets" : "does not set"} memory.provider=signet`
 			: `${configPath} does not exist`,
-		fix: isProviderConfigured(hermesHome) ? undefined : "Run `signet setup --harness hermes-agent`.",
+		fix: isProviderConfigured(hermesHome, targetRoot) ? undefined : "Run `signet setup --harness hermes-agent`.",
 	});
 	checks.push({
 		id: "user-plugin",

@@ -4,11 +4,12 @@ import { join } from "node:path";
 import { resolveDefaultBasePath, writeFileScopedAtomicSync } from "@signet/core";
 import type { Hono } from "hono";
 
-type ReviewTargetType = "skill" | "mcp";
+type ReviewTargetType = "skill";
+type StoredReviewTargetType = ReviewTargetType | "mcp";
 
 interface MarketplaceReview {
 	readonly id: string;
-	readonly targetType: ReviewTargetType;
+	readonly targetType: StoredReviewTargetType;
 	readonly targetId: string;
 	readonly displayName: string;
 	readonly rating: number;
@@ -26,12 +27,8 @@ interface ReviewsSyncConfig {
 	readonly lastSyncAt: string | null;
 	readonly lastSyncError: string | null;
 }
-
-// Production sync endpoint. Pre-configured so users only need to set enabled: true.
 const REVIEWS_SYNC_URL = "https://reviews.signetai.sh/api/reviews/sync";
 const REVIEW_SYNC_TIMEOUT_MS = 15_000;
-// A daemon normally owns a workspace; keying the queue keeps distinct test or
-// embedded workspaces independent while serializing calls for the same one.
 const reviewSyncFlights = new Map<string, Promise<unknown>>();
 
 const DEFAULT_CONFIG: ReviewsSyncConfig = {
@@ -62,10 +59,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function parseTargetType(value: unknown): ReviewTargetType | null {
-	if (value === "skill" || value === "mcp") {
+	if (value === "skill") {
 		return value;
 	}
 	return null;
+}
+
+function parseStoredTargetType(value: unknown): StoredReviewTargetType | null {
+	if (value === "mcp") {
+		return value;
+	}
+	return parseTargetType(value);
 }
 
 function parseText(value: unknown): string | null {
@@ -84,7 +88,7 @@ function parseRating(value: unknown): number | null {
 
 function normalizeReview(value: unknown): MarketplaceReview | null {
 	if (!isRecord(value)) return null;
-	const targetType = parseTargetType(value.targetType);
+	const targetType = parseStoredTargetType(value.targetType);
 	const targetId = parseText(value.targetId);
 	const displayName = parseText(value.displayName);
 	const rating = parseRating(value.rating);
@@ -201,12 +205,18 @@ function isReviewSyncTimeout(error: unknown): boolean {
 
 export function mountMarketplaceReviewsRoutes(app: Hono): void {
 	app.get("/api/marketplace/reviews", (c) => {
-		const targetType = parseTargetType(c.req.query("type"));
+		const requestedType = c.req.query("type");
+		const targetType = requestedType === undefined ? null : parseTargetType(requestedType);
+		if (requestedType !== undefined && targetType === null) {
+			return c.json({ error: "Unsupported review target type" }, 400);
+		}
 		const targetId = parseText(c.req.query("id"));
 		const limit = parseLimit(c.req.query("limit"));
 		const offset = parseOffset(c.req.query("offset"));
 
-		const allReviews = readReviews().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+		const allReviews = readReviews()
+			.filter((item) => item.targetType === "skill")
+			.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 		const filtered = allReviews.filter((item) => {
 			if (targetType && item.targetType !== targetType) return false;
 			if (targetId && item.targetId !== targetId) return false;
@@ -311,7 +321,7 @@ export function mountMarketplaceReviewsRoutes(app: Hono): void {
 		}
 
 		const reviews = readReviews();
-		const existing = reviews.find((item) => item.id === id);
+		const existing = reviews.find((item) => item.id === id && item.targetType === "skill");
 		if (!existing) {
 			return c.json({ error: "Review not found" }, 404);
 		}
@@ -335,24 +345,26 @@ export function mountMarketplaceReviewsRoutes(app: Hono): void {
 			syncedAt: null,
 		};
 
-		writeReviews(reviews.map((item) => (item.id === id ? updated : item)));
+		writeReviews(reviews.map((item) => (item.id === id && item.targetType === "skill" ? updated : item)));
 		return c.json({ success: true, review: updated });
 	});
 
 	app.delete("/api/marketplace/reviews/:id", (c) => {
 		const id = c.req.param("id");
 		const reviews = readReviews();
-		if (!reviews.some((item) => item.id === id)) {
+		if (!reviews.some((item) => item.id === id && item.targetType === "skill")) {
 			return c.json({ error: "Review not found" }, 404);
 		}
 
-		writeReviews(reviews.filter((item) => item.id !== id));
+		writeReviews(reviews.filter((item) => item.id !== id || item.targetType !== "skill"));
 		return c.json({ success: true, id });
 	});
 
 	app.get("/api/marketplace/reviews/config", (c) => {
 		const config = readConfig();
-		const pending = readReviews().filter((item) => item.syncedAt === null || item.updatedAt > item.syncedAt).length;
+		const pending = readReviews().filter(
+			(item) => item.targetType === "skill" && (item.syncedAt === null || item.updatedAt > item.syncedAt),
+		).length;
 		return c.json({ ...config, pending });
 	});
 
@@ -364,7 +376,9 @@ export function mountMarketplaceReviewsRoutes(app: Hono): void {
 			}
 
 			const reviews = readReviews();
-			const pending = reviews.filter((item) => item.syncedAt === null || item.updatedAt > item.syncedAt);
+			const pending = reviews.filter(
+				(item) => item.targetType === "skill" && (item.syncedAt === null || item.updatedAt > item.syncedAt),
+			);
 			if (pending.length === 0) {
 				return c.json({ success: true, sent: 0, synced: 0, message: "No pending reviews" });
 			}
@@ -391,7 +405,9 @@ export function mountMarketplaceReviewsRoutes(app: Hono): void {
 				const syncedAt = new Date().toISOString();
 				const pendingIds = new Set(pending.map((item) => item.id));
 				const nextReviews = reviews.map((item) =>
-					pendingIds.has(item.id) ? { ...item, syncedAt, source: "synced" as const } : item,
+					item.targetType === "skill" && pendingIds.has(item.id)
+						? { ...item, syncedAt, source: "synced" as const }
+						: item,
 				);
 				writeReviews(nextReviews);
 

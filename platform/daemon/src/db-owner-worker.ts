@@ -1,18 +1,19 @@
 import { dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Database as BunDatabase } from "bun:sqlite";
-import { findSqliteVecExtension, vectorSearchWithMetadata } from "@signet/core";
+import { activeVectorProjectionTable, findSqliteVecExtension, vectorSearchWithMetadata } from "@signet/core";
 import {
 	applyObsidianSourceStructureInTx,
 	applyObsidianSourceStructurePurgeInTx,
+	isObsidianSourceFileIndexedInTx,
 	purgeObsidianSourceFileStructureInTx,
 } from "./obsidian-source-graph";
 import { indexSourceArtifactStructureInTx, purgeSourceArtifactStructureInTx } from "./source-artifact-graph";
 import { purgeSourceOwnedRowsInTx } from "./source-purge-tx";
+import { removeAgentInTx } from "./agent-removal";
 import { upsertMemoryArtifactInTx, type MemoryArtifactUpsertFields } from "./memory-lineage";
-import { upsertMemoryContentSafetyInTx } from "./memory-content-safety";
 import { NATIVE_MEMORY_BRIDGE_SOURCE_NODE_ID } from "./native-memory-constants";
 import { applySourceSnapshotImportInTx } from "./source-snapshots";
 import { commitTranscriptImportBatchInTx, purgeTranscriptImportSourceInTx } from "./transcript-import-commit";
@@ -31,6 +32,7 @@ import type {
 	DbOwnerNativeMemoryIndex,
 	DbOwnerVectorSearchPayload,
 } from "./db-owner-protocol";
+import { applyVectorRepairBatch, VectorRepairAbortError } from "./vector-repair-owner";
 import type { EmbeddingConfig } from "./memory-config";
 import { awaitEmbeddingProviderAvailable, recordEmbeddingProviderFailure } from "./embedding-circuit-breaker";
 import { vectorToBlob } from "./db-helpers";
@@ -50,6 +52,7 @@ interface SqliteRunResult {
 }
 
 interface SqliteStatement {
+	finalize?(): void;
 	all(...params: readonly unknown[]): unknown[];
 	get(...params: readonly unknown[]): unknown;
 	run(...params: readonly unknown[]): SqliteRunResult;
@@ -59,7 +62,7 @@ interface SqliteDatabase {
 	prepare(sql: string): SqliteStatement;
 	exec(sql: string): void;
 	loadExtension?(path: string): void;
-	close(): void;
+	close(throwOnError?: boolean): void;
 }
 
 interface SqliteDatabaseConstructor {
@@ -136,7 +139,7 @@ export function runDbOwnerWorker(): void {
 	const closeAndExit = (code: number): never => {
 		if (parentWatch !== undefined) clearInterval(parentWatch);
 		try {
-			if (db !== undefined) db.close();
+			if (db !== undefined) db.close(true);
 		} finally {
 			process.exit(code);
 		}
@@ -148,10 +151,6 @@ export function runDbOwnerWorker(): void {
 	function writeDiagnostic(message: string): void {
 		process.stderr.write(`${message}\n`);
 	}
-
-	// Readiness attests only that the protocol channel is available. Database
-	// construction, custom SQLite selection, and extension loading are startup
-	// work owned by this process and must not delay the parent handshake.
 	send({ type: "ready", pid: process.pid });
 
 	const startupStarted = process.env.SIGNET_DB_OWNER_TEST_STARTUP_STARTED;
@@ -178,8 +177,6 @@ export function runDbOwnerWorker(): void {
 	}
 	if (db === undefined) closeAndExit(1);
 	parentWatch = setInterval(() => {
-		// SIGKILL bypasses daemon cleanup. Close the owner database as soon as
-		// its control-process parent disappears, before exiting as an orphan.
 		if (process.ppid !== parentPid) closeAndExit(0);
 	}, 50);
 	parentWatch.unref();
@@ -200,9 +197,32 @@ export function runDbOwnerWorker(): void {
 			throw new DbOwnerCancellationRequested();
 		}
 		const commitMarker = process.env.SIGNET_DB_OWNER_TEST_COMMIT_STARTED;
-		if (commitMarker !== undefined) writeFileSync(commitMarker, "started\n");
+		const commitPauseMs = Number.parseInt(process.env.SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS ?? "0", 10);
+		const commitResultPauseMs = Number.parseInt(process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS ?? "0", 10);
+		const commitResultGate = process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_GATE;
+
+		if (commitMarker !== undefined) writeFileSync(commitMarker, commitPauseMs > 0 ? "waiting\n" : "started\n");
+		if (Number.isFinite(commitPauseMs) && commitPauseMs > 0) {
+			Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS");
+			wait(Math.min(commitPauseMs, 60_000));
+		}
 		db.exec("COMMIT");
 		if (context !== undefined) context.committed = true;
+		if (commitMarker !== undefined && Number.isFinite(commitPauseMs) && commitPauseMs > 0) {
+			writeFileSync(commitMarker, "completed\n");
+			Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_STARTED");
+		}
+		if (
+			Number.isFinite(commitResultPauseMs) &&
+			commitResultPauseMs > 0 &&
+			commitResultGate !== undefined &&
+			existsSync(commitResultGate)
+		) {
+			rmSync(commitResultGate, { force: true });
+			Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS");
+			if (commitMarker !== undefined) writeFileSync(commitMarker, "result-wait\n");
+			wait(Math.min(commitResultPauseMs, 60_000));
+		}
 	};
 	const withBusyRetry = <Result>(operation: () => Result, context?: JobExecutionContext): Result => {
 		for (let attempt = 0; ; attempt += 1) {
@@ -214,9 +234,7 @@ export function runDbOwnerWorker(): void {
 			} catch (error) {
 				try {
 					db.exec("ROLLBACK");
-				} catch {
-					// Preserve the original SQLite error.
-				}
+				} catch {}
 				if (!isBusyError(error) || attempt >= BUSY_RETRIES) throw error;
 				wait(BUSY_BACKOFF_MS * 2 ** attempt);
 			}
@@ -309,11 +327,15 @@ export function runDbOwnerWorker(): void {
 		try {
 			const params = (statement.params ?? []).map(bindParameter);
 			const prepared = readonlyDb.prepare(statement.sql);
-			return statement.result === "all"
-				? enforceResultLimit(statement, prepared.all(...params))
-				: enforceResultLimit(statement, prepared.get(...params));
+			try {
+				return statement.result === "all"
+					? enforceResultLimit(statement, prepared.all(...params))
+					: enforceResultLimit(statement, prepared.get(...params));
+			} finally {
+				prepared.finalize?.();
+			}
 		} finally {
-			readonlyDb.close();
+			readonlyDb.close(true);
 		}
 	}
 
@@ -367,9 +389,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// The original error is the actionable failure.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -391,9 +411,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				/* preserve original error */
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -410,9 +428,32 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// The original error is the actionable failure.
-			}
+			} catch {}
+			throw error;
+		}
+	}
+
+	function executeVectorRepair(
+		request: Extract<DbOwnerJob["request"], { readonly kind: "vector_repair" }>,
+		context: JobExecutionContext,
+	): unknown {
+		db.exec("BEGIN IMMEDIATE");
+		try {
+			const result = applyVectorRepairBatch(db as never, request.input, {
+				shouldAbort: () => {
+					if (cancellationRequested(context.jobId)) throw new VectorRepairAbortError();
+					if (Date.now() >= context.deadlineAt)
+						throw new VectorRepairAbortError("vector repair owner deadline exceeded");
+					return false;
+				},
+			});
+			commit(context);
+			return result;
+		} catch (error) {
+			try {
+				db.exec("ROLLBACK");
+			} catch {}
+			if (error instanceof VectorRepairAbortError) throw new DbOwnerCancellationRequested();
 			throw error;
 		}
 	}
@@ -439,9 +480,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// Preserve the original owner failure.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -477,9 +516,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// Preserve the original owner failure.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -487,8 +524,6 @@ export function runDbOwnerWorker(): void {
 	async function executeDreamingEpisodicBacklog(
 		request: Extract<DbOwnerJob["request"], { readonly kind: "dreaming_episodic_backlog" }>,
 	): Promise<number> {
-		// Keep source selection, evidence rendering, and exact token counting out
-		// of the daemon process. The exact operation has no finite source cap.
 		const { getDreamingEpisodicTokenBacklogInDb } = await import("./pipeline/dreaming");
 		return await getDreamingEpisodicTokenBacklogInDb(db as never, request.input.agentId);
 	}
@@ -496,8 +531,6 @@ export function runDbOwnerWorker(): void {
 	async function executeDreamingEpisodicBacklogProbe(
 		request: Extract<DbOwnerJob["request"], { readonly kind: "dreaming_episodic_backlog_probe" }>,
 	): Promise<unknown> {
-		// The scheduled gate stays bounded and returns structured completeness
-		// instead of turning an incomplete source page into a token count.
 		const { probeDreamingEpisodicBacklogInDb } = await import("./pipeline/dreaming");
 		return await probeDreamingEpisodicBacklogInDb(
 			db as never,
@@ -528,15 +561,43 @@ export function runDbOwnerWorker(): void {
 		return readDreamingEvidenceSourceInDb(db as never, request.input);
 	}
 
+	async function executeDreamingEvidenceReview(
+		request: Extract<DbOwnerJob["request"], { readonly kind: "dreaming_evidence_review" }>,
+	): Promise<unknown> {
+		const { reviewDreamingEvidenceInDb } = await import("./pipeline/dreaming-evidence-consumption");
+		return reviewDreamingEvidenceInDb(db as never, request.input);
+	}
+
 	async function executeDreamingPassFinalize(
 		request: Extract<DbOwnerJob["request"], { readonly kind: "dreaming_pass_finalize" }>,
 		context: JobExecutionContext,
 	): Promise<null> {
 		const { finalizeDreamingPassInDb } = await import("./pipeline/dreaming");
-		return withBusyRetry(() => {
+		withBusyRetry(() => {
 			finalizeDreamingPassInDb(db as never, request.input);
 			return null;
 		}, context);
+		if (request.input.mode === "incremental-content") {
+			try {
+				const { executeMemoryHead } = await import("./memory-head-owner");
+				const publication = withBusyRetry(() =>
+					executeMemoryHead(db as never, dirname(dirname(ownerDbPath)), {
+						action: "read",
+						agentId: request.input.agentId,
+					}),
+				);
+				if (publication.publication === "pending") {
+					console.warn(
+						`Dreaming pass ${request.input.passId} completed; MEMORY.md projection remains pending for agent ${request.input.agentId}`,
+					);
+				}
+			} catch (error) {
+				console.warn(
+					`Dreaming pass ${request.input.passId} completed; MEMORY.md projection retry failed for agent ${request.input.agentId}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+		return null;
 	}
 
 	async function executeDreamingReviewDue(
@@ -571,9 +632,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// Preserve the original owner failure.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -599,9 +658,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// The original error is the actionable failure.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -639,9 +696,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// The original error is the actionable failure.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -701,9 +756,10 @@ export function runDbOwnerWorker(): void {
 			providerGate = await awaitEmbeddingProviderAvailable(providerKey, undefined, 10_000);
 			return providerGate.available;
 		};
+		const vecTable = activeVectorProjectionTable(database);
 		const vecSchema = database
-			.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_embeddings'")
-			.get() as { sql?: string } | null;
+			.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+			.get(vecTable) as { sql?: string } | null;
 		const vecAvailable = vecSchema !== null;
 		const vecDimensions = vecSchema?.sql?.match(/float\\s*\\[\\s*(\\d+)\\s*\\]/i)?.[1];
 		const currentHashes = new Set<string>();
@@ -724,12 +780,6 @@ export function runDbOwnerWorker(): void {
 				)
 				.get("source_chunk", "obsidian_chunk", chunk.id, input.agentId) as { id: string; content_hash: string } | null;
 			if (existing?.content_hash === contentHash) {
-				upsertMemoryContentSafetyInTx(database as unknown as import("./db-accessor").WriteDb, {
-					agentId: input.agentId,
-					sourceKind: "source_chunk",
-					sourceId: embeddingId,
-					content: chunk.chunkText,
-				});
 				skipped++;
 				continue;
 			}
@@ -761,7 +811,7 @@ export function runDbOwnerWorker(): void {
 				continue;
 			}
 			if (existing !== null) {
-				if (vecAvailable) database.prepare("DELETE FROM vec_embeddings WHERE id = ?").run(existing.id);
+				if (vecAvailable) database.prepare(`DELETE FROM ${vecTable} WHERE id = ?`).run(existing.id);
 				database.prepare("DELETE FROM embeddings WHERE id = ?").run(existing.id);
 			}
 			database
@@ -784,15 +834,9 @@ export function runDbOwnerWorker(): void {
 					new Date().toISOString(),
 					input.agentId,
 				);
-			upsertMemoryContentSafetyInTx(database as unknown as import("./db-accessor").WriteDb, {
-				agentId: input.agentId,
-				sourceKind: "source_chunk",
-				sourceId: embeddingId,
-				content: chunk.chunkText,
-			});
 			if (vecAvailable && vecDimensions === String(vector.length))
 				database
-					.prepare("INSERT OR REPLACE INTO vec_embeddings (id, embedding) VALUES (?, ?)")
+					.prepare(`INSERT OR REPLACE INTO ${vecTable} (id, embedding) VALUES (?, ?)`)
 					.run(embeddingId, vectorToBlob(vector));
 			embedded++;
 		}
@@ -808,7 +852,7 @@ export function runDbOwnerWorker(): void {
 		}>;
 		for (const row of stale) {
 			if (row.source_type === "obsidian_chunk" || currentHashes.has(row.content_hash)) continue;
-			if (vecAvailable) database.prepare("DELETE FROM vec_embeddings WHERE id = ?").run(row.id);
+			if (vecAvailable) database.prepare(`DELETE FROM ${vecTable} WHERE id = ?`).run(row.id);
 			database.prepare("DELETE FROM embeddings WHERE id = ?").run(row.id);
 		}
 		return { embedded, skipped, providerUnavailable: false };
@@ -834,10 +878,28 @@ export function runDbOwnerWorker(): void {
 				"SELECT source_sha256 FROM memory_artifacts WHERE agent_id = ? AND source_path = ? AND COALESCE(is_deleted, 0) = 0 LIMIT 1",
 			)
 			.get(input.agentId, sourcePath) as { source_sha256: string } | null | undefined;
+		const artifactChanged = existing?.source_sha256 !== input.sourceHash;
+		const graphCurrent =
+			input.graph !== undefined &&
+			!artifactChanged &&
+			isObsidianSourceFileIndexedInTx(db as unknown as import("./db-accessor").WriteDb, {
+				agentId: input.agentId,
+				sourceId: input.graph.sourceId,
+				filePath: sourcePath,
+			});
+		const graphIndexed = input.graph !== undefined && !graphCurrent;
 		db.exec("BEGIN IMMEDIATE");
 		try {
-			upsertMemoryArtifactInTx(db as unknown as BunDatabase, nativeMemoryArtifactFields(input));
-			if (input.graph !== undefined) {
+			if (artifactChanged) upsertMemoryArtifactInTx(db as unknown as BunDatabase, nativeMemoryArtifactFields(input));
+			if (checkpoint !== undefined) {
+				db.prepare(
+					`UPDATE source_sync_failures
+					 SET resolved_at = datetime('now'), last_observed_at = datetime('now')
+					 WHERE agent_id = ? AND source_key = ? AND phase = 'content'
+					   AND item_path = ? AND resolved_at IS NULL`,
+				).run(input.agentId, checkpoint.sourceKey, sourcePath);
+			}
+			if (graphIndexed && input.graph !== undefined) {
 				applyObsidianSourceStructureInTx(db as unknown as import("./db-accessor").WriteDb, {
 					agentId: input.agentId,
 					sourceId: input.graph.sourceId,
@@ -869,16 +931,14 @@ export function runDbOwnerWorker(): void {
 			}
 			commit(context);
 			return {
-				artifactChanged: existing?.source_sha256 !== input.sourceHash,
-				graphIndexed: input.graph !== undefined,
+				artifactChanged,
+				graphIndexed,
 				embeddingProviderUnavailable: embeddingResult.providerUnavailable,
 			};
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// Preserve the original error.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -895,9 +955,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// Preserve the original error.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -914,9 +972,7 @@ export function runDbOwnerWorker(): void {
 		} catch (error) {
 			try {
 				db.exec("ROLLBACK");
-			} catch {
-				// Preserve the original error.
-			}
+			} catch {}
 			throw error;
 		}
 	}
@@ -952,8 +1008,6 @@ export function runDbOwnerWorker(): void {
 						return router.createWorkloadProvider("session_synthesis", agentId);
 					case "aggregateRecall":
 						return router.createWorkloadProvider("aggregate_recall", agentId);
-					case "widgetGeneration":
-						return router.createWorkloadProvider("widget_generation", agentId);
 					case "repair":
 						return router.createWorkloadProvider("repair", agentId);
 					case "interactive":
@@ -1034,6 +1088,7 @@ export function runDbOwnerWorker(): void {
 		if (job.request.kind === "batch")
 			return executeBatch(job.request.statements, job.request.requireChanges === true, context);
 		if (job.request.kind === "source_snapshot_import") return executeSourceSnapshotImport(job.request, context);
+		if (job.request.kind === "vector_repair") return executeVectorRepair(job.request, context);
 		if (job.request.kind === "transcript_bulk_commit") return executeTranscriptBulkCommit(job.request, context);
 		if (job.request.kind === "dreaming_hygiene_attention") return executeDreamingHygieneAttention(job.request, context);
 		if (job.request.kind === "dreaming_surprisal_attention")
@@ -1045,6 +1100,7 @@ export function runDbOwnerWorker(): void {
 			return await executeDreamingEpisodicBacklogExists(job.request);
 		if (job.request.kind === "dreaming_evidence_search") return await executeDreamingEvidenceSearch(job.request);
 		if (job.request.kind === "dreaming_evidence_source") return await executeDreamingEvidenceSource(job.request);
+		if (job.request.kind === "dreaming_evidence_review") return await executeDreamingEvidenceReview(job.request);
 		if (job.request.kind === "dreaming_pass_finalize") return executeDreamingPassFinalize(job.request, context);
 		if (job.request.kind === "dreaming_review_due") return await executeDreamingReviewDue(job.request);
 		if (job.request.kind === "dreaming_evidence_classify") return await executeDreamingEvidenceClassify(job.request);
@@ -1106,9 +1162,20 @@ export function runDbOwnerWorker(): void {
 			} catch (error) {
 				try {
 					db.exec("ROLLBACK");
-				} catch {
-					/* preserve original error */
-				}
+				} catch {}
+				throw error;
+			}
+		}
+		if (job.request.kind === "agent_remove") {
+			db.exec("BEGIN IMMEDIATE");
+			try {
+				const result = removeAgentInTx(db as never, job.request.input);
+				commit(context);
+				return result;
+			} catch (error) {
+				try {
+					db.exec("ROLLBACK");
+				} catch {}
 				throw error;
 			}
 		}
@@ -1152,10 +1219,6 @@ export function runDbOwnerWorker(): void {
 					}
 				},
 			});
-			// Conversion is a non-transactional SQLite operation: once it returns,
-			// VACUUM and the durable marker have completed. An active cancellation
-			// that arrived during the conversion must therefore report completion,
-			// not cancellation after durable changes.
 			if (context !== undefined && converted) context.committed = true;
 			return {
 				converted,
@@ -1312,9 +1375,6 @@ export function runDbOwnerWorker(): void {
 		}
 	});
 	process.stdin.on("end", () => {
-		// The daemon owns this pipe. If it is killed before it can send the
-		// protocol shutdown command, close SQLite immediately rather than
-		// leaving an orphan owner holding the eval workspace database lock.
 		closeAndExit(0);
 	});
 

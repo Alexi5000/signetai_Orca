@@ -1,13 +1,3 @@
-/**
- * Dreaming agent — periodic smart-model consolidation of the knowledge graph.
- *
- * Reads accumulated completed transcript projections and the current entity graph,
- * produces structured graph mutations (create, merge, update, delete,
- * supersede), and applies them through bounded, yielding write transactions.
- *
- * See docs/specs/approved/dreaming-memory-consolidation.md
- */
-
 import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -39,23 +29,26 @@ import {
 	ownerQueryAll,
 	ownerQueryOne,
 	ownerRunStatement,
+	runOwnerJob,
 	ownerChanges,
 	type DbOwnerMaintenance,
 } from "../db-owner-maintenance";
+import { DbOwnerDeadlineError, DbOwnerDiedError } from "../db-owner-client";
 import { DB_OWNER_MAX_WORK_UNITS } from "../db-owner-protocol";
 import { getDbOwnerForAccessor, runDbOwnerDomainOperation } from "../db-owner-runtime";
 import {
 	EPISODIC_CAPTURED_AT_FLOOR,
+	scanEpisodicSourceCandidates,
 	type EpisodicCursor,
 	type EpisodicSourceRecord,
 	readEpisodicSource,
 	readRecentEpisodicSources,
 	searchEpisodicSources,
 	timestampMillis,
+	utcTimestampMs,
 } from "../episodic-sources";
 import { type GraphHygieneCaps, getDreamingHygieneCandidatesInDb } from "../knowledge-graph-hygiene";
 import { logger } from "../logger";
-import { upsertMemoryContentSafetyInTx } from "../memory-content-safety";
 import type { GraphWriteCaps } from "../ontology-proposals";
 import { isPipelineTimeout, recordPipelineError } from "../pipeline-error";
 import { normalizePipelineCause, recordPipelineOperation } from "../pipeline-operation";
@@ -64,8 +57,24 @@ import { upsertThreadHead } from "../thread-heads";
 import { createDreamingAgentTools } from "./dreaming-agent-tools";
 import { enqueueDreamingAttentionInTx, getDreamingAttentionWorkloadDiagnostics } from "./dreaming-attention";
 import type { DreamingToolCallTrace } from "./dreaming-capabilities";
-import { renderDreamingEvidence } from "./dreaming-evidence";
-import { deliveredOffsetForSource, recordDreamingEvidenceConsumptionInTx } from "./dreaming-evidence-consumption";
+import { DREAMING_CAPABILITY_IDS, dreamingEvidencePageChars, listDreamingAttention } from "./dreaming-capabilities";
+import {
+	MEMORY_HEAD_MAX_TOKENS,
+	readCuratedMemoryHead,
+	type MemoryHeadCommitInput,
+	type MemoryHeadCommitter,
+} from "../memory-head";
+import { commitCuratedMemoryHeadInDb, memoryHeadInputError, withContentPassWrites } from "../memory-head-owner";
+import { renderDreamingEvidence, sanitizeTranscriptForDreaming } from "./dreaming-evidence";
+import {
+	deliveredOffsetForSource,
+	evidenceContentSha256,
+	failedOperationEvidence,
+	recordDreamingEvidenceConsumptionInTx,
+	resolveImportedSourceAttentionInTx,
+	SEEN_IMPORTED_SOURCE_ATTENTION_SQL,
+	STALLED_EVIDENCE_ATTENTION_SQL,
+} from "./dreaming-evidence-consumption";
 import {
 	parseDreamingReviewedExcludedEvidence,
 	recordDreamingReviewedExcludedEvidenceInTx,
@@ -97,6 +106,8 @@ import {
 	type DreamingLiveEventHub,
 } from "./dreaming-live-events";
 import { countTokens } from "./tokenizer";
+import { dreamingScopeKey, renderDreamingHistoryForPass } from "./dreaming-history";
+import { detectLocalTimeZone } from "../memory-config";
 
 export type DreamingMode = "incremental" | "compact" | "incremental-hygiene" | "incremental-content";
 
@@ -116,7 +127,7 @@ export type DreamingEpisodicBacklogProbe =
 	| {
 			readonly kind: "indeterminate";
 			readonly tokenLowerBound: number;
-			readonly hasBacklog: boolean;
+			readonly hasBacklog: boolean | null;
 			readonly sourcesScanned: number;
 	  };
 
@@ -126,13 +137,6 @@ export type DreamingTriggerDecision =
 			readonly trigger: true;
 			readonly reason: "first-run" | "attention" | "token-threshold" | "continuation" | "max-interval";
 	  };
-
-/**
- * The focused runbook a scheduled pass follows (#1098): hygiene passes
- * process structural attention only, content passes handle evidence-linked
- * work and bounded exploration hints. Combined modes ("incremental",
- * "compact") keep the full runbook.
- */
 export type DreamingPassFocus = "hygiene" | "content";
 
 export interface DreamingState {
@@ -143,8 +147,6 @@ export interface DreamingState {
 	readonly lastPassId: string | null;
 	readonly lastPassMode: string | null;
 }
-
-/** Queue bounded deterministic graph cleanup work for the next Dreaming pass. */
 export async function enqueueDreamingHygieneAttention(
 	accessor: DbAccessor,
 	agentId: string,
@@ -172,14 +174,6 @@ export async function enqueueDreamingHygieneAttention(
 			}),
 	});
 }
-
-/**
- * Queue bounded embedding-geometry hints without touching the evidence cursor
- * or invoking an embedding provider. The selector is deliberately independent
- * of the workload resolver: it only reuses vectors already stored for primary
- * episodic memories, then the normal Dreaming worker decides when and how to
- * spend an inference pass.
- */
 export async function enqueueDreamingSurprisalAttention(
 	accessor: DbAccessor,
 	agentId: string,
@@ -269,8 +263,6 @@ function parseEpisodicCursor(value: string | null): EpisodicCursor | null {
 		return null;
 	}
 }
-
-/** Exported for cursor round-trip tests. */
 export function _testParseEpisodicCursor(value: string | null): EpisodicCursor | null {
 	return parseEpisodicCursor(value);
 }
@@ -286,6 +278,7 @@ export interface DreamingPassRow {
 	readonly tokensOutput: number | null;
 	readonly tokensCacheRead: number | null;
 	readonly tokensCacheWrite: number | null;
+	readonly tokensPeakContext: number | null;
 	readonly tokensCost: number | null;
 	readonly mutationsApplied: number | null;
 	readonly mutationsSkipped: number | null;
@@ -361,15 +354,13 @@ export interface DreamingEvidenceExclusion {
 }
 
 export type { DreamingAttention } from "./dreaming-attention";
-
-/** Routed bounded-agent executor. The daemon creates the tools and owns all writes. */
 export interface DreamingAgentExecutor {
 	run(input: {
 		readonly passId: string;
 		readonly prompt: string;
 		readonly tools: ReturnType<typeof createDreamingAgentTools>;
 		readonly timeoutMs: number;
-		readonly maxTokens: number;
+		readonly maxTokens?: number;
 		readonly onEvent?: (event: unknown) => void;
 		readonly onSessionInfo?: (info: {
 			readonly sessionId?: string;
@@ -410,10 +401,6 @@ function deferredEvidenceKeys(value: unknown, primaryAgentId: string): ReadonlyS
 	return keys;
 }
 
-// ---------------------------------------------------------------------------
-// Dreaming state DB helpers
-// ---------------------------------------------------------------------------
-
 function readDreamingState(db: ReadDb, agentId: string): DreamingState {
 	let row:
 		| {
@@ -434,7 +421,6 @@ function readDreamingState(db: ReadDb, agentId: string): DreamingState {
 			)
 			.get(agentId) as typeof row;
 	} catch {
-		// The constellation can be read while an old workspace migrates.
 		row = undefined;
 	}
 	if (!row) {
@@ -542,20 +528,7 @@ export async function recordDreamingFailure(accessor: DbAccessor, agentId: strin
 		{ deadlineMs: 30_000, estimatedWorkUnits: 1 },
 	);
 }
-
-// ---------------------------------------------------------------------------
-// Dreaming pass records
-// ---------------------------------------------------------------------------
-
-/** Timestamps at or below the corrupt pre-epoch floor never advance a watermark. */
 const EVIDENCE_WATERMARK_FLOOR_MS = Date.parse(EPISODIC_CAPTURED_AT_FLOOR);
-
-/**
- * The newest captured_at `search_evidence` actually returned to a pass. The
- * pass-end watermark may advance only this far: evidence captured after the
- * surfaced frontier but before pass start was never shown to the agent and
- * must stay pending for the next scan-first search (#1149).
- */
 function surfacedEvidenceWatermark(items: readonly unknown[]): string | null {
 	let watermark: string | null = null;
 	for (const item of items) {
@@ -563,26 +536,14 @@ function surfacedEvidenceWatermark(items: readonly unknown[]): string | null {
 		const capturedAt = typeof item.capturedAt === "string" ? item.capturedAt : null;
 		if (capturedAt === null) continue;
 		const ms = timestampMillis(capturedAt);
-		// Corrupt pre-epoch rows can never advance a watermark; the sentinel
-		// bypass in the episodic readers keeps them listable regardless.
 		if (ms <= EVIDENCE_WATERMARK_FLOOR_MS) continue;
 		if (watermark === null || ms > timestampMillis(watermark)) watermark = capturedAt;
 	}
 	return watermark;
 }
-
-/**
- * The pass-end evidence watermark: the newer of the previous watermark and
- * the newest source the pass surfaced, never later than the pass started.
- * A pass that surfaced nothing keeps its previous watermark, so skipped
- * evidence is re-listed by the next scan-first search instead of being
- * counted as processed (#1149).
- */
 function nextEvidenceWatermark(surfaced: string, previous: string | null, cutoff: string): string | null {
 	const surfacedMs = timestampMillis(surfaced);
 	const cutoffMs = timestampMillis(cutoff);
-	// Clock skew can date a source after pass start; cap the watermark so
-	// the cursor never advances past the pass itself.
 	const capped = surfacedMs > cutoffMs ? cutoff : surfaced;
 	if (previous === null) return capped;
 	return timestampMillis(capped) > timestampMillis(previous) ? capped : previous;
@@ -612,21 +573,52 @@ export async function createDreamingPassThroughOwner(
 	mode: DreamingMode,
 ): Promise<string> {
 	const id = randomUUID();
-	const handle = maintenance.owner.submit<{ readonly changes: number }>(
-		{
-			kind: "query",
-			statement: {
-				sql: `INSERT INTO dreaming_passes (id, agent_id, mode, status, started_at, created_at)
-				 VALUES (?, ?, ?, 'running', strftime('%Y-%m-%d %H:%M:%f', 'now'), strftime('%Y-%m-%d %H:%M:%f', 'now'))`,
-				params: [id, agentId, mode],
-				result: "run",
-			},
+	const request = {
+		kind: "query" as const,
+		statement: {
+			sql: `INSERT INTO dreaming_passes (id, agent_id, mode, status, started_at, created_at)
+			 VALUES (?, ?, ?, 'running', strftime('%Y-%m-%d %H:%M:%f', 'now'), strftime('%Y-%m-%d %H:%M:%f', 'now'))
+			 ON CONFLICT(id) DO NOTHING`,
+			params: [id, agentId, mode],
+			result: "run" as const,
 		},
-		{ operation: "dreaming.pass.create", lane: "maintenance", deadlineMs: 10_000, estimatedWorkUnits: 1 },
-	);
-	await handle.result;
-	dreamingLiveEvents.startPass({ passId: id, agentId, mode });
-	return id;
+	};
+	let creationMayHaveCommitted = false;
+	for (;;) {
+		try {
+			await runOwnerJob<{ readonly changes: number }>(
+				maintenance.owner,
+				request,
+				"dreaming.pass.create",
+				"maintenance",
+				{ deadlineMs: 10_000, estimatedWorkUnits: 1, waitForOwnerCompletionOnDeadline: true },
+			);
+			dreamingLiveEvents.startPass({ passId: id, agentId, mode });
+			return id;
+		} catch (error) {
+			const uncertain = error instanceof DbOwnerDeadlineError || error instanceof DbOwnerDiedError;
+			if (!uncertain && !creationMayHaveCommitted) throw error;
+			creationMayHaveCommitted ||= uncertain;
+			let persisted: { readonly id: string } | undefined;
+			try {
+				persisted = await ownerQueryOne<{ readonly id: string }>(
+					maintenance.owner,
+					"dreaming.pass.create.reconcile",
+					"SELECT id FROM dreaming_passes WHERE id = ?",
+					[id],
+					{ deadlineMs: 10_000, estimatedWorkUnits: 1, waitForOwnerCompletionOnDeadline: true },
+				);
+			} catch {
+				await new Promise<void>((resolve) => setTimeout(resolve, 100));
+				continue;
+			}
+			if (persisted !== undefined) {
+				dreamingLiveEvents.startPass({ passId: persisted.id, agentId, mode });
+				return persisted.id;
+			}
+			if (!uncertain) throw error;
+		}
+	}
 }
 
 async function failDreamingPass(accessor: DbAccessor, passId: string, error: string): Promise<void> {
@@ -659,6 +651,7 @@ export async function getDreamingPasses(
 		        completed_at AS completedAt, tokens_consumed AS tokensConsumed,
 		        tokens_input AS tokensInput, tokens_output AS tokensOutput,
 		        tokens_cache_read AS tokensCacheRead, tokens_cache_write AS tokensCacheWrite,
+		        tokens_peak_context AS tokensPeakContext,
 		        tokens_cost AS tokensCost,
 		        mutations_applied AS mutationsApplied,
 		        mutations_skipped AS mutationsSkipped,
@@ -677,11 +670,16 @@ export interface DreamingPassScope extends DreamingPassRow {
 	readonly agentId: string;
 }
 
+interface DreamingPassReadOptions {
+	readonly signal?: AbortSignal;
+}
+
 function dreamingPassSelect(includeAgent = false): string {
 	return `SELECT ${includeAgent ? "agent_id AS agentId, " : ""}id, mode, status, started_at AS startedAt,
 				completed_at AS completedAt, tokens_consumed AS tokensConsumed,
 				tokens_input AS tokensInput, tokens_output AS tokensOutput,
 				tokens_cache_read AS tokensCacheRead, tokens_cache_write AS tokensCacheWrite,
+		        tokens_peak_context AS tokensPeakContext,
 				tokens_cost AS tokensCost,
 				mutations_applied AS mutationsApplied,
 				mutations_skipped AS mutationsSkipped,
@@ -694,6 +692,7 @@ export async function getDreamingPass(
 	accessor: DbAccessor,
 	agentId: string,
 	passId: string,
+	options: DreamingPassReadOptions = {},
 ): Promise<DreamingPassScope | null> {
 	return (
 		(await ownerQueryOne<DreamingPassScope>(
@@ -701,7 +700,7 @@ export async function getDreamingPass(
 			"dreaming.pass.read",
 			`${dreamingPassSelect(true)} WHERE agent_id = ? AND id = ? LIMIT 1`,
 			[agentId, passId],
-			{ deadlineMs: 30_000, estimatedWorkUnits: 1 },
+			{ deadlineMs: 30_000, estimatedWorkUnits: 1, signal: options.signal },
 		)) ?? null
 	);
 }
@@ -709,15 +708,19 @@ export async function getDreamingPass(
 export async function getActiveDreamingPasses(
 	accessor: DbAccessor,
 	agentId: string,
+	options: DreamingPassReadOptions = {},
 ): Promise<readonly DreamingPassScope[]> {
 	return await ownerQueryAll<DreamingPassScope>(
 		await getDbOwnerForAccessor(accessor),
 		"dreaming.passes.active",
 		`${dreamingPassSelect(true)} WHERE agent_id = ? AND status = 'running' ORDER BY started_at ASC, id ASC`,
 		[agentId],
-		{ deadlineMs: 30_000, estimatedWorkUnits: 10 },
+		{ deadlineMs: 30_000, estimatedWorkUnits: 10, signal: options.signal },
 	);
 }
+
+const DREAMING_CODEMODE_PROMPT =
+	"Lookups (search_entities, get_entity, list_aspect_claims, validate_proposal, attention_list, zoom_history) are available only inside the codemode tool. Batch the lookups a page needs into one script: call them through tools.<name>(args), parse each JSON result, and print only what you need, carrying ids from results instead of retyping them. Reading and acknowledging evidence (search_evidence, review_evidence) and every write (apply_ontology_ops, runbook_write, memory_head_commit) stay direct tool calls; a script cannot call them.";
 
 const MAX_DREAMING_TOOL_TRACE_JSON_CHARS = 128_000;
 
@@ -730,10 +733,23 @@ function serializeToolTrace(value: unknown): string {
 	}
 	if (json === undefined) return "null";
 	if (json.length <= MAX_DREAMING_TOOL_TRACE_JSON_CHARS) return json;
+	const items = compactTraceItems(value);
+	const durable = items === null ? {} : { ok: true, items };
+	const previewChars = Math.max(0, MAX_DREAMING_TOOL_TRACE_JSON_CHARS - JSON.stringify(durable).length);
 	return JSON.stringify({
 		truncated: true,
 		originalChars: json.length,
-		preview: json.slice(0, MAX_DREAMING_TOOL_TRACE_JSON_CHARS),
+		...durable,
+		preview: json.slice(0, previewChars),
+	});
+}
+
+function compactTraceItems(value: unknown): unknown[] | null {
+	if (!isRecord(value) || value.ok !== true || !Array.isArray(value.items)) return null;
+	return value.items.map((item) => {
+		if (!isRecord(item) || typeof item.content !== "string") return item;
+		const { content, ...metadata } = item;
+		return { ...metadata, contentChars: content.length, contentSha256: evidenceContentSha256(content) };
 	});
 }
 
@@ -777,8 +793,6 @@ async function recordDreamingToolCall(
 		{ deadlineMs: 30_000, estimatedWorkUnits: 1 },
 	);
 }
-
-/** Return the Pi capability trace for one scoped Dreaming pass. */
 export async function getDreamingToolCalls(
 	accessor: DbAccessor,
 	agentId: string,
@@ -888,10 +902,6 @@ export async function requestDreamingEvidenceRequeue(
 	return ownerChanges(result[0]) > 0;
 }
 
-// ---------------------------------------------------------------------------
-// Data fetching for prompt assembly
-// ---------------------------------------------------------------------------
-
 function _fetchEpisodicEvidence(
 	db: ReadDb,
 	agentId: string,
@@ -909,17 +919,11 @@ function _fetchEpisodicEvidence(
 	);
 }
 
-// ---------------------------------------------------------------------------
-// Prompt construction
-// ---------------------------------------------------------------------------
-
 function _readIdentityFile(
 	dir: string,
 	entry: IdentityContextFileEntry,
 ): { readonly content: string; readonly unreadable: boolean } {
 	const path = join(dir, entry.path);
-	// Identity files are optional context. A missing file is ordinary, not a
-	// degraded pass or a reason to fill the daemon logs every five minutes.
 	if (!existsSync(path)) return { content: "", unreadable: false };
 	try {
 		const raw = readFileSync(path, "utf-8").trim();
@@ -934,18 +938,11 @@ function _readIdentityFile(
 		return { content: "", unreadable: true };
 	}
 }
-
-/**
- * The Dreaming agent's complete fixed prompt. No identity files, no working
- * memory, no injected evidence window: the agent drives everything through the
- * tool surface (attention_list, search_evidence, runbook_read) following this
- * process contract. Hardcoded so users cannot accidentally mutate the process.
- */
 export const DREAMING_AGENT_PROMPT = `You are a bounded Signet maintenance agent. Your task is to maintain durable, evidence-cited semantic understanding as the relevant entities, relationships, and claims change over time. Attach each claim to its entity and aspect rather than allowing it to exist as standalone.
 
 ## Process
 
-Purpose: maintain durable, evidence-cited semantic understanding in the knowledge graph. The graph is a derived structure; every write carries provenance (an attention id for hygiene, an exact quote from episodic evidence for content). Use the pass log (runbook_read) as the dedup source: the previous pass's viewed sources and changes are the cutoff.
+Purpose: maintain durable, evidence-cited semantic understanding in the knowledge graph. The graph is a derived structure; every write carries provenance (an attention id for hygiene, an exact quote from episodic evidence for content). Use the pass history (shown below, zoom_history for detail) as the dedup source: the previous pass's viewed sources and changes are the cutoff.
 
 An install may have several agent scopes (listed in <agent_scopes> when there is more than one): the scoped tools take an agentId, so address any scope you need — each write is attributed to the agent you name. attention_list without an agentId lists the whole install's attention queue, with each record carrying its owning agentId.
 
@@ -955,25 +952,38 @@ An install may have several agent scopes (listed in <agent_scopes> when there is
 - Exploration hints: bounded embedding-surprisal records (kind=surprisal); these are not evidence
 - Graph: entities, aspects, claims, links (active/archived/pinned)
 - Evidence: episodic store (memories, artifacts, completed transcripts)
-- Pass log: dreaming_passes + runbook notes (what changed, what was viewed)
+- Pass history: one line per earlier pass, coarser for older passes, each openable with zoom_history down to the pass's runbook note
 
 ### Per-pass process
 
-1. Read the pass log (runbook_read). Establish cutoff: sources viewed, changes applied, deferred items.
-2. Query the attention queue (attention_list, kind=hygiene, status=pending). Process ALL pending hygiene records first, before any content work:
+1. Read the pass history below. Establish cutoff: sources viewed, changes applied, deferred items. Zoom (zoom_history) into any line that mentions work you are about to repeat, resume, or re-defer before acting on it.
+2. Work the pending hygiene records listed in <pending_attention>. Process ALL of them first, before any content work:
    - Inspect the flagged target (get_entity — check aspects, claims, pinned).
    - Archive or merge it, citing its attention id (provenance: "attention:<uuid>", or attention:$<index> for a flag you minted in the same batch).
    - \`attribute_over_cap\` / \`aspect_over_cap\` flags: the write gate rejects new claims or aspects past the cap, so consolidate the flagged target — merge_aspects to fold over-cap aspects together, supersede_claim_value to collapse duplicate claim keys, archive_claim_value for stale snapshots. Consolidation (merge_aspects) may exceed the attribute cap; it is the remedy the cap forces.
    - If you discover junk the queue did not flag, mint a flag op and archive in the same batch.
    - If you inspect a flagged target and judge it should stay as it is (a deliberate keep — e.g. a live entity with a non-concrete type, or an over-cap aspect you chose not to consolidate), close the record with decline_attention citing its attention id. Declining is an affirmative judgment: only decline records you actually inspected, and never decline records you could not complete this pass — defer those with a named blocker instead.
-3. Query attention_list with kind=surprisal. These are bounded exploration hints, not evidence and not hygiene provenance. For each hint, inspect its memory:<id> subjectRef with search_evidence in the owning scope. Treat the score only as a priority signal: if the source establishes a useful, settled fact, use a normal content operation with an exact quote; if it is valid but not useful or is noise, use decline_attention after inspecting it. Never create a claim or entity from the score alone, and never cite attention:<id> for a content operation. A surprisal hint must not bypass the evidence cursor or audited apply path.
-4. Query attention_list with kind=review_due. For expired records, inspect the cited memory with search_evidence using its subjectRef, then supersede the matching active claim with supersede_claim_value. Use the supplied entityId, aspectId, attributeId, and claimKey when present. The replacement must state that the planned event remains unconfirmed; never rewrite it as if the event happened. Cite an exact quote from the original memory. Do not supersede approaching records. When creating or setting a future temporal claim, set payload.reviewAfter to the referenced ISO timestamp.
-5. Only when the hygiene queue is clear: find new evidence since the cutoff. First LIST unprocessed sources with search_evidence — omit the query and omit since so it lists from the scope's evidence watermark (the frontier the last pass actually surfaced), newest first; only after seeing what is there, narrow with a query if the list is large. Prefer evidence from completed transcript sessions; historical summary rows are not part of the default delivery path. A transcript with completed: false is mid-stream — defer filing from it with the named blocker "transcript still mid-stream" (re-check completed each pass: a session still active when re-checked is a re-verified blocker, not a repeated one), and note the deferral in the pass log, because its states may be contradicted by the session's end. For each new source:
+3. Take the surprisal hints listed in <pending_attention>. These are bounded exploration hints, not evidence and not hygiene provenance. For each hint, inspect its memory:<id> subjectRef with search_evidence in the owning scope. Treat the score only as a priority signal: if the source establishes a useful, settled fact, use a normal content operation with an exact quote; if it is valid but not useful or is noise, use decline_attention after inspecting it. Never create a claim or entity from the score alone, and never cite attention:<id> for a content operation. A surprisal hint must not bypass the evidence cursor or audited apply path.
+4. Take the review_due records listed in <pending_attention>. For expired records, inspect the cited memory with search_evidence using its subjectRef, then supersede the matching active claim with supersede_claim_value. Use the supplied entityId, aspectId, attributeId, and claimKey when present. The replacement must state that the planned event remains unconfirmed; never rewrite it as if the event happened. Cite an exact quote from the original memory. Do not supersede approaching records. When creating or setting a future temporal claim, set payload.reviewAfter to the referenced ISO timestamp. Then take the contested_claim records with reason source_changed: the claim's source was edited after the claim was filed. Read the source's current text with search_evidence using details.sourceRef. If it still states the claim, close the record with decline_attention. If it states a different value, supersede the claim with supersede_claim_value citing an exact quote from the current text, then close the record with decline_attention. If it no longer states the claim, archive it with archive_claim_value and provenance attention:<id>. For reason source_removed the source no longer exists: archive the claim the same way unless search_evidence finds other evidence that still states it, in which case close the record with decline_attention.
+5. Only when the hygiene queue is clear: find new evidence since the cutoff. Read unprocessed evidence one page at a time with search_evidence — omit the query, since, and before to take the next page of the durable delivery queue. A page holds one excerpt per source; a source with contentHasNext continues by itself on a later page, so do not page through queued sources with sourceRef and offset. File what each page establishes (or mark a source you have read in full as reviewed or deferred), then call review_evidence for that page, before asking for the next page, so the work is kept if the pass runs out of time. Acknowledge each excerpt with the sourceRef and contentOffset from the page, and omit through when you reviewed all of it; set through to an exact quote only when you stopped partway, so the rest is delivered again. Text you never acknowledge or cite stays queued for a later pass. When an excerpt reports reviewedChars, its first reviewedChars characters were reviewed by an earlier pass: do not file them again; stop when hasMore is false or the queue reports deliveryClosed. Use a query or sourceRef only to look up specific history or verify a citation. Prefer evidence from completed transcript sessions; historical summary rows are not part of the default delivery path. A transcript with completed: false is mid-stream — defer filing from it with the named blocker "transcript still mid-stream" (re-check completed each pass: a session still active when re-checked is a re-verified blocker, not a repeated one), and note the deferral in the pass log, because its states may be contradicted by the session's end. For each new source:
    - search_entities for subjects it establishes.
    - File claims only for what the source establishes as settled fact: outcomes, decisions, shipped changes, stable behavior. Do not file instructions that were merely suggested, hypotheses or diagnoses, open questions, or intermediate states of an ongoing investigation. When a source shows an attempt and its outcome, file the outcome.
-   - If you inspect an entire source revision and it contains no durable fact, add it to reviewedExcludedEvidence with the owning agentId, sourceRef, and a specific reason. The agentId must be the scope used for search_evidence. This is terminal for that immutable revision; do not use it for a temporary blocker, which belongs in deferredEvidence.
+   - A concrete deliverable the assistant produced for the user's own project, plan, or situation (a budget, schedule, draft, plan, or specific recommendation the user asked for) is a durable fact about that project: file its specifics as a claim on the project, worded as proposed or drafted rather than confirmed. Generic information not tied to the user's own circumstances is not. Work the user asks for on behalf of their own job, business, employer, trip, or event is their own situation.
+   - When the user asks for advice, the advice is not a durable fact, but what the user discloses about themselves to get it is: their situation, constraints, habits, preferences, and how they feel about them (for example, that they work from home and miss socializing with colleagues). File those as claims about the user even when the conversation reaches no decision.
+   - For every source, do this before deciding it has nothing to file: list each statement the user makes about themselves — something they own, bought, did, attended, plan, like or dislike, a person or pet in their life, a place, a date, an amount, or a count. Each one is a claim to file about the user, quoted exactly. A conversation that is mostly generic advice still has these statements; file them and skip only the advice. A source with even one such statement is never excluded.
+   - The user is a person entity. Use the user's name when the source states it; otherwise use the entity named "User". Search for it first and reuse it. When a source shows several named speakers, such as a group chat or messages with authors, file each speaker's statements on that speaker's own person entity, and never file a named speaker's statements on "User".
+   - An excerpt that continues on a later page (contentHasNext) is not a reason to defer: file what this excerpt establishes now, and the rest arrives on a later page.
+   - Filing about a subject that does not exist yet takes three apply_ontology_ops calls in order: create_entity, then create_aspect with the returned entity id, then add_claim_value with the entity and aspect ids, putting every claim for that aspect in the one call. Do all three in this pass. A missing entity or aspect, or a claim you have not checked yet, is work to do now, never a blocker.
+   - Copy each sourceRef character for character from the search_evidence result.
+   - The only valid reasons to defer a source are a transcript that is still mid-stream and a tool error you could not fix after correcting the call.
+   - Bias toward action and carry each source to completion within this pass: filed claims, a reviewed exclusion, or one of those deferrals. Never end a pass with work you could have done, and never stop at describing what should be filed. If your pass log would say a fact was found but not filed, file it before writing the log.
+   - If you inspect an entire source revision and it contains no durable fact, no self-disclosure by the user, and no deliverable produced for the user's own situation, add it to reviewedExcludedEvidence with the owning agentId, sourceRef, and a specific reason. The agentId must be the scope used for search_evidence. This is terminal for that immutable revision; do not use it for a temporary blocker, which belongs in deferredEvidence.
+   - File one fact per claim, and keep every date, amount, count, and name the source gives for it. Never combine two facts into one claim: two projects with different start dates are two claims, each with its own date.
+   - Say what each named thing is when a claim names it: "listens to music on Spotify, their music streaming service", "keeps their savings at Monzo, their bank", "saw The 1975, a band, live". People later ask by kind ("which streaming service", "what bank"), and a claim that only names the thing cannot be found that way.
+   - Resolve every relative time ("yesterday", "last weekend", "three weeks ago", "next month") against the source's capturedAt and write the absolute date in the claim ("On 2023-03-19 the user completed the Walk for Hunger"). Then set the claim's time: occurredAt for an event, validFrom (and validUntil once it ends) for a state that holds over time, with timePrecision (day, week, month, year, or approximate). A vague time with no anchor ("recently") stays as written and gets no time fields. Dates and states belong in claims, never in entity names: name an entity for what it is ("Universal Studios Hollywood trip"), not when or how it stood ("trip (planned as of 2023-05-30)"), so later passes find it again under the same name. The same holds for claim keys: a key names the attribute ("instagram_followers", "house_budget"), never its value or date ("instagram_followers_1300", "lentil-soup-plan-2023-05-22"), so a later value for the same attribute lands in the same slot and supersedes the old one.
    - A claim must be a complete statement: it names the subject and the fact about it. A bare label ("SHIP-WITH-FIXES"), a fragment ("Root cause confirmed."), or an implementation detail without its subject is not a claim — do not file it.
    - Before adding a claim, check the target aspect's existing claims; if one covers the same key or is contradicted by the new evidence, supersede it (supersede_claim_value) instead of adding alongside.
+   - Attach before you add: file a claim under an existing aspect that covers its domain rather than creating a new aspect. When an entity is at its aspect cap, restructure in this pass instead of stopping or deferring: merge overlapping aspects (merge_aspects) or rename one to cover both (rename_aspect), each with a reason, then file the claim.
    - The evidence source and the graph target must use the same agent scope: search evidence with the agentId of the entity you will update, then pass that same agentId to apply_ontology_ops. A source found in another scope cannot support a write here.
    - create_entity only for durable subjects clearly established by the source.
    - When the evidence supports a possible relationship, merge, or other ontology change but the relationship is ambiguous rather than settled, do not apply it immediately. Emit the normal ontology operation with risk: "review_required". Its reason must be a concise, human-readable explanation that names the entities and the proposed relationship; the exact evidence citation remains required. The daemon will place it in the user's review queue for confirmation, not treat the queue as a work-deferral mechanism.
@@ -982,7 +992,7 @@ An install may have several agent scopes (listed in <agent_scopes> when there is
 
 ### What counts as durable
 
-A write is durable when the source establishes it as settled fact: an outcome, a decision, a shipped change, or a stable behavior, attached to the entity and aspect it belongs to. An entity is removable when it is non-concrete (zero active aspects/claims, non-concrete type, legacy-only deps) or an exact-canonical duplicate (same canonical name, same scope). Trust your judgment beyond that.
+A write is durable when the source establishes it as settled fact: an outcome, a decision, a shipped change, or a stable behavior, attached to the entity and aspect it belongs to. A concrete deliverable produced for the user's own project or situation is durable too, recorded as proposed rather than confirmed. An entity is removable when it is non-concrete (zero active aspects/claims, non-concrete type, legacy-only deps) or an exact-canonical duplicate (same canonical name, same scope). Trust your judgment beyond that.
 
 ### Must not
 
@@ -1007,18 +1017,11 @@ The pass is done when:
 - The pass log is written with sources viewed + changes applied (this is the next pass's dedup).
 - No flag is left unresolved for a target you archived; no writes attempted against pinned or source-root entities.
 `;
-
-/**
- * The fixed prompt for a hygiene-only pass (#1098): the attention-queue
- * runbook (combined-process steps 1-2 + 4). Content maintenance is out of
- * scope — content passes own it, so a hygiene pass spends its whole budget
- * on the queue instead of running out before step 3.
- */
 export const DREAMING_HYGIENE_AGENT_PROMPT = `You are a bounded Signet maintenance agent. Your task is to maintain durable, evidence-cited semantic understanding as the relevant entities, relationships, and claims change over time. Attach each claim to its entity and aspect rather than allowing it to exist as standalone.
 
 ## Process
 
-Purpose: maintain durable, evidence-cited semantic understanding in the knowledge graph. This is a HYGIENE pass: process the attention queue — inspect flagged targets and archive or merge them with attention provenance, minting flags for junk the queue missed. Content maintenance (claims, entities) belongs to content passes, which cite exact quotes from episodic evidence. Use the pass log (runbook_read) as the dedup source: the previous pass's changes are the cutoff.
+Purpose: maintain durable, evidence-cited semantic understanding in the knowledge graph. This is a HYGIENE pass: process the attention queue — inspect flagged targets and archive or merge them with attention provenance, minting flags for junk the queue missed. Content maintenance (claims, entities) belongs to content passes, which cite exact quotes from episodic evidence. Use the pass history (shown below, zoom_history for detail) as the dedup source: the previous pass's changes are the cutoff.
 
 An install may have several agent scopes (listed in <agent_scopes> when there is more than one): the scoped tools take an agentId, so address any scope you need — each write is attributed to the agent you name. attention_list without an agentId lists the whole install's attention queue, with each record carrying its owning agentId.
 
@@ -1026,12 +1029,12 @@ An install may have several agent scopes (listed in <agent_scopes> when there is
 
 - Hygiene queue: dreaming_attention pending records (kind=hygiene)
 - Graph: entities, aspects, claims, links (active/archived/pinned)
-- Pass log: dreaming_passes + runbook notes (what changed, what was viewed)
+- Pass history: one line per earlier pass, coarser for older passes, each openable with zoom_history down to the pass's runbook note
 
 ### Per-pass process
 
-1. Read the pass log (runbook_read). Establish cutoff: sources viewed, changes applied, deferred items.
-2. Query the attention queue (attention_list, kind=hygiene, status=pending). Process ALL pending hygiene records:
+1. Read the pass history below. Establish cutoff: sources viewed, changes applied, deferred items. Zoom (zoom_history) into any line that mentions work you are about to repeat, resume, or re-defer before acting on it.
+2. Work the pending hygiene records listed in <pending_attention>. Process ALL of them:
    - Inspect the flagged target (get_entity — check aspects, claims, pinned).
    - Archive or merge it, citing its attention id (provenance: "attention:<uuid>", or attention:$<index> for a flag you minted in the same batch).
    - If you discover junk the queue did not flag, mint a flag op and archive in the same batch.
@@ -1062,18 +1065,11 @@ The pass is done when:
 - The pass log is written with changes applied (this is the next pass's dedup).
 - No flag is left unresolved for a target you archived; no writes attempted against pinned or source-root entities.
 `;
-
-/**
- * The fixed prompt for a content-only pass (#1098): the evidence runbook
- * (combined-process steps 1, 3, 4). Hygiene archives are out of scope —
- * hygiene passes own that queue, while content passes handle review and
- * bounded surprisal hints alongside new evidence.
- */
 export const DREAMING_CONTENT_AGENT_PROMPT = `You are a bounded Signet maintenance agent. Your task is to maintain durable, evidence-cited semantic understanding as the relevant entities, relationships, and claims change over time. Attach each claim to its entity and aspect rather than allowing it to exist as standalone.
 
 ## Process
 
-Purpose: maintain durable, evidence-cited semantic understanding in the knowledge graph. This is a CONTENT pass: process review work, inspect bounded surprisal hints, and find new evidence since the cutoff; extract/update claims with exact-quote citations and create entities only for durable subjects. Hygiene archives/merges belong to hygiene passes, which process structural attention. Use the pass log (runbook_read) as the dedup source: the previous pass's viewed sources and changes are the cutoff.
+Purpose: maintain durable, evidence-cited semantic understanding in the knowledge graph. This is a CONTENT pass: process review work, inspect bounded surprisal hints, and find new evidence since the cutoff; extract/update claims with exact-quote citations and create entities only for durable subjects. Hygiene archives/merges belong to hygiene passes, which process structural attention. Use the pass history (shown below, zoom_history for detail) as the dedup source: the previous pass's viewed sources and changes are the cutoff.
 
 An install may have several agent scopes (listed in <agent_scopes> when there is more than one): the scoped tools take an agentId, so address any scope you need — each write is attributed to the agent you name. attention_list without an agentId lists the whole install's attention queue, with each record carrying its owning agentId.
 
@@ -1082,34 +1078,48 @@ An install may have several agent scopes (listed in <agent_scopes> when there is
 - Exploration hints: bounded embedding-surprisal records (kind=surprisal); these are not evidence
 - Graph: entities, aspects, claims, links (active/archived/pinned)
 - Evidence: episodic store (memories, artifacts, completed transcripts)
-- Pass log: dreaming_passes + runbook notes (what changed, what was viewed)
+- Pass history: one line per earlier pass, coarser for older passes, each openable with zoom_history down to the pass's runbook note
 
 ### Per-pass process
 
-1. Read the pass log (runbook_read). Establish cutoff: sources viewed, changes applied, deferred items.
-2. Query attention_list with kind=review_due. For expired records, inspect the cited memory with search_evidence using its subjectRef, then supersede the matching active claim with supersede_claim_value. Use the supplied entityId, aspectId, attributeId, and claimKey when present. The replacement must state that the planned event remains unconfirmed; never rewrite it as if the event happened. Cite an exact quote from the original memory. Do not supersede approaching records. When creating or setting a future temporal claim, set payload.reviewAfter to the referenced ISO timestamp.
-3. Query attention_list with kind=surprisal. These are bounded exploration hints, not evidence and not hygiene provenance. Inspect each hint's memory:<id> subjectRef with search_evidence in the owning scope. If the source establishes a useful settled fact, use a normal content operation with an exact quote; otherwise decline_attention after inspection. Never create a claim or entity from the score alone, and never cite attention:<id> for a content operation.
-4. Find new evidence since the cutoff. First LIST unprocessed sources with search_evidence — omit the query and omit since so it lists from the scope's evidence watermark (the frontier the last pass actually surfaced), newest first; only after seeing what is there, narrow with a query if the list is large. Prefer evidence from completed transcript sessions; historical summary rows are not part of the default delivery path. A transcript with completed: false is mid-stream — defer filing from it with the named blocker "transcript still mid-stream" (re-check completed each pass: a session still active when re-checked is a re-verified blocker, not a repeated one), and note the deferral in the pass log, because its states may be contradicted by the session's end. For each new source:
+1. Read the pass history below. Establish cutoff: sources viewed, changes applied, deferred items. Zoom (zoom_history) into any line that mentions work you are about to repeat, resume, or re-defer before acting on it.
+2. Take the review_due records listed in <pending_attention>. For expired records, inspect the cited memory with search_evidence using its subjectRef, then supersede the matching active claim with supersede_claim_value. Use the supplied entityId, aspectId, attributeId, and claimKey when present. The replacement must state that the planned event remains unconfirmed; never rewrite it as if the event happened. Cite an exact quote from the original memory. Do not supersede approaching records. When creating or setting a future temporal claim, set payload.reviewAfter to the referenced ISO timestamp. Then take the contested_claim records with reason source_changed: the claim's source was edited after the claim was filed. Read the source's current text with search_evidence using details.sourceRef. If it still states the claim, close the record with decline_attention. If it states a different value, supersede the claim with supersede_claim_value citing an exact quote from the current text, then close the record with decline_attention. If it no longer states the claim, archive it with archive_claim_value and provenance attention:<id>. For reason source_removed the source no longer exists: archive the claim the same way unless search_evidence finds other evidence that still states it, in which case close the record with decline_attention.
+3. Take the surprisal hints listed in <pending_attention>. These are bounded exploration hints, not evidence and not hygiene provenance. Inspect each hint's memory:<id> subjectRef with search_evidence in the owning scope. If the source establishes a useful settled fact, use a normal content operation with an exact quote; otherwise decline_attention after inspection. Never create a claim or entity from the score alone, and never cite attention:<id> for a content operation.
+4. Find new evidence since the cutoff. Read unprocessed evidence one page at a time with search_evidence — omit the query, since, and before to take the next page of the durable delivery queue. A page holds one excerpt per source; a source with contentHasNext continues by itself on a later page, so do not page through queued sources with sourceRef and offset. File what each page establishes (or mark a source you have read in full as reviewed or deferred), then call review_evidence for that page, before asking for the next page, so the work is kept if the pass runs out of time. Acknowledge each excerpt with the sourceRef and contentOffset from the page, and omit through when you reviewed all of it; set through to an exact quote only when you stopped partway, so the rest is delivered again. Text you never acknowledge or cite stays queued for a later pass. When an excerpt reports reviewedChars, its first reviewedChars characters were reviewed by an earlier pass: do not file them again; stop when hasMore is false or the queue reports deliveryClosed. Use a query or sourceRef only to look up specific history or verify a citation. Prefer evidence from completed transcript sessions; historical summary rows are not part of the default delivery path. A transcript with completed: false is mid-stream — defer filing from it with the named blocker "transcript still mid-stream" (re-check completed each pass: a session still active when re-checked is a re-verified blocker, not a repeated one), and note the deferral in the pass log, because its states may be contradicted by the session's end. For each new source:
    - search_entities for subjects it establishes.
    - File claims only for what the source establishes as settled fact: outcomes, decisions, shipped changes, stable behavior. Do not file instructions that were merely suggested, hypotheses or diagnoses, open questions, or intermediate states of an ongoing investigation. When a source shows an attempt and its outcome, file the outcome.
-   - If you inspect an entire source revision and it contains no durable fact, add it to reviewedExcludedEvidence with the owning agentId, sourceRef, and a specific reason. The agentId must be the scope used for search_evidence. This is terminal for that immutable revision; do not use it for a temporary blocker, which belongs in deferredEvidence.
+   - A concrete deliverable the assistant produced for the user's own project, plan, or situation (a budget, schedule, draft, plan, or specific recommendation the user asked for) is a durable fact about that project: file its specifics as a claim on the project, worded as proposed or drafted rather than confirmed. Generic information not tied to the user's own circumstances is not. Work the user asks for on behalf of their own job, business, employer, trip, or event is their own situation.
+   - When the user asks for advice, the advice is not a durable fact, but what the user discloses about themselves to get it is: their situation, constraints, habits, preferences, and how they feel about them (for example, that they work from home and miss socializing with colleagues). File those as claims about the user even when the conversation reaches no decision.
+   - For every source, do this before deciding it has nothing to file: list each statement the user makes about themselves — something they own, bought, did, attended, plan, like or dislike, a person or pet in their life, a place, a date, an amount, or a count. Each one is a claim to file about the user, quoted exactly. A conversation that is mostly generic advice still has these statements; file them and skip only the advice. A source with even one such statement is never excluded.
+   - The user is a person entity. Use the user's name when the source states it; otherwise use the entity named "User". Search for it first and reuse it. When a source shows several named speakers, such as a group chat or messages with authors, file each speaker's statements on that speaker's own person entity, and never file a named speaker's statements on "User".
+   - An excerpt that continues on a later page (contentHasNext) is not a reason to defer: file what this excerpt establishes now, and the rest arrives on a later page.
+   - Filing about a subject that does not exist yet takes three apply_ontology_ops calls in order: create_entity, then create_aspect with the returned entity id, then add_claim_value with the entity and aspect ids, putting every claim for that aspect in the one call. Do all three in this pass. A missing entity or aspect, or a claim you have not checked yet, is work to do now, never a blocker.
+   - Copy each sourceRef character for character from the search_evidence result.
+   - The only valid reasons to defer a source are a transcript that is still mid-stream and a tool error you could not fix after correcting the call.
+   - Bias toward action and carry each source to completion within this pass: filed claims, a reviewed exclusion, or one of those deferrals. Never end a pass with work you could have done, and never stop at describing what should be filed. If your pass log would say a fact was found but not filed, file it before writing the log.
+   - If you inspect an entire source revision and it contains no durable fact, no self-disclosure by the user, and no deliverable produced for the user's own situation, add it to reviewedExcludedEvidence with the owning agentId, sourceRef, and a specific reason. The agentId must be the scope used for search_evidence. This is terminal for that immutable revision; do not use it for a temporary blocker, which belongs in deferredEvidence.
+   - File one fact per claim, and keep every date, amount, count, and name the source gives for it. Never combine two facts into one claim: two projects with different start dates are two claims, each with its own date.
+   - Say what each named thing is when a claim names it: "listens to music on Spotify, their music streaming service", "keeps their savings at Monzo, their bank", "saw The 1975, a band, live". People later ask by kind ("which streaming service", "what bank"), and a claim that only names the thing cannot be found that way.
+   - Resolve every relative time ("yesterday", "last weekend", "three weeks ago", "next month") against the source's capturedAt and write the absolute date in the claim ("On 2023-03-19 the user completed the Walk for Hunger"). Then set the claim's time: occurredAt for an event, validFrom (and validUntil once it ends) for a state that holds over time, with timePrecision (day, week, month, year, or approximate). A vague time with no anchor ("recently") stays as written and gets no time fields. Dates and states belong in claims, never in entity names: name an entity for what it is ("Universal Studios Hollywood trip"), not when or how it stood ("trip (planned as of 2023-05-30)"), so later passes find it again under the same name. The same holds for claim keys: a key names the attribute ("instagram_followers", "house_budget"), never its value or date ("instagram_followers_1300", "lentil-soup-plan-2023-05-22"), so a later value for the same attribute lands in the same slot and supersedes the old one.
    - A claim must be a complete statement: it names the subject and the fact about it. A bare label ("SHIP-WITH-FIXES"), a fragment ("Root cause confirmed."), or an implementation detail without its subject is not a claim — do not file it.
    - Before adding a claim, check the target aspect's existing claims; if one covers the same key or is contradicted by the new evidence, supersede it (supersede_claim_value) instead of adding alongside.
+   - Attach before you add: file a claim under an existing aspect that covers its domain rather than creating a new aspect. When an entity is at its aspect cap, restructure in this pass instead of stopping or deferring: merge overlapping aspects (merge_aspects) or rename one to cover both (rename_aspect), each with a reason, then file the claim.
    - The evidence source and the graph target must use the same agent scope: search evidence with the agentId of the entity you will update, then pass that same agentId to apply_ontology_ops. A source found in another scope cannot support a write here.
    - create_entity only for durable subjects clearly established by the source.
    - When the evidence supports a possible relationship, merge, or other ontology change but the relationship is ambiguous rather than settled, do not apply it immediately. Emit the normal ontology operation with risk: "review_required". Its reason must be a concise, human-readable explanation that names the entities and the proposed relationship; the exact evidence citation remains required. The daemon will place it in the user's review queue for confirmation, not treat the queue as a work-deferral mechanism.
    - Validate before writing (validate_proposal).
-5. Write the pass log (runbook_write) last. Its summary is read back by a human who did not watch the pass: write a specific entity-named change manifest, not process narration. Use Markdown, max 2000 chars, with these sections when applicable: ## Updated, ## Created, ## Deferred, ## No-op. Under every section, each line must name the entity or entity id, state the exact change (claim filed or superseded, aspect touched, entity/aspect/link archived or merged, or why no change was needed), and cite the source or provenance reference (memory, artifact, or transcript as kind:id; hygiene attention:<id>). Deferred and No-op lines must state the specific blocker or reason; never use generic categories such as "content-related" or "ongoing structural process". Omit empty sections. Put the same deferred items and open questions in the runbook's deferred and openQuestions fields.
+5. Update MEMORY.md: call memory_head_read; its committedEntries are the last published entries whose support still holds, with that support, returned even when your own writes left the head stale. Then call memory_head_commit with the complete set of entries to retain, each with exact source/quote support. The rendered head, one "- text" line per entry, must be at most ${MEMORY_HEAD_MAX_TOKENS} tokens; memory_head_read reports committedTokens. Keep entries terse, and when the retained set would exceed the budget, condense or drop the least durable entries. A rejected commit, such as one over budget, is not staged; fix it and commit again. The pass needs exactly one accepted commit, and must not commit again after one is accepted. It cannot finish without that commit, even when nothing changed: resubmit the committedEntries, or submit an empty entry set only if committedEntries is empty and nothing durable qualifies yet, which clears the head.
+6. Write the pass log (runbook_write) last. Its summary is read back by a human who did not watch the pass: write a specific entity-named change manifest, not process narration. Use Markdown, max 2000 chars, with these sections when applicable: ## Updated, ## Created, ## Deferred, ## No-op. Under every section, each line must name the entity or entity id, state the exact change (claim filed or superseded, aspect touched, entity/aspect/link archived or merged, or why no change was needed), and cite the source or provenance reference (memory, artifact, or transcript as kind:id; hygiene attention:<id>). Deferred and No-op lines must state the specific blocker or reason; never use generic categories such as "content-related" or "ongoing structural process". Omit empty sections. Put the same deferred items and open questions in the runbook's deferred and openQuestions fields.
 
 ### What counts as durable
 
-A write is durable when the source establishes it as settled fact: an outcome, a decision, a shipped change, or a stable behavior, attached to the entity and aspect it belongs to. Trust your judgment beyond that.
+A write is durable when the source establishes it as settled fact: an outcome, a decision, a shipped change, or a stable behavior, attached to the entity and aspect it belongs to. A concrete deliverable produced for the user's own project or situation is durable too, recorded as proposed rather than confirmed. Trust your judgment beyond that.
 
 ### Must not
 
 - You may not write without provenance: content ops need an exact quote.
 - You may not file a claim without an exact quote, or a relationship the source does not state.
-- You may not make hygiene writes: archives and merges need attention records, which hygiene passes process.
+- You may not make hygiene writes: archives and merges need attention records, which hygiene passes process. The one exception is archive_claim_value for a contested_claim record.
 - You may not touch pinned entities, source-root entities, or topology entities.
 - You may not rewrite an existing claim without evidence that supersedes it.
 - You may not rename an entity or aspect without evidence that establishes the new name.
@@ -1126,36 +1136,101 @@ The pass is done when:
 - The pass log is written with sources viewed + changes applied (this is the next pass's dedup).
 - No writes attempted against pinned or source-root entities.
 `;
+export function dreamingPassPrompt(prompt: string, history: string, attention: string): string {
+	return `${prompt}
 
-/** The fixed prompt contract for a pass mode: focused modes get their runbook, combined modes keep the full one. */
+<pass_history>
+Earlier Dreaming passes in this scope, oldest first. Recent passes have one line each; older lines cover more passes. Each line reads id+n|text, covering passes id through id+n-1. zoom_history(id, n) opens a line into the two lines under it, and zoom_history(id, 1) returns that pass's full record.
+${history}
+</pass_history>
+
+<pending_attention>
+Pending attention for this pass's scopes as of pass start, one JSON line per kind. Work these records directly. Call attention_list only for a kind marked "more": true, or to re-check a kind after this pass flagged something.
+${attention}
+</pending_attention>`;
+}
+
+export function dreamingPassClock(now: Date, timeZone: string): string {
+	const parts = Object.fromEntries(
+		new Intl.DateTimeFormat("en-CA", {
+			timeZone,
+			weekday: "long",
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23",
+			timeZoneName: "longOffset",
+		})
+			.formatToParts(now)
+			.map((part) => [part.type, part.value]),
+	);
+	return `<current_time>
+It is now ${parts.weekday}, ${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} ${timeZone} (${parts.timeZoneName}). Use this for what is current, upcoming, or past due. Relative times inside evidence still resolve against that source's capturedAt, not this time.
+</current_time>`;
+}
+
+const ATTENTION_KINDS_BY_FOCUS: Readonly<Record<"hygiene" | "content" | "all", readonly string[]>> = {
+	hygiene: ["hygiene"],
+	content: ["review_due", "contested_claim", "evidence_requeue", "surprisal"],
+	all: ["hygiene", "review_due", "contested_claim", "evidence_requeue", "surprisal"],
+};
+const ATTENTION_ITEMS_PER_KIND = 20;
+const ATTENTION_TEXT_CHARS = 400;
+
+function boundAttentionValue(value: unknown): unknown {
+	if (typeof value === "string")
+		return value.length > ATTENTION_TEXT_CHARS ? `${value.slice(0, ATTENTION_TEXT_CHARS)}…` : value;
+	if (Array.isArray(value)) return value.map(boundAttentionValue);
+	if (isRecord(value))
+		return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, boundAttentionValue(entry)]));
+	return value;
+}
+
+export async function renderPendingDreamingAttention(
+	accessor: DbAccessor,
+	scopes: readonly string[],
+	mode: DreamingMode,
+): Promise<string> {
+	const focus = dreamingFocusOfMode(mode) ?? "all";
+	const lines: string[] = [];
+	for (const scope of scopes) {
+		for (const kind of ATTENTION_KINDS_BY_FOCUS[focus]) {
+			const items = await listDreamingAttention(accessor, {
+				agentId: scope,
+				kind,
+				status: "pending",
+				limit: ATTENTION_ITEMS_PER_KIND + 1,
+				agentFacing: true,
+			});
+			if (items.length === 0) continue;
+			lines.push(
+				JSON.stringify({
+					scope,
+					kind,
+					more: items.length > ATTENTION_ITEMS_PER_KIND,
+					items: items.slice(0, ATTENTION_ITEMS_PER_KIND).map(boundAttentionValue),
+				}),
+			);
+		}
+	}
+	return lines.length === 0 ? "none pending" : lines.join("\n");
+}
+
 export function dreamingPromptForMode(mode: DreamingMode): string {
 	if (mode === "incremental-hygiene") return DREAMING_HYGIENE_AGENT_PROMPT;
 	if (mode === "incremental-content") return DREAMING_CONTENT_AGENT_PROMPT;
 	return DREAMING_AGENT_PROMPT;
 }
-
-/** The focused runbook a pass mode follows, or null for the combined modes. */
 export function dreamingFocusOfMode(mode: DreamingMode): DreamingPassFocus | null {
 	if (mode === "incremental-hygiene") return "hygiene";
 	if (mode === "incremental-content") return "content";
 	return null;
 }
-
-/**
- * Whether a pass mode is allowed to update episodic state for this pass.
- * Attention-only content work (for example, a surprisal hint with an empty
- * backlog) must not advance or clear the evidence watermark.
- */
 function dreamingModeAdvancesEvidence(mode: DreamingMode, hasEpisodicWork: boolean): boolean {
 	return mode !== "incremental-hygiene" && hasEpisodicWork;
 }
-
-/**
- * The early-exit contract for a pass mode (#1098): a pass exits without
- * invoking the agent when its own work is empty — hygiene on an empty
- * attention queue, content on an empty episodic backlog. Combined modes
- * exit only when both are empty; compact never early-exits.
- */
 export function dreamingEarlyExitSummary(
 	mode: DreamingMode,
 	hasPendingHygieneAttention: boolean,
@@ -1173,16 +1248,8 @@ export function dreamingEarlyExitSummary(
 			? "No new episodic evidence or semantic attention to process"
 			: null;
 	}
-	return null; // compact never early-exits
+	return null;
 }
-
-/**
- * Which runbook the next scheduled pass gets. When both hygiene and content
- * work are pending, the worker alternates (hygiene → content → hygiene → …)
- * so content gets a guaranteed turn even while the hygiene queue refills
- * faster than passes drain it (#1098). When only one kind of work is
- * pending, run that kind directly so no pass is spent on an empty runbook.
- */
 export function selectDreamingPassMode(
 	lastScheduled: DreamingPassFocus | null,
 	hasPendingHygieneAttention: boolean,
@@ -1191,37 +1258,18 @@ export function selectDreamingPassMode(
 ): DreamingMode {
 	const hasContentWork = hasBacklog || hasPendingContentAttention;
 	if (hasPendingHygieneAttention && hasContentWork) {
-		// Tie: alternate so content gets a guaranteed turn even while the
-		// hygiene queue stays full, starting the cycle at hygiene.
 		return lastScheduled === "hygiene" ? "incremental-content" : "incremental-hygiene";
 	}
 	if (hasPendingHygieneAttention) return "incremental-hygiene";
 	if (hasContentWork) return "incremental-content";
-	// Unreachable through shouldTriggerDreaming (it fires only when attention
-	// or a backlog exists); the combined mode's early-exit gate is the
-	// defensive fallback.
 	return "incremental";
 }
 
-// ---------------------------------------------------------------------------
-// Main dreaming orchestrator
-// ---------------------------------------------------------------------------
-
-/**
- * Bounded tool-loop Dreaming pass. The daemon owns evidence selection,
- * exclusion/cursor bookkeeping, tool construction, and audited writes.
- */
-
 export interface DreamingPassLiveOptions {
-	/** Test seam; production uses the process-local ephemeral event hub. */
 	readonly hub?: DreamingLiveEventHub;
+	readonly userRequest?: { readonly sourceRef: string; readonly content: string };
+	readonly memoryHeadReader?: (agentId: string, passId?: string) => Promise<Record<string, unknown>>;
 }
-
-/**
- * Anonymous telemetry for a completed agentic dreaming pass: provider-reported
- * token usage and cost so dreaming economics show up in PostHog alongside
- * llm.generate and pipeline.embedding. Best-effort — never throws into the pass.
- */
 export function recordDreamingPassTelemetry(input: {
 	readonly mode: string;
 	readonly outcome: DreamingPassOutcome;
@@ -1277,9 +1325,7 @@ export function recordDreamingPassTelemetry(input: {
 			toolCalls: input.effects.toolCalls,
 			durationMs: input.effects.durationMs,
 		});
-	} catch {
-		// A telemetry collector is an observer, never part of the pass result.
-	}
+	} catch {}
 }
 
 export type DreamingPassOutcome = "completed" | "no-op" | "failed" | "cancelled";
@@ -1341,8 +1387,6 @@ function dreamingPassEffects(
 	return {
 		artifactsConsidered: state.consideredArtifacts.size,
 		memoriesCreated: state.createdMemoryIds.size,
-		// Dreaming semantic updates are represented as a new version plus a
-		// supersession, rather than an in-place memory update.
 		memoriesUpdated: 0,
 		memoriesSuperseded: state.supersededMemoryIds.size,
 		memoriesRetired: state.retiredMemoryIds.size,
@@ -1640,8 +1684,6 @@ export async function runDreamingAgentPass(
 	liveOptions?: DreamingPassLiveOptions,
 	ownerMaintenance?: DbOwnerMaintenance,
 ): Promise<{ passId: string; applied: number; skipped: number; failed: number; summary: string }> {
-	// Any pass may consume or create episodic evidence. Do not present the
-	// previous exact aggregate while the pass is mutating its source window.
 	for (const scope of scopes) invalidateDreamingEpisodicTokenBacklog(scope);
 	const passId =
 		existingPassId ??
@@ -1657,14 +1699,19 @@ export async function runDreamingAgentPass(
 	let applied = 0;
 	let failed = 0;
 	try {
-		const prompt =
+		const basePrompt =
 			scopes.length > 1
 				? `${dreamingPromptForMode(mode)}\n\n<agent_scopes>\n${scopes.join("\n")}\n</agent_scopes>`
 				: dreamingPromptForMode(mode);
+		const toolPrompt = cfg.codemode ? `${basePrompt}\n\n${DREAMING_CODEMODE_PROMPT}` : basePrompt;
+		const prompt = liveOptions?.userRequest
+			? `${toolPrompt}
 
-		// Pass-start cutoff, SQLite format. The stored watermark may also be
-		// the raw surfaced captured_at (ISO); every comparison goes through
-		// julianday(), so the mixed formats stay ordered (#1149).
+The authenticated user requested this scoped maintenance task. Their instruction was recorded as evidence before this pass. Address it using the same audited tools and citation requirements; report any unsupported change rather than bypassing validation.
+<user_request>
+${JSON.stringify(liveOptions.userRequest)}
+</user_request>`
+			: toolPrompt;
 		const cutoffRow = await ownerQueryOne<{ now: string }>(
 			await getDbOwnerForAccessor(accessor),
 			"dreaming.pass.cutoff",
@@ -1673,11 +1720,6 @@ export async function runDreamingAgentPass(
 			{ deadlineMs: 30_000, estimatedWorkUnits: 1 },
 		);
 		const cutoff = cutoffRow?.now ?? new Date().toISOString();
-
-		// One Dreaming pass covers the whole install: it only runs when some
-		// scope has pending attention or an episodic backlog. Scheduled checks
-		// are already gated by shouldTriggerDreaming; this protects manual
-		// triggers and compact runs from spending tokens on nothing.
 		const [hasPendingHygieneAttention, hasPendingContentAttention, hasPendingAttention] = await Promise.all([
 			Promise.all(
 				scopes.map(
@@ -1724,12 +1766,14 @@ export async function runDreamingAgentPass(
 			),
 		);
 		const hasBacklog = [...hasBacklogByScope.values()].some(Boolean);
-		const earlyExitSummary = dreamingEarlyExitSummary(
-			mode,
-			hasPendingHygieneAttention,
-			hasBacklog,
-			hasPendingContentAttention || (hasPendingAttention && !hasPendingHygieneAttention),
-		);
+		const earlyExitSummary = liveOptions?.userRequest
+			? null
+			: dreamingEarlyExitSummary(
+					mode,
+					hasPendingHygieneAttention,
+					hasBacklog,
+					hasPendingContentAttention || (hasPendingAttention && !hasPendingHygieneAttention),
+				);
 		if (earlyExitSummary !== null) {
 			const statements = [
 				ownerRunStatement(
@@ -1739,12 +1783,6 @@ export async function runDreamingAgentPass(
 					[earlyExitSummary, passId],
 				),
 			];
-			// The evidence watermark only advances when nothing new
-			// remains AND the mode consumes evidence: a focused pass
-			// that exits while the other mode's work is pending must not
-			// skip it for the next pass, and a hygiene pass must never
-			// advance the watermark even on an empty backlog (#1098,
-			// #1149).
 			if (dreamingModeAdvancesEvidence(mode, hasBacklog)) {
 				for (const scope of scopes) {
 					if (hasBacklogByScope.get(scope) === true) {
@@ -1789,16 +1827,54 @@ export async function runDreamingAgentPass(
 		}
 
 		let applyCallbackReported = false;
-		let memoryHeadResult: Record<string, unknown> | null = null;
+		let memoryHeadCommitInput: MemoryHeadCommitInput | null = null;
+		let memoryHeadCommitRejection = null as { readonly code: string; readonly error: string } | null;
+		const memoryHeadCommitter: MemoryHeadCommitter = {
+			read: (scopeId) => (liveOptions?.memoryHeadReader ?? readCuratedMemoryHead)(scopeId, passId),
+			async commit(input) {
+				if (mode !== "incremental-content" || input.agentId !== agentId || input.passId !== passId) {
+					memoryHeadCommitRejection = {
+						code: "PASS_NOT_AUTHORIZED",
+						error: "only the active content pass may stage its memory-head commit",
+					};
+					return { ok: false, ...memoryHeadCommitRejection };
+				}
+				if (memoryHeadCommitInput !== null) {
+					memoryHeadCommitInput = null;
+					memoryHeadCommitRejection = {
+						code: "MULTIPLE_COMMIT_ATTEMPTS",
+						error: "a content pass may stage only one memory-head commit",
+					};
+					return { ok: false, ...memoryHeadCommitRejection };
+				}
+				const invalid = memoryHeadInputError(input);
+				if (invalid !== null) {
+					memoryHeadCommitRejection = invalid;
+					return { ok: false, ...invalid };
+				}
+				memoryHeadCommitInput = input;
+				return { ok: true, code: "STAGED_FOR_FINALIZATION" };
+			},
+		};
 		let retirementCandidates: DreamingRetirementCandidates = new Map();
 		const rejectedEvidence: RejectedDreamingEvidence[] = [];
-		// The newest captured_at each scope's search_evidence surfaced this
-		// pass; the pass-end watermark may advance only to it (#1149).
 		const surfacedWatermarkByScope = new Map<string, string>();
 		const surfacedTranscriptRefsByScope = new Map<string, Set<string>>();
 		const tools = createDreamingAgentTools({
+			allowedAgentIds: liveOptions?.userRequest !== undefined ? [agentId] : scopes,
+			codemode: cfg.codemode,
+			...(mode === "incremental-content"
+				? {}
+				: {
+						capabilityIds: DREAMING_CAPABILITY_IDS.filter(
+							(id) => id !== "memory_head_read" && id !== "memory_head_commit",
+						),
+					}),
+			evidenceDeliveryDeadline: Date.now() + Math.floor(cfg.timeout / 2),
+			evidenceChars: dreamingEvidencePageChars(cfg.maxInputTokens),
 			accessor,
 			agentId,
+			memoryHeadCommitter,
 			actor: "dreaming",
 			passId,
 			mode,
@@ -1819,7 +1895,6 @@ export async function runDreamingAgentPass(
 			async onToolCall(trace) {
 				publishDreamingToolTrace(passId, trace, live);
 				await recordDreamingToolCall(accessor, agentId, passId, ++toolCallSequence, trace);
-				if (trace.tool === "memory_head_commit") memoryHeadResult = trace.output;
 				if (trace.tool === "search_evidence" && trace.output.ok === true && Array.isArray(trace.output.items)) {
 					const input = isRecord(trace.input) ? trace.input : null;
 					const scope = input !== null && typeof input.agentId === "string" ? input.agentId : agentId;
@@ -1835,10 +1910,6 @@ export async function runDreamingAgentPass(
 						if (sourceRef?.startsWith("transcript:")) transcriptRefs.add(sourceRef);
 					}
 					if (transcriptRefs.size > 0) surfacedTranscriptRefsByScope.set(scope, transcriptRefs);
-					// A sourceRef call reads a fragment of a source the
-					// listing already surfaced: it adds no new frontier (the
-					// listing's max covers it) and must not advance the
-					// watermark past the unread remainder (#1149).
 					if (input === null || typeof input.sourceRef !== "string") {
 						const scope = input !== null && typeof input.agentId === "string" ? input.agentId : agentId;
 						const surfaced = surfacedEvidenceWatermark(trace.output.items);
@@ -1876,33 +1947,48 @@ export async function runDreamingAgentPass(
 				}
 			},
 		});
+		const historyScopes = liveOptions?.userRequest !== undefined ? [agentId] : scopes;
+		await ownerTransaction(
+			await getDbOwnerForAccessor(accessor),
+			"dreaming.pass.scope-key",
+			[
+				ownerRunStatement("UPDATE dreaming_passes SET scope_key = ? WHERE id = ?", [
+					dreamingScopeKey(historyScopes),
+					passId,
+				]),
+			],
+			{ deadlineMs: 30_000, estimatedWorkUnits: 1 },
+		);
+		const passPrompt = dreamingPassPrompt(
+			prompt,
+			await renderDreamingHistoryForPass(accessor, agentId, historyScopes),
+			await renderPendingDreamingAttention(accessor, historyScopes, mode),
+		).concat("\n\n", dreamingPassClock(new Date(), detectLocalTimeZone()));
 		logger.info("dreaming", "Starting agentic dreaming pass", {
 			mode,
-			promptChars: prompt.length,
+			promptChars: passPrompt.length,
 		});
 		const executorResult = await executor.run({
 			passId,
-			prompt,
+			prompt: passPrompt,
 			tools,
 			timeoutMs: cfg.timeout,
-			maxTokens: cfg.maxOutputTokens,
+			maxTokens: cfg.maxOutputTokens ?? undefined,
 			onEvent: (event) => publishDreamingAgentEvent(passId, event, live),
 			onSessionInfo: (info) => publishDreamingSessionInfo(passId, info, live),
 		});
-		const memoryHeadMissing =
-			mode === "incremental-content" && (memoryHeadResult === null || Reflect.get(memoryHeadResult, "ok") !== true);
-		if (memoryHeadMissing)
-			logger.warn("dreaming", "Content pass completed without a successful memory-head commit", { passId });
-		const summary = `${executorResult.summary?.trim() || "Agentic Dreaming pass completed"}${memoryHeadMissing ? " [memory-head commit missing]" : ""}`;
+		if (mode === "incremental-content" && memoryHeadCommitInput === null) {
+			const rejection = memoryHeadCommitRejection;
+			throw new Error(
+				rejection === null
+					? "Content pass finalization requires a successful memory-head commit: the agent ended without calling memory_head_commit"
+					: `Content pass finalization requires a successful memory-head commit: memory_head_commit was rejected (${rejection.code}): ${rejection.error}`,
+			);
+		}
+		const summary = executorResult.summary?.trim() || "Agentic Dreaming pass completed";
 		const attribution = executorResult.attribution ?? null;
-		// Provider-reported aggregate when the executor surfaced it (pi-backed
-		// agent sessions); otherwise fall back to the local prompt estimate so
-		// acpx-backed passes keep a meaningful total.
 		const usage = executorResult.usage ?? null;
-		const tokensConsumed = usage?.totalTokens ?? countTokens(prompt);
-		// The watermark advances only to what this pass actually surfaced: a
-		// pass that completes without surfacing (or deferring) pending
-		// evidence must not skip it for the next scan-first search (#1149).
+		const tokensConsumed = usage?.totalTokens ?? countTokens(passPrompt);
 		const nextWatermarkByScope = new Map<string, string | null>();
 		for (const scope of scopes) {
 			const previous =
@@ -1921,24 +2007,14 @@ export async function runDreamingAgentPass(
 				surfaced === undefined ? previous : nextEvidenceWatermark(surfaced, previous, cutoff),
 			);
 		}
-		// Any pass that surfaces transcript evidence owns its direct temporal
-		// projection. Combined passes can ingest content too; gating this on the
-		// focused-mode name would advance the watermark without writing the
-		// manifest.
-		const transcriptManifestEntries = (
-			await Promise.all(
-				[...surfacedTranscriptRefsByScope.entries()].map(([scope, refs]) =>
-					Promise.all(
-						[...refs].map(async (sourceRef) => {
-							const source = await readDreamingEvidenceSource(accessor, scope, sourceRef);
-							return source === null || !source.completed
-								? []
-								: [{ scope, source, content: renderDreamingEvidence(source) }];
-						}),
-					).then((entries) => entries.flat()),
-				),
-			)
-		).flat();
+		const transcriptManifestEntries: Array<{ scope: string; source: EpisodicSourceRecord; content: string }> = [];
+		for (const [scope, refs] of surfacedTranscriptRefsByScope) {
+			for (const sourceRef of refs) {
+				const source = await readDreamingEvidenceSource(accessor, scope, sourceRef);
+				if (source !== null && source.completed)
+					transcriptManifestEntries.push({ scope, source, content: sanitizeTranscriptForDreaming(source.content) });
+			}
+		}
 		const finalizeInput: DbOwnerDreamingPassFinalize = {
 			passId,
 			mode,
@@ -1950,12 +2026,13 @@ export async function runDreamingAgentPass(
 			outputTokens: usage?.outputTokens ?? null,
 			cacheReadTokens: usage?.cacheReadTokens ?? null,
 			cacheCreationTokens: usage?.cacheCreationTokens ?? null,
+			peakContextTokens: usage?.peakContextTokens ?? null,
 			totalCost: usage?.totalCost ?? null,
 			applied,
 			failed,
 			summary,
 			rejectedEvidence,
-			memoryHeadResult,
+			memoryHeadCommitInput,
 			hasBacklogByScope: [...hasBacklogByScope].map(([scope, scopeHasBacklog]) => ({
 				scope,
 				hasBacklog: scopeHasBacklog,
@@ -1976,11 +2053,31 @@ export async function runDreamingAgentPass(
 				);
 				return await finalize.result;
 			},
-			runInline: ({ write }) =>
-				write((db) => {
+			runInline: async ({ write }) => {
+				const result = await write((db) => {
 					finalizeDreamingPassInDb(db, finalizeInput);
 					return null;
-				}),
+				});
+				if (mode === "incremental-content") {
+					try {
+						const projection = await memoryHeadCommitter.read(agentId);
+						if (projection.publication === "pending") {
+							logger.warn("dreaming", "Content pass completed with a pending MEMORY.md projection", {
+								passId,
+								agentId,
+								error: projection.publicationError,
+							});
+						}
+					} catch (error) {
+						logger.warn("dreaming", "Content pass completed but MEMORY.md projection retry failed", {
+							passId,
+							agentId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+				return result;
+			},
 		});
 		const outcome: DreamingPassOutcome =
 			failed > 0
@@ -2054,12 +2151,6 @@ export async function runDreamingAgentPass(
 		throw error;
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Threshold check
-// ---------------------------------------------------------------------------
-
-// Max backoff: 5min * 2^6 = ~5.3 hours.
 const MAX_FAILURE_BACKOFF_MULTIPLIER = 6;
 const FAILURE_BACKOFF_BASE_MS = 5 * 60 * 1000;
 const DREAMING_EVIDENCE_KINDS = ["memory", "artifact", "transcript"] as const;
@@ -2101,10 +2192,6 @@ function writeDreamingTranscriptManifestInTx(
 		if (!entry.source.completed || entry.content.trim().length === 0) continue;
 		const content = entry.content.trim();
 		const contentHash = createHash("sha256").update(content).digest("hex");
-		// Reuse an existing depth-0 row for this agent/session. The historical
-		// summary path used a different id, and the partial unique index cannot
-		// be handled by ON CONFLICT(id) alone. Updating it in place preserves
-		// child/memory lineage while replacing the derived content source.
 		const existing = db
 			.prepare(
 				`SELECT id FROM session_summaries
@@ -2133,12 +2220,6 @@ function writeDreamingTranscriptManifestInTx(
 			}),
 			now,
 		);
-		upsertMemoryContentSafetyInTx(db, {
-			agentId: entry.scope,
-			sourceKind: "summary",
-			sourceId: nodeId,
-			content,
-		});
 		upsertThreadHead(db as unknown as Database, {
 			agentId: entry.scope,
 			nodeId,
@@ -2152,21 +2233,40 @@ function writeDreamingTranscriptManifestInTx(
 		});
 	}
 }
-
-/** Finalize a pass inside the DB owner; the payload contains no callbacks. */
 export function finalizeDreamingPassInDb(db: WriteDb, input: DbOwnerDreamingPassFinalize): void {
-	writeDreamingTranscriptManifestInTx(db, {
-		passId: input.passId,
-		entries: input.transcriptManifestEntries as Array<{
-			scope: string;
-			source: EpisodicSourceRecord;
-			content: string;
-		}>,
-	});
+	let memoryHeadResult: Record<string, unknown> | null = null;
+	withContentPassWrites(db, input.passId, () =>
+		writeDreamingTranscriptManifestInTx(db, {
+			passId: input.passId,
+			entries: input.transcriptManifestEntries as Array<{
+				scope: string;
+				source: EpisodicSourceRecord;
+				content: string;
+			}>,
+		}),
+	);
+	if (input.mode === "incremental-content") {
+		const commitInput = input.memoryHeadCommitInput;
+		if (commitInput === null)
+			throw new Error(
+				"Content pass finalization requires a successful memory-head commit: the agent ended without calling memory_head_commit",
+			);
+		if (commitInput.agentId !== input.agentId || commitInput.passId !== input.passId) {
+			throw new Error("Content pass memory-head commit does not match its finalizing pass");
+		}
+		memoryHeadResult = commitCuratedMemoryHeadInDb(db, commitInput);
+		if (memoryHeadResult.ok !== true) {
+			const code = typeof memoryHeadResult.code === "string" ? memoryHeadResult.code : "unknown";
+			const error = typeof memoryHeadResult.error === "string" ? memoryHeadResult.error : "commit was rejected";
+			throw new Error(`Content pass finalization requires a successful memory-head commit (${code}): ${error}`);
+		}
+	} else if (input.memoryHeadCommitInput !== null) {
+		throw new Error("Only an incremental-content pass may commit the memory head");
+	}
 	db.prepare(
 		`UPDATE dreaming_passes SET status = 'completed', completed_at = datetime('now'),
 		 tokens_consumed = ?, tokens_input = ?, tokens_output = ?,
-		 tokens_cache_read = ?, tokens_cache_write = ?, tokens_cost = ?,
+		 tokens_cache_read = ?, tokens_cache_write = ?, tokens_peak_context = ?, tokens_cost = ?,
 		 mutations_applied = ?, mutations_skipped = ?,
 		 mutations_failed = ?, summary = ? WHERE id = ?`,
 	).run(
@@ -2175,6 +2275,7 @@ export function finalizeDreamingPassInDb(db: WriteDb, input: DbOwnerDreamingPass
 		input.outputTokens,
 		input.cacheReadTokens,
 		input.cacheCreationTokens,
+		input.peakContextTokens ?? null,
 		input.totalCost,
 		input.applied,
 		0,
@@ -2183,7 +2284,7 @@ export function finalizeDreamingPassInDb(db: WriteDb, input: DbOwnerDreamingPass
 		input.passId,
 	);
 	recordRejectedDreamingEvidenceInTx(db, input.passId, input.rejectedEvidence as RejectedDreamingEvidence[]);
-	if (input.memoryHeadResult !== null) {
+	if (memoryHeadResult !== null) {
 		const row = db.prepare("SELECT runbook_json AS runbookJson FROM dreaming_passes WHERE id = ?").get(input.passId) as
 			| { runbookJson: string | null }
 			| undefined;
@@ -2194,10 +2295,10 @@ export function finalizeDreamingPassInDb(db: WriteDb, input: DbOwnerDreamingPass
 		} catch {
 			manifest = {};
 		}
-		manifest.memoryHead = input.memoryHeadResult;
+		manifest.memoryHead = memoryHeadResult;
 		db.prepare("UPDATE dreaming_passes SET runbook_json = ? WHERE id = ?").run(JSON.stringify(manifest), input.passId);
 	}
-	if (input.mode !== "incremental-hygiene" && input.failed === 0) {
+	if (input.mode !== "incremental-hygiene") {
 		const runbook = db
 			.prepare("SELECT runbook_json AS runbookJson FROM dreaming_passes WHERE id = ?")
 			.get(input.passId) as { runbookJson: string | null } | null;
@@ -2208,11 +2309,19 @@ export function finalizeDreamingPassInDb(db: WriteDb, input: DbOwnerDreamingPass
 		} catch {
 			parsedRunbook = null;
 		}
-		const deferredEvidence = parsedRunbook === null ? null : deferredEvidenceKeys(parsedRunbook, input.agentId);
+		const runbookDeferred = parsedRunbook === null ? null : deferredEvidenceKeys(parsedRunbook, input.agentId);
+		const failedEvidence = failedOperationEvidence(db, input.passId, input.agentId, input.scopes);
+		const deferredEvidence = runbookDeferred === null ? null : new Set([...runbookDeferred, ...failedEvidence.sources]);
 		const reviewedExcludedEvidence =
 			parsedRunbook === null ? null : parseDreamingReviewedExcludedEvidence(parsedRunbook);
 		if (deferredEvidence !== null && reviewedExcludedEvidence !== null) {
-			recordDreamingEvidenceConsumptionInTx(db, { passId: input.passId, deferredEvidence });
+			recordDreamingEvidenceConsumptionInTx(db, {
+				passId: input.passId,
+				deferredEvidence,
+				withheldScopes: failedEvidence.scopes,
+				filedSources: failedEvidence.filedSources,
+				filedCitations: failedEvidence.filedCitations,
+			});
 			recordDreamingReviewedExcludedEvidenceInTx(db, {
 				passId: input.passId,
 				scopeIds: new Set(input.scopes),
@@ -2220,6 +2329,7 @@ export function finalizeDreamingPassInDb(db: WriteDb, input: DbOwnerDreamingPass
 				deferredEvidence,
 			});
 		}
+		resolveImportedSourceAttentionInTx(db, input.passId, input.scopes);
 	}
 	if (
 		dreamingModeAdvancesEvidence(
@@ -2234,22 +2344,14 @@ export function finalizeDreamingPassInDb(db: WriteDb, input: DbOwnerDreamingPass
 		}
 	}
 }
-
-// A scope that fails this many consecutive passes is halted: automatic
-// scheduling stops for the cooldown below instead of retrying forever on
-// the backoff ceiling (~5.3h per attempt). Explicit triggers bypass the
-// gate, and any successful pass resets the counter, so a halt self-heals
-// on the next forced or post-cooldown pass (#1059).
 export const DREAMING_FAILURE_HALT_THRESHOLD = 5;
 export const DREAMING_HALT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export const DREAMING_SCHEDULE_BACKLOG_MAX_SOURCES = 50;
 export function isDreamingScopeHalted(state: DreamingState, nowMs = Date.now()): boolean {
 	if (state.consecutiveFailures < DREAMING_FAILURE_HALT_THRESHOLD) return false;
-	const failedAt = state.lastFailureAt === null ? Number.NaN : Date.parse(state.lastFailureAt);
+	const failedAt = state.lastFailureAt === null ? Number.NaN : utcTimestampMs(state.lastFailureAt);
 	return Number.isFinite(failedAt) && nowMs - failedAt < DREAMING_HALT_COOLDOWN_MS;
 }
-
-/** Cheap sweep pre-check: one indexed dreaming_state row, no attention scan. */
 export async function isDreamingHaltActive(
 	accessor: DbAccessor,
 	agentId: string,
@@ -2260,7 +2362,7 @@ export async function isDreamingHaltActive(
 
 interface DreamingBacklogRead {
 	readonly entries: readonly DreamingBacklogTokenEntry[];
-	readonly hasBacklog: boolean;
+	readonly hasBacklog: boolean | null;
 	readonly complete: boolean;
 	readonly sourcesScanned: number;
 }
@@ -2311,7 +2413,21 @@ function backlogReadFromSources(
 	};
 }
 
+function withCandidateScanResult(
+	read: DreamingBacklogRead,
+	candidateScan: { readonly complete: boolean } | null,
+): DreamingBacklogRead {
+	if (candidateScan === null || candidateScan.complete) return read;
+	return {
+		...read,
+		hasBacklog: read.hasBacklog === true ? true : null,
+		complete: false,
+	};
+}
+
 function readDreamingEpisodicBacklogInDb(db: ReadDb, agentId: string, sourceLimit: number | null): DreamingBacklogRead {
+	const candidateScan = sourceLimit === null ? null : scanEpisodicSourceCandidates(db, agentId, sourceLimit);
+	const candidateRefs = candidateScan?.refs;
 	const hasConsumption =
 		db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dreaming_evidence_consumption'").get() !=
 		null;
@@ -2321,9 +2437,12 @@ function readDreamingEpisodicBacklogInDb(db: ReadDb, agentId: string, sourceLimi
 			query: "",
 			excludeDelivered: true,
 			limit: sourceLimit === null ? null : sourceLimit + 1,
+			order: sourceLimit === null ? "newest" : "none",
+			candidateRefs,
 		});
-		return backlogReadFromSources(queued, sourceLimit, (source) =>
-			validDreamingBacklogEntry(db, agentId, source, true),
+		return withCandidateScanResult(
+			backlogReadFromSources(queued, sourceLimit, (source) => validDreamingBacklogEntry(db, agentId, source, true)),
+			candidateScan,
 		);
 	}
 
@@ -2334,8 +2453,9 @@ function readDreamingEpisodicBacklogInDb(db: ReadDb, agentId: string, sourceLimi
 		sourceLimit === null ? null : sourceLimit + 1,
 		DREAMING_EVIDENCE_KINDS,
 		state.evidenceCursor ? null : state.lastPassAt,
-		"newest",
+		sourceLimit === null ? "newest" : "none",
 		state.evidenceCursor,
+		candidateRefs,
 	);
 	const resumed =
 		state.evidenceCursor?.fragmentOffset !== undefined && state.evidenceCursor.kind !== null
@@ -2350,21 +2470,15 @@ function readDreamingEpisodicBacklogInDb(db: ReadDb, agentId: string, sourceLimi
 	const resumedSource = resumedEntry !== null && resumed !== null && !resumedIsQueued ? resumed : null;
 	const resumedKey = resumedSource === null ? null : sourceRecordKey(resumedSource);
 	const availableSources = resumedSource === null ? queued : [resumedSource, ...queued];
-	return backlogReadFromSources(availableSources, sourceLimit, (source) => {
+	const read = backlogReadFromSources(availableSources, sourceLimit, (source) => {
 		const offset =
 			resumedKey !== null && sourceRecordKey(source) === resumedKey
 				? (state.evidenceCursor?.fragmentOffset ?? 0)
 				: undefined;
 		return validDreamingBacklogEntry(db, agentId, source, false, offset);
 	});
+	return withCandidateScanResult(read, candidateScan);
 }
-
-/**
- * Refresh the exact BPE backlog count without encoding on the daemon thread.
- * This operation always reads the complete canonical pending set. Scheduled
- * checks use probeDreamingEpisodicBacklog instead, so an incomplete page can
- * never overwrite the exact aggregate or masquerade as a token total.
- */
 export function getDreamingEpisodicTokenBacklogInDb(db: ReadDb, agentId: string): Promise<number> {
 	const read = readDreamingEpisodicBacklogInDb(db, agentId, null);
 	return refreshDreamingBacklogTokenCache(agentId, read.entries);
@@ -2376,8 +2490,6 @@ function ensureDreamingTokenThreshold(value: number): number {
 	}
 	return value;
 }
-
-/** Execute the bounded scheduler probe inside the database owner. */
 export function probeDreamingEpisodicBacklogInDb(
 	db: ReadDb,
 	agentId: string,
@@ -2389,7 +2501,7 @@ export function probeDreamingEpisodicBacklogInDb(
 	const read = readDreamingEpisodicBacklogInDb(db, agentId, sourceLimit);
 	return countDreamingBacklogTokenEntries(agentId, read.entries, read.complete ? undefined : threshold).then(
 		(result) => {
-			if (read.complete) {
+			if (read.complete && read.hasBacklog !== null) {
 				return {
 					kind: "exact",
 					tokens: result.tokens,
@@ -2414,10 +2526,8 @@ export function probeDreamingEpisodicBacklogInDb(
 		},
 	);
 }
-
-/** Read pending evidence presence without tokenizing its content. */
 export function hasDreamingEpisodicBacklogInDb(db: ReadDb, agentId: string): boolean {
-	return readDreamingEpisodicBacklogInDb(db, agentId, 1).hasBacklog;
+	return readDreamingEpisodicBacklogInDb(db, agentId, 1).hasBacklog ?? true;
 }
 
 export async function getDreamingEpisodicTokenBacklog(
@@ -2506,28 +2616,22 @@ export async function evaluateDreamingTrigger(
 		(await ownerQueryOne<{ present: number }>(
 			await getDbOwnerForAccessor(accessor),
 			"dreaming.attention.present",
-			"SELECT 1 AS present FROM dreaming_attention WHERE agent_id = ? AND resolved_at IS NULL LIMIT 1",
+			`SELECT 1 AS present FROM dreaming_attention
+			 WHERE agent_id = ? AND resolved_at IS NULL
+			   AND NOT ${STALLED_EVIDENCE_ATTENTION_SQL} AND NOT ${SEEN_IMPORTED_SOURCE_ATTENTION_SQL} LIMIT 1`,
 			[agentId],
 			{ deadlineMs: 30_000, estimatedWorkUnits: 1 },
 		)) !== undefined;
-
-	// Hard halt after repeated consecutive failures: no automatic scheduling
-	// for the cooldown window. Explicit operator triggers bypass this gate.
 	if (isDreamingScopeHalted(state, nowMs)) return { trigger: false };
-
-	// Back off by wall clock, not by evidence volume. A transient provider outage
-	// must not require exponentially more incoming evidence before recovery.
 	if (state.consecutiveFailures > 0) {
 		const exp = Math.min(state.consecutiveFailures, MAX_FAILURE_BACKOFF_MULTIPLIER);
-		const failedAt = state.lastFailureAt === null ? Number.NaN : Date.parse(state.lastFailureAt);
+		const failedAt = state.lastFailureAt === null ? Number.NaN : utcTimestampMs(state.lastFailureAt);
 		if (!Number.isFinite(failedAt) || nowMs - failedAt < FAILURE_BACKOFF_BASE_MS * 2 ** exp) return { trigger: false };
 	}
 
 	if (hasAttention) return { trigger: true, reason: "attention" };
-
-	// First run only backfills actual pending episodic evidence.
 	if (cfg.backfillOnFirstRun && state.lastPassAt === null) {
-		return backlog.hasBacklog ? { trigger: true, reason: "first-run" } : { trigger: false };
+		return backlog.hasBacklog !== false ? { trigger: true, reason: "first-run" } : { trigger: false };
 	}
 	const consumptionTable = await ownerQueryOne<{ present: number }>(
 		await getDbOwnerForAccessor(accessor),
@@ -2574,12 +2678,8 @@ export async function evaluateDreamingTrigger(
 			)) !== undefined;
 		if (hasContinuation) return { trigger: true, reason: "continuation" };
 	}
-
-	// A low-volume stream must not wait indefinitely for the batch ceiling.
-	// This is deliberately a maximum wait rather than an unconditional cron:
-	// empty ledgers never trigger a pass.
-	const lastPassMs = state.lastPassAt === null ? Number.NaN : Date.parse(state.lastPassAt);
-	if (backlog.hasBacklog && Number.isFinite(lastPassMs) && nowMs - lastPassMs >= cfg.maxInterval) {
+	const lastPassMs = state.lastPassAt === null ? Number.NaN : utcTimestampMs(state.lastPassAt);
+	if (backlog.hasBacklog !== false && Number.isFinite(lastPassMs) && nowMs - lastPassMs >= cfg.maxInterval) {
 		return { trigger: true, reason: "max-interval" };
 	}
 	return { trigger: false };

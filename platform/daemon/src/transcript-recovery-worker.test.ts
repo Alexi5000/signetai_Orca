@@ -1,7 +1,18 @@
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,15 +69,15 @@ describe("transcript recovery worker", () => {
 	beforeEach(() => {
 		previousSignetPath = process.env.SIGNET_PATH;
 		previousRecoveryHoldFile = process.env.SIGNET_TRANSCRIPT_RECOVERY_TEST_HOLD_FILE;
-		dir = mkdtempSync(join(tmpdir(), "signet-transcript-recovery-"));
+		dir = realpathSync(mkdtempSync(join(tmpdir(), "signet-transcript-recovery-")));
 		claudeRoot = join(dir, "native", "claude", "projects");
 		codexRoot = join(dir, "native", "codex", "sessions");
 		process.env.SIGNET_PATH = dir;
 		initDbAccessor(join(dir, "memory", "memories.db"));
 	});
 
-	afterEach(() => {
-		closeDbAccessor();
+	afterEach(async () => {
+		await closeDbAccessor();
 		if (previousSignetPath === undefined) Reflect.deleteProperty(process.env, "SIGNET_PATH");
 		else process.env.SIGNET_PATH = previousSignetPath;
 		if (previousRecoveryHoldFile === undefined)
@@ -156,18 +167,16 @@ describe("transcript recovery worker", () => {
 		expect(await runTranscriptCaptureOnce(getDbAccessor(), dir)).toBe(true);
 		expect(await runTranscriptCaptureOnce(getDbAccessor(), dir)).toBe(false);
 		expect(existsSync(join(dir, "memory", "claude-code", "transcripts", "transcript.jsonl"))).toBe(true);
-		expect(existsSync(join(dir, "memory", "codex", "transcripts", "transcript.jsonl"))).toBe(true);
-		expect(
-			getDbAccessor().withReadDb((db) =>
-				db
-					.prepare(
-						`SELECT COUNT(*) AS count
-						 FROM memory_artifacts
-						 WHERE agent_id = ? AND source_kind = 'transcript'`,
-					)
-					.get("agent-a"),
-			),
-		).toEqual({ count: 4 });
+		const transcriptRows = (await getDbAccessor().withReadDbAsync((db) =>
+			db
+				.prepare(
+					"SELECT source_path FROM memory_artifacts WHERE agent_id = ? AND source_kind = 'transcript' ORDER BY source_path",
+				)
+				.all("agent-a"),
+		)) as Array<{ source_path: string }>;
+		expect(transcriptRows).toHaveLength(2);
+		expect(transcriptRows[0]?.source_path).toStartWith("memory/claude-code/transcripts/transcript.jsonl#");
+		expect(transcriptRows[1]?.source_path).toStartWith("memory/codex/transcripts/transcript.jsonl#");
 		expect(readFileSync(claudePath, "utf8")).toBe(claudeRaw);
 		expect(readFileSync(codexPath, "utf8")).toBe(codexRaw);
 
@@ -177,6 +186,46 @@ describe("transcript recovery worker", () => {
 		expect(
 			getDbAccessor().withReadDb((db) => db.prepare("SELECT COUNT(*) AS count FROM transcript_recovery_files").get()),
 		).toEqual({ count: 2 });
+	});
+
+	it("skips Claude Code subagent transcripts, which carry their parent's session id", async () => {
+		const sessionDir = join(claudeRoot, "-repo", "parent-session");
+		const parentPath = join(claudeRoot, "-repo", "parent-session.jsonl");
+		writeSettled(
+			parentPath,
+			JSON.stringify({ sessionId: "parent-session", message: { role: "user", content: "parent question" } }),
+		);
+		writeSettled(
+			join(sessionDir, "subagents", "agent-a1.jsonl"),
+			JSON.stringify({
+				sessionId: "parent-session",
+				agentId: "a1",
+				isSidechain: true,
+				message: { role: "user", content: "subagent prompt" },
+			}),
+		);
+		writeSettled(
+			join(sessionDir, "subagents", "workflows", "wf_1", "journal.jsonl"),
+			JSON.stringify({ type: "workflow", step: 1 }),
+		);
+		writeSettled(
+			join(claudeRoot, "-repo", "sidechain-elsewhere.jsonl"),
+			JSON.stringify({
+				sessionId: "parent-session",
+				isSidechain: true,
+				message: { role: "user", content: "sidechain outside a subagents directory" },
+			}),
+		);
+
+		const result = await scan();
+		expect(result.discovered).toBe(2);
+		expect(result.enqueued).toBe(1);
+		expect(result.skippedInvalid).toBe(1);
+		expect(
+			getDbAccessor().withReadDb((db) =>
+				db.prepare("SELECT session_key, transcript_path FROM transcript_capture_jobs").all(),
+			),
+		).toEqual([{ session_key: "parent-session", transcript_path: parentPath }]);
 	});
 
 	it("deduplicates the same snapshot when hook and recovery timestamps differ", async () => {
@@ -230,6 +279,86 @@ describe("transcript recovery worker", () => {
 		).toEqual({ count: 1 });
 	});
 
+	it("canonicalizes symlinked recovery paths before generation deduplication", async () => {
+		const actualPath = join(dir, "external", "session.jsonl");
+		const symlinkPath = join(claudeRoot, "-repo", "session.jsonl");
+		writeSettled(
+			actualPath,
+			JSON.stringify({
+				sessionId: "symlinked-session",
+				message: { role: "user", content: "canonical path" },
+			}),
+		);
+		mkdirSync(dirname(symlinkPath), { recursive: true });
+		symlinkSync(actualPath, symlinkPath);
+
+		const first = await scan();
+		expect(first.enqueued).toBe(1);
+		expect(
+			await getDbAccessor().withReadDbAsync((db) =>
+				db.prepare("SELECT transcript_path FROM transcript_capture_jobs").get(),
+			),
+		).toEqual({ transcript_path: actualPath });
+
+		const second = await scan();
+		expect(second.enqueued).toBe(0);
+		expect(second.skippedUnchanged).toBe(1);
+	});
+
+	it("deduplicates multiple recovery aliases for one canonical source", async () => {
+		const actualPath = join(dir, "external", "aliased-session.jsonl");
+		const firstAlias = join(claudeRoot, "-repo", "first.jsonl");
+		const secondAlias = join(claudeRoot, "-repo", "second.jsonl");
+		writeSettled(
+			actualPath,
+			JSON.stringify({
+				sessionId: "aliased-session",
+				message: { role: "user", content: "one source" },
+			}),
+		);
+		mkdirSync(dirname(firstAlias), { recursive: true });
+		symlinkSync(actualPath, firstAlias);
+		symlinkSync(actualPath, secondAlias);
+
+		const result = await scan();
+		expect(result.discovered).toBe(1);
+		expect(result.examined).toBe(1);
+		expect(result.enqueued).toBe(1);
+		expect(
+			await getDbAccessor().withReadDbAsync((db) =>
+				db.prepare("SELECT COUNT(*) AS count FROM transcript_capture_jobs").get(),
+			),
+		).toEqual({ count: 1 });
+	});
+
+	it("revalidates same-stat recovery sources after a frontier cycle", async () => {
+		const path = join(claudeRoot, "-repo", "same-stat.jsonl");
+		const firstLine = JSON.stringify({
+			sessionId: "same-stat-session",
+			message: { role: "user", content: "first" },
+		});
+		const secondLine = JSON.stringify({ message: { role: "assistant", content: "later" } });
+		const initial = `${firstLine}${" ".repeat(secondLine.length + 1)}`;
+		const replacement = `${firstLine}\n${secondLine}`;
+		expect(Buffer.byteLength(initial)).toBe(Buffer.byteLength(replacement));
+		writeSettled(path, initial);
+
+		expect((await scan()).enqueued).toBe(1);
+		expect(await runTranscriptCaptureOnce(getDbAccessor(), dir)).toBe(true);
+		const originalStat = statSync(path);
+		writeFileSync(path, replacement);
+		utimesSync(path, originalStat.atime, originalStat.mtime);
+
+		const deferred = await scan();
+		const revalidated = await scan();
+		expect(deferred.skippedUnchanged).toBe(1);
+		expect(revalidated.deduplicated).toBe(1);
+		expect(await runTranscriptCaptureOnce(getDbAccessor(), dir)).toBe(true);
+		expect(readFileSync(join(dir, "memory", "claude-code", "transcripts", "transcript.jsonl"), "utf8")).toContain(
+			'"content":"later"',
+		);
+	});
+
 	it("does not replace a completed canonical transcript with a legacy snapshot", async () => {
 		const path = join(claudeRoot, "-repo", "completed-session.jsonl");
 		writeSettled(
@@ -250,8 +379,8 @@ describe("transcript recovery worker", () => {
 		expect(markSessionTranscriptCompleted("completed-session", "agent-a", "2099-01-01T00:00:00.000Z")).toBe(true);
 
 		const result = await scan();
-		expect(result.enqueued).toBe(0);
-		expect(result.deduplicated).toBe(1);
+		expect(result.enqueued).toBe(1);
+		expect(result.deduplicated).toBe(0);
 		const row = getDbAccessor().withReadDb(
 			(db) =>
 				db
@@ -271,11 +400,13 @@ describe("transcript recovery worker", () => {
 		writeSettled(path, firstLine);
 
 		expect((await scan()).enqueued).toBe(1);
+		expect(await runTranscriptCaptureOnce(getDbAccessor(), dir)).toBe(true);
 		writeSettled(path, `${firstLine}\n${secondLine}`);
 
 		const result = await scan();
 		expect(result.enqueued).toBe(1);
 		expect(result.deduplicated).toBe(0);
+		expect(await runTranscriptCaptureOnce(getDbAccessor(), dir)).toBe(true);
 		expect(
 			getDbAccessor().withReadDb(
 				(db) =>
@@ -306,6 +437,7 @@ describe("transcript recovery worker", () => {
 
 		const result = await scan();
 		expect(result.enqueued).toBe(1);
+		expect(await runTranscriptCaptureOnce(getDbAccessor(), dir)).toBe(true);
 		const row = getDbAccessor().withReadDb(
 			(db) =>
 				db
@@ -605,9 +737,7 @@ describe("transcript recovery worker", () => {
 		} finally {
 			try {
 				process.kill(targetPid, "SIGKILL");
-			} catch {
-				// The target should already be gone; keep cleanup idempotent.
-			}
+			} catch {}
 		}
 	}, 20_000);
 
@@ -781,13 +911,57 @@ describe("transcript recovery worker", () => {
 			roots: { claudeCode: claudeRoot, codex: codexRoot },
 			intervalMs: 60_000,
 		});
-		await new Promise((resolve) => setTimeout(resolve, 300));
+		const capturedPaths = () =>
+			(
+				getDbAccessor().withReadDb((db) =>
+					db.prepare("SELECT transcript_path FROM transcript_capture_jobs ORDER BY transcript_path").all(),
+				) as Array<{ transcript_path: string }>
+			).map((job) => job.transcript_path);
+		const deadline = Date.now() + 10_000;
+		while (capturedPaths().length < 2 && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
 		await resumed.stop();
-		const jobs = getDbAccessor().withReadDb((db) =>
-			db.prepare("SELECT transcript_path FROM transcript_capture_jobs ORDER BY transcript_path").all(),
-		) as Array<{ transcript_path: string }>;
-		expect(jobs.map((job) => job.transcript_path)).toEqual([firstPath, secondPath]);
-	});
+		expect(capturedPaths()).toEqual([firstPath, secondPath]);
+	}, 15_000);
+
+	it("completes a scan through the real recovery child process", async () => {
+		writeSettled(
+			join(claudeRoot, "-repo", "real-child.jsonl"),
+			JSON.stringify({ sessionId: "real-child", message: { role: "user", content: "real child" } }),
+		);
+		const infoMessages: string[] = [];
+		const warnMessages: string[] = [];
+		const originalInfo = logger.info;
+		const originalWarn = logger.warn;
+		logger.info = ((category, message) => {
+			infoMessages.push(`${category}:${message}`);
+		}) as typeof logger.info;
+		logger.warn = ((category, message, data) => {
+			warnMessages.push(`${category}:${message}:${JSON.stringify(data)}`);
+		}) as typeof logger.warn;
+		const handle = startTranscriptRecoveryWorker(getDbAccessor(), dir, "agent-a", {
+			roots: { claudeCode: claudeRoot, codex: codexRoot },
+			intervalMs: 60_000,
+		});
+		try {
+			const deadline = Date.now() + 10_000;
+			while (
+				!infoMessages.includes("transcripts:Transcript recovery scan complete") &&
+				warnMessages.length === 0 &&
+				Date.now() < deadline
+			) {
+				await Bun.sleep(25);
+			}
+			expect(warnMessages).toEqual([]);
+			expect(infoMessages).toContain("transcripts:Transcript recovery scan complete");
+			expect(handle.childPid).toBeNull();
+		} finally {
+			await handle.stop();
+			logger.info = originalInfo;
+			logger.warn = originalWarn;
+		}
+	}, 15_000);
 
 	it("closes the recovery database when its daemon parent is killed", async () => {
 		const databasePath = join(dir, "recovery-lock.db");

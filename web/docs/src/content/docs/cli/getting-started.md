@@ -69,7 +69,7 @@ signet setup --schema
 signet setup --file ./setup-plan.json --dry-run
 ```
 
-Interactive setup requires a TTY and opens the dashboard modal. It prints a URL if the browser cannot open. For headless setup, choose one of these modes:
+Interactive setup requires a TTY and opens guided dashboard onboarding. For the default local workspace, the CLI tries the Signet Desktop installation through each OS's launch target: the Windows `signet://` registry handler, the `ai.signet.app` macOS bundle, or the `signet.desktop` Linux entry. If Desktop is unavailable or launch fails, it falls back to the local browser URL. Custom workspaces and remote daemons keep the browser handoff so Desktop cannot silently open a different workspace. On a fresh default interactive run, the CLI creates only the protected workspace and minimal configuration/database bootstrap needed to start that flow; it does not preselect providers or harnesses, create identity files, install skills, or initialize Git. Existing workspaces are not reset. For scripted or headless setup, the CLI still supports explicit flags, plans, and JSON output. It prints the onboarding URL if neither handoff can open.
 
 - `--non-interactive` with flags for a scripted setup or reconfiguration.
 - `--file <path>` to apply a JSON setup plan.
@@ -92,7 +92,7 @@ A `--file` or `--json` plan is for fresh setup. It does not carry credentials fo
 | `--remote-url <url>` | Use a bare remote daemon origin instead of starting a local daemon. |
 | `--deployment-type local|vps|server` | Adjust non-interactive inferred defaults only. |
 
-Current setup accepts `claude-code`, `codex`, `kimi`, `opencode`, `forge`, `openclaw`, `oh-my-pi`, `pi`, `hermes-agent`, and `gemini` harness names. Kimi uses the ACPX agent name `kimi`. For OpenClaw, `--openclaw-runtime-path plugin|legacy` selects its integration path and `--configure-openclaw-workspace` opts into patching discovered configurations.
+Current setup accepts `claude-code`, `codex`, `kimi`, `opencode`, `forge`, `openclaw`, `oh-my-pi`, `pi`, `hermes-agent`, `gemini`, and `muse-code` harness names. Kimi uses the ACPX agent name `kimi`. For OpenClaw, `--openclaw-runtime-path plugin|legacy` selects its integration path and `--configure-openclaw-workspace` opts into patching discovered configurations.
 
 ### Inference and search flags
 
@@ -103,7 +103,7 @@ Current setup accepts `claude-code`, `codex`, `kimi`, `opencode`, `forge`, `open
 | `--extraction-endpoint <url>` | Endpoint for `openai-compatible` extraction. |
 | `--aggregate-recall-provider`, `--aggregate-recall-model`, `--aggregate-recall-endpoint` | Configure a distinct provider for aggregate recall. |
 | `--search-balance <alpha>` | Semantic/keyword balance from `0` through `1`. |
-| `--enable-dreaming` | Enable background memory consolidation. On an existing workspace, this updates the Dreaming and pipeline settings in `agent.yaml` while preserving unrelated configuration. |
+| `--enable-dreaming` | Enable background memory consolidation. Fresh setups enable Dreaming by default and ask about it during provider/model onboarding; without a working provider it remains enabled but unavailable until one is connected and tested. This flag opts an existing workspace in and updates its Dreaming and pipeline settings in `agent.yaml` while preserving unrelated configuration. |
 
 When an explicitly selected Ollama service or model is unavailable during non-interactive setup, Signet keeps Ollama selected and reports the problem; it does not silently switch to native embeddings. Setup continues with embeddings unavailable until Ollama is ready; use `signet doctor` to check readiness.
 

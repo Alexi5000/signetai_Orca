@@ -47,10 +47,10 @@ describe("hybridRecall freshness-aware rehearsal", () => {
 		initDbAccessor(join(dir, "memory", "memories.db"));
 	});
 
-	afterEach(() => {
-		closeDbAccessor();
+	afterEach(async () => {
+		await closeDbAccessor();
 		if (prevSignetPath === undefined) {
-			process.env.SIGNET_PATH = undefined;
+			delete process.env.SIGNET_PATH;
 		} else {
 			process.env.SIGNET_PATH = prevSignetPath;
 		}
@@ -83,14 +83,10 @@ describe("hybridRecall freshness-aware rehearsal", () => {
 			).run("recent-fact", "heron status level is blue", RECENT_CREATED, RECENT_CREATED);
 		});
 	}
-
-	// Keep this suite focused on ranking. Access-ledger writes are tested separately.
 	async function recall(query: string, cfg: ResolvedMemoryConfig, trackRecallAccess = false) {
 		return hybridRecall(
 			{
 				query,
-				// Pin the lexical channel so both facts tie on BM25 and only the
-				// temporal prior can break the tie.
 				keywordQuery: "heron",
 				limit: 5,
 				agentId: "agent-a",

@@ -14,19 +14,22 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import type { DbAccessor, ReadDb, WriteDb } from "./db-accessor";
-import { DbOwnerDeadlineError, type DbOwnerClient } from "./db-owner-client";
+import { DbOwnerDeadlineError, type DbOwnerClient, type DbOwnerHealth } from "./db-owner-client";
 import { ownerQueryAll, ownerRunStatement, ownerTransaction } from "./db-owner-maintenance";
 import type { DbOwnerStatement } from "./db-owner-protocol";
 import { logger } from "./logger";
 import { resolveEmbeddedWorkerPath } from "./native-runtime-assets";
 
 export type DatabaseIntegrityState = "unknown" | "healthy" | "repaired" | "corrupt" | "unavailable" | "degraded";
+export type FtsVerificationStatus = "pending" | "unverifiable" | "complete";
 
 export interface DatabaseIntegrityProgress {
 	readonly checkpointKey: string;
 	readonly phase: "running" | "complete" | "cancelled" | "timed_out" | "unavailable" | "degraded";
 	readonly checkedObjects: number;
+	readonly skippedObjects: number;
 	readonly failedObjects: number;
+	readonly scannedObjects?: number;
 	readonly remainingObjects: number;
 	readonly lastObject: string | null;
 	readonly databasePagesObserved: number;
@@ -55,6 +58,7 @@ export interface DatabaseIntegrityStatus {
 	readonly repairGuidance: string | null;
 	readonly ownerState: string | null;
 	readonly ownerGeneration: number | null;
+	readonly ftsVerification: FtsVerificationStatus;
 	readonly incrementalProgress: DatabaseIntegrityProgress | null;
 }
 
@@ -70,13 +74,6 @@ const INTEGRITY_CHILD_ENV_KEYS = [
 	"SIGNET_INSPECTOR_PROXY_PUBLIC",
 	"SIGNET_INSPECTOR_PROXY_TARGET",
 ] as const;
-
-/**
- * Integrity's direct-database compatibility path remains process-isolated:
- * SQLite work is synchronous and must be hard-killable at its deadline. It
- * deliberately admits one child at a time and does not queue callers. The
- * owner-routed production path below does not use this child at all.
- */
 let integrityChildActive = false;
 
 class IntegrityChildAdmissionError extends Error {
@@ -114,13 +111,9 @@ async function terminateAndReapChild(child: ChildProcess, reaped: Promise<void>)
 	if (!childHasExited(child)) {
 		try {
 			child.kill("SIGKILL");
-		} catch {
-			// The child may have exited between the state check and kill.
-		}
+		} catch {}
 	}
 	await reaped;
-	// Let the runtime finish releasing stdio and native file handles after the
-	// close event before another operation can touch the database path.
 	await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
@@ -142,6 +135,7 @@ let latestStatus: DatabaseIntegrityStatus = {
 	repairGuidance: null,
 	ownerState: null,
 	ownerGeneration: null,
+	ftsVerification: "pending",
 	incrementalProgress: null,
 };
 
@@ -169,8 +163,6 @@ function mergeIntegrityState(
 		? incrementalState
 		: globalState;
 }
-
-/** Clear the migration-wide latch after a confirmed clean global scan. */
 export function resetGlobalIntegrityLatch(): void {
 	globalIntegrityState = null;
 	globalIntegrityMessage = null;
@@ -221,11 +213,18 @@ function statusWith(
 		repairGuidance,
 		ownerState: health?.state ?? null,
 		ownerGeneration: health?.generation ?? null,
+		ftsVerification: latestStatus.ftsVerification,
 		incrementalProgress: null,
 	};
 }
+function boundedScanCoverage(scannedObjects: number): string[] {
+	if (scannedObjects === 0) return [];
+	const tables = scannedObjects === 1 ? "1 large table was" : `${scannedObjects} large tables were`;
+	return [
+		`${tables} read in bounded rowid chunks instead of quick_check; their b-tree structure and indexes were not verified`,
+	];
+}
 
-/** Publish checkpointed integrity maintenance through the existing health surfaces. */
 export function updateDatabaseIntegrityStatus(
 	progress: DatabaseIntegrityProgress,
 	errors: readonly string[] = [],
@@ -235,6 +234,8 @@ export function updateDatabaseIntegrityStatus(
 	const failed = progress.failedObjects > 0 || errors.length > 0;
 	const operationalFailure = progress.phase === "unavailable" || progress.phase === "timed_out";
 	const degraded = progress.phase === "degraded" || progress.degradationReason !== null;
+	const ftsVerification: FtsVerificationStatus =
+		progress.skippedObjects > 0 ? "unverifiable" : progress.phase === "complete" ? "complete" : "pending";
 	const state: DatabaseIntegrityState = operationalFailure
 		? "unavailable"
 		: degraded
@@ -281,17 +282,16 @@ export function updateDatabaseIntegrityStatus(
 			: globalStateWins
 				? latestStatus.quickCheck
 				: progress.phase === "complete"
-					? { ok: true, messages: [] }
+					? { ok: true, messages: boundedScanCoverage(progress.scannedObjects ?? 0) }
 					: latestStatus.quickCheck,
 		durationMs: progress.elapsedMs,
 		repairGuidance: publishedState === "corrupt" || publishedState === "unavailable" ? REPAIR_GUIDANCE : null,
 		ownerState: health?.state ?? latestStatus.ownerState,
 		ownerGeneration: health?.generation ?? latestStatus.ownerGeneration,
+		ftsVerification,
 		incrementalProgress: progress,
 	};
 }
-
-/** Publish migration-wide integrity without replacing quick-check details. */
 export function publishDatabaseIntegrityStatus(
 	state: "healthy" | GlobalIntegrityState,
 	messages: readonly string[] = [],
@@ -325,10 +325,13 @@ export function publishDatabaseIntegrityStatus(
 		ownerGeneration: health?.generation ?? latestStatus.ownerGeneration,
 	};
 }
-
-/** Return the last startup integrity result without touching SQLite. */
-export function getDatabaseIntegrityStatus(): DatabaseIntegrityStatus {
-	return latestStatus;
+export function getDatabaseIntegrityStatus(ownerHealth?: DbOwnerHealth | null): DatabaseIntegrityStatus {
+	if (ownerHealth === undefined) return latestStatus;
+	return {
+		...latestStatus,
+		ownerState: ownerHealth?.state ?? null,
+		ownerGeneration: ownerHealth?.generation ?? null,
+	};
 }
 
 export type TelemetryIndexRepairAudit = (
@@ -400,8 +403,6 @@ interface KillableChildOptions {
 	readonly onLine?: (line: string) => boolean;
 	readonly errorMessage?: (code: number | null, stderr: string) => string;
 }
-
-/** Run a synchronous child with one timeout/reap path for all integrity phases. */
 async function runKillableChild(options: KillableChildOptions): Promise<KillableChildOutput> {
 	const child = spawn(options.executable, [...options.args], {
 		env: options.env,
@@ -571,7 +572,7 @@ try {
   process.stderr.write(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;
 } finally {
-  database.close();
+  database.close(true);
 }
 `;
 
@@ -633,13 +634,6 @@ async function runKillableTelemetryRepair(
 async function writeAsync<Result>(accessor: DbAccessor, processBatch: (db: WriteDb) => Result): Promise<Result> {
 	return accessor.withWriteTxAsync(processBatch, { siteToken: "db:database.integrity.write" });
 }
-
-/**
- * Run the global quick_check away from Bun's main event loop after readiness.
- * The scan runs in a child process because SQLite's synchronous PRAGMA cannot
- * observe Worker.terminate() while native code is running. A child process can
- * be SIGKILLed at the deadline, so the budget is a real upper bound.
- */
 export function runDeferredIntegrityCheck(
 	accessor: DbAccessor,
 	dbPath: string,
@@ -758,16 +752,6 @@ async function runDeferredIntegrityCheckInternal(
 		return latestStatus;
 	}
 }
-
-/**
- * Check the database and repair only disposable telemetry indexes when the
- * targeted check identifies damage. Production REINDEX work runs in a
- * killable child with a real deadline. Production audits are admitted through
- * the bounded async writer queue only after the child commits and verification
- * succeeds. Owner-routed repairs keep their audit statement in the same
- * transaction as REINDEX; test doubles without a database path use one queued
- * transaction for both operations.
- */
 export interface IntegrityRepairOptions {
 	readonly quickCheck?: IntegrityCheckStatus;
 	readonly dbPath?: string;
@@ -862,9 +846,6 @@ export async function repairTelemetryIndexes(
 		latestStatus = statusWith("healthy", quickCheck, telemetryCheck, [], "complete", 0, null, options?.owner);
 		return latestStatus;
 	}
-
-	// quick_check covers the whole database. A failed global check is not
-	// safely repairable by rebuilding a telemetry index.
 	if (!quickCheck.ok) {
 		latestStatus = statusWith(
 			"corrupt",

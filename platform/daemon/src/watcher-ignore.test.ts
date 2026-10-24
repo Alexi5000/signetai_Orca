@@ -30,8 +30,6 @@ describe("createAgentsWatcherIgnoreMatcher", () => {
 		expect(shouldIgnore(join(agentsDir, "memory", "memories.db-wal"))).toBe(true);
 		expect(shouldIgnore(join(agentsDir, "memory", "memories.db-shm"))).toBe(true);
 		expect(shouldIgnore(join(agentsDir, "memory", "memories.db-journal"))).toBe(true);
-
-		// User-managed .db files should NOT be ignored
 		expect(shouldIgnore(join(agentsDir, "my-project", "data.db"))).toBe(false);
 		expect(shouldIgnore(join(agentsDir, "notes.db"))).toBe(false);
 	});
@@ -164,5 +162,21 @@ describe("createAgentsWatcherIgnoreMatcher", () => {
 			false,
 		);
 		expect(shouldIgnore(join(agentsDir, "MEMORY.backup-2026-04-10.md"))).toBe(false);
+	});
+
+	it("ignores v2 database files and canonical artifacts in v2 transcripts/", () => {
+		const agentsDir = makeTempAgentsDir();
+		writeFileSync(join(agentsDir, "workspace-layout.json"), `${JSON.stringify({ version: 2 })}\n`);
+		const shouldIgnore = createAgentsWatcherIgnoreMatcher(agentsDir);
+
+		expect(shouldIgnore(join(agentsDir, "data", "signet.db"))).toBe(true);
+		expect(shouldIgnore(join(agentsDir, "data", "signet.db-wal"))).toBe(true);
+		expect(
+			shouldIgnore(join(agentsDir, "transcripts", "2026-04-10T12-00-00.000Z--abcdefghijklmnop--transcript.md")),
+		).toBe(true);
+		expect(shouldIgnore(join(agentsDir, "transcripts", "2026-04-10T12-00-00.000Z--abcdefghijklmnop--summary.md"))).toBe(
+			true,
+		);
+		expect(shouldIgnore(join(agentsDir, "transcripts", "MEMORY.md"))).toBe(false);
 	});
 });

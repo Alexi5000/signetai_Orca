@@ -4,7 +4,7 @@ mock.module("electron", () => ({
 	app: { isPackaged: false },
 }));
 
-const { resolveBunPath } = await import("./paths.js");
+const { resolveBunPath } = await import("./paths.ts");
 
 describe("desktop Bun runtime resolution", () => {
 	test("uses a known absolute Windows Bun path when the bundled runtime is absent", () => {

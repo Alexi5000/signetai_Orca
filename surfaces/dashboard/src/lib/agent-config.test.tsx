@@ -1,21 +1,16 @@
-/**
- * Regression test for the OAuth disconnect purge bug: a mutation followed by
- * an immediate save() in the same tick used to serialize the PRE-mutation
- * config, so the daemon-side OAuth secret was deleted but the
- * `inference.accounts.<provider>` entry survived in agent.yaml. The dashboard
- * kept reporting the provider as connected ("credentials are never removed").
- *
- * The store keeps a ref (agentRef.current) that save() serializes; it was only
- * refreshed during React renders, which have not committed by the time the
- * disconnect handler calls save(). mutate() must write through to the ref
- * synchronously.
- */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import { act } from "react";
 import { useEffect, useRef } from "react";
 import { type Root, createRoot } from "react-dom/client";
-import { type AgentConfigStore, isDreamingEnabled, useAgentConfig } from "./agent-config";
+import {
+	type AgentConfigStore,
+	dreamingBlockedBy,
+	pv2MaintenanceMode,
+	pv2ToggleValue,
+	pv2ToggleWriteForm,
+	useAgentConfig,
+} from "./agent-config";
 import { writeEmbeddingEndpoint } from "./embedding-config";
 
 const INITIAL_CONFIG = `inference:
@@ -79,7 +74,6 @@ async function mountHarness(): Promise<{
 	await act(async () => {
 		root.render(<Harness onStore={(s) => (store = s)} />);
 	});
-	// Let the reload effect fetch + setAgent land.
 	await act(async () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 	});
@@ -99,8 +93,6 @@ beforeAll(() => {
 	const window = new Window();
 	for (const key of Object.getOwnPropertyNames(window)) {
 		if (!(key in globalThis)) {
-			// happy-dom v20 ships no GlobalRegistrator; mirror the window's
-			// browser globals so react-dom/client and the api client work.
 			(globalThis as Record<string, unknown>)[key] = (window as unknown as Record<string, unknown>)[key];
 		}
 	}
@@ -126,20 +118,112 @@ afterAll(() => {
 
 describe("agent config store", () => {
 	test("dreaming follows the daemon's pipeline gate contract", () => {
-		expect(isDreamingEnabled({ memory: { pipelineV2: { enabled: true } } })).toBe(true);
-		expect(isDreamingEnabled({ memory: { pipelineV2: { paused: false, mutationsFrozen: false } } })).toBe(true);
-		expect(isDreamingEnabled({ memory: { pipelineV2: { paused: true } } })).toBe(false);
-		expect(isDreamingEnabled({ memory: { pipelineV2: { mutationsFrozen: true } } })).toBe(false);
-		expect(isDreamingEnabled({ memory: { dreaming: {} } })).toBe(true);
+		expect(dreamingBlockedBy({ memory: { pipelineV2: { enabled: true } } })).toBeNull();
+		expect(dreamingBlockedBy({ memory: { pipelineV2: { paused: false, mutationsFrozen: false } } })).toBeNull();
+		expect(dreamingBlockedBy({ memory: { pipelineV2: { paused: true } } })).toBe("paused");
+		expect(dreamingBlockedBy({ memory: { pipelineV2: { mutationsFrozen: true } } })).toBe("frozen");
+		expect(dreamingBlockedBy({ memory: { pipelineV2: { enabled: false, paused: true } } })).toBe("disabled");
+		expect(dreamingBlockedBy({ memory: { pipelineV2: { paused: true, mutationsFrozen: true } } })).toBe("paused");
+		expect(dreamingBlockedBy({ memory: { dreaming: {} } })).toBeNull();
+	});
+
+	test("config readers can display daemon defaults without overwriting explicit values", async () => {
+		const harness = await mountHarness();
+		expect(harness.store.aBool(["memory", "pipelineV2", "missing"], true)).toBe(true);
+		expect(harness.store.aBool(["memory", "pipelineV2", "mutationsFrozen"], false)).toBe(true);
+		expect(harness.store.aStr(["memory", "pipelineV2", "missingMode"], "execute")).toBe("execute");
+		await harness.unmount();
+	});
+
+	test("pv2ToggleValue mirrors the daemon resolver: nested boolean, then flat boolean, then default", () => {
+		const nested = { memory: { pipelineV2: { autonomous: { enabled: false } } } };
+		expect(
+			pv2ToggleValue(
+				nested,
+				["memory", "pipelineV2", "autonomous", "enabled"],
+				["memory", "pipelineV2", "autonomousEnabled"],
+				true,
+			),
+		).toBe(false);
+		const flat = { memory: { pipelineV2: { autonomousEnabled: true } } };
+		expect(
+			pv2ToggleValue(
+				flat,
+				["memory", "pipelineV2", "autonomous", "enabled"],
+				["memory", "pipelineV2", "autonomousEnabled"],
+				false,
+			),
+		).toBe(true);
+		const both = { memory: { pipelineV2: { autonomous: { enabled: false }, autonomousEnabled: true } } };
+		expect(
+			pv2ToggleValue(
+				both,
+				["memory", "pipelineV2", "autonomous", "enabled"],
+				["memory", "pipelineV2", "autonomousEnabled"],
+				true,
+			),
+		).toBe(false);
+		const stringForm = { memory: { pipelineV2: { autonomous: { enabled: "false" } } } };
+		expect(
+			pv2ToggleValue(
+				stringForm,
+				["memory", "pipelineV2", "autonomous", "enabled"],
+				["memory", "pipelineV2", "autonomousEnabled"],
+				true,
+			),
+		).toBe(true);
+		expect(
+			pv2ToggleValue(
+				{},
+				["memory", "pipelineV2", "autonomous", "enabled"],
+				["memory", "pipelineV2", "autonomousEnabled"],
+				true,
+			),
+		).toBe(true);
+		expect(
+			pv2ToggleValue(
+				{},
+				["memory", "pipelineV2", "autonomous", "enabled"],
+				["memory", "pipelineV2", "autonomousEnabled"],
+				false,
+			),
+		).toBe(false);
+	});
+
+	test("pv2ToggleWriteForm keeps a config on the form it already uses", () => {
+		const flat = { memory: { pipelineV2: { graphEnabled: false } } };
+		expect(
+			pv2ToggleWriteForm(flat, ["memory", "pipelineV2", "graph", "enabled"], ["memory", "pipelineV2", "graphEnabled"]),
+		).toBe("flat");
+		const nested = { memory: { pipelineV2: { graph: { enabled: true } } } };
+		expect(
+			pv2ToggleWriteForm(
+				nested,
+				["memory", "pipelineV2", "graph", "enabled"],
+				["memory", "pipelineV2", "graphEnabled"],
+			),
+		).toBe("nested");
+		const both = { memory: { pipelineV2: { graph: { enabled: true }, graphEnabled: false } } };
+		expect(
+			pv2ToggleWriteForm(both, ["memory", "pipelineV2", "graph", "enabled"], ["memory", "pipelineV2", "graphEnabled"]),
+		).toBe("nested");
+		expect(
+			pv2ToggleWriteForm({}, ["memory", "pipelineV2", "graph", "enabled"], ["memory", "pipelineV2", "graphEnabled"]),
+		).toBe("nested");
+	});
+
+	test("maintenance mode follows the daemon's nullish string contract", () => {
+		const nestedInvalid = { memory: { pipelineV2: { autonomous: { maintenanceMode: "auto" } } } };
+		expect(pv2MaintenanceMode(nestedInvalid)).toBe("auto");
+		expect(pv2MaintenanceMode({ memory: { pipelineV2: { maintenanceMode: "observe" } } })).toBeUndefined();
+		expect(pv2MaintenanceMode({})).toBeUndefined();
+		expect(pv2MaintenanceMode({ memory: { pipelineV2: { autonomous: { maintenanceMode: 5 } } } })).toBeUndefined();
 	});
 
 	test("mutations are visible to an immediate save in the same tick (disconnect purge regression)", async () => {
 		capturedSaveBody = null;
 		const harness = await mountHarness();
 		expect(harness.store.ready).toBe(true);
-
-		// Exactly what handleDisconnect does: delete the account entry, then
-		// persist — no render in between.
 		await act(async () => {
 			harness.store.aDel(["inference", "accounts", "openai-codex"]);
 			await harness.store.save();
@@ -156,9 +240,6 @@ describe("agent config store", () => {
 		capturedSaveBody = null;
 		const harness = await mountHarness();
 		expect(harness.store.ready).toBe(true);
-
-		// Exactly what linkOAuthAccount does: kind + providerFamily + drop the
-		// credentialRef, then persist without a render in between.
 		await act(async () => {
 			const base = ["inference", "accounts", "anthropic"] as const;
 			harness.store.aSetStr([...base, "kind"], "subscription_session");
@@ -178,11 +259,6 @@ describe("agent config store", () => {
 		capturedSaveBody = null;
 		const harness = await mountHarness();
 		expect(harness.store.ready).toBe(true);
-
-		// Saving without touching the settings must preserve everything the
-		// operator configured outside the dashboard (mutationsFrozen, custom
-		// executors, unknown top-level keys) — a full-model rewrite would drop
-		// them silently.
 		await act(async () => {
 			await harness.store.save();
 		});

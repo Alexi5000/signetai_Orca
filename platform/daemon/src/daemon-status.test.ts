@@ -1,9 +1,10 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Hono } from "hono";
 import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
-import { createDbOwnerClient } from "./db-owner-client";
+import { createDbOwnerClient, type DbOwnerClient } from "./db-owner-client";
 
 let app: Hono;
 let dir = "";
@@ -55,7 +56,7 @@ describe("daemon status contract", () => {
 			const { closeDbAccessor } = await import("./db-accessor");
 			const daemon = await import("./daemon");
 			await daemon.stopDaemonRuntimeForTests();
-			closeDbAccessor();
+			await closeDbAccessor();
 		} catch {}
 		if (prev === undefined) {
 			Reflect.deleteProperty(process.env, "SIGNET_PATH");
@@ -80,8 +81,6 @@ describe("daemon status contract", () => {
 			releaseOwner = resolve;
 		});
 		let ownerBlocked = false;
-		// A REAL gate: every read through the owner awaits this promise, so the
-		// "DB owner blocked" condition is actually true while we measure.
 		accessor.withReadDbAsync = async (fn, options) => {
 			ownerBlocked = true;
 			await ownerStarted$;
@@ -89,8 +88,6 @@ describe("daemon status contract", () => {
 		};
 
 		try {
-			// Fire /api/status FIRST. It awaits readEmbeddingUsageSummary ->
-			// withReadDbAsync, so it must be held pending behind the gate.
 			const statusStartedAt = performance.now();
 			let statusLatencyMs = -1;
 			const statusPromise = Promise.resolve(app.request("http://localhost/api/status")).then((response: Response) => {
@@ -98,27 +95,18 @@ describe("daemon status contract", () => {
 				expect(response.status).toBe(200);
 				return response;
 			});
-
-			// Give /api/status a beat to reach the blocked owner.
 			await new Promise<void>((resolve) => setTimeout(resolve, 50));
 			expect(ownerBlocked).toBe(true);
-			// Status must NOT have resolved while the owner is blocked — it is
-			// genuinely contending (not silently dropped). Prove it is still pending.
 			const pending = await Promise.race([
 				statusPromise.then(() => "resolved"),
 				new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 300)),
 			]);
 			expect(pending).toBe("pending");
-
-			// /health/live touches no DB accessor and MUST respond promptly while
-			// the DB owner is still blocked.
 			const healthStartedAt = performance.now();
 			const healthResponse = await app.request("http://localhost/health/live");
 			const healthLatencyMs = performance.now() - healthStartedAt;
 			expect(healthResponse.status).toBe(200);
 			expect(healthLatencyMs).toBeLessThan(1_000);
-
-			// Release the owner; /api/status must now complete promptly.
 			releaseOwner?.();
 			const res = await statusPromise;
 			expect(res.status).toBe(200);
@@ -159,6 +147,136 @@ describe("daemon status contract", () => {
 		).toBe(true);
 	});
 
+	it("reports agent-scoped workspace and ontology counts", async () => {
+		const { getDbAccessor } = await import("./db-accessor");
+		const { closeRegisteredDbOwnerMaintenance, createDbOwnerMaintenance, registerDbOwnerMaintenance } = await import(
+			"./db-owner-maintenance"
+		);
+		const { getDbOwnerForAccessor } = await import("./db-owner-runtime");
+		const agentId = `status-test-${crypto.randomUUID()}`;
+		const previousAgentId = process.env.SIGNET_AGENT_ID;
+		let owner: DbOwnerClient | undefined;
+		let maintenanceRegistered = false;
+		process.env.SIGNET_AGENT_ID = agentId;
+		const now = new Date().toISOString();
+		try {
+			owner = await getDbOwnerForAccessor(getDbAccessor());
+			registerDbOwnerMaintenance(createDbOwnerMaintenance({ dbPath: join(dir, "memory", "memories.db"), owner }));
+			maintenanceRegistered = true;
+			await getDbAccessor().withWriteTxAsync(
+				(db) => {
+					for (const [id, scopedAgent, isDeleted] of [
+						["status-memory", agentId, 0],
+						["status-unassigned-memory", agentId, 0],
+						["deleted-status-memory", agentId, 1],
+						["other-memory", "other-agent", 0],
+					] as const) {
+						db.prepare(
+							`INSERT INTO memories (id, content, type, agent_id, updated_by, created_at, updated_at, is_deleted)
+					 VALUES (?, ?, 'fact', ?, 'test', ?, ?, ?)`,
+						).run(id, id, scopedAgent, now, now, isDeleted);
+					}
+					for (const [key, scopedAgent] of [
+						["status-session", agentId],
+						["other-session", "other-agent"],
+					]) {
+						db.prepare(
+							`INSERT INTO session_transcripts (session_key, content, agent_id, created_at, updated_at)
+					 VALUES (?, ?, ?, ?, ?)`,
+						).run(key, key, scopedAgent, now, now);
+					}
+					for (const [id, name, scopedAgent] of [
+						["status-source", "Status Source", agentId],
+						["status-target", "Status Target", agentId],
+						["other-status-source", "Other Status Source", "other-agent"],
+						["other-status-target", "Other Status Target", "other-agent"],
+					]) {
+						db.prepare(
+							`INSERT INTO entities
+					 (id, name, entity_type, canonical_name, mentions, agent_id, pinned, pinned_at, created_at, updated_at)
+					 VALUES (?, ?, 'concept', ?, 1, ?, 0, NULL, ?, ?)`,
+						).run(id, name, name.toLowerCase(), scopedAgent, now, now);
+					}
+					for (const memoryId of ["status-memory", "status-unassigned-memory"]) {
+						db.prepare("INSERT INTO memory_entity_mentions (memory_id, entity_id) VALUES (?, ?)").run(
+							memoryId,
+							"status-source",
+						);
+					}
+					db.prepare(
+						`INSERT INTO entity_aspects (id, entity_id, agent_id, name, canonical_name, weight, created_at, updated_at)
+				 VALUES ('status-aspect', 'status-source', ?, 'overview', 'overview', 0.5, ?, ?)`,
+					).run(agentId, now, now);
+					db.prepare(
+						`INSERT INTO entity_aspects (id, entity_id, agent_id, name, canonical_name, weight, created_at, updated_at)
+				 VALUES ('other-status-aspect', 'other-status-source', 'other-agent', 'overview', 'overview', 0.5, ?, ?)`,
+					).run(now, now);
+					db.prepare(
+						`INSERT INTO entity_attributes
+					(id, aspect_id, agent_id, kind, content, normalized_content, confidence, importance, memory_id, status, created_at, updated_at)
+					VALUES ('status-claim', 'status-aspect', ?, 'claim', 'Status claim', 'status claim', 0.8, 0.5, 'status-memory', 'active', ?, ?)`,
+					).run(agentId, now, now);
+					db.prepare(
+						`INSERT INTO entity_attributes
+				 (id, aspect_id, agent_id, kind, content, normalized_content, confidence, importance, status, created_at, updated_at)
+				 VALUES ('other-status-claim', 'other-status-aspect', 'other-agent', 'claim', 'Other claim', 'other claim', 0.8, 0.5, 'active', ?, ?)`,
+					).run(now, now);
+					db.prepare(
+						`INSERT INTO entity_dependencies
+				 (id, source_entity_id, target_entity_id, agent_id, dependency_type, strength, created_at, updated_at)
+				 VALUES ('status-link', 'status-source', 'status-target', ?, 'depends_on', 0.8, ?, ?)`,
+					).run(agentId, now, now);
+					db.prepare(
+						`INSERT INTO entity_dependencies
+				 (id, source_entity_id, target_entity_id, agent_id, dependency_type, strength, created_at, updated_at)
+				 VALUES ('other-status-link', 'other-status-source', 'other-status-target', 'other-agent', 'depends_on', 0.8, ?, ?)`,
+					).run(now, now);
+				},
+				{ operation: "test.status-workspace.seed" },
+			);
+
+			owner?.setWriteBlocked(true);
+			const response = await app.request("http://localhost/api/status/workspace");
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as {
+				agentId?: string;
+				memoryCount?: number;
+				capturedSessionCount?: number | null;
+				schema?: string;
+				needsMigration?: boolean;
+				ontology?: {
+					entityCount?: number;
+					aspectCount?: number;
+					claimCount?: number;
+					dependencyCount?: number;
+					unassignedMemoryCount?: number;
+					coveragePercent?: number;
+				};
+			};
+			expect(body).toMatchObject({
+				agentId,
+				memoryCount: 2,
+				capturedSessionCount: 1,
+				schema: "core",
+				needsMigration: false,
+				ontology: {
+					entityCount: 2,
+					aspectCount: 1,
+					claimCount: 1,
+					dependencyCount: 1,
+					unassignedMemoryCount: 1,
+					coveragePercent: 50,
+				},
+			});
+		} finally {
+			owner?.setWriteBlocked(false);
+			if (maintenanceRegistered) await closeRegisteredDbOwnerMaintenance();
+			await owner?.close();
+			if (previousAgentId === undefined) Reflect.deleteProperty(process.env, "SIGNET_AGENT_ID");
+			else process.env.SIGNET_AGENT_ID = previousAgentId;
+		}
+	});
+
 	it("serves status without synchronously reading SQLite when the event loop is under pressure", async () => {
 		const { getDbAccessor } = await import("./db-accessor");
 		const accessor = getDbAccessor();
@@ -193,17 +311,21 @@ describe("daemon status contract", () => {
 		fixture.exec("VACUUM");
 		fixture.close();
 		const owner = createDbOwnerClient({ dbPath: vacuumPath });
+		const activeFile = join(dir, "vacuum-active");
 		const previousPause = process.env.SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS;
+		const previousActiveFile = process.env.SIGNET_TEST_DB_OWNER_VACUUM_ACTIVE_FILE;
 		process.env.SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS = "1000";
+		process.env.SIGNET_TEST_DB_OWNER_VACUUM_ACTIVE_FILE = activeFile;
 		const server = Bun.serve({ port: 0, fetch: app.fetch });
 		try {
 			await owner.start();
 			const job = owner.submit(
 				{ kind: "vacuum_conversion" },
-				{ operation: "db.vacuum_conversion", lane: "maintenance", deadlineMs: 5000, estimatedWorkUnits: 1 },
+				{ operation: "db.vacuum_conversion", lane: "maintenance", deadlineMs: 10_000, estimatedWorkUnits: 1 },
 			);
-			const deadline = Date.now() + 2000;
-			while (owner.health().activeJobId === null && Date.now() < deadline) await Bun.sleep(5);
+			const deadline = Date.now() + 10_000;
+			while (!existsSync(activeFile) && Date.now() < deadline) await Bun.sleep(5);
+			expect(existsSync(activeFile)).toBe(true);
 			expect(owner.health().activeJobId).not.toBeNull();
 			const started = performance.now();
 			const [live, status] = await Promise.all([
@@ -213,14 +335,17 @@ describe("daemon status contract", () => {
 			expect(performance.now() - started).toBeLessThan(250);
 			expect(live.status).toBe(200);
 			expect(status.status).toBe(200);
-			await owner.awaitResult(job, 5000).catch(() => undefined);
+			expect(await owner.awaitResult(job, 10_000)).toEqual({ converted: true });
 		} finally {
 			server.stop(true);
 			await owner.close().catch(() => undefined);
 			if (previousPause === undefined) Reflect.deleteProperty(process.env, "SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS");
 			else process.env.SIGNET_TEST_DB_OWNER_VACUUM_PAUSE_MS = previousPause;
+			if (previousActiveFile === undefined)
+				Reflect.deleteProperty(process.env, "SIGNET_TEST_DB_OWNER_VACUUM_ACTIVE_FILE");
+			else process.env.SIGNET_TEST_DB_OWNER_VACUUM_ACTIVE_FILE = previousActiveFile;
 		}
-	});
+	}, 30_000);
 
 	it("reports unknown queue completeness when the status read fails", async () => {
 		const { getDbAccessor } = await import("./db-accessor");
@@ -273,12 +398,6 @@ describe("daemon status contract", () => {
 		expect(extraction).toBeDefined();
 		expect(typeof extraction?.resolved).toBe("string");
 		expect(typeof extraction?.effective).toBe("string");
-		// fallbackProvider must always be present as a string. #949 dropped this field
-		// from the status object (it was sourcing from the retired flat config field),
-		// which made `signet status` print "fallback: unknown". The type was widened
-		// from the narrow "llama-cpp"|"ollama"|"none" enum to RuntimeProviderName
-		// because the routing registry's fallbackTargetRefs can resolve to any
-		// executor. Asserting presence + string type is the real regression guard.
 		expect(typeof extraction?.fallbackProvider).toBe("string");
 		expect(
 			extraction?.status === "active" ||
@@ -324,7 +443,6 @@ describe("daemon status contract", () => {
 					};
 				};
 			};
-			// Dreaming owns all semantic writes; legacy extraction is permanently retired.
 			expect(body.providerResolution?.extraction?.effective).toBe("none");
 			expect(body.providerResolution?.extraction?.status).toBe("disabled");
 			expect(body.providerResolution?.extraction?.reason).toBe("Dreaming owns semantic writes");
@@ -407,6 +525,9 @@ describe("daemon status contract", () => {
 		expect(runtimeStart).toBeGreaterThanOrEqual(0);
 		expect(maintenanceStart).toBeGreaterThan(runtimeStart);
 		expect(maintenanceStart).toBeLessThan(workerStart);
+		expect(
+			source.slice(workerStart, source.indexOf("setDreamingWorker(dreamingWorkerHandle)", workerStart)),
+		).not.toContain("memoryCfg.dreaming.enabled");
 	});
 
 	it("counts non-errored connectors as active for heartbeat telemetry", () => {
@@ -506,7 +627,6 @@ describe.skip("legacy extraction cutover sweep (#946) [retired config fixtures p
 	}
 
 	beforeEach(async () => {
-		// Re-init a clean DB so each assertion sees only its own seed rows.
 		const { closeDbAccessor, initDbAccessor } = await import("./db-accessor");
 		closeDbAccessor();
 		initDbAccessor(join(dir, "memory", "memories.db"), { agentsDir: dir });
@@ -514,8 +634,6 @@ describe.skip("legacy extraction cutover sweep (#946) [retired config fixtures p
 
 	it("retires pre-existing pending legacy extract jobs on startup", async () => {
 		seedPendingLegacyJob("mem-cutover", "job-cutover");
-
-		// Startup sweeps the pending backlog because Dreaming always owns semantic writes.
 		await restartRuntime(DREAMING_ENABLED_CONFIG);
 
 		const job = getJob("job-cutover");
@@ -544,8 +662,6 @@ describe.skip("legacy extraction cutover sweep (#946) [retired config fixtures p
 		await restartRuntime(DREAMING_ENABLED_CONFIG);
 		const afterFirst = countMemoryJobs();
 		expect(getJob("job-idem").status).toBe("dead");
-
-		// A second restart must not duplicate, delete, or re-mutate rows.
 		await restartRuntime(DREAMING_ENABLED_CONFIG);
 		expect(countMemoryJobs()).toBe(afterFirst);
 		const job = getJob("job-idem");
@@ -553,14 +669,6 @@ describe.skip("legacy extraction cutover sweep (#946) [retired config fixtures p
 		expect(job.error).toBe("Dreaming cutover: legacy extraction worker not started");
 	});
 });
-
-// ---------------------------------------------------------------------------
-// Structural worker retirement (#946)
-//
-// When Dreaming owns semantic writes, the legacy structural classify and
-// structural dependency workers are not started and their status shape is
-// retired from /api/status. No producer may create pending structural jobs.
-// ---------------------------------------------------------------------------
 describe.skip("structural worker retirement under Dreaming (#946) [retired config fixtures pending migration]", () => {
 	const DREAMING_ENABLED_STRUCTURAL_CONFIG = `memory:
   pipelineV2:
@@ -617,21 +725,15 @@ describe.skip("structural worker retirement under Dreaming (#946) [retired confi
 	});
 
 	beforeAll(() => {
-		// The earlier describe block's afterAll restores SIGNET_PATH to its
-		// pre-test value, so re-pin it to this suite's temp dir here.
 		if (process.env.SIGNET_PATH !== dir) process.env.SIGNET_PATH = dir;
 	});
 
 	afterAll(() => {
-		// Restore whatever the daemon process held before this suite; the
-		// top-level suite's afterAll handles the canonical restore.
 		if (prev === undefined) Reflect.deleteProperty(process.env, "SIGNET_PATH");
 		else process.env.SIGNET_PATH = prev;
 	});
 
 	it("does not expose legacy structural workers in the status shape and never starts them", async () => {
-		// structural.enabled AND graph.enabled would have started both structural
-		// workers under the legacy pipeline; under Dreaming they must be absent.
 		await restartRuntime(DREAMING_ENABLED_STRUCTURAL_CONFIG);
 
 		const res = await app.request("http://localhost/api/pipeline/status");
@@ -642,12 +744,7 @@ describe.skip("structural worker retirement under Dreaming (#946) [retired confi
 		const workers = body.workers ?? {};
 		expect(workers).not.toHaveProperty("structuralClassify");
 		expect(workers).not.toHaveProperty("structuralDependency");
-		// The cross-entity dependency-synthesis worker was retired under the
-		// full Dreaming cutover (#946): it wrote dependencies directly via
-		// upsertDependency, bypassing the audited create_link path. Dreaming
-		// is now the sole semantic dependency writer.
 		expect(workers).not.toHaveProperty("dependencySynthesis");
-		// Preserved non-semantic workers remain present.
 		expect(workers).toHaveProperty("document");
 		expect(workers.document).toMatchObject({
 			inFlight: 0,
@@ -661,9 +758,6 @@ describe.skip("structural worker retirement under Dreaming (#946) [retired confi
 	});
 
 	it("does not accumulate new pending structural jobs from pre-existing rows under Dreaming", async () => {
-		// A pre-existing pending structural job (left from before the cutover)
-		// should remain, but the runtime must not create additional pending
-		// structural jobs while Dreaming owns semantic writes.
 		await restartRuntime(DREAMING_ENABLED_STRUCTURAL_CONFIG);
 		seedPendingStructuralJob("mem-pre", "job-struct-pre", "structural_classify");
 		const before = countStructuralJobs();
@@ -674,16 +768,7 @@ describe.skip("structural worker retirement under Dreaming (#946) [retired confi
 	});
 
 	it("does not start the dependency-synthesis worker and cannot produce direct dependency writes under Dreaming", async () => {
-		// The retired dependency-synthesis worker polled for entities whose
-		// last_synthesized_at lagged updated_at, called an LLM, and wrote
-		// entity_dependencies rows directly via upsertDependency — bypassing
-		// the audited create_link path. Under the full Dreaming cutover the
-		// worker must never start, so seeding stale entities must produce no
-		// dependency rows and never set last_synthesized_at.
 		await restartRuntime(DREAMING_ENABLED_STRUCTURAL_CONFIG);
-
-		// Seed a stale entity with facts and candidate mentions — exactly the
-		// inputs the retired worker would have picked up on its next tick.
 		const { getDbAccessor } = require("./db-accessor") as typeof import("./db-accessor");
 		getDbAccessor().withWriteTx((db) => {
 			const now = new Date().toISOString();
@@ -708,9 +793,6 @@ describe.skip("structural worker retirement under Dreaming (#946) [retired confi
 				 VALUES ('attr-dep', 'asp-dep', 'default', 'fact', 'dep source uses dep target', 'dep source uses dep target', 0.9, 0.5, 'active', ?, ?)`,
 			).run(now, now);
 		});
-
-		// Restart again so any worker that *did* start would observe the stale
-		// entity on its first tick, then wait well past a default poll cycle.
 		await restartRuntime(DREAMING_ENABLED_STRUCTURAL_CONFIG);
 		await new Promise((resolve) => setTimeout(resolve, 1500));
 
@@ -730,8 +812,6 @@ describe.skip("structural worker retirement under Dreaming (#946) [retired confi
 					last_synthesized_at: string | null;
 				},
 		);
-		// The retired worker's exclusive side-effect (markSynthesized) must
-		// never fire — proving no dependency-synthesis tick ran.
 		expect(synthesized.last_synthesized_at).toBeNull();
 	});
 

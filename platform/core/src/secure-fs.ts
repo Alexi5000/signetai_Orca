@@ -242,7 +242,7 @@ export async function writeFileAtomic(
 export function writeFileExclusiveSync(
 	path: string,
 	data: SecureWriteData,
-	options: { readonly mode?: number; readonly encoding?: BufferEncoding } = {},
+	options: { readonly mode?: number; readonly encoding?: BufferEncoding; readonly fsync?: boolean } = {},
 ): boolean {
 	const tmp = tempSiblingPath(path);
 	const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, PRIVATE_FILE_MODE);
@@ -252,6 +252,7 @@ export function writeFileExclusiveSync(
 			let offset = 0;
 			while (offset < buffer.length) offset += writeSync(fd, buffer, offset, buffer.length - offset);
 			fchmodSync(fd, options.mode ?? defaultFileMode());
+			if (options.fsync) fsyncSync(fd);
 		} finally {
 			closeSync(fd);
 		}

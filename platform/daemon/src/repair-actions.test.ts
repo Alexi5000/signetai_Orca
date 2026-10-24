@@ -1,18 +1,15 @@
-/**
- * Tests for the repair-actions module (F2 track: Autonomous Maintenance).
- */
-
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { readMemoriesFtsSql } from "../../core/src/fts-schema";
 import { runMigrations } from "../../core/src/migrations";
 import { normalizeAndHashContent } from "./content-normalization";
-import type { DbAccessor, ReadDb, WriteDb } from "./db-accessor";
+import type { DbAccessor, ReadDb, ReadAdmissionOptions, WriteDb } from "./db-accessor";
 import { toFtsSchemaQueryDb } from "./db-accessor";
 import { ensureEmbeddingIndexState } from "./embedding-index-state";
 import { embeddingProfileFingerprint } from "./embedding-profile";
 import { DEFAULT_PIPELINE_V2 } from "./memory-config";
 import type { EmbeddingConfig, PipelineV2Config } from "./memory-config";
+import { reportEventLoopLag, resetPressureState } from "./system-pressure";
 import {
 	cancelObsoleteJobs,
 	checkFtsConsistency,
@@ -33,11 +30,7 @@ import {
 	triggerRetentionSweep,
 } from "./repair-actions";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function asAccessor(db: Database, onAsyncWrite?: () => void): DbAccessor {
+function asAccessor(db: Database, onAsyncWrite?: () => void, onAsyncRead?: () => void): DbAccessor {
 	return {
 		withWriteTx<T>(fn: (wdb: WriteDb) => T): T {
 			db.exec("BEGIN IMMEDIATE");
@@ -73,8 +66,9 @@ function asAccessor(db: Database, onAsyncWrite?: () => void): DbAccessor {
 		withReadDb<T>(fn: (rdb: ReadDb) => T): T {
 			return fn(db as unknown as ReadDb);
 		},
-		withReadDbAsync<T>(fn: (rdb: ReadDb) => Promise<T>): Promise<T> {
-			return fn(db as unknown as ReadDb);
+		withReadDbAsync<T>(fn: (rdb: ReadDb) => T | Promise<T>, _options?: ReadAdmissionOptions): Promise<T> {
+			onAsyncRead?.();
+			return Promise.resolve(fn(db as unknown as ReadDb));
 		},
 		close() {
 			db.close();
@@ -82,7 +76,7 @@ function asAccessor(db: Database, onAsyncWrite?: () => void): DbAccessor {
 	};
 }
 
-function installLegacyPorterMemoriesFts(db: Database, indexedId?: string, tokenizer = "porter unicode61"): void {
+function installMemoriesFtsWithTokenizer(db: Database, indexedId?: string, tokenizer = "unicode61"): void {
 	db.exec("DROP TRIGGER IF EXISTS memories_ai");
 	db.exec("DROP TRIGGER IF EXISTS memories_ad");
 	db.exec("DROP TRIGGER IF EXISTS memories_au");
@@ -220,9 +214,7 @@ function insertSummaryJob(db: Database, id: string, status: string, createdAt?: 
 function ensureVecTable(db: Database): void {
 	try {
 		db.exec("DROP TABLE IF EXISTS vec_embeddings");
-	} catch {
-		// ignore drop failures in tests
-	}
+	} catch {}
 	db.exec("CREATE TABLE vec_embeddings (id TEXT PRIMARY KEY, embedding BLOB)");
 }
 
@@ -257,10 +249,6 @@ function insertEmbedding(
 	);
 }
 
-// ---------------------------------------------------------------------------
-// Rate limiter tests
-// ---------------------------------------------------------------------------
-
 describe("createRateLimiter", () => {
 	it("allows the first call", async () => {
 		const limiter = createRateLimiter();
@@ -278,30 +266,14 @@ describe("createRateLimiter", () => {
 
 	it("enforces hourly budget", async () => {
 		const limiter = createRateLimiter();
-		// Use a 0ms cooldown so the limiter only blocks on budget, not cooldown
 		for (let i = 0; i < 3; i++) {
 			limiter.record("action");
 		}
-		// Manually set lastRunAt to be well in the past so cooldown is clear
-		// We can't directly access internals, so test via a limiter with budget=2
 		const lim2 = createRateLimiter();
 		lim2.record("a");
 		lim2.record("a");
-		// Both records happened so count=2; budget is 2, so third should be blocked
-		// But cooldown would block too. Use budget=2 and cooldown=0 scenario:
-		// We need to move time forward conceptually — easiest is to just verify
-		// the budget path via a fresh limiter with a budget of 1
 		const lim1 = createRateLimiter();
 		lim1.record("b");
-		// Now set lastRunAt in the past so cooldown is clear but count stays at 1
-		// We can't do this without access to internals, so instead just verify
-		// that a budget of 0 blocks (budget must be >= 1 per config clamp, but
-		// we can test the logic indirectly through a fresh action)
-		//
-		// The most reliable test: use a limiter with budget=1, record once,
-		// then check via a zero-cooldown call in the future. Since we can't
-		// fake Date.now() easily, verify the count path triggers at budget=1
-		// by calling check with budget=0 after recording.
 		const result = lim1.check("b", 0, 0);
 		expect(result.allowed).toBe(false);
 		expect(result.reason).toMatch(/hourly budget exhausted/);
@@ -309,32 +281,17 @@ describe("createRateLimiter", () => {
 
 	it("resets hourly count after the hour window expires", async () => {
 		const limiter = createRateLimiter();
-		// Record, then directly verify that a past hourResetAt causes reset.
-		// We can observe this indirectly: record with budget=1, then once
-		// the hour resets the check should pass with cooldown=0.
-		// Since we cannot fake Date.now here, simulate via the internal state
-		// by calling with an extremely small hourly window indirectly:
-		// just verify budget check passes again after the window.
-		// This is tested at the integration level via requeueDeadJobs gating;
-		// here we verify the branch via the module's public API with budget=50.
 		const lim = createRateLimiter();
-		// Record 49 times — still under budget of 50
 		for (let i = 0; i < 49; i++) {
 			lim.record("x");
 		}
 		const allowed = lim.check("x", 0, 50);
-		// 49 < 50, cooldown 0 so passes
 		expect(allowed.allowed).toBe(true);
-		// One more record makes it 50 — at budget
 		lim.record("x");
 		const denied = lim.check("x", 0, 50);
 		expect(denied.allowed).toBe(false);
 	});
 });
-
-// ---------------------------------------------------------------------------
-// Policy gate tests
-// ---------------------------------------------------------------------------
 
 describe("checkRepairGate", () => {
 	it("denies when autonomousFrozen is true", async () => {
@@ -481,11 +438,425 @@ describe("pruneGenericEntities", () => {
 			db.close();
 		}
 	});
-});
 
-// ---------------------------------------------------------------------------
-// requeueDeadJobs
-// ---------------------------------------------------------------------------
+	it("bounds inspection work and reports a resumable partial scan", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		let readCalls = 0;
+		let timerFired = false;
+		const accessor = asAccessor(db, undefined, () => {
+			readCalls += 1;
+		});
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+		setTimeout(() => {
+			timerFired = true;
+		}, 0);
+
+		try {
+			const insert = db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES (?, ?, ?, 'project', 'default', 1, 0, ?, ?)`,
+			);
+			for (let i = 0; i < 250; i += 1) {
+				insert.run(`ent-valid-${String(i).padStart(3, "0")}`, `Project ${i}`, `project ${i}`, now, now);
+			}
+
+			const result = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: true,
+				batchSize: 100,
+				inspectionLimit: 205,
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.affected).toBe(0);
+			expect(result.details).toMatchObject({
+				status: "partial",
+				complete: false,
+				candidateLimit: 100,
+				inspectionLimit: 205,
+				inspected: 205,
+				matched: 0,
+				remaining: "unknown",
+			});
+			expect((result.details as { cursor?: unknown }).cursor).toEqual({
+				updatedAt: now,
+				id: "ent-valid-045",
+				agentId: "default",
+				scanGeneration: 250,
+			});
+			expect(readCalls).toBe(3);
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(timerFired).toBe(true);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("restarts the scan when a previously scanned entity changes behind the keyset cursor", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		let readCalls = 0;
+		const accessor = asAccessor(db, undefined, () => {
+			readCalls += 1;
+			if (readCalls === 2) {
+				db.prepare(
+					`UPDATE entities
+					    SET name = 'Sender', canonical_name = 'sender', updated_at = ?
+					  WHERE id = 'ent-249'`,
+				).run("2026-05-12T18:00:00.000Z");
+			}
+		});
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+
+		try {
+			const insert = db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES (?, ?, ?, 'project', 'default', 1, 0, ?, ?)`,
+			);
+			for (let i = 0; i < 250; i += 1) {
+				insert.run(`ent-${String(i).padStart(3, "0")}`, `Project ${i}`, `project ${i}`, now, now);
+			}
+
+			const result = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: false,
+				candidateLimit: 100,
+				inspectionLimit: 500,
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.affected).toBe(0);
+			expect(result.details).toMatchObject({
+				status: "partial",
+				complete: false,
+				inspected: 100,
+				matched: 0,
+				reason: "changed",
+				cursor: null,
+			});
+			expect(readCalls).toBe(2);
+			expect(db.prepare("SELECT name FROM entities WHERE id = 'ent-249'").get()).toEqual({ name: "Sender" });
+		} finally {
+			db.close();
+		}
+	});
+
+	it("resumes a keyset cursor across equal timestamps without skipping matches", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		const accessor = asAccessor(db);
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+
+		try {
+			const insert = db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES (?, ?, ?, 'person', 'default', 1, 0, ?, ?)`,
+			);
+			for (let i = 0; i < 250; i += 1) {
+				const name = i % 40 === 0 ? `Sender ${i}` : `Project ${i}`;
+				insert.run(`ent-${String(i).padStart(3, "0")}`, name, name.toLowerCase(), now, now);
+			}
+
+			let cursor: { updatedAt: string; id: string; agentId: string; scanGeneration: number } | undefined;
+			let totalMatched = 0;
+			let complete = false;
+			const seenCursors = new Set<string>();
+			for (let pass = 0; pass < 20 && !complete; pass += 1) {
+				const result = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+					dryRun: true,
+					candidateLimit: 1,
+					inspectionLimit: 50,
+					cursor,
+				});
+				expect(result.success).toBe(true);
+				const details = result.details as {
+					complete: boolean;
+					matched: number;
+					cursor: { updatedAt: string; id: string; agentId: string; scanGeneration: number } | null;
+				};
+				totalMatched += details.matched;
+				complete = details.complete;
+				if (!complete) {
+					expect(details.cursor).not.toBeNull();
+					cursor = details.cursor ?? undefined;
+					const cursorKey = `${cursor?.updatedAt}:${cursor?.id}`;
+					expect(seenCursors.has(cursorKey)).toBe(false);
+					seenCursors.add(cursorKey);
+				}
+			}
+
+			expect(complete).toBe(true);
+			expect(totalMatched).toBe(7);
+			expect(seenCursors.size).toBeGreaterThan(1);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("restarts a resumed cursor when the scan generation changes between calls", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		const accessor = asAccessor(db);
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+
+		try {
+			const insert = db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES (?, ?, ?, 'project', 'default', 1, 0, ?, ?)`,
+			);
+			for (let i = 0; i < 250; i += 1) {
+				const name = `Project ${i}`;
+				insert.run(`ent-${String(i).padStart(3, "0")}`, name, name.toLowerCase(), now, now);
+			}
+
+			const first = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: true,
+				candidateLimit: 100,
+				inspectionLimit: 50,
+			});
+			const firstDetails = first.details as {
+				complete: boolean;
+				cursor: { updatedAt: string; id: string; agentId: string; scanGeneration: number } | null;
+			};
+			expect(firstDetails.complete).toBe(false);
+			expect(firstDetails.cursor).not.toBeNull();
+			const cursor = firstDetails.cursor;
+			if (cursor === null) throw new Error("first scan did not return a cursor");
+
+			const generationBefore = cursor.scanGeneration;
+			db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES ('ent-zzz', 'Sender', 'sender', 'person', 'default', 1, 0, ?, ?)`,
+			).run(now, now);
+			const generationAfter = db
+				.prepare("SELECT generation FROM generic_entity_prune_scan_state WHERE id = 1")
+				.get() as { generation: number };
+			expect(generationAfter.generation).toBeGreaterThan(generationBefore);
+
+			const resumed = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: true,
+				candidateLimit: 100,
+				inspectionLimit: 500,
+				cursor,
+			});
+
+			expect(resumed.success).toBe(true);
+			expect(resumed.details).toMatchObject({
+				complete: true,
+				matched: 1,
+			});
+			expect(resumed.message).toContain("Sender");
+		} finally {
+			db.close();
+		}
+	});
+
+	it("stops at the server deadline without applying an unscanned plan", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		const baseAccessor = asAccessor(db);
+		let readCalls = 0;
+		const accessor: DbAccessor = {
+			...baseAccessor,
+			async withReadDbAsync<T>(fn: (rdb: ReadDb) => T | Promise<T>, options?: ReadAdmissionOptions): Promise<T> {
+				readCalls += 1;
+				const result = await baseAccessor.withReadDbAsync(fn, options);
+				await new Promise<void>((resolve) => setTimeout(resolve, 100));
+				return result;
+			},
+		};
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+
+		try {
+			db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES ('ent-sender', 'Sender', 'sender', 'person', 'default', 12, 0, ?, ?)`,
+			).run(now, now);
+
+			const result = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: false,
+				candidateLimit: 1,
+				inspectionLimit: 10,
+				deadlineAt: performance.now() + 50,
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.affected).toBe(0);
+			expect(readCalls).toBe(1);
+			expect(result.details).toMatchObject({ status: "partial", complete: false, inspected: 0, reason: "deadline" });
+			expect(db.prepare("SELECT COUNT(*) AS count FROM entities WHERE id = 'ent-sender'").get()).toEqual({
+				count: 1,
+			});
+		} finally {
+			db.close();
+		}
+	});
+
+	it("stops on pressure raised during the final page before deleting candidates", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		const accessor = asAccessor(db, undefined, () => reportEventLoopLag(101));
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+
+		try {
+			db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES ('ent-sender-final', 'Sender', 'sender', 'person', 'default', 1, 0, ?, ?)`,
+			).run(now, now);
+
+			const result = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: false,
+				candidateLimit: 1,
+				inspectionLimit: 10,
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.affected).toBe(0);
+			expect(result.details).toMatchObject({ complete: false, reason: "pressure" });
+			expect(db.prepare("SELECT COUNT(*) AS count FROM entities WHERE id = 'ent-sender-final'").get()).toEqual({
+				count: 1,
+			});
+		} finally {
+			resetPressureState();
+			db.close();
+		}
+	});
+
+	it("stops between pages when system pressure rises without applying partial candidates", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		let readCalls = 0;
+		const accessor = asAccessor(db, undefined, () => {
+			readCalls += 1;
+			if (readCalls === 1) reportEventLoopLag(101);
+		});
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+
+		try {
+			const insert = db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES (?, ?, ?, 'person', 'default', 1, 0, ?, ?)`,
+			);
+			for (let i = 0; i < 250; i += 1) {
+				insert.run(`ent-sender-${String(i).padStart(3, "0")}`, `Sender ${i}`, `sender ${i}`, now, now);
+			}
+
+			const result = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: false,
+				candidateLimit: 200,
+				inspectionLimit: 250,
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.affected).toBe(0);
+			expect(readCalls).toBe(1);
+			expect(result.details).toMatchObject({
+				status: "partial",
+				complete: false,
+				inspected: 100,
+				reason: "pressure",
+			});
+			expect((db.prepare("SELECT COUNT(*) AS count FROM entities").get() as { count: number }).count).toBe(250);
+		} finally {
+			resetPressureState();
+			db.close();
+		}
+	});
+
+	it("stops at request cancellation without persisting a partial candidate set", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		const controller = new AbortController();
+		let readCalls = 0;
+		const accessor = asAccessor(db, undefined, () => {
+			readCalls += 1;
+			if (readCalls === 1) setImmediate(() => controller.abort());
+		});
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+
+		try {
+			const insert = db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned,  created_at, updated_at)
+				 VALUES (?, ?, ?, 'person', 'default', 1, 0, ?, ?)`,
+			);
+			insert.run("ent-sender", "Sender", "sender", now, now);
+			for (let i = 0; i < 150; i += 1) {
+				insert.run(`ent-valid-${i}`, `Project ${i}`, `project ${i}`, now, now);
+			}
+
+			const result = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: false,
+				batchSize: 1,
+				inspectionLimit: 500,
+				signal: controller.signal,
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.affected).toBe(0);
+			expect(readCalls).toBe(1);
+			expect(result.details).toMatchObject({ status: "partial", complete: false, reason: "cancelled" });
+			expect(db.prepare("SELECT COUNT(*) AS count FROM entities WHERE id = 'ent-sender'").get()).toEqual({ count: 1 });
+		} finally {
+			db.close();
+		}
+	});
+
+	it("revalidates agent ownership and entity state before deleting scanned candidates", async () => {
+		const db = new Database(":memory:");
+		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
+		const accessor = asAccessor(db, undefined, () => {
+			queueMicrotask(() => {
+				db.prepare(
+					`UPDATE entities
+					    SET name = 'Project Phoenix', canonical_name = 'project phoenix', agent_id = 'other', updated_at = ?
+					  WHERE id = 'ent-sender'`,
+				).run("2026-05-12T18:00:00.000Z");
+			});
+		});
+		const limiter = createRateLimiter();
+		const now = "2026-05-11T18:00:00.000Z";
+
+		try {
+			db.prepare(
+				`INSERT INTO entities
+				 (id, name, canonical_name, entity_type, agent_id, mentions, pinned, created_at, updated_at)
+				 VALUES ('ent-sender', 'Sender', 'sender', 'person', 'default', 12, 0, ?, ?)`,
+			).run(now, now);
+
+			const result = await pruneGenericEntities(accessor, TEST_CFG, CTX_OPERATOR, limiter, {
+				dryRun: false,
+				candidateLimit: 1,
+				inspectionLimit: 10,
+			});
+
+			expect(result.success).toBe(true);
+			expect(result.affected).toBe(0);
+			expect(result.details).toMatchObject({ complete: false, reason: "changed", matched: 1, cursor: null });
+			expect(db.prepare("SELECT name, agent_id FROM entities WHERE id = 'ent-sender'").get()).toEqual({
+				name: "Project Phoenix",
+				agent_id: "other",
+			});
+		} finally {
+			db.close();
+		}
+	});
+});
 
 describe("requeueDeadJobs", () => {
 	let db: Database;
@@ -546,10 +917,6 @@ describe("requeueDeadJobs", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// cancelObsoleteJobs / pruneTerminalJobs — aggregate --max-batch cap (#1053)
-// ---------------------------------------------------------------------------
-
 describe("repair --max-batch aggregate cap (#1053)", () => {
 	let db: Database;
 	let accessor: DbAccessor;
@@ -594,7 +961,6 @@ describe("repair --max-batch aggregate cap (#1053)", () => {
 
 			expect(result.success).toBe(true);
 			expect(result.affected).toBeLessThanOrEqual(1000);
-			// memory_jobs is selected first and consumes the whole budget.
 			expect(countMemoryByStatus("cancelled")).toBe(1000);
 			expect(countSummaryByStatus("cancelled")).toBe(0);
 		});
@@ -640,8 +1006,6 @@ describe("repair --max-batch aggregate cap (#1053)", () => {
 			expect(result.affected).toBe(0);
 			expect(result.totalMatching).toBe(1001);
 			expect(result.preview?.length ?? 0).toBeLessThanOrEqual(50);
-			// Preview ids come only from the memory queue (the first table),
-			// matching the apply-time selection order.
 			expect(result.preview?.every((id) => id.startsWith("memory_jobs:mem-job-"))).toBe(true);
 			expect(countMemoryByStatus("cancelled")).toBe(0);
 			expect(countSummaryByStatus("cancelled")).toBe(0);
@@ -710,10 +1074,6 @@ describe("repair --max-batch aggregate cap (#1053)", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// releaseStaleLeases
-// ---------------------------------------------------------------------------
-
 describe("releaseStaleLeases", () => {
 	let db: Database;
 	let accessor: DbAccessor;
@@ -730,12 +1090,8 @@ describe("releaseStaleLeases", () => {
 
 	it("releases stale leased jobs back to pending", async () => {
 		insertMemory(db, "mem-3");
-
-		// Leased 10 minutes ago — past a 5-minute lease timeout
 		const staleAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
 		insertJob(db, "job-stale", "mem-3", "leased", staleAt);
-
-		// Leased 1 second ago — within a 5-minute lease timeout
 		const freshAt = new Date(Date.now() - 1000).toISOString();
 		insertJob(db, "job-fresh", "mem-3", "leased", freshAt);
 
@@ -788,10 +1144,6 @@ describe("releaseStaleLeases", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// checkFtsConsistency
-// ---------------------------------------------------------------------------
-
 describe("checkFtsConsistency", () => {
 	let db: Database;
 	let accessor: DbAccessor;
@@ -817,7 +1169,6 @@ describe("checkFtsConsistency", () => {
 		const result = await checkFtsConsistency(accessor, TEST_CFG, CTX_OPERATOR, limiter, false);
 
 		expect(result.success).toBe(true);
-		// counts match (FTS5 external content reads from memories)
 		expect(result.affected).toBe(0);
 		expect(result.message).toMatch(/consistent/);
 	});
@@ -825,37 +1176,34 @@ describe("checkFtsConsistency", () => {
 	it("runs rebuild without error when repair=true", async () => {
 		insertMemory(db, "mem-fts-rebuild");
 		const limiter = createRateLimiter();
-		// repair=true triggers rebuild even when consistent; should not throw
 		const result = await checkFtsConsistency(accessor, TEST_CFG, CTX_OPERATOR, limiter, true);
-		// Rebuild only runs on mismatch; consistent case is a no-op
 		expect(result.success).toBe(true);
 	});
 
-	it("detects legacy porter tokenizer drift", async () => {
+	it("detects unicode61 tokenizer drift", async () => {
 		insertMemory(db, "We celebrate wins together");
-		installLegacyPorterMemoriesFts(db);
+		installMemoriesFtsWithTokenizer(db);
 		const limiter = createRateLimiter();
 		const result = await checkFtsConsistency(accessor, TEST_CFG, CTX_OPERATOR, limiter, false);
 
 		expect(result.success).toBe(true);
 		expect(result.affected).toBe(1);
 		expect(result.message).toMatch(/tokenizer drift/i);
-		expect(readMemoriesFtsSql(toFtsSchemaQueryDb(db))).toContain("porter unicode61");
+		expect(readMemoriesFtsSql(toFtsSchemaQueryDb(db))).toContain("tokenize='unicode61'");
 	});
 
-	it("repairs legacy porter tokenizer drift when repair=true", async () => {
+	it("repairs unicode61 tokenizer drift to porter stemming when repair=true", async () => {
 		insertMemory(db, "We celebrate wins together");
-		installLegacyPorterMemoriesFts(db);
+		installMemoriesFtsWithTokenizer(db);
 		const limiter = createRateLimiter();
 		const result = await checkFtsConsistency(accessor, TEST_CFG, CTX_OPERATOR, limiter, true);
 
 		expect(result.success).toBe(true);
 		expect(result.affected).toBe(1);
-		expect(result.message).toMatch(/unicode61 tokenizer/i);
+		expect(result.message).toMatch(/porter unicode61 tokenizer/i);
 
 		const sql = readMemoriesFtsSql(toFtsSchemaQueryDb(db));
-		expect(sql).toContain("tokenize='unicode61'");
-		expect(sql).not.toContain("porter unicode61");
+		expect(sql).toContain("tokenize='porter unicode61'");
 	});
 
 	it("does not treat legitimate tombstones as FTS corruption", async () => {
@@ -873,7 +1221,7 @@ describe("checkFtsConsistency", () => {
 	it("defers autonomous repair until a genuine mismatch persists", async () => {
 		insertMemory(db, "mem-fts-deferred");
 		insertMemory(db, "mem-fts-deferred-missing");
-		installLegacyPorterMemoriesFts(db, "mem-fts-deferred", "unicode61");
+		installMemoriesFtsWithTokenizer(db, "mem-fts-deferred", "porter unicode61");
 
 		const first = await checkFtsConsistency(accessor, TEST_CFG, CTX_DAEMON, createRateLimiter(), true);
 		expect(first.success).toBe(true);
@@ -893,7 +1241,7 @@ describe("checkFtsConsistency", () => {
 	it("repairs a genuinely incomplete FTS index", async () => {
 		insertMemory(db, "mem-fts-corrupt-indexed");
 		insertMemory(db, "mem-fts-corrupt-missing");
-		installLegacyPorterMemoriesFts(db, "mem-fts-corrupt-indexed", "unicode61");
+		installMemoriesFtsWithTokenizer(db, "mem-fts-corrupt-indexed", "porter unicode61");
 
 		const result = await checkFtsConsistency(accessor, TEST_CFG, CTX_OPERATOR, createRateLimiter(), true);
 		expect(result.success).toBe(true);
@@ -907,7 +1255,7 @@ describe("checkFtsConsistency", () => {
 	it("coalesces concurrent FTS rebuilds through one async write", async () => {
 		insertMemory(db, "mem-fts-concurrent-indexed");
 		insertMemory(db, "mem-fts-concurrent-missing");
-		installLegacyPorterMemoriesFts(db, "mem-fts-concurrent-indexed", "unicode61");
+		installMemoriesFtsWithTokenizer(db, "mem-fts-concurrent-indexed", "porter unicode61");
 
 		const results = await Promise.all([
 			checkFtsConsistency(accessor, TEST_CFG, CTX_OPERATOR, createRateLimiter(), true),
@@ -920,10 +1268,6 @@ describe("checkFtsConsistency", () => {
 		expect(repairAuditCount(db, "checkFtsConsistency")).toBe(1);
 	});
 });
-
-// ---------------------------------------------------------------------------
-// reembedMissingMemories
-// ---------------------------------------------------------------------------
 
 describe("reembedMissingMemories", () => {
 	let db: Database;
@@ -989,16 +1333,6 @@ describe("reembedMissingMemories", () => {
 	});
 
 	it("resolves the active profile before writing, instead of comparing the raw configured fingerprint", async () => {
-		// Regression: a prior --model-mismatch migration promotes the durable
-		// active generation with a *named* profile (e.g. "nomic-embed-text-v1.5"),
-		// persisted in embedding_index_state.active_profile_json. The route's
-		// raw `embeddingCfg` (loaded straight from agent.yaml) carries no
-		// `profile` field. Before the fix, isActiveEmbeddingConfig compared the
-		// raw config's identity fingerprint against that named-profile
-		// fingerprint on every batch — a permanent mismatch, not a race — so
-		// `signet embed backfill` failed 100% of the time with "embedding
-		// profile changed during provider work", even though nothing changed
-		// concurrently.
 		insertMemory(db, "mem-named-profile");
 		const rawCfg: EmbeddingConfig = { ...TEST_EMBEDDING_CFG, model: "nomic-embed-text:v1.5" };
 		accessor.withWriteTx((writeDb) => {
@@ -1035,16 +1369,10 @@ describe("reembedMissingMemories", () => {
 		expect(result.success).toBe(true);
 		expect(result.affected).toBe(1);
 		expect(db.prepare("SELECT id FROM embeddings WHERE source_id = 'mem-named-profile'").get()).toBeTruthy();
-		// The embedding call must use the resolved (named) profile, not the raw
-		// identity config, so its formatting matches the rest of the active index.
 		expect(seenCfgs[0]?.profile).toBe("nomic-embed-text-v1.5");
 	});
 
 	it("reconciles canonical embedding state after a mid-write vector-index failure", async () => {
-		// Proof for #1325: the canonical embedding write and the derived vec
-		// index update are separate failure boundaries. If vec insertion fails
-		// after the canonical row commits, the existing resync owner must make
-		// the derived index converge without re-embedding or changing the source.
 		ensureVecTable(db);
 		insertMemory(db, "mem-mid-write");
 		db.exec(`
@@ -1075,19 +1403,12 @@ describe("reembedMissingMemories", () => {
 		expect(db.prepare("SELECT id FROM memories WHERE id = 'mem-mid-write' AND is_deleted = 0").get()).toBeTruthy();
 		expect(db.prepare("SELECT source_id FROM embeddings WHERE source_id = 'mem-mid-write'").all()).toHaveLength(1);
 		expect(db.prepare("SELECT id FROM vec_embeddings").all()).toHaveLength(0);
-
-		// Reconciliation owns the derived index. It must repair the missing vec
-		// row from the canonical embedding without invoking the provider again.
 		db.exec("DROP TRIGGER reject_vec_insert");
 		const repaired = await resyncVectorIndex(accessor, TEST_CFG, CTX_OPERATOR, createRateLimiter());
 		expect(repaired.success).toBe(true);
 		expect(repaired.affected).toBe(1);
 		expect(db.prepare("SELECT id FROM vec_embeddings").all()).toHaveLength(1);
 		expect(db.prepare("SELECT source_id FROM embeddings WHERE source_id = 'mem-mid-write'").all()).toHaveLength(1);
-
-		// The delete boundary must also fail closed. A failed derived delete
-		// rolls back canonical cleanup, so retrying the existing orphan owner is
-		// safe and eventually removes both projections.
 		db.prepare("UPDATE memories SET is_deleted = 1 WHERE id = 'mem-mid-write'").run();
 		db.exec(`
 			CREATE TRIGGER reject_vec_delete
@@ -1109,9 +1430,6 @@ describe("reembedMissingMemories", () => {
 	});
 
 	it("selects a missing agent memory but reports a cross-agent hash conflict", async () => {
-		// The hash is globally unique, but repair selection is agent-scoped.
-		// Agent B's missing memory must be selected without updating Agent A's
-		// existing embedding.
 		ensureVecTable(db);
 		const sharedHash = "cross-agent-shared-hash";
 		insertMemory(db, "mem-a", "agent-a", sharedHash);
@@ -1143,7 +1461,6 @@ describe("reembedMissingMemories", () => {
 			10,
 			false,
 			false,
-			undefined,
 		);
 
 		expect(selected).toEqual(["content for mem-b-unique"]);
@@ -1183,10 +1500,11 @@ describe("reembedMissingMemories", () => {
 			.prepare("SELECT vector, chunk_text, source_id, agent_id, dimensions FROM embeddings WHERE id = 'emb-owner'")
 			.get();
 		const providerInputs: string[] = [];
+		const cfg = { ...TEST_CFG, repair: { ...TEST_CFG.repair, reembedCooldownMs: 0 } };
 
 		const result = await reembedMissingMemories(
 			accessor,
-			TEST_CFG,
+			cfg,
 			CTX_AGENT,
 			createRateLimiter(),
 			async (content) => {
@@ -1198,13 +1516,46 @@ describe("reembedMissingMemories", () => {
 			1,
 			false,
 			true,
-			0,
 		);
 
 		expect(providerInputs).toEqual(["content for mem-repairable"]);
-		expect(result.success).toBe(false);
+		expect(result.success).toBe(true);
 		expect(result.affected).toBe(1);
-		expect(result.details).toEqual({ selected: 2, failed: 0, stale: 0, crossAgentHashConflicts: 1 });
+		expect(result.details).toMatchObject({
+			selected: 1,
+			failed: 0,
+			stale: 0,
+			crossAgentHashConflicts: 0,
+			status: "running",
+			remaining: 1,
+		});
+		const operationId = result.details?.operationId;
+		expect(typeof operationId).toBe("string");
+
+		const conflict = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_AGENT,
+			createRateLimiter(),
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"agent-b",
+			1,
+			false,
+			true,
+			operationId as string,
+		);
+
+		expect(conflict.success).toBe(false);
+		expect(conflict.affected).toBe(0);
+		expect(conflict.details).toMatchObject({
+			selected: 1,
+			failed: 0,
+			stale: 0,
+			crossAgentHashConflicts: 1,
+			status: "failed",
+		});
+		expect(conflict.message).toContain("1 selected memory(s) could not be persisted");
 		expect(db.prepare("SELECT source_id FROM embeddings WHERE source_id = 'mem-repairable'").get()).toBeTruthy();
 		expect(db.prepare("SELECT source_id FROM embeddings WHERE source_id = 'mem-conflict'").get()).toBeNull();
 		expect(db.prepare("SELECT source_id FROM embeddings WHERE content_hash = ?").all(sharedHash)).toEqual([
@@ -1293,6 +1644,47 @@ describe("reembedMissingMemories", () => {
 		expect(result.affected).toBe(0);
 		expect(result.message).toMatch(/changed during provider work/);
 		expect(db.prepare("SELECT id FROM embeddings WHERE source_id = ?").get("mem-agent-race")).toBeNull();
+	});
+
+	it("does not persist a batch after durable lease ownership changes", async () => {
+		insertMemory(db, "mem-lease-race");
+		let providerStarted!: () => void;
+		const providerReady = new Promise<void>((resolve) => {
+			providerStarted = resolve;
+		});
+		let releaseProvider!: () => void;
+		const providerReleased = new Promise<void>((resolve) => {
+			releaseProvider = resolve;
+		});
+
+		const repair = reembedMissingMemories(
+			accessor,
+			TEST_CFG,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				providerStarted();
+				await providerReleased;
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+		);
+
+		await providerReady;
+		db.prepare("UPDATE embedding_repair_budget SET lease_id = ?, lease_expires_at = ? WHERE id = 1").run(
+			"replacement-lease",
+			new Date(Date.now() + 60 * 60_000).toISOString(),
+		);
+		releaseProvider();
+
+		const result = await repair;
+		expect(result.success).toBe(false);
+		expect(result.affected).toBe(0);
+		expect(result.message).toMatch(/lease was lost before persistence/);
+		expect(result.details).toMatchObject({ leaseLost: true });
+		expect(db.prepare("SELECT id FROM embeddings WHERE source_id = ?").get("mem-lease-race")).toBeNull();
 	});
 
 	it("normalizes an empty memory agent_id on missing-memory repair", async () => {
@@ -1511,13 +1903,6 @@ describe("reembedMissingMemories", () => {
 	});
 
 	it("writes content_hash back to memories row when it was NULL -- null-hash memory does not reappear in subsequent backfill passes", async () => {
-		// Regression test for Bug 2: reembedMissingMemoriesBatch computed a hash but
-		// did not write it back to memories.content_hash. On the next pass the
-		// embedding-coverage query could not use the hash-match branch (because
-		// m.content_hash IS NULL), so the memory kept appearing as unembedded
-		// and the backfill cycled indefinitely.
-		//
-		// Test with the unique index in place to exercise the production code path.
 		db.exec(
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_content_hash_unique
 			 ON memories(content_hash) WHERE content_hash IS NOT NULL AND is_deleted = 0`,
@@ -1540,15 +1925,11 @@ describe("reembedMissingMemories", () => {
 			10,
 			false,
 		);
-
-		// After first pass, memories.content_hash must be populated
 		const after = db.prepare("SELECT content_hash FROM memories WHERE id = 'mem-write-back'").get() as {
 			content_hash: string | null;
 		};
 		expect(typeof after.content_hash).toBe("string");
 		expect((after.content_hash ?? "").length).toBeGreaterThan(0);
-
-		// A second pass must find zero unembedded memories (no cycle)
 		const limiter2 = createRateLimiter();
 		const second = await reembedMissingMemories(
 			accessor,
@@ -1565,32 +1946,22 @@ describe("reembedMissingMemories", () => {
 	});
 
 	it("does not throw when a duplicate-content null-hash memory collides with an existing hashed memory", async () => {
-		// Regression: the write-back ran unconditionally, causing a UNIQUE constraint
-		// violation when another non-deleted memory already owned the same content_hash.
-		// That aborted the entire batch, so the cycle never resolved.
-		// With the unique index active (production path), the write-back must be skipped
-		// for the duplicate and the batch must complete without throwing.
 		db.exec(
 			`CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_content_hash_unique
 			 ON memories(content_hash) WHERE content_hash IS NOT NULL AND is_deleted = 0`,
 		);
 		const now = new Date().toISOString();
 		const { contentHash: hash } = normalizeAndHashContent("duplicate content for collision test");
-
-		// Memory that already owns the hash
 		db.prepare(
 			`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by)
 			 VALUES (?, ?, ?, 'fact', ?, ?, 'test')`,
 		).run("mem-owner", "duplicate content for collision test", hash, now, now);
-
-		// Null-hash memory with identical content -- this is the one that would collide
 		db.prepare(
 			`INSERT INTO memories (id, content, type, created_at, updated_at, updated_by)
 			 VALUES (?, ?, 'fact', ?, ?, 'test')`,
 		).run("mem-dupe", "duplicate content for collision test", now, now);
 
 		const limiter = createRateLimiter();
-		// Must not throw
 		const result = await reembedMissingMemories(
 			accessor,
 			TEST_CFG,
@@ -1603,8 +1974,6 @@ describe("reembedMissingMemories", () => {
 			false,
 		);
 		expect(result.success).toBe(true);
-
-		// Duplicate's hash stays null -- dedup worker will clean it up later
 		const dupe = db.prepare("SELECT content_hash FROM memories WHERE id = 'mem-dupe'").get() as {
 			content_hash: string | null;
 		};
@@ -1658,11 +2027,6 @@ describe("reembedMissingMemories", () => {
 
 	it("does not cycle-embed duplicate-hash memories — both report as embedded after one pass", async () => {
 		ensureVecTable(db);
-		// Regression test: before the fix, two memories with the same content_hash
-		// created an infinite backfill loop. Backfill would embed A, then embed B
-		// (ON CONFLICT reassigns source_id to B), making A "missing" again. The
-		// fix keeps the original owner stable on conflict and treats hash coverage
-		// as embedded, so both memories are considered covered after one pass.
 		const a = "2026-03-25T00:00:00.000Z";
 		const b = "2026-03-25T00:00:01.000Z";
 
@@ -1674,14 +2038,10 @@ describe("reembedMissingMemories", () => {
 			`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by)
 			 VALUES (?, ?, ?, 'fact', ?, ?, 'test')`,
 		).run("mem-dup-b", "identical content", "hash-dup", b, b);
-
-		// No embedding yet — both should show as missing
 		const before = await getEmbeddingGapStats(accessor, "default");
 		expect(before.unembedded).toBe(2);
 
 		const limiter = createRateLimiter();
-
-		// First pass: embeds both (one is deduplicated via ON CONFLICT)
 		const first = await reembedMissingMemories(
 			accessor,
 			TEST_CFG,
@@ -1694,8 +2054,6 @@ describe("reembedMissingMemories", () => {
 			false,
 		);
 		expect(first.success).toBe(true);
-
-		// After one pass, both should be considered "embedded" via hash match
 		const after = await getEmbeddingGapStats(accessor, "default");
 		expect(after.unembedded).toBe(0);
 		const rows = db.prepare("SELECT source_id FROM embeddings WHERE content_hash = ?").all("hash-dup") as Array<{
@@ -1703,8 +2061,6 @@ describe("reembedMissingMemories", () => {
 		}>;
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.source_id).toBe("mem-dup-a");
-
-		// A second pass should not attempt to re-embed either memory (no cycle)
 		const limiter2 = createRateLimiter();
 		const secondPass = await reembedMissingMemories(
 			accessor,
@@ -1720,7 +2076,7 @@ describe("reembedMissingMemories", () => {
 		expect(secondPass.message).toMatch(/no unembedded memories found/);
 	});
 
-	it("can sweep all missing embeddings across multiple batches in one run", async () => {
+	it("resumes a bounded full sweep through its durable operation checkpoint", async () => {
 		const now = new Date().toISOString();
 		for (let i = 0; i < 5; i++) {
 			db.prepare(
@@ -1730,9 +2086,10 @@ describe("reembedMissingMemories", () => {
 		}
 
 		const limiter = createRateLimiter();
-		const result = await reembedMissingMemories(
+		const cfg = { ...TEST_CFG, repair: { ...TEST_CFG.repair, reembedCooldownMs: 0 } };
+		const first = await reembedMissingMemories(
 			accessor,
-			TEST_CFG,
+			cfg,
 			CTX_OPERATOR,
 			limiter,
 			async () => [0.1, 0.2, 0.3],
@@ -1743,9 +2100,47 @@ describe("reembedMissingMemories", () => {
 			true,
 		);
 
-		expect(result.success).toBe(true);
-		expect(result.affected).toBe(5);
-		expect(result.message).toMatch(/across 3 batch/);
+		expect(first.success).toBe(true);
+		expect(first.affected).toBe(2);
+		expect(first.details).toMatchObject({ status: "running", remaining: 3, batches: 1 });
+		const operationId = first.details?.operationId;
+		expect(typeof operationId).toBe("string");
+
+		const second = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			limiter,
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"default",
+			2,
+			false,
+			true,
+			operationId as string,
+		);
+
+		expect(second.success).toBe(true);
+		expect(second.affected).toBe(2);
+		expect(second.details).toMatchObject({ status: "running", remaining: 1, batches: 2 });
+
+		const third = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			limiter,
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"default",
+			2,
+			false,
+			true,
+			operationId as string,
+		);
+
+		expect(third.success).toBe(true);
+		expect(third.affected).toBe(1);
+		expect(third.details).toMatchObject({ status: "complete", remaining: 0, batches: 3 });
 
 		const remaining = db
 			.prepare(
@@ -1756,6 +2151,408 @@ describe("reembedMissingMemories", () => {
 			)
 			.get() as { n: number };
 		expect(remaining.n).toBe(0);
+	});
+
+	it("does not retry a provider failure while its durable backoff is active", async () => {
+		const now = new Date().toISOString();
+		db.prepare(
+			`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by)
+			 VALUES (?, ?, ?, 'fact', ?, ?, 'test')`,
+		).run("mem-failing", "failing content", "hash-failing", now, now);
+		db.prepare(
+			`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by)
+			 VALUES (?, ?, ?, 'fact', ?, ?, 'test')`,
+		).run("mem-next", "next content", "hash-next", now, now);
+		const cfg = { ...TEST_CFG, repair: { ...TEST_CFG.repair, reembedCooldownMs: 0, reembedHourlyBudget: 5 } };
+		let providerCalls = 0;
+		const first = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				providerCalls++;
+				return null;
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+		);
+		expect(first.success).toBe(false);
+		expect(providerCalls).toBe(1);
+
+		const secondInputs: string[] = [];
+		const second = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async (content) => {
+				secondInputs.push(content);
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+		);
+
+		expect(second.success).toBe(true);
+		expect(secondInputs).toEqual(["next content"]);
+		expect(providerCalls).toBe(1);
+	});
+
+	it("keeps a transient provider failure resumable through the same operation id", async () => {
+		insertMemory(db, "mem-provider-retry", "default", "hash-provider-retry");
+		const cfg = { ...TEST_CFG, repair: { ...TEST_CFG.repair, reembedCooldownMs: 0, reembedHourlyBudget: 5 } };
+		let shouldFail = true;
+		const first = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				if (shouldFail) return null;
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			true,
+		);
+		const operationId = first.details?.operationId;
+		expect(first.success).toBe(false);
+		expect(typeof operationId).toBe("string");
+		expect(first.details).toMatchObject({ status: "running" });
+
+		db.prepare("UPDATE embedding_repair_backoff SET retry_at = ? WHERE memory_id = ?").run(
+			new Date(Date.now() - 1).toISOString(),
+			"mem-provider-retry",
+		);
+		shouldFail = false;
+		const second = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			true,
+			operationId as string,
+		);
+
+		expect(second.success).toBe(true);
+		expect(second.affected).toBe(1);
+		expect(db.prepare("SELECT source_id FROM embeddings WHERE source_id = 'mem-provider-retry'").get()).toBeTruthy();
+	});
+
+	it("suppresses backoff for a failed NULL-hash memory", async () => {
+		insertMemory(db, "mem-null-backoff", "default");
+		insertMemory(db, "mem-null-next", "default");
+		const cfg = { ...TEST_CFG, repair: { ...TEST_CFG.repair, reembedCooldownMs: 0, reembedHourlyBudget: 5 } };
+		let providerCalls = 0;
+		const first = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				providerCalls++;
+				return null;
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+		);
+		expect(first.success).toBe(false);
+		expect(providerCalls).toBe(1);
+
+		const secondInputs: string[] = [];
+		const second = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async (content) => {
+				providerCalls++;
+				secondInputs.push(content);
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+		);
+		expect(second.success).toBe(true);
+		expect(secondInputs).toEqual(["content for mem-null-next"]);
+		expect(providerCalls).toBe(2);
+		expect(db.prepare("SELECT COUNT(*) AS n FROM embeddings WHERE source_id = 'mem-null-backoff'").get()).toEqual({
+			n: 0,
+		});
+		expect(db.prepare("SELECT COUNT(*) AS n FROM embeddings WHERE source_id = 'mem-null-next'").get()).toEqual({
+			n: 1,
+		});
+	});
+
+	it("records a terminal checkpoint when the active profile changes before resume", async () => {
+		insertMemory(db, "mem-profile-retry", "default", "hash-profile-retry");
+		insertMemory(db, "mem-profile-retry-2", "default", "hash-profile-retry-2");
+		const cfg = { ...TEST_CFG, repair: { ...TEST_CFG.repair, reembedCooldownMs: 0, reembedHourlyBudget: 5 } };
+		const first = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			true,
+		);
+		const operationId = first.details?.operationId as string;
+		ensureEmbeddingIndexState(db, TEST_EMBEDDING_CFG);
+		db.prepare("UPDATE embedding_index_state SET active_profile_json = ? WHERE id = 1").run(
+			JSON.stringify({
+				fingerprint: embeddingProfileFingerprint({ ...TEST_EMBEDDING_CFG, model: "promoted-model" }),
+				provider: TEST_EMBEDDING_CFG.provider,
+				model: "promoted-model",
+				dimensions: TEST_EMBEDDING_CFG.dimensions,
+				baseUrl: TEST_EMBEDDING_CFG.base_url,
+			}),
+		);
+
+		const resumed = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			true,
+			operationId,
+		);
+
+		expect(resumed.success).toBe(false);
+		expect(resumed.message).toMatch(/does not match|profile changed/i);
+		expect(
+			db
+				.prepare("SELECT status, last_error FROM embedding_repair_checkpoints WHERE checkpoint_id = ?")
+				.get(operationId),
+		).toMatchObject({ status: "failed" });
+	});
+
+	it("respects the configured cooldown between full-sweep batches", async () => {
+		insertMemory(db, "mem-cooldown-1", "default", "hash-cooldown-1");
+		insertMemory(db, "mem-cooldown-2", "default", "hash-cooldown-2");
+		const cfg = { ...TEST_CFG, repair: { ...TEST_CFG.repair, reembedCooldownMs: 60_000, reembedHourlyBudget: 5 } };
+		const first = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			true,
+		);
+		const operationId = first.details?.operationId as string;
+		const second = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			true,
+			operationId,
+		);
+
+		expect(second.success).toBe(false);
+		expect(second.message).toMatch(/cooldown active/);
+	});
+
+	it("reports when every selected memory is deferred by provider backoff", async () => {
+		insertMemory(db, "mem-only-backoff", "default");
+		const cfg = { ...TEST_CFG, repair: { ...TEST_CFG.repair, reembedCooldownMs: 0, reembedHourlyBudget: 5 } };
+		const first = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => null,
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+		);
+		expect(first.success).toBe(false);
+
+		const second = await reembedMissingMemories(
+			accessor,
+			cfg,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => [0.1, 0.2, 0.3],
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+		);
+		expect(second.success).toBe(false);
+		expect(second.message).toContain("retry backoff");
+		expect(db.prepare("SELECT COUNT(*) AS n FROM embeddings WHERE source_id = 'mem-only-backoff'").get()).toEqual({
+			n: 0,
+		});
+	});
+
+	it("rejects an invalid batch size before selecting provider work", async () => {
+		insertMemory(db, "mem-invalid-batch", "default", "hash-invalid-batch");
+		let providerCalls = 0;
+		const result = await reembedMissingMemories(
+			accessor,
+			TEST_CFG,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				providerCalls++;
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			0,
+		);
+
+		expect(result.success).toBe(false);
+		expect(result.details).toMatchObject({ invalidInput: true });
+		expect(providerCalls).toBe(0);
+	});
+
+	it("does not persist vectors after the batch byte budget is reached", async () => {
+		insertMemory(db, "mem-byte-budget", "default", "hash-byte-budget");
+		let providerCalls = 0;
+		const result = await reembedMissingMemories(
+			accessor,
+			TEST_CFG,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				providerCalls++;
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			false,
+			undefined,
+			undefined,
+			{ maxVectorBytes: 30 },
+		);
+
+		expect(result.success).toBe(false);
+		expect(result.details).toMatchObject({ byteLimitReached: true });
+		expect(providerCalls).toBe(1);
+		expect(db.prepare("SELECT source_id FROM embeddings WHERE source_id = 'mem-byte-budget'").get()).toBeNull();
+	});
+
+	it("discards provider work when the HTTP request is cancelled", async () => {
+		insertMemory(db, "mem-cancelled", "default", "hash-cancelled");
+		const controller = new AbortController();
+		let providerCalls = 0;
+		const result = await reembedMissingMemories(
+			accessor,
+			TEST_CFG,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				providerCalls++;
+				controller.abort();
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			false,
+			undefined,
+			undefined,
+			{ signal: controller.signal },
+		);
+
+		expect(result.success).toBe(false);
+		expect(result.details).toMatchObject({ cancelled: true });
+		expect(providerCalls).toBe(1);
+		expect(db.prepare("SELECT source_id FROM embeddings WHERE source_id = 'mem-cancelled'").get()).toBeNull();
+	});
+
+	it("stops a batch when its run-time budget expires", async () => {
+		insertMemory(db, "mem-time-budget", "default", "hash-time-budget");
+		let providerCalls = 0;
+		const result = await reembedMissingMemories(
+			accessor,
+			TEST_CFG,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				providerCalls++;
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			1,
+			false,
+			false,
+			undefined,
+			undefined,
+			{ runBudgetMs: 1 },
+		);
+
+		expect(result.success).toBe(false);
+		expect(result.details).toMatchObject({ timedOut: true });
+		expect(providerCalls).toBe(1);
+		expect(db.prepare("SELECT source_id FROM embeddings WHERE source_id = 'mem-time-budget'").get()).toBeNull();
+	});
+
+	it("clamps an oversized request before selecting provider work", async () => {
+		const now = new Date().toISOString();
+		for (let i = 0; i < 25; i++) {
+			db.prepare(
+				"INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by) VALUES (?, ?, ?, 'fact', ?, ?, 'test')",
+			).run(`mem-cap-${i}`, `content cap ${i}`, `hash-cap-${i}`, now, now);
+		}
+		let providerCalls = 0;
+		const result = await reembedMissingMemories(
+			accessor,
+			TEST_CFG,
+			CTX_OPERATOR,
+			createRateLimiter(),
+			async () => {
+				providerCalls++;
+				return [0.1, 0.2, 0.3];
+			},
+			TEST_EMBEDDING_CFG,
+			"default",
+			999,
+		);
+		expect(result.success).toBe(true);
+		expect(result.affected).toBe(20);
+		expect(providerCalls).toBe(20);
+		const remaining = db
+			.prepare(
+				"SELECT COUNT(*) AS n FROM memories m WHERE NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.source_id = m.id)",
+			)
+			.get() as { n: number };
+		expect(remaining.n).toBe(5);
 	});
 });
 
@@ -1802,11 +2599,6 @@ describe("reembedModelMigration", () => {
 	});
 
 	it("refuses a live run and leaves vectors untouched when the vec index is pinned to a different dimension", async () => {
-		// Regression guard: without the pre-check, syncVecInsert's dimension
-		// mismatch error is silently swallowed (db-helpers catch{}), leaving
-		// `embeddings` updated to the new model/dims while `vec_embeddings`
-		// keeps stale vectors under the same id until a daemon restart. The
-		// migration must detect FLOAT[D_old] != target and refuse.
 		const db = new Database(":memory:");
 		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
 		ensureVecTable(db);
@@ -1822,15 +2614,12 @@ describe("reembedModelMigration", () => {
 			TEST_CFG,
 			CTX_OPERATOR,
 			createRateLimiter(),
-			async () => [0.4, 0.5, 0.6], // returns 3-dim vectors
-			{ ...TEST_EMBEDDING_CFG, model: "model-b", dimensions: 3 }, // target FLOAT[3]
+			async () => [0.4, 0.5, 0.6],
+			{ ...TEST_EMBEDDING_CFG, model: "model-b", dimensions: 3 },
 			"default",
 			10,
-			false, // live run
 			false,
-			// Inject the live vec dimension the daemon booted under, as if the
-			// operator changed embedding.dimensions in config without restarting.
-			// (sqlite_master is not writable in bun:sqlite, so we inject directly.)
+			false,
 			() => 768,
 		);
 
@@ -1839,7 +2628,6 @@ describe("reembedModelMigration", () => {
 		expect(result.totalMatching).toBe(1);
 		expect(result.message).toContain("restart the daemon");
 		expect(result.details).toMatchObject({ vecDimensions: 768 });
-		// No silent corruption: the memory and its vector are unchanged.
 		expect(db.prepare("SELECT embedding_model FROM memories WHERE id = 'model-a'").get()).toEqual({
 			embedding_model: "model-a",
 		});
@@ -1987,10 +2775,6 @@ describe("reembedModelMigration", () => {
 	});
 
 	it("survives a per-row write failure, records partial progress, and still returns a structured result", async () => {
-		// Regression guard: without try/catch around withWriteTx, a single
-		// transaction failure (SQLITE_BUSY / disk error) propagated as an
-		// opaque 500, skipped the audit write, and lost all counts. The loop
-		// must now record the failure and return partial success.
 		const db = new Database(":memory:");
 		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
 		ensureVecTable(db);
@@ -2010,7 +2794,6 @@ describe("reembedModelMigration", () => {
 		const flaky: DbAccessor = {
 			withWriteTx<T>(fn: (wdb: WriteDb) => T): T {
 				writeCalls++;
-				// First per-row write (m-fail) throws; the rest (m-ok + audit) delegate.
 				if (writeCalls === 1) throw new Error("simulated write failure");
 				return inner.withWriteTx(fn);
 			},
@@ -2041,11 +2824,10 @@ describe("reembedModelMigration", () => {
 			false,
 		);
 
-		expect(result.success).toBe(false); // one row failed
-		expect(result.affected).toBe(1); // partial progress
+		expect(result.success).toBe(false);
+		expect(result.affected).toBe(1);
 		expect((result.details as { failed: number }).failed).toBe(1);
 		expect(result.message).toContain("1 failed");
-		// The non-failing row was updated; the failing row was not.
 		expect(db.prepare("SELECT embedding_model FROM memories WHERE id = 'm-ok'").get()).toEqual({
 			embedding_model: "model-b",
 		});
@@ -2133,14 +2915,6 @@ describe("cleanOrphanedEmbeddings", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// triggerRetentionSweep
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// getDedupStats
-// ---------------------------------------------------------------------------
-
 describe("getEmbeddingGapStats", () => {
 	let db: Database;
 	let accessor: DbAccessor;
@@ -2154,10 +2928,6 @@ describe("getEmbeddingGapStats", () => {
 	afterEach(() => {
 		db.close();
 	});
-
-	// Seeds `total` active memories, embedding `total - gaps` of them via a
-	// per-row embedding (source_id match). The remaining `gaps` memories have no
-	// embedding and no matching hash, so they stay unembedded.
 	function seedCoverage(total: number, gaps: number): void {
 		ensureVecTable(db);
 		const now = new Date().toISOString();
@@ -2193,10 +2963,6 @@ describe("getEmbeddingGapStats", () => {
 	});
 
 	it("never reports 100% or complete=true while gaps remain (issue #906 scenario: 2251 memories, 5 gaps)", async () => {
-		// 5 gaps -> 99.78% already renders below 100% even under the old code, so
-		// this guards the sub-100% + complete=false invariant and exact-count
-		// parity for the issue's stated scenario. The round-up boundary itself
-		// (1 gap -> 99.96% -> old "100.0%") is covered by the test below.
 		seedCoverage(2251, 5);
 		const stats = await getEmbeddingGapStats(accessor, "default");
 		expect(stats.total).toBe(2251);
@@ -2211,7 +2977,6 @@ describe("getEmbeddingGapStats", () => {
 	});
 
 	it("floors a single gap in a large store below 100% instead of rounding up", async () => {
-		// (2250/2251)*100 = 99.9556% would render as "100.0%" with naive toFixed(1).
 		seedCoverage(2251, 1);
 		const stats = await getEmbeddingGapStats(accessor, "default");
 		expect(stats.unembedded).toBe(1);
@@ -2236,7 +3001,6 @@ describe("getDedupStats", () => {
 	beforeEach(() => {
 		db = new Database(":memory:");
 		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
-		// Drop the unique index to simulate a legacy database with duplicates
 		db.exec("DROP INDEX IF EXISTS idx_memories_content_hash_unique");
 		accessor = asAccessor(db);
 	});
@@ -2254,21 +3018,18 @@ describe("getDedupStats", () => {
 
 	it("counts exact hash clusters and excess", async () => {
 		const now = new Date().toISOString();
-		// 3 memories with the same hash = 1 cluster, 2 excess
 		for (let i = 0; i < 3; i++) {
 			db.prepare(
 				`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by, importance)
 				 VALUES (?, ?, 'hash-A', 'fact', ?, ?, 'test', 0.5)`,
 			).run(`dup-a-${i}`, "duplicate content A", now, now);
 		}
-		// 2 memories with another hash = 1 cluster, 1 excess
 		for (let i = 0; i < 2; i++) {
 			db.prepare(
 				`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by, importance)
 				 VALUES (?, ?, 'hash-B', 'fact', ?, ?, 'test', 0.5)`,
 			).run(`dup-b-${i}`, "duplicate content B", now, now);
 		}
-		// 1 unique memory
 		db.prepare(
 			`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by, importance)
 			 VALUES (?, ?, 'hash-C', 'fact', ?, ?, 'test', 0.5)`,
@@ -2276,13 +3037,12 @@ describe("getDedupStats", () => {
 
 		const stats = await getDedupStats(accessor);
 		expect(stats.exactClusters).toBe(2);
-		expect(stats.exactExcess).toBe(3); // 2 + 1
+		expect(stats.exactExcess).toBe(3);
 		expect(stats.totalActive).toBe(6);
 	});
 
 	it("excludes pinned and manual_override memories", async () => {
 		const now = new Date().toISOString();
-		// Insert 2 with same hash, but one is pinned
 		db.prepare(
 			`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by, importance, pinned)
 			 VALUES (?, ?, 'hash-pin', 'fact', ?, ?, 'test', 0.5, 1)`,
@@ -2293,14 +3053,11 @@ describe("getDedupStats", () => {
 		).run("unpinned-1", "content", now, now);
 
 		const stats = await getDedupStats(accessor);
-		// The pinned one is excluded from the query, so there is only 1
-		// non-pinned row with hash-pin -- not a cluster
 		expect(stats.exactClusters).toBe(0);
 	});
 
 	it("excludes NULL content_hash from clustering", async () => {
 		const now = new Date().toISOString();
-		// 3 memories with NULL hash -- should NOT form a cluster
 		for (let i = 0; i < 3; i++) {
 			db.prepare(
 				`INSERT INTO memories (id, content, type, created_at, updated_at, updated_by, importance)
@@ -2314,10 +3071,6 @@ describe("getDedupStats", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// deduplicateMemories
-// ---------------------------------------------------------------------------
-
 describe("deduplicateMemories", () => {
 	let db: Database;
 	let accessor: DbAccessor;
@@ -2325,7 +3078,6 @@ describe("deduplicateMemories", () => {
 	beforeEach(() => {
 		db = new Database(":memory:");
 		runMigrations(db as unknown as Parameters<typeof runMigrations>[0]);
-		// Drop the unique index to simulate a legacy database with duplicates
 		db.exec("DROP INDEX IF EXISTS idx_memories_content_hash_unique");
 		accessor = asAccessor(db);
 	});
@@ -2336,7 +3088,6 @@ describe("deduplicateMemories", () => {
 
 	it("removes exact duplicates and keeps the best keeper", async () => {
 		const now = new Date().toISOString();
-		// Insert 3 memories with same hash but different importance
 		db.prepare(
 			`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by, importance, access_count, update_count)
 			 VALUES (?, ?, 'hash-dup', 'fact', ?, ?, 'test', 0.3, 1, 0)`,
@@ -2354,17 +3105,13 @@ describe("deduplicateMemories", () => {
 		const result = await deduplicateMemories(accessor, TEST_CFG, CTX_OPERATOR, limiter);
 
 		expect(result.success).toBe(true);
-		expect(result.affected).toBe(2); // 2 losers soft-deleted
+		expect(result.affected).toBe(2);
 		expect(result.clusters).toBe(1);
-
-		// The high-importance one should be kept
 		const kept = db
 			.prepare("SELECT id FROM memories WHERE content_hash = 'hash-dup' AND is_deleted = 0")
 			.all() as Array<{ id: string }>;
 		expect(kept).toHaveLength(1);
 		expect(kept[0].id).toBe("high-importance");
-
-		// Losers should be soft-deleted
 		const deleted = db
 			.prepare("SELECT id FROM memories WHERE content_hash = 'hash-dup' AND is_deleted = 1")
 			.all() as Array<{ id: string }>;
@@ -2390,7 +3137,7 @@ describe("deduplicateMemories", () => {
 		expect(tags).toContain("alpha");
 		expect(tags).toContain("beta");
 		expect(tags).toContain("gamma");
-		expect(tags).toHaveLength(3); // no duplicates
+		expect(tags).toHaveLength(3);
 	});
 
 	it("skips clusters containing pinned memories", async () => {
@@ -2406,9 +3153,6 @@ describe("deduplicateMemories", () => {
 
 		const limiter = createRateLimiter();
 		const result = await deduplicateMemories(accessor, TEST_CFG, CTX_OPERATOR, limiter);
-
-		// Pinned memories are excluded from the initial query, so the
-		// cluster only contains unpinned-mem (1 row) -- not enough to deduplicate
 		expect(result.affected).toBe(0);
 	});
 
@@ -2425,8 +3169,6 @@ describe("deduplicateMemories", () => {
 
 		const limiter = createRateLimiter();
 		await deduplicateMemories(accessor, TEST_CFG, CTX_OPERATOR, limiter);
-
-		// Check audit trail
 		const keeperHistory = db
 			.prepare("SELECT event FROM memory_history WHERE memory_id = 'audit-keeper'")
 			.all() as Array<{ event: string }>;
@@ -2457,8 +3199,6 @@ describe("deduplicateMemories", () => {
 		expect(result.affected).toBe(0);
 		expect(result.clusters).toBe(1);
 		expect(result.message).toMatch(/dry run/);
-
-		// Nothing should be deleted
 		const active = db.prepare("SELECT COUNT(*) AS n FROM memories WHERE is_deleted = 0").get() as { n: number };
 		expect(active.n).toBe(2);
 	});
@@ -2475,7 +3215,6 @@ describe("deduplicateMemories", () => {
 		).run("idem-2", "content", now, now);
 
 		const limiter = createRateLimiter();
-		// Use no cooldown for idempotency test
 		const cfg = {
 			...TEST_CFG,
 			repair: { ...TEST_CFG.repair, dedupCooldownMs: 0 },
@@ -2501,14 +3240,12 @@ describe("deduplicateMemories", () => {
 
 	it("handles multiple clusters in one batch", async () => {
 		const now = new Date().toISOString();
-		// Cluster 1: hash-multi-A (3 dupes)
 		for (let i = 0; i < 3; i++) {
 			db.prepare(
 				`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by, importance)
 				 VALUES (?, ?, 'hash-multi-A', 'fact', ?, ?, 'test', ?)`,
 			).run(`multi-a-${i}`, "content A", now, now, 0.5 + i * 0.1);
 		}
-		// Cluster 2: hash-multi-B (2 dupes)
 		for (let i = 0; i < 2; i++) {
 			db.prepare(
 				`INSERT INTO memories (id, content, content_hash, type, created_at, updated_at, updated_by, importance)
@@ -2521,16 +3258,12 @@ describe("deduplicateMemories", () => {
 
 		expect(result.success).toBe(true);
 		expect(result.clusters).toBe(2);
-		expect(result.affected).toBe(3); // 2 from cluster A + 1 from cluster B
+		expect(result.affected).toBe(3);
 
 		const active = db.prepare("SELECT COUNT(*) AS n FROM memories WHERE is_deleted = 0").get() as { n: number };
-		expect(active.n).toBe(2); // 1 keeper per cluster
+		expect(active.n).toBe(2);
 	});
 });
-
-// ---------------------------------------------------------------------------
-// triggerRetentionSweep
-// ---------------------------------------------------------------------------
 
 describe("triggerRetentionSweep", () => {
 	it("calls sweep on the retention handle", async () => {
@@ -2549,10 +3282,6 @@ describe("triggerRetentionSweep", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// resyncVectorIndex
-// ---------------------------------------------------------------------------
-
 describe("resyncVectorIndex", () => {
 	let db: Database;
 	let accessor: DbAccessor;
@@ -2568,7 +3297,7 @@ describe("resyncVectorIndex", () => {
 		db.close();
 	});
 
-	it("inserts missing vec rows and removes orphan vec rows", async () => {
+	it("inserts missing vec rows and retains unknown-owner vec rows", async () => {
 		insertMemory(db, "mem-v-1");
 		insertMemory(db, "mem-v-2");
 
@@ -2598,10 +3327,10 @@ describe("resyncVectorIndex", () => {
 		const result = await resyncVectorIndex(accessor, TEST_CFG, CTX_OPERATOR, limiter);
 
 		expect(result.success).toBe(true);
-		expect(result.affected).toBe(2);
+		expect(result.affected).toBe(1);
 
 		const ids = db.prepare("SELECT id FROM vec_embeddings ORDER BY id").all() as Array<{ id: string }>;
-		expect(ids.map((row) => row.id)).toEqual(["emb-v-1", "emb-v-2"]);
+		expect(ids.map((row) => row.id)).toEqual(["emb-orphan", "emb-v-1", "emb-v-2"]);
 	});
 
 	it("returns a clear error when vec table is missing", async () => {

@@ -68,8 +68,9 @@ not drift into separate request shapes or result formatting.
 
 Hybrid vector + keyword search over stored memories. Returns results ranked
 by combined BM25 + vector similarity score with optional graph boost and
-reranking. Transcript search is intentionally separate; use `session_search`
-when you need session transcript evidence.
+reranking. Up to `search.transcript_evidence_limit` excerpts (default 2) from
+the agent's own session transcripts fill the last result slots; use
+`session_search` to search transcripts directly.
 
 **Parameters:**
 
@@ -643,9 +644,7 @@ Streamable HTTP transport (MCP spec 2025-03-26). Runs stateless — each
 request gets a fresh server instance. Requests are admitted through a bounded
 in-flight cap of 8; excess requests receive a structured 503 response and can
 retry. JSON request bodies are limited to 512 KiB and oversized bodies receive
-413 before MCP server creation. Marketplace tool discovery is shared per
-authorization and scope context for a 30-second refresh window, so concurrent
-stateless servers do not repeat the same marketplace refresh.
+413 before MCP server creation.
 
 ```
 POST http://localhost:3850/mcp     # Send MCP messages

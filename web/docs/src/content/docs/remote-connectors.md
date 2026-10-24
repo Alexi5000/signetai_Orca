@@ -104,11 +104,13 @@ Verify remote unauthenticated requests are rejected in `hybrid` or `team` mode
 from the remote machine:
 
 ```bash
-curl -i http://signet-home:3850/api/auth/whoami
+curl -i http://signet-home:3850/api/memories
 ```
 
 A `401 Unauthorized` response is expected for a remote request without a key.
-`/health` may still be reachable because it is a basic health endpoint.
+`/health`, `/api/mode`, and `/api/auth/whoami` stay reachable without a key so
+clients can check health and sign in; `whoami` answers `200` with
+`"authenticated": false`.
 
 ## 3. Create a connector API key
 
@@ -249,9 +251,11 @@ so merely supporting a harness does not add an unused row to the home page.
 The legacy `harnesses` and `configuredHarnesses` fields remain available to
 setup flows.
 
-Installation markers alone do not prove runtime health: the default inspection
-reports Degraded with an explicit unverified-health diagnostic. Healthy requires
-a connector-specific probe that validates its runtime. Inspection runs outside
+Installation markers alone do not prove runtime health: the shared default
+inspection reports Not verified with an explicit unverified-health diagnostic. A
+connector-specific probe may report Healthy, Degraded, or Needs auth when it can
+validate the corresponding runtime condition; registry-derived states such as a
+detected but unconfigured harness remain Degraded. Inspection runs outside
 the HTTP process in a child process, with a five-second deadline per connector. A timed
 out or failed inspection stays visible without suppressing other connectors.
 Requests cancel their child processes on disconnect; daemon shutdown waits for cleanup.
@@ -445,12 +449,13 @@ That usually means auth is working: localhost is allowed without a key, while
 remote requests require one. Verify with:
 
 ```bash
-curl -i http://signet-home:3850/api/auth/whoami
-curl -i http://signet-home:3850/api/auth/whoami \
+curl -i http://signet-home:3850/api/memories
+curl -i http://signet-home:3850/api/memories \
   -H "Authorization: Bearer $SIGNET_API_KEY"
 ```
 
-The first remote request should be `401`; the second should succeed.
+The first remote request should be `401`; the second should succeed. To see
+why a key is rejected, call `/api/auth/whoami` with it and read `error`.
 
 ### You exposed a key accidentally
 

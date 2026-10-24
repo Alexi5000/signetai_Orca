@@ -35,16 +35,26 @@ Before submitting changes, run the full check suite:
 bun run typecheck   # Workspace typecheck (includes the daemon backlog tracked in #969)
 bun run lint        # Biome static analysis
 bun run format      # Biome auto-format
+bun run comments:check # Maintained source, test, script, and config comment policy
+bun run build       # Production packages and staged runtime artifacts
 bun test            # All maintained repository tests (excludes vendored references/)
 ```
 
 Git hooks
 ---
 
-The pre-commit hook runs staged Biome validation and the workspace typecheck.
-The typecheck observes the current working tree rather than reconstructing the
-staged index, so unrelated unstaged changes can affect its result. It also prints
-a documentation reminder when a commit may change user-visible behavior, APIs,
+The pre-commit hook runs staged Biome validation and the typechecks of the
+workspaces affected by the staged files, including their workspace dependencies.
+It selects the affected workspaces from staged paths only; unrelated packages
+are not checked. Documentation- and asset-only changes skip the TypeScript
+checks entirely. The full workspace typecheck remains in CI
+(`bun run typecheck`), and shared root files (`package.json`, `tsconfig.json`,
+`biome.json`, `bunfig.toml`, `bun.lock`) plus `scripts/` and `tests/` widen the
+scoped check back to all workspaces. Packages whose typechecks need built
+workspace artifacts build them on demand during the hook. The scoped checks
+observe the current working tree rather than reconstructing the staged index,
+so unrelated unstaged changes can affect their result. The hook also prints a
+documentation reminder when a commit may change user-visible behavior, APIs,
 schemas, configuration, or lifecycle. The documentation step is intentionally
 advisory; it does not run a separate documentation checker.
 
@@ -193,6 +203,15 @@ call to `withReadDbAsync`/`withWriteTxAsync` (thread an async wrapper up to the
 nearest await boundary), delete the marker, and when the count drops, re-run
 `bun scripts/legacy-sync-db-baseline.ts` in the same PR.
 
+**Database ownership:** Runtime packages may import SQLite implementations only
+from the exact owner modules listed by `bun run audit:database-ownership`.
+Type-only SQLite imports remain valid. New runtime owners require an explicit
+architecture change rather than a directory-wide exception.
+
+**Agent identity:** Harness names describe provenance; they are not fallback
+agent IDs. `bun run audit:agent-identity` rejects implicit `hermes-agent`
+fallbacks while preserving explicit harness labels and comparisons.
+
 **Commit messages:** Conventional commits with a 50-character subject
 line and 72-character body width. Use imperative mood. Types: `feat`,
 `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`,
@@ -202,8 +221,14 @@ e.g. `feat(daemon): add rate limiting to auth middleware`.
 **File size:** Aim to keep files under ~700 LOC. Split or refactor when
 a file grows unwieldy, especially if it improves testability.
 
-**Comments:** Explain why, not what. Self-explanatory code needs no
-inline narration; non-obvious logic or workarounds deserve a brief note.
+**Comments:** Maintained source, tests, scripts, and configuration stay
+comment-free. Express invariants through names, types, structure, and tests.
+Run `bun run comments:write` after rebasing a branch, then verify with
+`bun run comments:check`. The deterministic rewrite excludes documentation,
+asset trees, generated output, vendored/reference trees, lockfiles, and license
+artifacts; it preserves shebangs, legal notices, and compiler, linter, coverage,
+bundler, and language-server directives whose comment syntax changes tool
+behavior.
 
 ### Naming
 

@@ -1,28 +1,82 @@
-/**
- * Typed Signet daemon API client. Covers the endpoints the redesigned
- * dashboard consumes (see surfaces/dashboard/DASHBOARD_API_MAP.md §3, §6). The
- * previous Svelte client had ~110 functions; only the surfaces the mockup
- * stages are implemented here. Gap-list items (§4) are intentionally absent,
- * but §6 documents which mockup surfaces already have daemon backing the Svelte
- * client never wired (review-queue, ontology proposals, os/chat, bitwarden).
- *
- * Base resolution mirrors the Electron + daemon contract: requests go to the
- * same origin (daemon in-browser; `app://signet/` proxies /api,/memory,/health
- * to the daemon in Electron).
- */
-
+import { dashboardQueryCache } from "./query-cache";
 import { installDemoApi } from "./demo";
+import { getDesktopBridge } from "./desktop";
+import { onboardingPreviewFetch, installOnboardingPreview } from "./onboarding-preview";
+import { authHeaders, noteUnauthorized } from "./session";
+
+export const onboardingPreview = import.meta.env.DEV && import.meta.env.VITE_ONBOARDING_PREVIEW === true;
 
 const API_BASE = "";
 
-/** Appends an optional API key/auth header if one is stored (dashboard auth). */
-function authHeaders(): HeadersInit {
-	const token = typeof localStorage !== "undefined" ? localStorage.getItem("signet-token") : null;
-	return token ? { Authorization: `Bearer ${token}` } : {};
+function invalidateMutation(path: string): void {
+	const resources = path.startsWith("/api/auth/api-keys")
+		? ["api-keys"]
+		: path.includes("/harnesses/")
+			? ["harnesses", "status", "identity", "agent-list"]
+			: path.includes("/secrets")
+				? ["secrets", "inference-"]
+				: path.includes("/inference/")
+					? ["inference-"]
+					: /\/(sources|memory|memories|knowledge|ontology|dream|reflections)(?:\/|\?|$)/.test(path)
+						? [
+								"sources",
+								"source-import",
+								"protection",
+								"knowledge-stats",
+								"constellation",
+								"recent-memories",
+								"timeline",
+								"proposals",
+								"dream-",
+							]
+						: null;
+	dashboardQueryCache.invalidate(
+		resources ? (key) => resources.some((resource) => key.includes(`:${resource}`)) : undefined,
+	);
+}
+
+async function dashboardFetch(path: string, init?: RequestInit): Promise<Response> {
+	if (onboardingPreview) return onboardingPreviewFetch(path, init);
+	const method = init?.method?.toUpperCase() ?? "GET";
+	const deadline = method === "GET" ? AbortSignal.timeout(20_000) : undefined;
+	const signal = init?.signal && deadline ? AbortSignal.any([init.signal, deadline]) : (init?.signal ?? deadline);
+	const response = await fetch(path, { ...init, signal });
+	if (response.status === 401) {
+		noteUnauthorized();
+		dashboardQueryCache.clear(false);
+	} else if (response.ok && method !== "GET" && !path.includes("/probe") && !path.includes("/decision"))
+		invalidateMutation(path);
+	return response;
 }
 
 async function getJSON<T>(path: string, init?: RequestInit): Promise<T | null> {
 	return (await getJSONResult<T>(path, init)).data;
+}
+
+export type ApiKeyRole = "admin" | "operator" | "agent" | "readonly";
+
+export interface ApiKeyRecord {
+	readonly id: string;
+	readonly prefix: string;
+	readonly name: string;
+	readonly role: ApiKeyRole;
+	readonly agentId: string | null;
+	readonly connector: string | null;
+	readonly createdAt: string;
+	readonly lastUsedAt: string | null;
+	readonly revokedAt: string | null;
+	readonly expiresAt: string | null;
+}
+
+export interface CreatedApiKey extends ApiKeyRecord {
+	readonly key: string;
+}
+
+export interface ApiKeyInput {
+	readonly name: string;
+	readonly role: ApiKeyRole;
+	readonly agentId?: string;
+	readonly expiresAt?: string;
 }
 
 export interface ApiReadResult<T> {
@@ -32,19 +86,36 @@ export interface ApiReadResult<T> {
 	readonly status?: number;
 }
 
+function describeForbidden(reason: string): string {
+	const permission = /lacks '([a-z]+)' permission/.exec(reason)?.[1];
+	if (permission) return `Requires the ${permission} permission.`;
+	const scope = /scope restricted to (\w+) '([^']+)'/.exec(reason);
+	if (scope) return `Your credential is limited to ${scope[1]} ${scope[2]}.`;
+	return reason;
+}
+
 export async function getJSONResult<T>(path: string, init?: RequestInit): Promise<ApiReadResult<T>> {
 	try {
-		const res = await fetch(`${API_BASE}${path}`, {
+		const res = await dashboardFetch(`${API_BASE}${path}`, {
 			...init,
 			headers: { Accept: "application/json", ...authHeaders(), ...(init?.headers ?? {}) },
 		});
 		const body = (await res.json().catch(() => null)) as { error?: unknown; details?: unknown } | T | null;
 		const errorBody = typeof body === "object" && body !== null && "error" in body;
 		if (!res.ok || errorBody) {
-			const error =
+			const reason =
 				typeof body === "object" && body !== null && "error" in body && typeof body.error === "string"
 					? body.error
 					: `request failed (${res.status})`;
+			const retryAfter = Number(res.headers.get("Retry-After"));
+			const error =
+				res.status === 403
+					? describeForbidden(reason)
+					: res.status === 429
+						? Number.isFinite(retryAfter) && retryAfter > 0
+							? `Too many requests. Try again in ${retryAfter}s.`
+							: "Too many requests. Try again shortly."
+						: reason;
 			const details = typeof body === "object" && body !== null && "details" in body ? body.details : undefined;
 			return { data: null, error, details, status: res.status };
 		}
@@ -71,9 +142,6 @@ async function postJSONResult<T>(path: string, body?: unknown, signal?: AbortSig
 		body: body ? JSON.stringify(body) : undefined,
 	});
 }
-
-/** POST/DELETE that preserves the daemon's `{error}` body on failure so
- *  forms can surface the real rejection reason. */
 async function mutateJSON<T extends { error?: string }>(
 	path: string,
 	method: "POST" | "DELETE",
@@ -81,7 +149,7 @@ async function mutateJSON<T extends { error?: string }>(
 	signal?: AbortSignal,
 ): Promise<{ ok: boolean; data: T | null }> {
 	try {
-		const res = await fetch(`${API_BASE}${path}`, {
+		const res = await dashboardFetch(`${API_BASE}${path}`, {
 			method,
 			signal,
 			headers: {
@@ -98,6 +166,10 @@ async function mutateJSON<T extends { error?: string }>(
 	}
 }
 
+function agentQuery(agentId: string | undefined): string {
+	return agentId ? `?agentId=${encodeURIComponent(agentId)}` : "";
+}
+
 async function postSourceImport(
 	agentId: string,
 	files: readonly File[],
@@ -105,7 +177,7 @@ async function postSourceImport(
 ): Promise<ApiReadResult<SourceImportJob>> {
 	const descriptors = files.map((file) => ({ id: crypto.randomUUID(), name: file.name }));
 	try {
-		const res = await fetch(`${API_BASE}/api/sources/imports?agentId=${encodeURIComponent(agentId)}`, {
+		const res = await dashboardFetch(`${API_BASE}/api/sources/imports?agentId=${encodeURIComponent(agentId)}`, {
 			method: "POST",
 			signal: AbortSignal.timeout(30_000),
 			headers: { "Content-Type": "application/json", Accept: "application/json", ...authHeaders() },
@@ -120,12 +192,20 @@ async function postSourceImport(
 	}
 }
 
-// ── Types (derived from real daemon responses) ──────────────────────────────
-
 export interface ConfigFile {
 	name: string;
 	content: string;
 	size: number;
+}
+
+export interface AssistantModelSelection {
+	readonly targetRef: string;
+	readonly model: string;
+}
+export interface AssistantModelOption extends AssistantModelSelection {
+	readonly name: string;
+	readonly provider: string;
+	readonly account: string;
 }
 
 export interface CatalogModel {
@@ -155,8 +235,6 @@ export interface InferenceCatalog {
 	oauthProviders: readonly OAuthProviderStatus[];
 	acpxAgents: readonly string[];
 }
-
-/** Subset of the inference router status the settings screens consume. */
 export interface InferenceStatus {
 	enabled?: boolean;
 	source?: string;
@@ -253,8 +331,6 @@ export interface TelemetryHealth {
 }
 
 export type TelemetryHealthResponse = { enabled: false } | ({ enabled: true } & TelemetryHealth);
-
-// 1Password service-account integration (daemon routes/secrets-routes.ts).
 export interface OnePasswordVault {
 	id: string;
 	name: string;
@@ -292,7 +368,20 @@ export interface DaemonStatus {
 		enabled: boolean;
 		paused: boolean;
 		shadowMode: boolean;
+		mutationsFrozen?: boolean;
+		graph?: { enabled?: boolean };
+		autonomous?: {
+			enabled?: boolean;
+			frozen?: boolean;
+			allowUpdateDelete?: boolean;
+			maintenanceMode?: "execute" | "observe";
+		};
 		extraction?: { provider?: string; model?: string };
+	};
+	dreaming?: {
+		enabled: boolean;
+		workerRunning: boolean;
+		blockedBy?: "disabled" | "paused" | "frozen" | "no_provider" | null;
 	};
 }
 
@@ -306,6 +395,8 @@ export interface KnowledgeStats {
 	entityCount: number;
 	aspectCount: number;
 	attributeCount: number;
+	claimCount: number;
+	constraintCount: number;
 	dependencyCount: number;
 	coveragePercent: number;
 }
@@ -313,10 +404,14 @@ export interface KnowledgeStats {
 export interface KnowledgeConstellation {
 	entities: Array<{
 		id: string;
+		agentId: string;
 		name: string;
 		entityType: string;
 		mentions: number;
 		pinned: boolean;
+		sourceId?: string | null;
+		sourceKind?: string | null;
+		sourcePath?: string | null;
 		aspects: Array<{
 			id: string;
 			name: string;
@@ -326,7 +421,15 @@ export interface KnowledgeConstellation {
 				content: string;
 				kind: string;
 				importance: number;
+				confidence: number;
 				version: number;
+				memoryId: string | null;
+				groupKey: string | null;
+				claimKey: string | null;
+				sourceKind: string | null;
+				sourceId: string | null;
+				sourcePath: string | null;
+				sourceRoot: string | null;
 			}>;
 		}>;
 	}>;
@@ -336,8 +439,33 @@ export interface KnowledgeConstellation {
 		dependencyType: string;
 		strength: number;
 	}>;
+	assertions: Array<{
+		id: string;
+		subjectEntityId: string;
+		claimAttributeId: string | null;
+		predicate: string;
+		content: string;
+		confidence: number;
+		speaker: string | null;
+		sourceKind: string | null;
+		sourceId: string | null;
+		sourcePath: string | null;
+		sourceRoot: string | null;
+		evidenceCount: number;
+		assertedAt: string;
+	}>;
 	proposals: Array<{ id: string }>;
-	metadata: { proposals: { pending: number } };
+	metadata: {
+		proposals: { pending: number };
+		dreaming?: {
+			episodicTokensPending: number | null;
+			episodicBacklogProbe?: KnowledgeConstellationBacklogProbe | null;
+		};
+	};
+}
+
+export interface KnowledgeConstellationBacklogProbe {
+	readonly kind: "exact" | "threshold-reached" | "indeterminate";
 }
 
 export interface OntologyProposal {
@@ -371,7 +499,6 @@ export interface Memory {
 	created_at: string;
 	who: string;
 	importance: number;
-	/** Inconsistent in the wild: string (delimited) | string[] | null. */
 	tags: string | string[] | null;
 	source_type?: string | null;
 	pinned: 0 | 1;
@@ -406,9 +533,12 @@ export interface SourceStats {
 }
 
 export interface SourceHealth {
-	status: "healthy" | "degraded" | "unhealthy" | "empty";
+	status: "healthy" | "degraded" | "unhealthy" | "empty" | "unknown";
+	error?: string;
 	latestArtifactAt?: string | null;
 	failures?: { total: number; recoverable: number };
+	checkpoints?: { total: number; partial: number; stale: number };
+	purge?: { deletedArtifacts: number; orphanChunks: number };
 	semantic?: {
 		entities: number;
 		aspects: number;
@@ -420,8 +550,6 @@ export interface SourceHealth {
 	};
 	importExtraction?: {
 		documentEntityId: string | null;
-		aspectsCreated: number;
-		attributesCreated: number;
 	};
 	permission?: {
 		status: "clear" | "denied";
@@ -442,15 +570,10 @@ export interface SignetSource {
 	lastIndexedAt?: string | null;
 	stats?: SourceStats;
 	health?: SourceHealth;
-	/** Present on daemons that track per-source index jobs. */
 	indexJob?: SourceIndexJob | null;
-	/** Top-level on the daemon entry (obsidian exclude globs). */
 	excludeGlobs?: string[];
-	/** Kind-specific config bag (github repos/tokenRef, discord guildIds/tokenRef) — mirrors core SignetSourceEntry. */
 	providerSettings?: Record<string, unknown> | null;
 }
-
-/** Mirrors daemon `source-index-progress.ts` SourceIndexJob. */
 export interface SourceIndexJob {
 	readonly id: string;
 	readonly sourceId: string;
@@ -495,12 +618,13 @@ export interface SourceImportsResponse {
 	readonly imports: readonly SourceImportJob[];
 }
 
+export type DashboardProtectionReport = import("@signet/core").ProtectionStatus;
 export interface SourcesResponse {
 	version: number;
 	sources: SignetSource[];
 }
 
-export type HarnessConnectorHealthStatus = "healthy" | "degraded" | "unhealthy" | "needs-auth";
+export type HarnessConnectorHealthStatus = "healthy" | "degraded" | "unhealthy" | "needs-auth" | "unknown";
 
 export interface HarnessConnectorHealth {
 	status: HarnessConnectorHealthStatus;
@@ -515,6 +639,7 @@ export interface HarnessConnectorCapabilities {
 }
 
 export interface HarnessConnector {
+	inspectionStatus?: "complete" | "unavailable";
 	id: string;
 	displayName: string;
 	kind: "harness";
@@ -554,8 +679,34 @@ export interface HarnessActionResponse {
 	readonly warnings?: readonly string[];
 }
 
-export interface SkillsResponse {
-	count: number;
+export interface Skill {
+	readonly name: string;
+	readonly description: string;
+	readonly version?: string;
+	readonly author?: string;
+	readonly userInvocable: boolean;
+	readonly argHint?: string;
+	readonly path?: string;
+}
+
+export interface SkillDetail extends Skill {
+	readonly content: string;
+}
+
+function readSkill(value: unknown): Skill | null {
+	if (!value || typeof value !== "object") return null;
+	const raw = value as Record<string, unknown>;
+	if (typeof raw.name !== "string" || raw.name.length === 0) return null;
+	const text = (key: string) => (typeof raw[key] === "string" && raw[key] ? (raw[key] as string) : undefined);
+	return {
+		name: raw.name,
+		description: text("description") ?? "",
+		version: text("version"),
+		author: text("author") ?? text("maintainer"),
+		userInvocable: raw.user_invocable === true,
+		argHint: text("arg_hint"),
+		path: text("path"),
+	};
 }
 
 export interface Agent {
@@ -584,8 +735,6 @@ export interface ImportSourcesResponse {
 				duplicate: boolean;
 				extraction?: {
 					documentEntityId: string | null;
-					aspectsCreated: number;
-					attributesCreated: number;
 				};
 		  }
 		| {
@@ -594,15 +743,11 @@ export interface ImportSourcesResponse {
 				sourceId: string;
 				extraction?: {
 					documentEntityId: string | null;
-					aspectsCreated: number;
-					attributesCreated: number;
 				};
 		  }
 		| { fileName: string; status: "failed"; error: string }
 	>;
 }
-
-/** Daily brief reflections — daemon `reflection-routes.ts` formatReflection. */
 export interface DailyReflection {
 	id: string;
 	date: string;
@@ -712,7 +857,7 @@ export interface DreamStatus {
 		tokenThreshold: number;
 		backfillOnFirstRun: boolean;
 		maxInputTokens: number;
-		maxOutputTokens: number;
+		maxOutputTokens: number | null;
 		timeout: number;
 	};
 	passes: DreamPass[];
@@ -720,11 +865,13 @@ export interface DreamStatus {
 	exclusions: ReadonlyArray<{ sourceKind: string; sourceId: string; reason: string }>;
 }
 
-// ── Client ──────────────────────────────────────────────────────────────────
-
 export const api = {
 	getStatus: () => getJSON<DaemonStatus>("/api/status"),
 	getIdentity: () => getJSON<DashboardIdentity>("/api/identity"),
+	connectHarness: (id: string, signal?: AbortSignal) =>
+		postJSONResult<{ success: boolean }>(`/api/harnesses/${encodeURIComponent(id)}/connect`, undefined, signal),
+	disconnectHarness: (id: string) =>
+		postJSONResult<{ success: boolean }>(`/api/harnesses/${encodeURIComponent(id)}/disconnect`, {}),
 	getHarnesses: () => getJSONResult<HarnessesResponse>("/api/harnesses"),
 	getHarnessHealth: (id: string) => getJSONResult<HarnessConnector>(`/api/harnesses/${encodeURIComponent(id)}/health`),
 	repairHarness: (id: string) =>
@@ -745,24 +892,20 @@ export const api = {
 	},
 	getHealth: async (): Promise<boolean> => {
 		try {
-			return (await fetch(`${API_BASE}/health`)).ok;
+			return (await dashboardFetch(`${API_BASE}/health`)).ok;
 		} catch {
 			return false;
 		}
 	},
-
-	// Dreaming
 	getDreamStatus: () => getJSON<DreamStatus>("/api/dream/status"),
 	getDreamPassTools: (passId: string) =>
 		getJSON<{ agentId: string; passId: string; items: DreamToolCall[] }>(
 			`/api/dream/passes/${encodeURIComponent(passId)}/tools`,
 		),
 	getDreamQuality: () => getJSON<DreamQuality>("/api/dream/quality"),
-	/** POST /api/dream/trigger — starts a pass asynchronously. 409 while a pass
-	 *  is already running; 503 when the dreaming worker is not up. */
 	triggerDream: async (mode: "incremental" | "compact" = "incremental") => {
 		try {
-			const res = await fetch(`${API_BASE}/api/dream/trigger`, {
+			const res = await dashboardFetch(`${API_BASE}/api/dream/trigger`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", ...authHeaders() },
 				body: JSON.stringify({ mode }),
@@ -782,8 +925,6 @@ export const api = {
 			return { ok: false, status: 0, passId: null, error: "daemon unreachable" };
 		}
 	},
-
-	// Memory
 	getMemories: (opts: { limit?: number; offset?: number; type?: string } = {}) => {
 		const p = new URLSearchParams();
 		if (opts.limit) p.set("limit", String(opts.limit));
@@ -792,13 +933,20 @@ export const api = {
 		const qs = p.toString();
 		return getJSON<{ memories: Memory[]; stats: MemoryStats }>(`/api/memories${qs ? `?${qs}` : ""}`);
 	},
-	getSkills: async (): Promise<SkillsResponse | null> => {
-		const result = await getJSONResult<{ count?: unknown; skills?: unknown; error?: unknown }>("/api/skills");
-		if (result.error) return null;
+	getSkills: async (): Promise<readonly Skill[] | null> => {
+		const result = await getJSONResult<{ skills?: unknown; error?: unknown }>("/api/skills");
 		const data = result.data;
-		if (typeof data?.error === "string") return null;
-		if (typeof data?.count === "number") return { count: data.count };
-		return Array.isArray(data?.skills) ? { count: data.skills.length } : null;
+		if (result.error || typeof data?.error === "string" || !Array.isArray(data?.skills)) return null;
+		return data.skills
+			.map(readSkill)
+			.filter((skill): skill is Skill => skill !== null)
+			.sort((a, b) => a.name.localeCompare(b.name));
+	},
+	getSkill: async (name: string): Promise<SkillDetail | null> => {
+		const result = await getJSONResult<Record<string, unknown>>(`/api/skills/${encodeURIComponent(name)}`);
+		const skill = readSkill(result.data);
+		const content = result.data?.content;
+		return skill && typeof content === "string" ? { ...skill, content } : null;
 	},
 	getMemoryTimeline: (tzOffset = 0) => getJSON<MemoryTimeline>(`/api/memory/timeline?tzOffset=${tzOffset}`),
 	getEmbeddingHealth: () => getJSON<EmbeddingHealthReport>("/api/embeddings/health"),
@@ -813,14 +961,13 @@ export const api = {
 		const result = await getJSON<{ results?: Memory[] }>(`/memory/search?${params}`);
 		return result ? { memories: result.results ?? [] } : null;
 	},
-	/** PATCH /api/memory/:id — daemon requires a non-empty `reason`. */
 	updateMemory: async (
 		id: string,
 		patch: { pinned?: boolean; content?: string; type?: string; tags?: string[] | null; importance?: number },
 		reason: string,
 	): Promise<{ ok: boolean; error?: string }> => {
 		try {
-			const res = await fetch(`${API_BASE}/api/memory/${encodeURIComponent(id)}`, {
+			const res = await dashboardFetch(`${API_BASE}/api/memory/${encodeURIComponent(id)}`, {
 				method: "PATCH",
 				headers: { "Content-Type": "application/json", ...authHeaders() },
 				body: JSON.stringify({ ...patch, reason }),
@@ -832,10 +979,9 @@ export const api = {
 			return { ok: false, error: "daemon unreachable" };
 		}
 	},
-	/** DELETE /api/memory/:id — soft delete; daemon requires a non-empty `reason`. */
 	deleteMemory: async (id: string, reason: string): Promise<{ ok: boolean; error?: string }> => {
 		try {
-			const res = await fetch(`${API_BASE}/api/memory/${encodeURIComponent(id)}`, {
+			const res = await dashboardFetch(`${API_BASE}/api/memory/${encodeURIComponent(id)}`, {
 				method: "DELETE",
 				headers: { "Content-Type": "application/json", ...authHeaders() },
 				body: JSON.stringify({ reason }),
@@ -847,20 +993,16 @@ export const api = {
 			return { ok: false, error: "daemon unreachable" };
 		}
 	},
-
-	/** GET /api/reflections/today — today's daily brief reflections (newest first). */
 	getTodayReflections: (agentId?: string) => {
 		const q = agentId && agentId !== "default" ? `?agentId=${encodeURIComponent(agentId)}` : "";
 		return getJSON<TodayReflectionResponse>(`/api/reflections/today${q}`);
 	},
-	/** POST /api/reflections/generate — LLM daily brief(s); slow by nature (up to ~2min).
-	 *  Omitted count falls back to the daemon's configured daily brief count. */
 	generateReflections: async (agentId: string | undefined, count?: number): Promise<TodayReflectionResponse> => {
 		const agentQ = agentId && agentId !== "default" ? `?agentId=${encodeURIComponent(agentId)}` : "";
 		const sep = agentQ ? "&" : "?";
 		const countQ = count === undefined ? "" : `${sep}count=${count}`;
 		try {
-			const res = await fetch(`${API_BASE}/api/reflections/generate${agentQ}${countQ}`, {
+			const res = await dashboardFetch(`${API_BASE}/api/reflections/generate${agentQ}${countQ}`, {
 				method: "POST",
 				headers: authHeaders(),
 			});
@@ -873,7 +1015,6 @@ export const api = {
 			return { reflection: null, reflections: [], error: "Failed to reach the daemon" };
 		}
 	},
-	/** POST /api/reflections/:id/answer — writes the answer back into the memory thread. */
 	answerReflection: async (
 		id: string,
 		answer: string,
@@ -881,7 +1022,7 @@ export const api = {
 	): Promise<{ success: boolean; memoryId?: string; error?: string }> => {
 		const q = agentId && agentId !== "default" ? `?agentId=${encodeURIComponent(agentId)}` : "";
 		try {
-			const res = await fetch(`${API_BASE}/api/reflections/${encodeURIComponent(id)}/answer${q}`, {
+			const res = await dashboardFetch(`${API_BASE}/api/reflections/${encodeURIComponent(id)}/answer${q}`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", ...authHeaders() },
 				body: JSON.stringify({ answer: answer.trim() }),
@@ -893,12 +1034,10 @@ export const api = {
 			return { success: false, error: "daemon unreachable" };
 		}
 	},
-
-	// Knowledge graph
 	getKnowledgeStats: () => getJSON<KnowledgeStats>("/api/knowledge/stats"),
-	getKnowledgeConstellation: (limit = 48, dependencyLimit = 160) =>
+	getKnowledgeConstellation: (limit = 48, dependencyLimit = 160, agentId = "all") =>
 		getJSON<KnowledgeConstellation>(
-			`/api/knowledge/constellation?limit=${limit}&max_aspects_per_entity=4&dependency_limit=${dependencyLimit}`,
+			`/api/knowledge/constellation?limit=${limit}&max_aspects_per_entity=4&dependency_limit=${dependencyLimit}&agent_id=${encodeURIComponent(agentId)}`,
 		),
 	getOntologyProposals: (status: "pending" | "applied" | "rejected" | "failed" = "pending", limit = 20) =>
 		getJSON<{ items: OntologyProposal[]; limit: number; offset: number }>(
@@ -919,13 +1058,13 @@ export const api = {
 		);
 		return { ok, error: ok ? undefined : (data?.error ?? "Failed to reject proposal") };
 	},
-
-	// Sources
 	getSources: () => getJSON<SourcesResponse>("/api/sources"),
-	getSourceImports: () => getJSONResult<SourceImportsResponse>("/api/sources/imports"),
-	getSourceImport: (jobId: string) =>
+	getProtection: () => getJSONResult<DashboardProtectionReport>("/api/protection"),
+	getSourceImports: (agentId?: string) =>
+		getJSONResult<SourceImportsResponse>(`/api/sources/imports${agentQuery(agentId)}`),
+	getSourceImport: (jobId: string, agentId?: string) =>
 		getJSONResult<{ job: SourceImportJob; files: SourceImportFile[] }>(
-			`/api/sources/imports/${encodeURIComponent(jobId)}`,
+			`/api/sources/imports/${encodeURIComponent(jobId)}${agentQuery(agentId)}`,
 		),
 	createSourceImport: (
 		agentId: string,
@@ -985,7 +1124,7 @@ export const api = {
 						return { data: null, error: "File prefix differs from the retained upload" };
 				} else {
 					for (let attempt = 0; ; attempt++) {
-						const response = await fetch(`${path}${query}`, {
+						const response = await dashboardFetch(`${path}${query}`, {
 							method: "PATCH",
 							signal: AbortSignal.timeout(60_000),
 							headers: {
@@ -1029,7 +1168,7 @@ export const api = {
 				},
 			};
 			for (let attempt = 0; ; attempt++) {
-				const response = await fetch(finalizePath, {
+				const response = await dashboardFetch(finalizePath, {
 					...finalizeOptions,
 					signal: AbortSignal.timeout(15 * 60_000),
 				}).catch(() => null);
@@ -1054,19 +1193,19 @@ export const api = {
 			return { data: null, error: error instanceof Error ? error.message : "Upload failed" };
 		}
 	},
-	controlSourceImport: (jobId: string, action: "start" | "pause" | "resume" | "retry" | "cancel") =>
+	controlSourceImport: (jobId: string, action: "start" | "pause" | "resume" | "retry" | "cancel", agentId?: string) =>
 		postJSON<{ jobId: string; control: string; changed: boolean }>(
-			`/api/sources/imports/${encodeURIComponent(jobId)}/${action}`,
+			`/api/sources/imports/${encodeURIComponent(jobId)}/${action}${agentQuery(agentId)}`,
 			undefined,
 			AbortSignal.timeout(30_000),
 		),
-	getSourceImportRejections: (jobId: string) =>
+	getSourceImportRejections: (jobId: string, agentId?: string) =>
 		getJSON<{ jobId: string; rejections: readonly unknown[] }>(
-			`/api/sources/imports/${encodeURIComponent(jobId)}/rejections`,
+			`/api/sources/imports/${encodeURIComponent(jobId)}/rejections${agentQuery(agentId)}`,
 		),
-	getSourceImportReconciliation: (jobId: string) =>
+	getSourceImportReconciliation: (jobId: string, agentId?: string) =>
 		getJSON<{ jobId: string; reconciliation: readonly unknown[] }>(
-			`/api/sources/imports/${encodeURIComponent(jobId)}/reconciliation`,
+			`/api/sources/imports/${encodeURIComponent(jobId)}/reconciliation${agentQuery(agentId)}`,
 		),
 	importSources: async (
 		files: readonly File[],
@@ -1078,7 +1217,7 @@ export const api = {
 			for (const file of files) form.append("files", file, file.name);
 			for (const path of paths) form.append("paths", path);
 			form.set("duplicateMode", duplicateMode);
-			const res = await fetch(`${API_BASE}/api/sources/import`, {
+			const res = await dashboardFetch(`${API_BASE}/api/sources/import`, {
 				method: "POST",
 				headers: authHeaders(),
 				body: form,
@@ -1089,10 +1228,18 @@ export const api = {
 			return { ok: false, error: "daemon unreachable" };
 		}
 	},
-	/** POST /api/sources/pick-files — native multi-file picker for a local desktop daemon. */
 	pickFiles: async (): Promise<{ ok: boolean; paths?: string[]; unavailable?: boolean; error?: string }> => {
+		const desktop = getDesktopBridge();
+		if (desktop?.pickFiles) {
+			try {
+				const paths = await desktop.pickFiles({ title: "Choose files to import" });
+				return { ok: true, paths: paths ? [...paths] : [] };
+			} catch {
+				return { ok: false, error: "desktop file picker failed" };
+			}
+		}
 		try {
-			const res = await fetch(`${API_BASE}/api/sources/pick-files`, {
+			const res = await dashboardFetch(`${API_BASE}/api/sources/pick-files`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", ...authHeaders() },
 				body: JSON.stringify({ title: "Choose files to import" }),
@@ -1104,7 +1251,6 @@ export const api = {
 			return { ok: false, error: "daemon unreachable" };
 		}
 	},
-	/** Re-index = re-POST the source's own config; the daemon upserts (created:false) and re-queues an index job. */
 	reindexSource: async (source: SignetSource): Promise<{ ok: boolean; error?: string }> => {
 		const ps = source.providerSettings ?? {};
 		const tokenRef = typeof ps.tokenRef === "string" && ps.tokenRef ? ps.tokenRef : undefined;
@@ -1112,15 +1258,17 @@ export const api = {
 			obsidian: { root: source.root, name: source.name, excludeGlobs: source.excludeGlobs },
 			web: { url: source.root },
 			github: { repos: Array.isArray(ps.repos) ? ps.repos : [], tokenRef, name: source.name },
+			notion: { tokenRef, name: source.name },
 			discord: { guildIds: Array.isArray(ps.guildIds) ? ps.guildIds : [], tokenRef, name: source.name },
 		};
 		const body = bodies[source.kind] as { repos?: unknown[]; guildIds?: unknown[] } | undefined;
 		if (!body) return { ok: false, error: `re-index not supported for ${source.kind}` };
 		if (source.kind === "github" && !body.repos?.length) return { ok: false, error: "source config is missing repos" };
+		if (source.kind === "notion" && !tokenRef) return { ok: false, error: "source config is missing tokenRef" };
 		if (source.kind === "discord" && !body.guildIds?.length)
 			return { ok: false, error: "source config is missing guild ids" };
 		try {
-			const res = await fetch(`${API_BASE}/api/sources/${source.kind}`, {
+			const res = await dashboardFetch(`${API_BASE}/api/sources/${source.kind}`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", ...authHeaders() },
 				body: JSON.stringify(body),
@@ -1132,10 +1280,9 @@ export const api = {
 			return { ok: false, error: "daemon unreachable" };
 		}
 	},
-	/** DELETE /api/sources/:id — removes config and purges indexed artifacts. */
 	removeSource: async (id: string): Promise<{ ok: boolean; error?: string }> => {
 		try {
-			const res = await fetch(`${API_BASE}/api/sources/${encodeURIComponent(id)}`, {
+			const res = await dashboardFetch(`${API_BASE}/api/sources/${encodeURIComponent(id)}`, {
 				method: "DELETE",
 				headers: authHeaders(),
 			});
@@ -1146,10 +1293,9 @@ export const api = {
 			return { ok: false, error: "daemon unreachable" };
 		}
 	},
-	/** POST /api/sources/:kind — connect a source; daemon upserts and queues an index job (202). */
 	addSource: async (kind: string, body: unknown): Promise<{ ok: boolean; error?: string }> => {
 		try {
-			const res = await fetch(`${API_BASE}/api/sources/${kind}`, {
+			const res = await dashboardFetch(`${API_BASE}/api/sources/${kind}`, {
 				method: "POST",
 				signal: AbortSignal.timeout(30_000),
 				headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -1162,10 +1308,18 @@ export const api = {
 			return { ok: false, error: "daemon unreachable" };
 		}
 	},
-	/** POST /api/sources/pick-directory — native folder picker (Electron only; 501 in a plain browser). */
 	pickDirectory: async (): Promise<{ ok: boolean; path?: string; unavailable?: boolean }> => {
+		const desktop = getDesktopBridge();
+		if (desktop?.pickDirectory) {
+			try {
+				const path = await desktop.pickDirectory({ title: "Choose your vault folder" });
+				return path ? { ok: true, path } : { ok: false };
+			} catch {
+				return { ok: false };
+			}
+		}
 		try {
-			const res = await fetch(`${API_BASE}/api/sources/pick-directory`, {
+			const res = await dashboardFetch(`${API_BASE}/api/sources/pick-directory`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", ...authHeaders() },
 				body: JSON.stringify({ title: "Choose your vault folder" }),
@@ -1178,10 +1332,9 @@ export const api = {
 			return { ok: false };
 		}
 	},
-	/** GET /api/sources/:id/snapshot — exported artifact payload (downloaded client-side). */
 	getSourceSnapshot: async (id: string): Promise<unknown | null> => {
 		try {
-			const res = await fetch(`${API_BASE}/api/sources/${encodeURIComponent(id)}/snapshot`, {
+			const res = await dashboardFetch(`${API_BASE}/api/sources/${encodeURIComponent(id)}/snapshot`, {
 				headers: authHeaders(),
 			});
 			if (!res.ok) return null;
@@ -1190,15 +1343,19 @@ export const api = {
 			return null;
 		}
 	},
-
-	// Home
 	getHomeGreeting: () => getJSON<HomeGreeting>("/api/home/greeting"),
 	getContinuityLatest: () => getJSON<{ scores: ContinuityScore[] }>("/api/analytics/continuity/latest"),
-
-	// Secrets (the unlock gate maps to dashboard auth; names list is plaintext)
 	getSecrets: () => getJSON<{ secrets?: string[]; provider?: string }>("/api/secrets"),
-
-	// 1Password service-account integration (secrets vault panel)
+	listApiKeys: () => getJSONResult<{ apiKeys: ApiKeyRecord[] }>("/api/auth/api-keys"),
+	createApiKey: (input: ApiKeyInput) =>
+		postJSONResult<{ apiKey: CreatedApiKey }>("/api/auth/api-keys", {
+			name: input.name,
+			role: input.role,
+			...(input.agentId ? { agentId: input.agentId, scope: { agent: input.agentId } } : {}),
+			...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+		}),
+	revokeApiKey: (id: string) =>
+		getJSONResult<{ apiKey: ApiKeyRecord }>(`/api/auth/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
 	getOnePasswordStatus: async (): Promise<OnePasswordStatus> => {
 		const data = await getJSON<Partial<OnePasswordStatus>>("/api/secrets/1password/status");
 		return {
@@ -1234,10 +1391,8 @@ export const api = {
 		if (!ok) return { success: false, error: data?.error ?? "Failed to import from 1Password" };
 		return { ...data, success: true };
 	},
-
-	// Inference (settings modal) — the catalog drives the provider connect
-	// wall and the backend/model pickers. Defensive defaults mirror the old
-	// Svelte panel so a pre-#968 daemon just shows fewer cards.
+	getAssistantModels: (signal?: AbortSignal) =>
+		getJSONResult<{ models: readonly AssistantModelOption[] }>("/api/assistant/models", { signal }),
 	getInferenceCatalog: async (): Promise<InferenceCatalog | null> => {
 		const c = await getJSON<Partial<InferenceCatalog>>("/api/inference/catalog");
 		if (!c) return null;
@@ -1269,16 +1424,14 @@ export const api = {
 			refresh: boolean;
 		},
 		signal?: AbortSignal,
-	) => postJSON<InferenceProbeResult>("/api/inference/execute", body, signal ?? AbortSignal.timeout(30_000)),
-
-	// Config files (settings: agent.yaml read/write)
+	) => postJSONResult<InferenceProbeResult>("/api/inference/execute", body, signal ?? AbortSignal.timeout(30_000)),
 	getConfigFiles: async (): Promise<ConfigFile[]> => {
 		const data = await getJSON<{ files?: ConfigFile[] }>("/api/config", { signal: AbortSignal.timeout(10_000) });
 		return data?.files ?? [];
 	},
 	saveConfigFile: async (file: string, content: string): Promise<SaveConfigResult> => {
 		try {
-			const res = await fetch(`${API_BASE}/api/config`, {
+			const res = await dashboardFetch(`${API_BASE}/api/config`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json", ...authHeaders() },
 				body: JSON.stringify({ file, content }),
@@ -1291,39 +1444,34 @@ export const api = {
 			return { ok: false, status: 0, error: "daemon unreachable" };
 		}
 	},
-
-	// Secrets vault (provider API keys — values are never read back)
-	putSecret: async (name: string, value: string, signal?: AbortSignal): Promise<{ ok: boolean; error?: string }> => {
-		const { ok, data } = await mutateJSON<{ error?: string }>(
+	putSecret: async (
+		name: string,
+		value: string,
+		signal?: AbortSignal,
+		authorizeKeyring = false,
+	): Promise<{ ok: boolean; error?: string; authorizationRequired?: boolean }> => {
+		const { ok, data } = await mutateJSON<{ error?: string; authorizationRequired?: boolean }>(
 			`/api/secrets/${encodeURIComponent(name)}`,
 			"POST",
-			{
-				value,
-			},
-			signal ?? AbortSignal.timeout(30_000),
+			{ value, ...(authorizeKeyring ? { authorizeKeyring: true } : {}) },
+			signal
+				? AbortSignal.any([signal, AbortSignal.timeout(authorizeKeyring ? 150_000 : 30_000)])
+				: AbortSignal.timeout(authorizeKeyring ? 150_000 : 30_000),
 		);
-		return { ok, error: ok ? undefined : (data?.error ?? "Failed to store secret") };
+		return {
+			ok,
+			error: ok ? undefined : (data?.error ?? "Failed to store secret"),
+			authorizationRequired: !ok && data?.authorizationRequired === true,
+		};
 	},
 	deleteSecret: async (name: string): Promise<{ ok: boolean; error?: string }> => {
 		const { ok, data } = await mutateJSON<{ error?: string }>(`/api/secrets/${encodeURIComponent(name)}`, "DELETE");
 		return { ok, error: ok ? undefined : (data?.error ?? "Failed to delete secret") };
 	},
-
-	// Daemon logs (settings → Logs section)
 	getLogs: (limit = 200) => getJSON<{ logs: LogEntry[]; count: number }>(`/api/logs?limit=${limit}`),
 	getTelemetryHealth: () => getJSON<TelemetryHealthResponse>("/api/telemetry/health"),
 };
-
-// postJSON is exported for future mutation surfaces (review-queue apply/reject,
-// ontology proposals, dream trigger). Not currently called from a built view.
 export { postJSON };
-
-/**
- * Start a daemon-side OAuth login and pump its SSE stream. Ported 1:1 from
- * the old Svelte client — the stream is consumed via fetch + reader (no
- * EventSource, since the login is a POST). The session id arrives either in
- * the X-Signet-OAuth-Session-Id response header or the first `session` event.
- */
 export function startOAuthLogin(providerId: string): OAuthLoginHandle {
 	const handlers: Array<(event: OAuthLoginEvent) => void> = [];
 	const errorHandlers: Array<(message: string) => void> = [];
@@ -1337,7 +1485,7 @@ export function startOAuthLogin(providerId: string): OAuthLoginHandle {
 		for (const h of errorHandlers) h(message);
 	};
 
-	const pump = fetch(`${API_BASE}/api/inference/oauth/login/${encodeURIComponent(providerId)}`, {
+	const pump = dashboardFetch(`${API_BASE}/api/inference/oauth/login/${encodeURIComponent(providerId)}`, {
 		method: "POST",
 		headers: { Accept: "text/event-stream", ...authHeaders() },
 		signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10 * 60_000)]),
@@ -1348,9 +1496,7 @@ export function startOAuthLogin(providerId: string): OAuthLoginHandle {
 				try {
 					const body = (await response.json()) as { error?: string };
 					if (body?.error) message = body.error;
-				} catch {
-					/* keep status message */
-				}
+				} catch {}
 				throw new Error(message);
 			}
 			capturedSessionId = response.headers.get("X-Signet-OAuth-Session-Id");
@@ -1404,7 +1550,7 @@ export function startOAuthLogin(providerId: string): OAuthLoginHandle {
 }
 
 export async function completeOAuthInteraction(sessionId: string, responseId: string, value: string): Promise<boolean> {
-	const res = await fetch(`${API_BASE}/api/inference/oauth/complete`, {
+	const res = await dashboardFetch(`${API_BASE}/api/inference/oauth/complete`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json", ...authHeaders() },
 		body: JSON.stringify({ sessionId, responseId, value }),
@@ -1414,17 +1560,78 @@ export async function completeOAuthInteraction(sessionId: string, responseId: st
 }
 
 export async function disconnectOAuthProvider(providerId: string): Promise<boolean> {
-	const res = await fetch(`${API_BASE}/api/inference/oauth/disconnect/${encodeURIComponent(providerId)}`, {
+	const res = await dashboardFetch(`${API_BASE}/api/inference/oauth/disconnect/${encodeURIComponent(providerId)}`, {
 		method: "POST",
 		headers: authHeaders(),
 	});
 	return res.ok;
 }
-
-// Demo build (VITE_DEMO=1): the marketing site embeds the real dashboard
-// with fixture data instead of screenshots. Vite replaces the flag with a
-// literal at build time, so this call is dead code — and the demo module is
-// tree-shaken — from every non-demo build (daemon + Electron).
 if (import.meta.env.VITE_DEMO === "1") {
 	installDemoApi(api);
+}
+if (onboardingPreview) installOnboardingPreview(api);
+
+export async function streamAssistantChat(
+	messages: readonly import("@signet/core").AssistantChatMessage[],
+	onEvent: (event: import("@signet/core").AssistantChatEvent) => void,
+	signal: AbortSignal,
+	conversationId: string,
+	selectedEntityId?: string,
+	modelSelection?: AssistantModelSelection,
+): Promise<void> {
+	const { parseAssistantChatEvent } = await import("@signet/core/assistant-chat");
+	const response = await dashboardFetch("/api/assistant/chat", {
+		method: "POST",
+		signal,
+		headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders() },
+		body: JSON.stringify({
+			requestId: crypto.randomUUID(),
+			conversationId,
+			messages,
+			selectedEntityId,
+			modelSelection: modelSelection ? { targetRef: modelSelection.targetRef, model: modelSelection.model } : undefined,
+		}),
+	});
+	if (!response.ok) {
+		const body: unknown = await response.json().catch(() => null);
+		throw new Error(
+			typeof body === "object" && body !== null && "error" in body && typeof body.error === "string"
+				? body.error
+				: `Assistant unavailable (${response.status})`,
+		);
+	}
+	if (!response.body) throw new Error("Assistant stream unavailable");
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	let finished = false;
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			buffer += decoder.decode(value, { stream: !done });
+			if (buffer.length > 1024 * 1024) throw new Error("Assistant event limit exceeded");
+			let boundary = buffer.indexOf("\n\n");
+			while (boundary >= 0) {
+				const frame = buffer.slice(0, boundary);
+				buffer = buffer.slice(boundary + 2);
+				const data = frame
+					.split("\n")
+					.filter((line) => line.startsWith("data: "))
+					.map((line) => line.slice(6))
+					.join("\n");
+				if (data) {
+					const event = parseAssistantChatEvent(JSON.parse(data));
+					onEvent(event);
+					if (event.type === "error") throw new Error(event.message);
+					if (event.type === "done") finished = true;
+				}
+				boundary = buffer.indexOf("\n\n");
+			}
+			if (done) break;
+		}
+		if (!finished) throw new Error("Assistant stream ended before completion");
+	} finally {
+		await reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
 }

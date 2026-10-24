@@ -13,6 +13,7 @@ import {
 	type SignetInstallMethod,
 	type SignetInstallationReport,
 	type SignetUpdateTarget,
+	type WorkspaceSourceRepoSyncOptions,
 	type WorkspaceSourceRepoSyncResult,
 	detectSignetInstallations,
 	parseSimpleYaml,
@@ -40,10 +41,6 @@ import {
 	verifyExecutableVersion,
 } from "./update-install";
 import { compareVersions, isMajorUpgrade, isVersionNewer } from "./version";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export interface UpdateInfo {
 	currentVersion: string;
@@ -89,7 +86,7 @@ export type UpdateChannel = "stable" | "nightly";
 
 export interface UpdateConfig {
 	autoInstall: boolean;
-	checkInterval: number; // seconds
+	checkInterval: number;
 	channel: UpdateChannel;
 }
 
@@ -131,10 +128,6 @@ export interface DesktopInstallDetection {
 	readonly reason?: string;
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const GITHUB_REPO = "Signet-AI/signetai";
 const NPM_PACKAGE = "signetai";
 const CHANNEL_TO_NPM_TAG: Record<UpdateChannel, "latest" | "next"> = {
@@ -147,10 +140,6 @@ export const MIN_UPDATE_INTERVAL_SECONDS = 300;
 export const MAX_UPDATE_INTERVAL_SECONDS = 604800;
 export const DESKTOP_UPDATE_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_UPDATE_INTERVAL_SECONDS = 21600;
-
-// ---------------------------------------------------------------------------
-// Module state
-// ---------------------------------------------------------------------------
 
 const SILENT_UPDATE_LOGGER: UpdateLogger = {
 	info: () => undefined,
@@ -177,10 +166,6 @@ let updateConfig: UpdateConfig = {
 	channel: "stable" as const,
 };
 let restartCallback: ((preferredExecutablePath?: string) => void) | null = null;
-
-// ---------------------------------------------------------------------------
-// Init / accessors
-// ---------------------------------------------------------------------------
 
 export interface UpdateSystemRuntime {
 	readonly logger?: UpdateLogger;
@@ -226,16 +211,10 @@ export function getUpdateState(): UpdateState {
 export function getUpdateConfig(): UpdateConfig {
 	return { ...updateConfig };
 }
-
-/** Read the canonical update config for daemonless recovery commands. */
 export function readUpdateConfigOffline(): UpdateConfig {
 	assertInitialized();
 	return { ...updateConfig };
 }
-
-// ---------------------------------------------------------------------------
-// Error categorization
-// ---------------------------------------------------------------------------
 
 export function categorizeUpdateError(raw: string): string {
 	const lower = raw.toLowerCase();
@@ -258,10 +237,6 @@ export function categorizeUpdateError(raw: string): string {
 
 	return raw;
 }
-
-// ---------------------------------------------------------------------------
-// Human-readable summary (sync — reads in-memory state only)
-// ---------------------------------------------------------------------------
 
 export function getUpdateSummary(): string | null {
 	if (currentVersion === "0.0.0") {
@@ -295,10 +270,6 @@ export function getUpdateSummary(): string | null {
 
 	return null;
 }
-
-// ---------------------------------------------------------------------------
-// Config helpers
-// ---------------------------------------------------------------------------
 
 export function parseBooleanFlag(value: unknown): boolean | null {
 	if (typeof value === "boolean") return value;
@@ -370,9 +341,7 @@ function loadUpdateConfig(): UpdateConfig {
 			}
 
 			break;
-		} catch {
-			// ignore parse errors
-		}
+		} catch {}
 	}
 
 	return defaults;
@@ -415,10 +384,6 @@ export function persistUpdateConfig(config: UpdateConfig): boolean {
 
 	return false;
 }
-
-// ---------------------------------------------------------------------------
-// Network
-// ---------------------------------------------------------------------------
 
 async function fetchStableFromGitHub(): Promise<{
 	version: string;
@@ -471,10 +436,6 @@ async function fetchLatestFromNpm(channel: UpdateChannel = "stable"): Promise<st
 
 	return version;
 }
-
-// ---------------------------------------------------------------------------
-// Core: check + install
-// ---------------------------------------------------------------------------
 
 export async function checkForUpdates(): Promise<UpdateInfo> {
 	assertInitialized();
@@ -544,14 +505,15 @@ export function normalizeTargetVersion(targetVersion: string | undefined): strin
 }
 
 interface FinalizeSuccessfulUpdateDeps {
-	syncWorkspaceSourceRepoAsync?: (workspaceDir: string) => Promise<WorkspaceSourceRepoSyncResult>;
+	syncWorkspaceSourceRepoAsync?: (
+		workspaceDir: string,
+		options?: WorkspaceSourceRepoSyncOptions,
+	) => Promise<WorkspaceSourceRepoSyncResult>;
 	updateDesktopInstallAfterUpdate?: (
 		repoSync: WorkspaceSourceRepoSyncResult,
 		installedVersion: string,
 		activeExecutablePath: string,
 	) => Promise<DesktopUpdateResult>;
-	/** Lifecycle hook (issue #1026 Phase 2): fired with (from, to) after a
-	 *  successful install so the daemon can emit `version.upgraded`. */
 	onUpgraded?: (from: string, to: string) => void;
 }
 
@@ -563,8 +525,6 @@ interface SuccessfulUpdateMetadata {
 interface RunUpdateDeps extends UpdateInstallDeps {
 	readonly detectInstallations?: () => SignetInstallationReport;
 	readonly finalizeSuccessfulUpdate?: typeof finalizeSuccessfulUpdateInstall;
-	/** Lifecycle hook (issue #1026 Phase 2): (from, to) after a successful
-	 *  install; forwarded into finalizeSuccessfulUpdateInstall. */
 	readonly onUpgraded?: (from: string, to: string) => void;
 }
 
@@ -591,12 +551,6 @@ function updateFailure(
 		...(options.observedVersion ? { observedVersion: options.observedVersion } : {}),
 	};
 }
-
-/**
- * When a package-manager daemon coexists with a direct native install, keep
- * the native installation authoritative. This is the common mixed-install
- * shape where npm is needed for `signet-mcp` but should not own Signet updates.
- */
 export function selectUpdateTarget(report: SignetInstallationReport): SignetUpdateTarget {
 	if (report.target.kind !== "package-manager") return report.target;
 
@@ -778,7 +732,7 @@ export async function finalizeSuccessfulUpdateInstall(
 	stdout: string,
 	metadata: SuccessfulUpdateMetadata,
 	deps: FinalizeSuccessfulUpdateDeps = {
-		syncWorkspaceSourceRepoAsync: (workspaceDir) => syncWorkspaceSourceRepoAsync(workspaceDir),
+		syncWorkspaceSourceRepoAsync: (workspaceDir, options) => syncWorkspaceSourceRepoAsync(workspaceDir, options),
 		updateDesktopInstallAfterUpdate: (repoSync, version, activeExecutablePath) =>
 			updateDesktopInstallAfterUpdate(repoSync, version, {
 				signetCliPath: activeExecutablePath,
@@ -792,8 +746,9 @@ export async function finalizeSuccessfulUpdateInstall(
 	let repoSync: WorkspaceSourceRepoSyncResult;
 	try {
 		repoSync = await (
-			deps.syncWorkspaceSourceRepoAsync ?? ((workspaceDir) => syncWorkspaceSourceRepoAsync(workspaceDir))
-		)(agentsDir);
+			deps.syncWorkspaceSourceRepoAsync ??
+			((workspaceDir, options) => syncWorkspaceSourceRepoAsync(workspaceDir, options))
+		)(agentsDir, { localChanges: "stash" });
 	} catch (error) {
 		repoSync = {
 			status: "error",
@@ -841,9 +796,10 @@ export async function finalizeSuccessfulUpdateInstall(
 
 	updateLogger.info("system", "Update installed successfully");
 	deps.onUpgraded?.(currentVersion, installedVersion);
+	const sourceChangesRecovery = repoSync.stashRef ? sourceChangesRecoveryMessage(repoSync) : "";
 	return {
 		success: true,
-		message: "Update installed. Restart daemon to apply.",
+		message: `Update installed. Restart daemon to apply.${sourceChangesRecovery}`,
 		output: stdout,
 		installedVersion,
 		restartRequired: true,
@@ -853,6 +809,11 @@ export async function finalizeSuccessfulUpdateInstall(
 		observedVersion: installedVersion,
 		desktopUpdate,
 	};
+}
+
+function sourceChangesRecoveryMessage(repoSync: WorkspaceSourceRepoSyncResult): string {
+	if (!repoSync.stashRef) return "";
+	return `\nLocal source changes were preserved in stash ${repoSync.stashRef}. Restore with: git -C "${repoSync.path}" stash apply ${repoSync.stashRef}`;
 }
 
 export async function runUpdate(targetVersion?: string, deps: RunUpdateDeps = {}): Promise<UpdateRunResult> {
@@ -987,10 +948,6 @@ export async function runUpdate(targetVersion?: string, deps: RunUpdateDeps = {}
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Auto-update cycle
-// ---------------------------------------------------------------------------
-
 async function runAutoUpdateCycle(): Promise<void> {
 	if (!updateConfig.autoInstall) {
 		return;
@@ -1051,8 +1008,6 @@ async function runAutoUpdateCycle(): Promise<void> {
 				updateLogger.info("update", "Invoking restart callback to spawn replacement daemon");
 				restartCallback(installResult.success ? installResult.activeExecutablePath : undefined);
 			} else {
-				// Fallback: clean exit — systemd/launchd Restart=always will respawn.
-				// Without a restart callback, the daemon simply exits.
 				updateLogger.warn(
 					"update",
 					"No restart callback registered — exiting and relying on service manager to restart",
@@ -1077,10 +1032,6 @@ async function runAutoUpdateCycle(): Promise<void> {
 		updateCheckInProgress = false;
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Timer management
-// ---------------------------------------------------------------------------
 
 export function startUpdateTimer(): void {
 	assertInitialized();
@@ -1113,10 +1064,6 @@ export function stopUpdateTimer(): void {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Config mutation (used by route handler)
-// ---------------------------------------------------------------------------
-
 export function setUpdateConfig(patch: { autoInstall?: boolean; checkInterval?: number; channel?: UpdateChannel }): {
 	config: UpdateConfig;
 	persisted: boolean;
@@ -1141,8 +1088,6 @@ export function setUpdateConfig(patch: { autoInstall?: boolean; checkInterval?: 
 	const persisted = persistUpdateConfig(updateConfig);
 	return { config: { ...updateConfig }, persisted };
 }
-
-/** Persist CLI changes without starting the daemon's background timer. */
 export function setUpdateConfigOffline(patch: {
 	autoInstall?: boolean;
 	checkInterval?: number;

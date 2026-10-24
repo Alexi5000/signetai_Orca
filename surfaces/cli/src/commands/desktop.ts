@@ -1,5 +1,7 @@
+import { confirm } from "@inquirer/prompts";
 import chalk from "chalk";
 import type { Command } from "commander";
+import { DESKTOP_MINIMUM_BUN_VERSION, prepareDesktopBun } from "../features/desktop-bun.js";
 import type { DesktopBuildResult, DesktopInstallResult } from "../features/desktop.js";
 
 interface DesktopDeps {
@@ -20,13 +22,15 @@ export function registerDesktopCommands(program: Command, deps: DesktopDeps): vo
 			"--repo <path>",
 			"Signet source checkout path (defaults to SIGNET_SOURCE_DIR, <configured workspace>/signetai, or cwd)",
 		)
-		.action((options: { readonly repo?: string }) => {
+		.action(async (options: { readonly repo?: string }) => {
 			try {
+				await checkBun();
 				console.log(chalk.cyan("Building Signet desktop from source..."));
 				const result = deps.buildDesktopFromSource({ repo: options.repo });
 				console.log(chalk.green("✓ Signet desktop build complete"));
 				console.log(chalk.dim(`  Source:   ${result.repo}`));
 				console.log(chalk.dim(`  Artifacts: ${result.releaseDir}`));
+				printLocalChangeStatus(result);
 			} catch (err) {
 				console.error(chalk.red("Signet desktop build failed"));
 				console.error(chalk.red(err instanceof Error ? err.message : String(err)));
@@ -42,8 +46,9 @@ export function registerDesktopCommands(program: Command, deps: DesktopDeps): vo
 			"Signet source checkout path (defaults to SIGNET_SOURCE_DIR, <configured workspace>/signetai, or cwd)",
 		)
 		.option("--skip-build", "Install the newest existing desktop artifact without rebuilding")
-		.action((options: { readonly repo?: string; readonly skipBuild?: boolean }) => {
+		.action(async (options: { readonly repo?: string; readonly skipBuild?: boolean }) => {
 			try {
+				if (!options.skipBuild) await checkBun();
 				console.log(
 					chalk.cyan(
 						options.skipBuild ? "Installing Signet desktop artifact..." : "Building and installing Signet desktop...",
@@ -65,13 +70,46 @@ export function registerDesktopCommands(program: Command, deps: DesktopDeps): vo
 				} else {
 					console.log(chalk.dim(`  App:      ${result.appDir}`));
 					console.log(chalk.dim(`  Executable: ${result.executable}`));
+					if (result.retiredLegacyAppDir) {
+						console.log(chalk.dim(`  Previous Signet app retired: ${result.retiredLegacyAppDir}`));
+					}
+					if (result.startMenuShortcut) console.log(chalk.dim(`  Start Menu: ${result.startMenuShortcut}`));
 					console.log(chalk.dim(`  Workspace: ${result.workspace}`));
-					console.log(chalk.cyan("\n  Run: launch the Signet Desktop executable above"));
+					console.log(chalk.cyan("\n  Run: launch Signet from the Start Menu or the executable above"));
 				}
+				printLocalChangeStatus(result);
 			} catch (err) {
 				console.error(chalk.red("Signet desktop install failed"));
 				console.error(chalk.red(err instanceof Error ? err.message : String(err)));
 				process.exit(1);
 			}
 		});
+}
+
+async function checkBun(): Promise<void> {
+	await prepareDesktopBun({
+		confirmUpgrade: async (message, version) => {
+			if (!process.stdin.isTTY || !process.stdout.isTTY) {
+				throw new Error(
+					`Signet desktop requires Bun ${DESKTOP_MINIMUM_BUN_VERSION} or newer; found ${version || "an unknown version"}. Upgrade Bun manually before retrying in a non-interactive terminal.`,
+				);
+			}
+			return confirm({ message, default: false });
+		},
+	});
+}
+
+function printLocalChangeStatus(result: DesktopBuildResult): void {
+	if (result.localChanges === "generated-only") {
+		console.log(chalk.dim("  Generated build artifacts were left in place during source sync."));
+		return;
+	}
+	if (result.localChanges === "left-in-place") {
+		console.log(chalk.yellow("  Local source changes were left in place during source sync."));
+		return;
+	}
+	if (result.localChanges !== "stashed" || !result.stashRef) return;
+
+	console.log(chalk.yellow(`  Local source changes were preserved in stash ${result.stashRef}.`));
+	console.log(chalk.dim(`  Restore: git -C "${result.repo}" stash apply ${result.stashRef}`));
 }

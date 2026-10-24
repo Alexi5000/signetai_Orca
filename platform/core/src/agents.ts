@@ -36,8 +36,6 @@ export interface NormalizedAgentRosterEntry {
 	readonly readPolicy: AgentRosterReadPolicy;
 	readonly policyGroup: string | null;
 }
-
-/** Standard identity files that may be overridden by a named agent. */
 const IDENTITY_FILES = [
 	"AGENTS.md",
 	"SOUL.md",
@@ -48,11 +46,6 @@ const IDENTITY_FILES = [
 	"MEMORY.md",
 	"BOOTSTRAP.md",
 ];
-
-/**
- * Scans {agentsDir}/agents/* subdirectories and returns a minimal
- * AgentDefinition for each one found. Returns [] when agents/ is absent.
- */
 export function discoverAgents(agentsDir: string): AgentDefinition[] {
 	const root = join(agentsDir, "agents");
 	if (!existsSync(root)) return [];
@@ -77,15 +70,6 @@ export function scaffoldAgent(name: string, agentsDir: string): void {
 	const identity = join(dir, "IDENTITY.md");
 	writeFileExclusiveSync(identity, `# Identity\n\nname: ${name}\n`);
 }
-
-/**
- * Returns a map of filename → absolute path for each identity file that
- * exists on disk for the given agent.
- *
- * Inheritance rules:
- * - Check `~/.agents/agents/{name}/{file}` first.
- * - Fall back to root-level `~/.agents/{file}` when the agent has no override.
- */
 export function getAgentIdentityFiles(name: string, agentsDir: string): Record<string, string> {
 	const result: Record<string, string> = {};
 	const agentDir = join(agentsDir, "agents", name);
@@ -147,19 +131,8 @@ export function buildAgentMemoryConfig(
 	if (readPolicy === "group" && typeof policyGroup === "string" && policyGroup.length > 0) {
 		return { read_policy: { type: "group", group: policyGroup } };
 	}
-	// CLI validation already rejects `group` without a concrete group name.
-	// Keep the fallback isolated here so malformed callers fail closed instead
-	// of widening access implicitly.
 	return { read_policy: "isolated" };
 }
-
-/**
- * Returns the subset of `allSkills` available to the given agent.
- *
- * - `undefined` / `null` skills → all skills pass through.
- * - Empty array → no skills.
- * - Non-empty array → intersection with `allSkills`.
- */
 export function resolveAgentSkills(agentDef: AgentDefinition, allSkills: readonly string[]): string[] {
 	if (agentDef.skills == null) return [...allSkills];
 	if (agentDef.skills.length === 0) return [];

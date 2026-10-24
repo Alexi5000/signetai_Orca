@@ -2,17 +2,37 @@ import { describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyPreviousDaemonExit, lifecyclePath, readDaemonLifecycle, writeDaemonLifecycle } from "./lifecycle";
-
-// Regression tests for issue #1148: a daemon death must be distinguishable as
-// clean, error, or unrecorded (killed/crashed) from the durable lifecycle
-// record alone, because the process itself leaves no trace on SIGKILL.
+import {
+	classifyPreviousDaemonExit,
+	lifecyclePath,
+	readDaemonLifecycle,
+	terminalLifecycleFields,
+	writeDaemonLifecycle,
+} from "./lifecycle";
 
 function tempRoot(): string {
 	return mkdtempSync(join(tmpdir(), "signet-lifecycle-"));
 }
 
 describe("daemon lifecycle record (#1148)", () => {
+	it("records a signal shutdown without a cleanup failure as clean", () => {
+		const exitedAt = "2026-08-07T01:00:00.000Z";
+		expect(terminalLifecycleFields("signal:SIGTERM", 0, null, exitedAt)).toEqual({
+			state: "clean",
+			exitedAt,
+			exitCode: 0,
+			reason: "signal:SIGTERM",
+		});
+		expect(terminalLifecycleFields("signal:SIGTERM", 0, undefined, exitedAt).state).toBe("clean");
+		expect(terminalLifecycleFields("error:startup", 1, new Error("boom"), exitedAt)).toEqual({
+			state: "error",
+			exitedAt,
+			exitCode: 1,
+			reason: "error:startup",
+			error: "boom",
+		});
+	});
+
 	it("persists a clean shutdown record with the exit path and code", () => {
 		const root = tempRoot();
 		try {
@@ -45,8 +65,10 @@ describe("daemon lifecycle record (#1148)", () => {
 				version: "0.222.0",
 				startedAt: "2026-09-09T00:00:00.000Z",
 				runtime: "bun-js",
+				startAttemptId: "test-start-attempt",
 			});
 			expect(readDaemonLifecycle(root)?.runtime).toBe("bun-js");
+			expect(readDaemonLifecycle(root)?.startAttemptId).toBe("test-start-attempt");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -55,9 +77,6 @@ describe("daemon lifecycle record (#1148)", () => {
 	it("leaves the record at running when the process dies without an exit path, which is how SIGKILL/OOM deaths surface", () => {
 		const root = tempRoot();
 		try {
-			// The daemon wrote "running" and then was killed: no terminal state
-			// is ever recorded. A status probe must be able to read exactly this
-			// and call it an unrecorded death, not a clean shutdown.
 			writeDaemonLifecycle(root, {
 				state: "running",
 				pid: 7,

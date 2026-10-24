@@ -1,17 +1,18 @@
+import { isWorkspacePrivatePath } from "@signet/core";
 import { readRuntimeConfig } from "./memory-config";
 import { logger } from "./logger";
 
 export const DEFAULT_SESSION_START_MAX_INJECT_TOKENS = 12_000;
+export const DEFAULT_SESSION_CONTINUITY_MAX_ENTRIES = 15;
+export const DEFAULT_SESSION_CONTINUITY_MAX_TOKENS = 3_000;
+export const DEFAULT_SESSION_CONTINUITY_ENTRY_MAX_TOKENS = 250;
 
 export interface HooksConfig {
 	sessionStart?: SessionStartHooksConfig;
 	userPromptSubmit?: UserPromptSubmitHooksConfig;
 	preCompaction?: PreCompactionHooksConfig;
-	/** Named context-budget profiles. Resolved per harness via `harnessProfiles`. */
 	contextProfiles?: Record<string, ContextBudgetProfileConfig>;
-	/** Maps harness names (for example `pi`) to a context profile name. */
 	harnessProfiles?: Record<string, string>;
-	/** Optional fallback profile when a harness has no explicit mapping. */
 	defaultContextProfile?: string;
 }
 
@@ -23,20 +24,16 @@ export interface SessionStartHooksConfig {
 	recencyBias?: number;
 	query?: string;
 	maxInjectTokens?: number;
-	/**
-	 * @deprecated Renamed to `maxInjectTokens`. If set without `maxInjectTokens`,
-	 * the value is auto-migrated using `Math.round(maxInjectChars / 4)` (~4 chars/token
-	 * for ASCII; code or Unicode content may be 1–2 chars/token, so migrate explicitly.
-	 */
+	sessionContinuityMaxEntries?: number;
+	sessionContinuityMaxTokens?: number;
+	sessionContinuityEntryMaxTokens?: number;
 	maxInjectChars?: number;
 }
 
 export interface UserPromptSubmitHooksConfig {
-	/** Set to false to disable per-prompt entity-context injection entirely. Default: true. */
 	enabled?: boolean;
 	recallLimit?: number;
 	maxInjectChars?: number;
-	/** Minimum scoped attribute relevance required before injecting entity context. */
 	minScore?: number;
 }
 
@@ -44,7 +41,6 @@ export interface PreCompactionHooksConfig {
 	summaryGuidelines?: string;
 	includeRecentMemories?: boolean;
 	memoryLimit?: number;
-	/** Cap the generated summary at this many characters. */
 	maxSummaryChars?: number;
 }
 
@@ -52,19 +48,14 @@ export interface ContextIdentityFileConfig {
 	path: string;
 	header?: string;
 	role?: string;
-	/** Preferred budget unit for profile-managed identity files. */
 	maxTokens?: number;
-	/** Compatibility with existing identity startup entries; interpreted as characters. */
 	budget?: number;
-	/** Explicit character budget for callers that cannot reason in tokens. */
 	maxChars?: number;
 	enabled?: boolean;
 }
 
 export interface ContextIdentityConfig {
-	/** Set false to suppress profile-managed identity files. */
 	include?: boolean;
-	/** Explicit ordered identity/context files for this profile. */
 	files?: readonly ContextIdentityFileConfig[];
 }
 
@@ -81,8 +72,6 @@ export interface ResolvedHooksConfig {
 	preCompaction?: PreCompactionHooksConfig;
 	identity?: ContextIdentityConfig;
 }
-
-// Derived from HooksConfig — update when adding new config sections.
 const KNOWN_HOOKS_KEYS: ReadonlySet<keyof HooksConfig> = new Set<keyof HooksConfig>([
 	"sessionStart",
 	"userPromptSubmit",
@@ -130,6 +119,9 @@ function readSessionStartConfig(value: unknown): SessionStartHooksConfig | undef
 		recencyBias: readNumber(record.recencyBias),
 		query: readString(record.query),
 		maxInjectTokens: readNumber(record.maxInjectTokens),
+		sessionContinuityMaxEntries: readNumber(record.sessionContinuityMaxEntries),
+		sessionContinuityMaxTokens: readNumber(record.sessionContinuityMaxTokens),
+		sessionContinuityEntryMaxTokens: readNumber(record.sessionContinuityEntryMaxTokens),
 		maxInjectChars: readNumber(record.maxInjectChars),
 	};
 }
@@ -162,10 +154,10 @@ function isSafeRelativeIdentityPath(path: string): boolean {
 	if (trimmed.startsWith("/") || trimmed.startsWith("~")) return false;
 	if (!trimmed.toLowerCase().endsWith(".md")) return false;
 	const parts = trimmed.split(/[\\/]/);
-	const deniedDirs = new Set([".daemon", ".secrets", "memory"]);
+	if (isWorkspacePrivatePath(trimmed)) return false;
 	return parts.every((part) => {
 		const normalized = part.toLowerCase();
-		return normalized !== ".." && !normalized.startsWith(".") && !deniedDirs.has(normalized);
+		return normalized !== ".." && !normalized.startsWith(".");
 	});
 }
 
@@ -270,11 +262,6 @@ function readHarnessProfiles(value: unknown): Record<string, string> | undefined
 }
 
 function mergeConfig<T extends object>(base: T | undefined, override: T | undefined): T | undefined {
-	// Profile readers emit fully-populated objects with `undefined` for unset keys.
-	// A naive spread would let an unset override key clobber a defined base value,
-	// so only copy override keys that are actually present and defined. This keeps
-	// global hook settings (e.g. `sessionStart.recencyBias`) inherited when a profile
-	// only overrides a subset of keys.
 	const merged = { ...(base ?? {}) } as Record<string, unknown>;
 	for (const [key, value] of Object.entries(override ?? {})) {
 		if (value !== undefined) merged[key] = value;
@@ -290,7 +277,6 @@ export function loadHooksConfig(agentsDir: string): HooksConfig {
 		if (!hooks || typeof hooks !== "object") {
 			return getDefaultHooksConfig();
 		}
-		// Warn on unrecognized keys so users catch typos early.
 		const record = hooks as Record<string, unknown>;
 		for (const key of Object.keys(record)) {
 			if (!KNOWN_HOOKS_KEYS.has(key as keyof HooksConfig)) {
@@ -320,6 +306,9 @@ export function getDefaultHooksConfig(): HooksConfig {
 			includeRecentContext: true,
 			recencyBias: 0.7,
 			maxInjectTokens: DEFAULT_SESSION_START_MAX_INJECT_TOKENS,
+			sessionContinuityMaxEntries: DEFAULT_SESSION_CONTINUITY_MAX_ENTRIES,
+			sessionContinuityMaxTokens: DEFAULT_SESSION_CONTINUITY_MAX_TOKENS,
+			sessionContinuityEntryMaxTokens: DEFAULT_SESSION_CONTINUITY_ENTRY_MAX_TOKENS,
 		},
 		userPromptSubmit: {
 			enabled: true,

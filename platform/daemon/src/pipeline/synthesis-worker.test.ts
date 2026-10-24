@@ -78,14 +78,13 @@ describe("synthesis-worker", () => {
 	});
 
 	afterEach(async () => {
-		// Remove persisted last-synthesis state between tests.
 		rmSync(join(agentsDir, ".daemon"), { recursive: true, force: true });
 	});
 
 	afterAll(() => {
 		rmSync(agentsDir, { recursive: true, force: true });
 		if (previousSignetPath === undefined) {
-			process.env.SIGNET_PATH = undefined;
+			delete process.env.SIGNET_PATH;
 		} else {
 			process.env.SIGNET_PATH = previousSignetPath;
 		}

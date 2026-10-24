@@ -1,18 +1,14 @@
+import type { LanguageModel } from "ai"
 import type { ProviderPrompts } from "./prompts"
-
-export interface JudgeConfig {
-  apiKey: string
-  model?: string
-}
+import type { GenerateOptions, GenerateResult, ModelUsage } from "../utils/llm"
+import type { ModelConfig } from "../utils/models"
 
 export interface JudgeInput {
   question: string
-  /** Raw question type from benchmark (e.g., "1", "single-session-user", "user_evidence") */
   questionType: string
   groundTruth: string
   hypothesis: string
   context?: string
-  /** Optional provider-specific judge prompts */
   providerPrompts?: ProviderPrompts
 }
 
@@ -20,14 +16,14 @@ export interface JudgeResult {
   score: number
   label: "correct" | "incorrect"
   explanation: string
+  usage?: ModelUsage
 }
 
 export interface Judge {
   name: string
-  initialize(config: JudgeConfig): Promise<void>
+  modelAlias: string
+  modelConfig: ModelConfig
   evaluate(input: JudgeInput): Promise<JudgeResult>
-  getPromptForQuestionType(questionType: string, providerPrompts?: ProviderPrompts): string
-  getModel(): import("ai").LanguageModel
+  generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult>
+  getModel(): LanguageModel
 }
-
-export type JudgeName = "openai" | "anthropic" | "google"

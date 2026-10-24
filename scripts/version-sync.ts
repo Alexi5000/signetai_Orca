@@ -103,14 +103,13 @@ function listCargoFiles(): string[] {
 
 function readCargoVersion(filePath: string): string | null {
 	const raw = readFileSync(filePath, "utf8");
-	// Match [package] or [workspace.package] section
-	const match = raw.match(/\[(?:workspace\.)?package\][^\[]*version\s*=\s*"([^"]+)"/s);
+	const match = raw.match(/\[(?:workspace\.)?package\][^[]*version\s*=\s*"([^"]+)"/s);
 	return match ? match[1] : null;
 }
 
 function readCargoPackageName(filePath: string): string | null {
 	const raw = readFileSync(filePath, "utf8");
-	const match = raw.match(/\[package\][^\[]*name\s*=\s*"([^"]+)"/s);
+	const match = raw.match(/\[package\][^[]*name\s*=\s*"([^"]+)"/s);
 	return match ? match[1] : null;
 }
 
@@ -130,7 +129,7 @@ function findNearestWorkspaceVersion(filePath: string): string | null {
 		const cargoFile = join(dir, "Cargo.toml");
 		if (existsSync(cargoFile)) {
 			const raw = readFileSync(cargoFile, "utf8");
-			const match = raw.match(/\[workspace\.package\][^\[]*version\s*=\s*"([^"]+)"/s);
+			const match = raw.match(/\[workspace\.package\][^[]*version\s*=\s*"([^"]+)"/s);
 			if (match) return match[1];
 		}
 		dir = dirname(dir);
@@ -174,16 +173,13 @@ export function collectCargoLockMismatches(cargoFiles: readonly string[], target
 }
 
 function usesWorkspaceVersion(raw: string): boolean {
-	// Only match version.workspace inside [package], not in dependency tables
-	return /\[package\][^\[]*version\.workspace\s*=\s*true/s.test(raw);
+	return /\[package\][^[]*version\.workspace\s*=\s*true/s.test(raw);
 }
 
 function updateCargoVersion(filePath: string, targetVersion: string, checkOnly: boolean): boolean {
 	const raw = readFileSync(filePath, "utf8");
-	// Crates that inherit version from workspace root — nothing to update
 	if (usesWorkspaceVersion(raw)) return false;
-	// Match [package] or [workspace.package] section
-	const versionPattern = /(\[(?:workspace\.)?package\][^\[]*version\s*=\s*")([^"]+)(")/s;
+	const versionPattern = /(\[(?:workspace\.)?package\][^[]*version\s*=\s*")([^"]+)(")/s;
 	if (!versionPattern.test(raw)) {
 		throw new Error(`Could not find [package] version in ${filePath}`);
 	}
@@ -202,12 +198,10 @@ function updateCargoVersion(filePath: string, targetVersion: string, checkOnly: 
 function regenerateCargoLock(cargoFile: string): void {
 	const dir = cargoFile.replace(/\/Cargo\.toml$/, "");
 	try {
-		// --workspace avoids bumping transitive deps (unlike generate-lockfile)
 		execSync("cargo update --workspace", { cwd: dir, stdio: "ignore" });
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		if (msg.includes("not found") || msg.includes("ENOENT")) {
-			// cargo not installed — non-fatal
 		} else {
 			console.warn(`Warning: cargo update failed in ${dir}: ${msg}`);
 		}
@@ -261,10 +255,6 @@ export function resolveWorkspaceProtocols(files: readonly string[], version: str
 		if (!pkg || !isPublishablePackage(pkg)) continue;
 
 		let changed = false;
-		// Replace workspace: protocols and exact pins to publishable workspace
-		// packages in runtime dependency fields. Dev-only workspace links must stay
-		// local so the nightly release can run bun install before the newly bumped
-		// internal packages have been published.
 		for (const field of PUBLISH_RUNTIME_DEPENDENCY_FIELDS) {
 			const deps = pkg[field];
 			if (!deps || typeof deps !== "object" || Array.isArray(deps)) continue;
@@ -378,15 +368,8 @@ function main() {
 	if (!explicitVersion && remoteReferenceVersion && compareSemver(remoteReferenceVersion, localReferenceVersion) > 0) {
 		console.log(`Local reference (${localReferenceVersion}) was behind origin/main (${remoteReferenceVersion}).`);
 	}
-
-	// Resolve workspace: protocols in publishable packages so npm publish
-	// ships real version strings instead of "workspace:*". Source manifests
-	// intentionally keep workspace links for local development, so check mode
-	// validates versions without flagging those release-time rewrites as drift.
 	const resolved = checkOnly ? [] : resolveWorkspaceProtocols(packageFiles, targetVersion, false);
 	const nativeOptionalDepsUpdated = syncSignetNativeOptionalDependencies(targetVersion, checkOnly);
-
-	// Sync Cargo.toml files under platform/ and runtimes/
 	const cargoUpdated: string[] = [];
 	const cargoFiles = listCargoFiles();
 	for (const file of cargoFiles) {

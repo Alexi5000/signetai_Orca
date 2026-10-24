@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { connect } from "node:net";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
+import { persistWorkspaceLayout } from "@signet/core";
 import {
 	DAEMON_JS_WORKER_FILES,
 	buildLaunchdDaemonPlist,
@@ -12,8 +13,10 @@ import {
 	buildSystemdDaemonStartArgs,
 	didLaunchdDaemonStart,
 	didSystemdDaemonStart,
+	daemonStartupLogPath,
 	getDaemonStatus,
 	getLaunchdDaemonLoadState,
+	hasDaemonProcess,
 	inspectDaemonJsBundle,
 	resolveBunJsDaemonBundle,
 	isDaemonEntrypointEnvironment,
@@ -23,6 +26,7 @@ import {
 	launchdDaemonLabel,
 	launchdDaemonPlistPath,
 	macOSLaunchAgentAttributionNotice,
+	readDaemonLifecycleRecord,
 	readDaemonStartFailureDiagnostics,
 	readManagedDaemonPid,
 	resolveDaemonProbeUrls,
@@ -33,7 +37,9 @@ import {
 	resolveDaemonPaths,
 	resolveDaemonPathForRuntime,
 	resolveDaemonRuntimeCommand,
+	stopDaemon,
 	stopManagedDaemonProcess,
+	startDaemon,
 	waitForDaemonLiveness,
 } from "./runtime.js";
 
@@ -285,6 +291,42 @@ describe("buildSystemdDaemonStartArgs", () => {
 		expect(args.slice(-2)).toEqual([process.execPath, "/opt/signet/dist/daemon.js"]);
 	});
 
+	it("propagates harness location overrides through systemd and launchd", () => {
+		const input = {
+			daemonPath: "/opt/signet/dist/daemon.js",
+			agentsDir: "/sandbox/.agents",
+			port: 3850,
+			host: "127.0.0.1",
+			bind: "0.0.0.0",
+			startupLogPath: "/sandbox/.agents/.daemon/logs/startup.log",
+			telemetryEnv: {
+				HOME: "/sandbox",
+				XDG_CONFIG_HOME: "/sandbox/.config",
+				CODEX_HOME: "/sandbox/codex",
+				HERMES_HOME: "/sandbox/hermes",
+				KIMI_SHARE_DIR: "/sandbox/kimi",
+				KIMI_CODE_HOME: " ",
+			},
+		};
+
+		const args = buildSystemdDaemonStartArgs(input);
+		const plist = buildLaunchdDaemonPlist(input);
+		const compactPlist = plist.replace(/>\s+</g, "><");
+
+		for (const [key, value] of [
+			["HOME", "/sandbox"],
+			["XDG_CONFIG_HOME", "/sandbox/.config"],
+			["CODEX_HOME", "/sandbox/codex"],
+			["HERMES_HOME", "/sandbox/hermes"],
+			["KIMI_SHARE_DIR", "/sandbox/kimi"],
+		]) {
+			expect(args).toContain(`--setenv=${key}=${value}`);
+			expect(compactPlist).toContain(`<key>${key}</key><string>${value}</string>`);
+		}
+		expect(args.some((arg) => arg.startsWith("--setenv=KIMI_CODE_HOME="))).toBe(false);
+		expect(plist).not.toContain("<key>KIMI_CODE_HOME</key>");
+	});
+
 	it("propagates the selected runtime through systemd and launchd", () => {
 		const input = {
 			daemonPath: "/opt/signet/runtime/daemon-js/daemon.js",
@@ -363,6 +405,23 @@ describe("buildSystemdDaemonStartArgs", () => {
 		expect(args).toContain("--setenv=BUN_OPTIONS=--cpu-prof --cpu-prof-dir=/tmp/signet-profile");
 	});
 
+	it("forwards a startup attempt identifier through service-manager boundaries", () => {
+		const input = {
+			daemonPath: "/opt/signet/dist/daemon.js",
+			agentsDir: "/home/user/.agents",
+			port: 3850,
+			host: "127.0.0.1",
+			bind: "0.0.0.0",
+			startupLogPath: "/home/user/.agents/.daemon/logs/startup.log",
+			startAttemptId: "current-attempt",
+		};
+
+		expect(buildSystemdDaemonStartArgs(input)).toContain("--setenv=SIGNET_DAEMON_START_ATTEMPT_ID=current-attempt");
+		expect(buildLaunchdDaemonPlist(input)).toMatch(
+			/<key>SIGNET_DAEMON_START_ATTEMPT_ID<\/key>\s*<string>current-attempt<\/string>/,
+		);
+	});
+
 	it("forwards only allowlisted telemetry variables through service-manager boundaries", () => {
 		const input = {
 			daemonPath: "/opt/signet/dist/daemon.js",
@@ -418,6 +477,27 @@ describe("buildSystemdDaemonStartArgs", () => {
 });
 
 describe("buildLaunchdDaemonPlist", () => {
+	it("keeps staged connector assets available to launchd health workers", () => {
+		const root = mkdtempSync(join(tmpdir(), "signet-launchd-connector-assets-"));
+		try {
+			mkdirSync(join(root, "dist"));
+			mkdirSync(join(root, "connectors", "hermes-agent", "hermes-plugin"), { recursive: true });
+			const plist = buildLaunchdDaemonPlist({
+				daemonPath: join(root, "dist", "daemon.js"),
+				agentsDir: join(root, "workspace"),
+				runtime: "bun-js",
+				port: 3850,
+				host: "127.0.0.1",
+				bind: "127.0.0.1",
+				startupLogPath: join(root, "startup.log"),
+			});
+			expect(plist).toContain("<key>SIGNET_CONNECTOR_ASSETS_DIR</key>");
+			expect(plist).toContain(`<string>${join(root, "connectors")}</string>`);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("starts daemon as a macOS LaunchAgent with explicit env and log routing", () => {
 		if (process.platform !== "darwin") return;
 		const plist = buildLaunchdDaemonPlist({
@@ -628,9 +708,187 @@ describe("readDaemonStartFailureDiagnostics", () => {
 			"May 13 signet-daemon-123: ENOSPC",
 		]);
 	});
+
+	it("reports a new lifecycle exit and its SIGTERM reason before journal details", () => {
+		const lines = readDaemonStartFailureDiagnostics(
+			{
+				startupLogPath: "/tmp/startup.log",
+				platform: "linux",
+				systemdUnitName: "signet-daemon-123",
+				failureKind: "process-exited",
+				startupDeadlineMs: 60_000,
+				processExit: null,
+				lifecycleRecord: {
+					state: "clean",
+					pid: 42,
+					version: "test",
+					startedAt: "2026-09-23T04:00:00.000Z",
+					exitedAt: "2026-09-23T04:00:02.000Z",
+					exitCode: 0,
+					reason: "signal:SIGTERM",
+				},
+			},
+			{
+				existsSync: () => false,
+				readFileSync: () => "",
+				spawnSync: () => ({ stdout: "unit stopped\n" }),
+			},
+		);
+
+		expect(lines[0]).toBe("Daemon process exited before becoming live.");
+		expect(lines[1]).toContain("state=clean");
+		expect(lines[1]).toContain("reason=signal:SIGTERM");
+		expect(lines[2]).toBe("Daemon failed to start. journalctl for signet-daemon-123:");
+	});
+
+	it("distinguishes a startup deadline from an observed process exit", () => {
+		const lines = readDaemonStartFailureDiagnostics(
+			{
+				startupLogPath: "/tmp/startup.log",
+				failureKind: "deadline",
+				startupDeadlineMs: 2_000,
+				processExit: null,
+				lifecycleRecord: {
+					state: "running",
+					pid: 43,
+					version: "test",
+					startedAt: "2026-09-23T04:00:00.000Z",
+				},
+			},
+			{
+				existsSync: () => false,
+				readFileSync: () => "",
+				spawnSync: () => ({ stdout: "" }),
+			},
+		);
+
+		expect(lines[0]).toBe("Daemon did not become live before the 2-second startup deadline.");
+		expect(lines[1]).toContain("state=running");
+		expect(lines).toContain("No startup diagnostics were captured.");
+	});
+});
+
+describe("startDaemon startup diagnostics", () => {
+	it("stops waiting when a systemd-launched process records an early SIGTERM", async () => {
+		if (process.platform !== "linux") return;
+		const previousEnv = {
+			PATH: process.env.PATH,
+			SIGNET_PATH: process.env.SIGNET_PATH,
+			SIGNET_PORT: process.env.SIGNET_PORT,
+			SIGNET_DAEMON_URL: process.env.SIGNET_DAEMON_URL,
+			SIGNET_HOST: process.env.SIGNET_HOST,
+			SIGNET_BIND: process.env.SIGNET_BIND,
+			SIGNET_DAEMON_RUNTIME: process.env.SIGNET_DAEMON_RUNTIME,
+			BUN_INSPECT: process.env.BUN_INSPECT,
+		};
+		const previousConsoleError = console.error;
+		const errors: string[] = [];
+		let root: string | null = null;
+		const restoreEnvironment = (key: string, value: string | undefined): void => {
+			if (value === undefined) delete process.env[key];
+			if (value !== undefined) process.env[key] = value;
+		};
+
+		try {
+			const server = createServer();
+			const port = await new Promise<number>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(0, "127.0.0.1", () => {
+					const address = server.address();
+					if (address === null || typeof address === "string") {
+						server.close();
+						reject(new Error("failed to reserve an ephemeral port"));
+						return;
+					}
+					const selectedPort = address.port;
+					server.close((error) => (error ? reject(error) : resolve(selectedPort)));
+				});
+			});
+			root = mkdtempSync(join(tmpdir(), "signet-startup-diagnostics-"));
+			const agentsDir = join(root, "workspace");
+			const memoryDir = join(agentsDir, "memory");
+			const binDir = join(root, "bin");
+			mkdirSync(memoryDir, { recursive: true });
+			mkdirSync(binDir, { recursive: true });
+			writeFileSync(join(agentsDir, "agent.yaml"), "name: test\n");
+			writeFileSync(join(memoryDir, "memories.db"), "");
+			const daemonPath = join(root, "fake-signet");
+			writeFileSync(daemonPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+			const systemdRunPath = join(binDir, "systemd-run");
+			writeFileSync(
+				systemdRunPath,
+				[
+					"#!/bin/sh",
+					"set -eu",
+					'mkdir -p "$SIGNET_PATH/.daemon"',
+					"started=$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')",
+					`printf '{"state":"clean","pid":4242,"version":"test","startAttemptId":"%s","startedAt":"%s","exitedAt":"%s","exitCode":0,"reason":"signal:SIGTERM"}\\n' "$SIGNET_DAEMON_START_ATTEMPT_ID" "$started" "$started" > "$SIGNET_PATH/.daemon/lifecycle.json"`,
+					"exit 0",
+					"",
+				].join("\n"),
+				{ mode: 0o755 },
+			);
+			const journalPath = join(binDir, "journalctl");
+			writeFileSync(journalPath, "#!/bin/sh\nprintf 'synthetic systemd journal\\n'\n", { mode: 0o755 });
+			process.env.PATH = `${binDir}${delimiter}${previousEnv.PATH ?? ""}`;
+			process.env.SIGNET_PATH = agentsDir;
+			process.env.SIGNET_PORT = String(port);
+			process.env.SIGNET_DAEMON_URL = `http://127.0.0.1:${port}`;
+			process.env.SIGNET_HOST = "127.0.0.1";
+			process.env.SIGNET_BIND = "127.0.0.1";
+			process.env.SIGNET_DAEMON_RUNTIME = "compiled";
+			process.env.BUN_INSPECT = "";
+			console.error = (...values: unknown[]) => errors.push(values.map(String).join(" "));
+
+			const startedAt = performance.now();
+			const started = await startDaemon(agentsDir, "compiled", daemonPath);
+			const elapsedMs = performance.now() - startedAt;
+
+			expect(started).toBe(false);
+			expect(elapsedMs).toBeLessThan(5_000);
+			expect(errors.join("\n")).toContain("Daemon process exited before becoming live.");
+			expect(errors.join("\n")).toContain("reason=signal:SIGTERM");
+			expect(errors.join("\n")).toContain("synthetic systemd journal");
+		} finally {
+			console.error = previousConsoleError;
+			restoreEnvironment("PATH", previousEnv.PATH);
+			restoreEnvironment("SIGNET_PATH", previousEnv.SIGNET_PATH);
+			restoreEnvironment("SIGNET_PORT", previousEnv.SIGNET_PORT);
+			restoreEnvironment("SIGNET_DAEMON_URL", previousEnv.SIGNET_DAEMON_URL);
+			restoreEnvironment("SIGNET_HOST", previousEnv.SIGNET_HOST);
+			restoreEnvironment("SIGNET_BIND", previousEnv.SIGNET_BIND);
+			restoreEnvironment("SIGNET_DAEMON_RUNTIME", previousEnv.SIGNET_DAEMON_RUNTIME);
+			restoreEnvironment("BUN_INSPECT", previousEnv.BUN_INSPECT);
+			if (root !== null) rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("readManagedDaemonPid", () => {
+	it("rejects a pid file that points at another workspace's daemon", () => {
+		const root = mkdtempSync(join(tmpdir(), "signet-runtime-test-"));
+		try {
+			const own = join(root, "own");
+			const dir = join(own, ".daemon");
+			mkdirSync(dir, { recursive: true });
+			const deps = (workspace: string) => ({
+				daemonPaths: ["/opt/signet/dist/daemon.js"],
+				isAlive: () => true,
+				readCmd: () => "bun /opt/signet/dist/daemon.js",
+				readEnv: () => `SIGNET_DAEMON_ENTRYPOINT=1\u0000SIGNET_PATH=${workspace}\u0000`,
+			});
+
+			writeFileSync(join(dir, "pid"), "4242\n");
+			expect(readManagedDaemonPid(own, deps(own))).toBe(4242);
+			expect(readManagedDaemonPid(own, deps("own"))).toBe(4242);
+
+			expect(readManagedDaemonPid(own, deps(join(root, "foreign")))).toBeNull();
+			expect(existsSync(join(dir, "pid"))).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts a live daemon pid when the command matches the daemon path", () => {
 		const root = mkdtempSync(join(tmpdir(), "signet-runtime-test-"));
 		const dir = join(root, ".daemon");
@@ -647,6 +905,33 @@ describe("readManagedDaemonPid", () => {
 		expect(pid).toBe(4242);
 
 		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("reads the managed pid and lifecycle record from runtime/ on a v2 workspace", () => {
+		const root = mkdtempSync(join(tmpdir(), "signet-runtime-test-"));
+		try {
+			writeFileSync(join(root, "workspace-layout.json"), `${JSON.stringify({ version: 2 })}\n`);
+			const dir = join(root, "runtime");
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, "pid"), "4343\n");
+			writeFileSync(
+				join(dir, "lifecycle.json"),
+				JSON.stringify({ state: "running", pid: 4343, version: "0.0.0", startedAt: "2026-01-01T00:00:00.000Z" }),
+			);
+
+			const pid = readManagedDaemonPid(root, {
+				daemonPaths: ["/opt/signet/dist/daemon.js"],
+				isAlive: () => true,
+				readCmd: () => "bun /opt/signet/dist/daemon.js",
+				readEnv: () => "SIGNET_DAEMON_ENTRYPOINT=1\u0000",
+			});
+
+			expect(pid).toBe(4343);
+			expect(readDaemonLifecycleRecord(root)?.pid).toBe(4343);
+			expect(existsSync(join(root, ".daemon"))).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects a daemon-path CLI process without the daemon entrypoint marker", () => {
@@ -793,6 +1078,163 @@ describe("stopManagedDaemonProcess", () => {
 	});
 });
 
+describe("stopDaemon", () => {
+	const reservePort = (): Promise<number> => {
+		const server = createServer();
+		return new Promise<number>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => {
+				const address = server.address();
+				const selected = address !== null && typeof address === "object" ? address.port : 0;
+				server.close((error) => (error ? reject(error) : resolve(selected)));
+			});
+		});
+	};
+	const launchMarked = (env: Record<string, string>, cwd?: string) => {
+		const base: Record<string, string | undefined> = { ...process.env, SIGNET_DAEMON_ENTRYPOINT: "1" };
+		Reflect.deleteProperty(base, "SIGNET_PATH");
+		Reflect.deleteProperty(base, "SIGNET_WORKSPACE");
+		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			cwd,
+			detached: true,
+			stdio: "ignore",
+			env: { ...base, ...env },
+		});
+		if (typeof child.pid !== "number") throw new Error("marked child did not expose a pid");
+		return { child, pid: child.pid };
+	};
+	const waitForMarker = async (pid: number): Promise<void> => {
+		for (let i = 0; i < 200; i += 1) {
+			try {
+				if (isDaemonEntrypointEnvironment(readFileSync(`/proc/${pid}/environ`, "utf-8"))) return;
+			} catch {}
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		throw new Error(`process ${pid} never exposed the daemon marker`);
+	};
+	const alive = (pid: number): boolean => {
+		try {
+			return !readFileSync(`/proc/${pid}/stat`, "utf-8").split(") ")[1]?.startsWith("Z");
+		} catch {
+			return false;
+		}
+	};
+	const withProbeUrl = async (port: number, run: () => Promise<void>): Promise<void> => {
+		const previous = process.env.SIGNET_DAEMON_URL;
+		process.env.SIGNET_DAEMON_URL = `http://127.0.0.1:${port}`;
+		try {
+			await run();
+		} finally {
+			if (previous === undefined) Reflect.deleteProperty(process.env, "SIGNET_DAEMON_URL");
+			if (previous !== undefined) process.env.SIGNET_DAEMON_URL = previous;
+		}
+	};
+
+	it("stops only marked daemon processes that belong to the requested workspace", async () => {
+		if (process.platform !== "linux") return;
+		const root = mkdtempSync(join(tmpdir(), "signet-stop-scope-"));
+		const own = join(root, "own");
+		const foreign = join(root, "foreign");
+		mkdirSync(own);
+		mkdirSync(foreign);
+		const port = await reservePort();
+		const ownDaemon = launchMarked({ SIGNET_PATH: own });
+		const foreignDaemon = launchMarked({ SIGNET_PATH: foreign });
+		try {
+			await waitForMarker(ownDaemon.pid);
+			await waitForMarker(foreignDaemon.pid);
+			await withProbeUrl(port, async () => {
+				expect(await hasDaemonProcess(own)).toBe(true);
+				expect(await stopDaemon(own)).toBe(true);
+
+				expect(alive(ownDaemon.pid)).toBe(false);
+				expect(alive(foreignDaemon.pid)).toBe(true);
+				expect(await hasDaemonProcess(foreign)).toBe(true);
+			});
+		} finally {
+			if (ownDaemon.child.exitCode === null) ownDaemon.child.kill("SIGKILL");
+			if (foreignDaemon.child.exitCode === null) foreignDaemon.child.kill("SIGKILL");
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not resolve a daemon's relative workspace against the caller's directory", async () => {
+		if (process.platform !== "linux") return;
+		const root = mkdtempSync(join(tmpdir(), "signet-stop-relative-"));
+		const daemonHome = join(root, "daemon-home");
+		const callerHome = join(root, "caller-home");
+		mkdirSync(join(daemonHome, "workspace"), { recursive: true });
+		mkdirSync(join(callerHome, "workspace"), { recursive: true });
+		const port = await reservePort();
+		const previousCwd = process.cwd();
+		const daemon = launchMarked({ SIGNET_PATH: "workspace" }, daemonHome);
+		try {
+			await waitForMarker(daemon.pid);
+			process.chdir(callerHome);
+			await withProbeUrl(port, async () => {
+				expect(await hasDaemonProcess(join(callerHome, "workspace"))).toBe(false);
+				expect(await stopDaemon(join(callerHome, "workspace"))).toBe(true);
+				expect(alive(daemon.pid)).toBe(true);
+			});
+		} finally {
+			process.chdir(previousCwd);
+			if (daemon.child.exitCode === null) daemon.child.kill("SIGKILL");
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("leaves a reachable daemon that reports another workspace running", async () => {
+		if (process.platform !== "linux") return;
+		const root = mkdtempSync(join(tmpdir(), "signet-stop-instance-"));
+		const own = join(root, "own");
+		const foreign = join(root, "foreign");
+		mkdirSync(own);
+		mkdirSync(foreign);
+		const daemon = launchMarked({});
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				const path = new URL(request.url).pathname;
+				if (path === "/health" || path === "/health/live") return Response.json({ status: "healthy" });
+				if (path === "/api/status") return Response.json({ pid: daemon.pid, uptime: 1, agentsDir: foreign });
+				return new Response("not found", { status: 404 });
+			},
+		});
+		try {
+			await waitForMarker(daemon.pid);
+			await withProbeUrl(Number(server.port), async () => {
+				expect(await stopDaemon(own)).toBe(true);
+				expect(alive(daemon.pid)).toBe(true);
+			});
+		} finally {
+			server.stop(true);
+			if (daemon.child.exitCode === null) daemon.child.kill("SIGKILL");
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("daemonStartupLogPath", () => {
+	it("keeps the macOS LaunchAgent log outside the workspace runtime directory", () => {
+		const darwin = daemonStartupLogPath("/Users/u/.agents", "darwin", "/Users/u");
+		expect(darwin.startsWith("/Users/u/Library/Logs/Signet/")).toBe(true);
+		expect(darwin.endsWith(".startup.log")).toBe(true);
+		expect(darwin).not.toContain("/.agents/");
+	});
+
+	it("uses the resolved runtime log directory elsewhere", () => {
+		const root = mkdtempSync(join(tmpdir(), "signet-startup-log-"));
+		try {
+			expect(daemonStartupLogPath(root, "linux")).toBe(join(root, ".daemon", "logs", "startup.log"));
+			persistWorkspaceLayout(root, { version: 2 });
+			expect(daemonStartupLogPath(root, "linux")).toBe(join(root, "runtime", "logs", "startup.log"));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("getDaemonStatus", () => {
 	it("single-flights concurrent daemon status probes", async () => {
 		let healthRequests = 0;
@@ -873,9 +1315,208 @@ describe("getDaemonStatus", () => {
 		expect(requests).toBe(6);
 	});
 
+	it("stops startup polling when the current attempt records a terminal lifecycle", async () => {
+		let now = 0;
+		let requests = 0;
+		globalThis.fetch = (async (_input: string | URL) => {
+			requests += 1;
+			return new Response("not live", { status: 503 });
+		}) as typeof fetch;
+		const currentRecord = {
+			state: "clean" as const,
+			pid: 42,
+			version: "test",
+			startedAt: "1970-01-01T00:00:02.000Z",
+			startAttemptId: "current-attempt",
+			exitedAt: "1970-01-01T00:00:03.000Z",
+			exitCode: 0,
+			reason: "signal:SIGTERM",
+		};
+
+		const result = await waitForDaemonLiveness(
+			10_000,
+			() => false,
+			async (ms) => {
+				now += ms;
+			},
+			() => now,
+			{
+				read: () => currentRecord,
+				startAttemptId: "current-attempt",
+				attemptStartedAt: 0,
+			},
+		);
+
+		expect(result).toBe(false);
+		expect(now).toBe(250);
+		expect(requests).toBe(0);
+	});
+
+	it("ignores terminal lifecycle records from another startup attempt", async () => {
+		let now = 0;
+		let requests = 0;
+		globalThis.fetch = (async (_input: string | URL) => {
+			requests += 1;
+			return new Response("live", { status: 200 });
+		}) as typeof fetch;
+		const unrelatedTerminalRecord = {
+			state: "error" as const,
+			pid: 42,
+			version: "test",
+			startedAt: "1970-01-01T00:00:02.000Z",
+			startAttemptId: "other-attempt",
+			systemdUnit: "signet-daemon-123",
+			exitedAt: "1970-01-01T00:00:03.000Z",
+			exitCode: 1,
+		};
+
+		const result = await waitForDaemonLiveness(
+			10_000,
+			() => false,
+			async (ms) => {
+				now += ms;
+			},
+			() => now,
+			{
+				read: () => unrelatedTerminalRecord,
+				startAttemptId: "current-attempt",
+				attemptStartedAt: 0,
+				systemdUnitName: "signet-daemon-123",
+			},
+		);
+
+		expect(result).toBe(true);
+		expect(now).toBe(250);
+		expect(requests).toBeGreaterThan(0);
+	});
+
+	it("ignores a matching lifecycle record created before the current startup attempt", async () => {
+		let now = 1000;
+		let requests = 0;
+		globalThis.fetch = (async (_input: string | URL) => {
+			requests += 1;
+			return new Response("live", { status: 200 });
+		}) as typeof fetch;
+		const previousRecord = {
+			state: "clean" as const,
+			pid: 41,
+			version: "test",
+			startedAt: "1970-01-01T00:00:00.500Z",
+			exitedAt: "1970-01-01T00:00:00.600Z",
+			exitCode: 0,
+			reason: "signal:SIGTERM",
+			startAttemptId: "current-attempt",
+		};
+
+		const result = await waitForDaemonLiveness(
+			10_000,
+			() => false,
+			async (ms) => {
+				now += ms;
+			},
+			() => now,
+			{
+				read: () => previousRecord,
+				startAttemptId: "current-attempt",
+				attemptStartedAt: 1000,
+			},
+		);
+
+		expect(result).toBe(true);
+		expect(now).toBe(1250);
+		expect(requests).toBeGreaterThan(0);
+	});
+
+	it("uses the exact systemd unit for lifecycle records from older daemon artifacts", async () => {
+		let now = 0;
+		let requests = 0;
+		globalThis.fetch = (async (_input: string | URL) => {
+			requests += 1;
+			return new Response("not live", { status: 503 });
+		}) as typeof fetch;
+		const legacyTerminalRecord = {
+			state: "error" as const,
+			pid: 42,
+			version: "test",
+			startedAt: "1970-01-01T00:00:02.000Z",
+			systemdUnit: "signet-daemon-123",
+			exitCode: 1,
+		};
+
+		const result = await waitForDaemonLiveness(
+			10_000,
+			() => false,
+			async (ms) => {
+				now += ms;
+			},
+			() => now,
+			{
+				read: () => legacyTerminalRecord,
+				startAttemptId: "current-attempt",
+				attemptStartedAt: 0,
+				systemdUnitName: "signet-daemon-123",
+			},
+		);
+
+		expect(result).toBe(false);
+		expect(now).toBe(250);
+		expect(requests).toBe(0);
+	});
+
+	it("does not mistake a previous terminal lifecycle record for the current startup", async () => {
+		let now = 0;
+		let requests = 0;
+		globalThis.fetch = (async (_input: string | URL) => {
+			requests += 1;
+			return new Response("live", { status: 200 });
+		}) as typeof fetch;
+		const previousRecord = {
+			state: "clean" as const,
+			pid: 41,
+			version: "test",
+			startedAt: "1970-01-01T00:00:01.000Z",
+			exitedAt: "1970-01-01T00:00:03.000Z",
+			exitCode: 0,
+			reason: "signal:SIGTERM",
+		};
+
+		const result = await waitForDaemonLiveness(
+			10_000,
+			() => false,
+			async (ms) => {
+				now += ms;
+			},
+			() => now,
+			{ read: () => previousRecord, startAttemptId: "current-attempt", attemptStartedAt: 0 },
+		);
+
+		expect(result).toBe(true);
+		expect(now).toBe(250);
+		expect(requests).toBeGreaterThan(0);
+	});
+
 	it("parses extraction provider degradation from /api/status", async () => {
 		globalThis.fetch = async (input: string | URL) => {
 			const url = String(input);
+			if (url.endsWith("/api/status/workspace")) {
+				return Response.json({
+					agentId: "default",
+					memoryCount: 190,
+					capturedSessionCount: 17,
+					schema: "cli-v1",
+					needsMigration: true,
+					ontology: {
+						entityCount: 3,
+						aspectCount: 4,
+						attributeCount: 5,
+						claimCount: 6,
+						constraintCount: 7,
+						dependencyCount: 8,
+						unassignedMemoryCount: 9,
+						coveragePercent: 95.3,
+					},
+				});
+			}
 			if (url.endsWith("/api/diagnostics/openclaw")) {
 				return Response.json({
 					status: "connected",
@@ -899,6 +1540,12 @@ describe("getDaemonStatus", () => {
 					host: "127.0.0.1",
 					bindHost: "127.0.0.1",
 					networkMode: "local",
+					agentsDir: "/tmp/status-workspace",
+					workspaceLayout: {
+						version: 1,
+						upgrade: { state: "blocked", reason: "runtime already exists", at: "2026-10-04T00:00:00.000Z" },
+					},
+					dreaming: { enabled: true, workerRunning: true, blockedBy: "no_provider" },
 					resources: {
 						rss: 169,
 						heapUsed: 106,
@@ -924,6 +1571,20 @@ describe("getDaemonStatus", () => {
 						},
 					},
 					pipeline: {
+						queue: {
+							memory: {
+								pending: 0,
+								leased: 0,
+								completed: 0,
+								failed: 0,
+								dead: 0,
+								oldestAgeSec: 0,
+								oldestDeadAgeSec: 0,
+								lastError: null,
+								completeness: "unknown",
+							},
+							summary: null,
+						},
 						dreaming: { status: "deferred", reason: "system_pressure", checkedAt: "2026-08-11T15:00:00.000Z" },
 					},
 				});
@@ -933,9 +1594,39 @@ describe("getDaemonStatus", () => {
 
 		const status = await getDaemonStatus();
 		expect(status.running).toBe(true);
-		// The mock has no /health/ready route (older daemon): readiness is unknown, not a regression.
 		expect(status.probe.status).toBe("healthy");
 		expect(status.probe.readinessReasons).toBeUndefined();
+		expect(status.workspacePath).toBe("/tmp/status-workspace");
+		expect(status.workspaceLayoutUpgrade).toBe("runtime already exists");
+		expect(status.dreaming).toEqual({ enabled: true, workerRunning: true, blockedBy: "no_provider" });
+		expect(status.workspaceStats).toEqual({
+			agentId: "default",
+			memoryCount: 190,
+			capturedSessionCount: 17,
+			schema: "cli-v1",
+			needsMigration: true,
+			ontology: {
+				entityCount: 3,
+				aspectCount: 4,
+				attributeCount: 5,
+				claimCount: 6,
+				constraintCount: 7,
+				dependencyCount: 8,
+				unassignedMemoryCount: 9,
+				coveragePercent: 95.3,
+			},
+		});
+		expect(status.queue?.memory).toEqual({
+			pending: null,
+			leased: null,
+			completed: null,
+			failed: null,
+			dead: null,
+			oldestAgeSec: null,
+			oldestDeadAgeSec: null,
+			lastError: null,
+			completeness: "unknown",
+		});
 		expect(status.scheduler).toEqual({
 			status: "deferred",
 			reason: "system_pressure",

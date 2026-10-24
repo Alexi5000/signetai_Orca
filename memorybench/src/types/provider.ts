@@ -1,6 +1,7 @@
 import type { UnifiedSession } from "./unified"
 import type { ProviderPrompts } from "./prompts"
 import type { ConcurrencyConfig } from "./concurrency"
+import type { IngestUsage } from "./checkpoint"
 
 export interface ProviderConfig {
   apiKey: string
@@ -24,7 +25,6 @@ export interface SearchOptions {
 export interface IngestResult {
   documentIds: string[]
   taskIds?: string[]
-  /** Scoped transcript-capture ownership for providers that ingest multiple agent scopes. */
   taskAgentIds?: Record<string, string>
 }
 
@@ -33,11 +33,10 @@ export interface IndexingProgress {
   failedIds: string[]
   total: number
 }
-
-/** Optional provider-owned barrier after the whole benchmark ingest phase. */
 export interface FinalizeIngestOptions {
   runId: string
   dataSourceRunId: string
+  agentIds?: string[]
 }
 
 export type IndexingProgressCallback = (progress: IndexingProgress) => void
@@ -48,7 +47,6 @@ export interface Provider {
   concurrency?: ConcurrencyConfig
   initialize(config: ProviderConfig): Promise<void>
   ingest(sessions: UnifiedSession[], options: IngestOptions): Promise<IngestResult>
-  /** Run a bounded provider-owned derivation only after all source sessions exist. */
   finalizeIngest?(options: FinalizeIngestOptions): Promise<void>
   awaitIndexing(
     result: IngestResult,
@@ -57,7 +55,11 @@ export interface Provider {
   ): Promise<void>
   search(query: string, options: SearchOptions): Promise<unknown[]>
   clear(containerTag: string): Promise<void>
+  getIngestUsage?(): IngestUsage
+  classifyResult?(result: unknown): RecallEvidenceKind
 }
+
+export type RecallEvidenceKind = "derived" | "raw-evidence"
 
 export type ProviderName =
   | "supermemory"

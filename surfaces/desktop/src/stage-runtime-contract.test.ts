@@ -1,15 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
-import { platformVecPackage } from "../scripts/stage-runtime.mjs";
-
-/**
- * The packaged daemon resolves every worker (db-owner, harness install,
- * dreaming tokens, transcript recovery, ...) as a sibling of daemon.js, and
- * resolves tiktoken's WASM from the staged node_modules. The staging script
- * must therefore copy the whole built dist directory rather than a hardcoded
- * file list, and must stage tiktoken.
- */
+import { platformVecPackage, runtimeDependencies } from "../scripts/stage-runtime.mjs";
 test("desktop runtime staging ships the full daemon dist and tiktoken", () => {
 	const source = readFileSync(join(import.meta.dir, "..", "scripts", "stage-runtime.mjs"), "utf8");
 	expect(source).toContain("for (const entry of readdirSync(daemonDist))");
@@ -22,20 +14,32 @@ test("desktop runtime staging ships the full daemon dist and tiktoken", () => {
 	expect(source).toContain('"tiktoken"');
 	expect(typeof daemonPkg.dependencies?.tiktoken).toBe("string");
 });
-
-/**
- * The hermes-agent connector copies its Python plugin from an on-disk
- * hermes-plugin directory that is NOT bundled into the daemon JS. Without
- * staging it and pointing SIGNET_CONNECTOR_ASSETS_DIR at the staged tree,
- * harness install fails with "could not refresh the Hermes repo Signet
- * provider" in the packaged desktop app.
- */
 test("desktop runtime staging ships connector assets for harness install", () => {
 	const source = readFileSync(join(import.meta.dir, "..", "scripts", "stage-runtime.mjs"), "utf8");
 	expect(source).toContain('resolve(connectorsOut, "hermes-agent", "hermes-plugin")');
 
 	const daemonManager = readFileSync(join(import.meta.dir, "daemon-manager.ts"), "utf8");
 	expect(daemonManager).toContain("SIGNET_CONNECTOR_ASSETS_DIR");
+});
+
+test("stages Bun runtime dependencies without the Node-only SQLite fallback", () => {
+	const daemonPkg = { dependencies: { "@firecrawl/anydoc": "^1.0.0", tiktoken: "^1.0.0" } };
+	const corePkg = {
+		dependencies: { "sqlite-vec": "^0.1.0", "@napi-rs/keyring": "1.3.0" },
+		optionalDependencies: {
+			"better-sqlite3": "^11.0.0",
+			"sqlite-vec-linux-x64": "^0.1.0",
+		},
+	};
+	const dependencies = runtimeDependencies(daemonPkg, corePkg, "linux", "x64");
+	expect(dependencies).toEqual({
+		"@firecrawl/anydoc": "^1.0.0",
+		tiktoken: "^1.0.0",
+		"@napi-rs/keyring": "1.3.0",
+		"sqlite-vec": "^0.1.0",
+		"sqlite-vec-linux-x64": "^0.1.0",
+	});
+	expect(dependencies).not.toHaveProperty("better-sqlite3");
 });
 
 test("selects the native sqlite-vec package for the target platform", () => {

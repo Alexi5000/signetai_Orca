@@ -1,9 +1,24 @@
-/**
- * @signet/core
- * Core library for Signet - portable AI agent identity
- */
-
 export { Signet } from "./signet";
+export { inspectRootGit, managedGitignoreUpdate } from "./git-transition";
+export {
+	prepareRootGitArchive,
+	planRootGitArchive,
+	verifyRootGitArchive,
+	restoreVerifiedRootGitArchive,
+} from "./git-archive-retirement";
+export type { RootGitArchive, RootGitArchivePlan, RootGitArchiveVerification } from "./git-archive-retirement";
+export type { ManagedGitignoreUpdate, RootGitInventory, RootGitMode } from "./git-transition";
+export { aggregateProtection, PROTECTION_COMPONENT_IDS, validateRestoreReceipt } from "./protection";
+export type {
+	ProtectionComponent,
+	ProtectionComponentId,
+	ProtectionComponentStatus,
+	ProtectionStatus,
+	RestoreReceipt,
+	RestoreReceiptInput,
+} from "./protection";
+export { buildProtectionEvidence, computeProtectionDigests } from "./protection-evidence";
+export type { ProtectionEvidence, ProtectionEvidenceOptions } from "./protection-evidence";
 export {
 	execFileHidden,
 	execFileSyncHidden,
@@ -42,7 +57,12 @@ export type {
 	ResolvedSecretV1,
 } from "./secrets";
 export { getSecretKeyring, setSecretKeyringForTests } from "./secrets-keyring";
-export type { SecretKeyringAdapter, SecretKeyringResult, SecretKeyringState } from "./secrets-keyring";
+export type {
+	SecretKeyringAdapter,
+	SecretKeyringAccessOptions,
+	SecretKeyringResult,
+	SecretKeyringState,
+} from "./secrets-keyring";
 export {
 	PRIVATE_DIR_MODE,
 	PRIVATE_FILE_MODE,
@@ -80,6 +100,7 @@ export {
 	ENTITY_TYPES,
 	ATTRIBUTE_KINDS,
 	ATTRIBUTE_STATUSES,
+	CLAIM_TIME_PRECISIONS,
 	DEPENDENCY_DESCRIPTIONS,
 	DEPENDENCY_TYPES,
 	TASK_STATUSES,
@@ -147,6 +168,7 @@ export type {
 	DecisionResult,
 	EntityType,
 	AttributeKind,
+	ClaimTimePrecision,
 	AttributeStatus,
 	DependencyType,
 	TaskStatus,
@@ -192,19 +214,13 @@ export { parseManifest, generateManifest } from "./manifest";
 export { parseSoul, generateSoul } from "./soul";
 export { parseMemory, generateMemory, type ParsedMemory } from "./memory";
 export {
-	MEMORY_CONTENT_SAFETY_POLICY_VERSION,
-	MEMORY_CONTENT_SAFETY_REASONS,
-	MEMORY_CONTENT_SAFETY_STATUSES,
-	MEMORY_CONTENT_WITHHELD_NOTICE,
-	assessMemoryContent,
-	isMemoryContentContextEligible,
-	scanMemoryContent,
-} from "./memory-content-safety";
-export type {
-	MemoryContentSafetyAssessment,
-	MemoryContentSafetyReason,
-	MemoryContentSafetyStatus,
-} from "./memory-content-safety";
+	CREDENTIAL_KINDS,
+	REDACTED_CREDENTIAL,
+	findCredentialSpans,
+	redactCredentials,
+	redactCredentialsDeep,
+} from "./credential-detection";
+export type { CredentialKind, CredentialSpan } from "./credential-detection";
 export {
 	LOOPBACK_HOST,
 	NETWORK_MODES,
@@ -241,6 +257,24 @@ export {
 	wrapMemoryContext,
 } from "./memory-context";
 export {
+	createFreshWorkspaceV2,
+	currentArtifactRelativePath,
+	findExistingWorkspaceDatabase,
+	hasExistingLegacyWorkspaceState,
+	hasExistingWorkspaceState,
+	persistWorkspaceLayout,
+	readWorkspaceLayoutOverrides,
+	resolveWorkspaceLayout,
+	resolveWorkspaceLayoutAs,
+	serializeWorkspaceLayout,
+	WORKSPACE_LAYOUT_V1,
+	WORKSPACE_LAYOUT_V2,
+	isWorkspacePrivatePath,
+	type WorkspaceLayout,
+	type WorkspaceLayoutOverrides,
+	type WorkspaceLayoutVersion,
+} from "./workspace-layout";
+export {
 	type WorkspaceSource,
 	type WorkspaceResolution,
 	type ResolveWorkspacePathOptions,
@@ -264,6 +298,7 @@ export {
 	keywordSearch,
 	hybridSearch,
 	cosineSimilarity,
+	activeVectorProjectionTable,
 	buildFtsMatchQuery,
 	type SearchOptions,
 	type SearchResult,
@@ -302,6 +337,7 @@ export type {
 } from "./recall";
 export {
 	createMemoriesFts,
+	MEMORIES_FTS_TOKENIZER,
 	memoriesFtsIntegrityIsComplete,
 	memoriesFtsNeedsTokenizerRepair,
 	readMemoriesFtsIndexRowCount,
@@ -316,6 +352,7 @@ export { migrate } from "./migrate";
 export type { MigrationSource } from "./migrate";
 export {
 	detectSchema,
+	detectSchemaType,
 	ensureUnifiedSchema,
 	ensureMigrationsTableSchema,
 	UNIFIED_SCHEMA,
@@ -340,13 +377,13 @@ export type { PromptContextEnvelope } from "./prompt-context";
 
 export {
 	SIGNET_GRAPHIQ_PLUGIN_ID,
-	SIGNET_PLUGIN_REGISTRY_DIR,
+	getPluginRegistryDir,
+	getPluginRegistryPath,
 	SIGNET_PLUGIN_REGISTRY_FILE,
 	SIGNET_PLUGIN_REGISTRY_VERSION,
 	SIGNET_SECRETS_PLUGIN_ID,
 } from "./plugins";
 export {
-	SIGNET_GRAPHIQ_STATE_FILE,
 	disableGraphiqState,
 	emptyGraphiqState,
 	enableGraphiqState,
@@ -381,6 +418,7 @@ export {
 	syncWorkspaceSourceRepo,
 } from "./workspace-source-repo";
 export type {
+	WorkspaceSourceRepoLocalChanges,
 	WorkspaceSourceRepoStatus,
 	WorkspaceSourceRepoSyncOptions,
 	WorkspaceSourceRepoSyncResult,
@@ -389,8 +427,10 @@ export {
 	addDiscordSource,
 	addGitHubSource,
 	addImportedSource,
+	addNotionSource,
 	addObsidianSource,
 	addWebSource,
+	deterministicImportedSourceId,
 	DEFAULT_DISCORD_DESKTOP_CACHE_PATH,
 	DEFAULT_DISCORD_MAX_ATTACHMENT_TEXT_BYTES,
 	DEFAULT_DISCORD_MAX_MESSAGES_PER_CHANNEL,
@@ -402,14 +442,18 @@ export {
 	MAX_DISCORD_MAX_MESSAGES_PER_CHANNEL,
 	MAX_DISCORD_MAX_ATTACHMENT_TEXT_BYTES,
 	MAX_GITHUB_MAX_ITEMS_PER_REPO,
+	DEFAULT_NOTION_MAX_PAGES,
+	MAX_NOTION_MAX_PAGES,
 	getAgentsDir,
 	getSourcesConfigPath,
 	loadSourcesConfig,
 	markSourceIndexed,
 	parseDiscordSettings,
 	parseGitHubSettings,
+	parseNotionSettings,
 	parseWebSettings,
 	normalizePublicWebUrl,
+	notionSourceId,
 	removeSource,
 	removeSourceIfGeneration,
 	saveSourcesConfig,
@@ -419,6 +463,7 @@ export type {
 	AddGitHubSourceInput,
 	AddImportedSourceInput,
 	AddImportedSourceResult,
+	AddNotionSourceInput,
 	AddObsidianSourceInput,
 	AddWebSourceInput,
 	AddSourceResult,
@@ -428,6 +473,7 @@ export type {
 	GitHubSourceSettings,
 	GitHubSourceState,
 	ImportedSourceDuplicateMode,
+	NotionSourceSettings,
 	RemoveSourceResult,
 	SignetSourceEntry,
 	SignetSourceKind,
@@ -451,29 +497,17 @@ export type {
 	SourceSyncResult,
 	SourceSyncStatus,
 } from "./source-substrate";
-
-// Portable export/import
-export {
-	collectExportData,
-	serializeExportData,
-	importMemories,
-	importEntities,
-	importRelations,
-} from "./export";
+export { collectExportData, serializeExportData, importBundle } from "./export";
 export type {
 	ExportOptions,
 	ExportManifest,
 	ExportData,
 	ImportOptions,
+	ImportInput,
 	ExportImportResult,
-	ImportConflictStrategy,
 } from "./export";
-
-// Migration runner
 export { runMigrations, hasPendingMigrations, MIGRATIONS, LATEST_SCHEMA_VERSION } from "./migrations/index";
 export type { MigrationDb, Migration } from "./migrations/index";
-
-// Identity file management
 export {
 	IDENTITY_FILES,
 	IDENTITY_PRESETS,
@@ -518,8 +552,6 @@ export type {
 	IdentityMap,
 	HermesTarget,
 } from "./identity";
-
-// Multi-agent support
 export {
 	discoverAgents,
 	scaffoldAgent,
@@ -530,8 +562,6 @@ export {
 	normalizeAgentRosterEntry,
 } from "./agents";
 export type { AgentRosterReadPolicy, NormalizedAgentRosterEntry, ResolvedAgentMemoryPolicy } from "./agents";
-
-// Skills unification
 export {
 	loadClawdhubLock,
 	symlinkClaudeSkills,
@@ -545,12 +575,8 @@ export type {
 	SkillsConfig,
 	SkillsResult,
 } from "./skills";
-
-// Skill transcript parsing (pure — no fs)
 export { parseTranscriptSkills } from "./skill-transcript";
 export type { ParsedSkillInvocation } from "./skill-transcript";
-
-// Memory import
 export {
 	importMemoryLogs,
 	chunkContent,
@@ -562,8 +588,6 @@ export type {
 	ChunkOptions,
 	HierarchicalChunk,
 } from "./import";
-
-// Markdown utilities
 export {
 	buildSignetBlock,
 	buildArchitectureDoc,
@@ -573,8 +597,6 @@ export {
 	SIGNET_BLOCK_START,
 	SIGNET_BLOCK_END,
 } from "./markdown";
-
-// YAML utilities
 export { formatYaml, parseRuntimeYaml, parseSimpleYaml, parseYamlDocument, stringifyYamlDocument } from "./yaml";
 export {
 	ROUTING_ACCOUNT_KINDS,
@@ -637,16 +659,12 @@ export {
 	setPipelinePaused,
 } from "./pipeline-pause";
 export type { PipelineConfigData, PipelinePauseState } from "./pipeline-pause";
-
-// Symlink utilities
 export {
 	symlinkSkills,
 	symlinkDir,
 	type SymlinkOptions,
 	type SymlinkResult,
 } from "./symlinks";
-
-// Package manager resolution utilities
 export {
 	parsePackageManagerUserAgent,
 	detectAvailablePackageManagers,
@@ -667,12 +685,8 @@ export {
 	type SignetInstallMethod,
 	type SignetUpdateTarget,
 } from "./signet-installation";
-
-// Memory provenance
 export { DAEMON_DERIVED_MEMORY_SOURCE_TYPES, isDaemonDerivedMemorySourceType } from "./memory-provenance";
 export { SOURCE_NATIVE_TOPOLOGY_ENTITY_TYPES } from "./ontology-topology";
-
-// Connector runtime types
 export {
 	CONNECTOR_PROVIDERS,
 	CONNECTOR_STATUSES,
@@ -693,25 +707,8 @@ export type {
 	DocumentRow,
 	ConnectorRow,
 } from "./connector-types";
-
-// Signet OS types
-export { DEFAULT_APP_SIZE } from "./signet-os-types";
-export type {
-	SignetAppManifest,
-	SignetAppEvents,
-	SignetAppSize,
-	AutoCardToolAction,
-	AutoCardResource,
-	AutoCardManifest,
-	McpProbeResult,
-	AppTrayState,
-	AppTrayEntry,
-	SignetOSEvent,
-	BrowserEventType,
-	EventBusSubscription,
-	ContextSnapshot,
-} from "./signet-os-types";
-
 export { parseTranscriptMessages, buildExportTranscriptRecord } from "./transcript-export";
 
 export { openPrivateDaemonLog, appendPrivateDaemonLog } from "./daemon-logs";
+export { parseAssistantChatEvent } from "./assistant-chat";
+export type { AssistantChatEvent, AssistantChatMessage } from "./assistant-chat";

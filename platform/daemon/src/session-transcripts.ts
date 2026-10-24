@@ -2,20 +2,22 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { writeFileAtomicSync } from "@signet/core";
 import { dirname, join } from "node:path";
+import { resolveWorkspaceLayout } from "@signet/core";
 import { extractAnchorTerms } from "./anchor-terms";
 import { type DbAccessor, type ReadDb, type WriteDb, getDbAccessor } from "./db-accessor";
 import { logger } from "./logger";
-import { upsertMemoryContentSafetyInTx } from "./memory-content-safety";
 import { sanitizeFtsQuery } from "./memory-search";
 import {
 	type TranscriptIdentity,
 	type TranscriptSessionKeyClassification,
 	appendCanonicalTranscriptSnapshotIfMissing,
 	canonicalTranscriptPath,
+	digestTranscriptTurns,
 	readCanonicalTranscriptSessionKeys,
 	rewriteReplacingLiveOnlySessions,
 	sanitizeHarnessPath,
 	sessionSeqCacheKey,
+	transcriptTextToTurns,
 } from "./transcript-jsonl";
 
 interface TranscriptRow {
@@ -37,7 +39,24 @@ interface StoredTranscriptBackfillRow {
 	readonly updated_at?: string | null;
 }
 
+const CANONICAL_BACKFILL_RETRY_BASE_MS = 60_000;
+const CANONICAL_BACKFILL_RETRY_MAX_MS = 60 * 60_000;
+
+interface CanonicalBackfillRetry {
+	readonly attempts: number;
+	readonly retryAt: number;
+}
+
+interface CanonicalBackfillGap {
+	readonly markdownFailures?: number;
+	readonly databaseOk?: boolean;
+	readonly markerWritten?: boolean;
+	readonly threw?: boolean;
+}
+
 const canonicalBackfills = new Set<string>();
+const canonicalBackfillRuns = new Map<string, Promise<void>>();
+const canonicalBackfillRetries = new Map<string, CanonicalBackfillRetry>();
 
 const OMP_UUID_LIKE_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}[:-][0-9a-f]{4}[:-][0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -94,9 +113,31 @@ function knownBackfillKeys(classification: TranscriptSessionKeyClassification): 
 	return new Set([...classification.canonicalKeys, ...classification.liveOnlyKeys]);
 }
 
-function markBackfillCanonical(classification: TranscriptSessionKeyClassification, key: string): void {
+function markBackfillCanonical(
+	classification: TranscriptSessionKeyClassification,
+	key: string,
+	transcript: string,
+): void {
 	classification.liveOnlyKeys.delete(key);
 	classification.canonicalKeys.add(key);
+	classification.completedDigests.set(key, digestTranscriptTurns(transcriptTextToTurns(transcript)));
+}
+
+function diagnoseCompletedMismatch(
+	classification: TranscriptSessionKeyClassification,
+	key: string,
+	input: TranscriptIdentity & { readonly transcript: string },
+): boolean {
+	const completedDigest = classification.completedDigests.get(key);
+	if (!completedDigest || completedDigest === digestTranscriptTurns(transcriptTextToTurns(input.transcript)))
+		return false;
+	logger.warn("transcripts", "Divergent completed transcript representation retained", {
+		harness: input.harness,
+		sessionKey: input.sessionKey,
+		sourceFormat: input.sourceFormat,
+		sourcePath: input.sourcePath,
+	});
+	return true;
 }
 
 function tableExists(name: string): boolean {
@@ -104,7 +145,7 @@ function tableExists(name: string): boolean {
 		// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
 		return getDbAccessor().withReadDb(
 			(db: import("./db-accessor").ReadDb) => tableExistsInDatabase(db, name),
-			"db:session-transcripts.legacy.line104",
+			"db:sync.session-transcripts.145",
 		);
 	} catch {
 		return false;
@@ -117,7 +158,7 @@ function sessionTranscriptsHasColumn(column: string): boolean {
 		return getDbAccessor().withReadDb((db: import("./db-accessor").ReadDb) => {
 			const cols = db.prepare("PRAGMA table_info(session_transcripts)").all() as ReadonlyArray<Record<string, unknown>>;
 			return cols.some((col) => col.name === column);
-		}, "db:session-transcripts.legacy.line116");
+		}, "db:sync.session-transcripts.157");
 	} catch {
 		return false;
 	}
@@ -155,7 +196,7 @@ async function backfillMarkdownTranscriptArtifacts(
 	agentId: string | undefined,
 	getSeen: (harness: string) => Promise<BackfillSeen>,
 ): Promise<number> {
-	const memoryDir = join(basePath, "memory");
+	const memoryDir = resolveWorkspaceLayout(basePath).transcripts;
 	if (!existsSync(memoryDir)) return 0;
 	let failures = 0;
 	const liveOnlyReplacements = new Map<
@@ -167,7 +208,7 @@ async function backfillMarkdownTranscriptArtifacts(
 		const path = join(memoryDir, name);
 		try {
 			const parsed = parseArtifactFrontmatter(readFileSync(path, "utf8"));
-			if (!parsed || parsed.frontmatter.kind !== "transcript") continue;
+			if (parsed?.frontmatter.kind !== "transcript") continue;
 			const rowAgentId = parsed.frontmatter.agent_id || "default";
 			if (agentId && rowAgentId !== agentId) continue;
 			const harness = parsed.frontmatter.harness || "unknown";
@@ -185,6 +226,10 @@ async function backfillMarkdownTranscriptArtifacts(
 			};
 			const { classification } = await getSeen(harness);
 			const key = sessionSeqCacheKey(input);
+			if (classification.canonicalKeys.has(key)) {
+				if (diagnoseCompletedMismatch(classification, key, input)) failures++;
+				continue;
+			}
 			if (classification.liveOnlyKeys.has(key)) {
 				const replacements =
 					liveOnlyReplacements.get(harness) ||
@@ -203,7 +248,7 @@ async function backfillMarkdownTranscriptArtifacts(
 				continue;
 			}
 			if (await appendCanonicalTranscriptSnapshotIfMissing(input, knownBackfillKeys(classification))) {
-				markBackfillCanonical(classification, key);
+				markBackfillCanonical(classification, key, input.transcript);
 			}
 		} catch (error) {
 			failures++;
@@ -220,8 +265,8 @@ async function backfillMarkdownTranscriptArtifacts(
 		try {
 			await rewriteReplacingLiveOnlySessions(jsonlPath, replacements);
 			const { classification } = await getSeen(harness);
-			for (const key of replacements.keys()) {
-				markBackfillCanonical(classification, key);
+			for (const [key, replacement] of replacements) {
+				markBackfillCanonical(classification, key, replacement.transcript);
 			}
 		} catch (error) {
 			failures++;
@@ -246,6 +291,7 @@ async function backfillDatabaseTranscripts(
 		string,
 		Map<string, { readonly identity: TranscriptIdentity; readonly transcript: string }>
 	>();
+	let mismatches = 0;
 	try {
 		let offset = 0;
 		while (true) {
@@ -265,7 +311,7 @@ async function backfillDatabaseTranscripts(
 						ORDER BY agent_id, harness, session_key, rowid
 						LIMIT ? OFFSET ?`;
 				return db.prepare(sql).all(PAGE_SIZE, offset) as unknown as StoredTranscriptBackfillRow[];
-			}, "db:session-transcripts.legacy.line252");
+			}, "db:sync.session-transcripts.298");
 			if (rows.length === 0) break;
 			for (const row of rows) {
 				const rowAgentId = row.agent_id?.trim() || "default";
@@ -283,6 +329,10 @@ async function backfillDatabaseTranscripts(
 				};
 				const { classification } = await getSeen(harness);
 				const key = sessionSeqCacheKey(input);
+				if (classification.canonicalKeys.has(key)) {
+					if (diagnoseCompletedMismatch(classification, key, input)) mismatches++;
+					continue;
+				}
 				if (classification.liveOnlyKeys.has(key)) {
 					const replacements =
 						liveOnlyReplacements.get(harness) ||
@@ -300,7 +350,7 @@ async function backfillDatabaseTranscripts(
 					continue;
 				}
 				if (await appendCanonicalTranscriptSnapshotIfMissing(input, knownBackfillKeys(classification))) {
-					markBackfillCanonical(classification, key);
+					markBackfillCanonical(classification, key, input.transcript);
 				}
 			}
 			offset += PAGE_SIZE;
@@ -311,8 +361,8 @@ async function backfillDatabaseTranscripts(
 			const jsonlPath = canonicalTranscriptPath(basePath, harness);
 			await rewriteReplacingLiveOnlySessions(jsonlPath, replacements);
 			const { classification } = await getSeen(harness);
-			for (const key of replacements.keys()) {
-				markBackfillCanonical(classification, key);
+			for (const [key, replacement] of replacements) {
+				markBackfillCanonical(classification, key, replacement.transcript);
 			}
 		}
 	} catch (error) {
@@ -321,7 +371,7 @@ async function backfillDatabaseTranscripts(
 		});
 		return false;
 	}
-	return true;
+	return mismatches === 0;
 }
 
 const BACKFILL_MARKER = ".canonical-transcript-backfill-v1";
@@ -331,7 +381,7 @@ function markerScope(agentId?: string): string {
 }
 
 function getMarkerPath(basePath: string, agentId?: string): string {
-	return join(basePath, "memory", `${BACKFILL_MARKER}.${markerScope(agentId)}`);
+	return join(resolveWorkspaceLayout(basePath).transcripts, `${BACKFILL_MARKER}.${markerScope(agentId)}`);
 }
 
 function markerMatches(path: string, agentId?: string): boolean {
@@ -347,31 +397,64 @@ function markerMatches(path: string, agentId?: string): boolean {
 	}
 }
 
-export async function ensureCanonicalTranscriptHistory(basePath: string, agentId?: string): Promise<void> {
+export function ensureCanonicalTranscriptHistory(basePath: string, agentId?: string): Promise<void> {
 	const key = `${basePath}:${agentId ?? "*"}`;
-	if (canonicalBackfills.has(key)) return;
+	if (canonicalBackfills.has(key)) return Promise.resolve();
+	const running = canonicalBackfillRuns.get(key);
+	if (running) return running;
+	const retry = canonicalBackfillRetries.get(key);
+	if (retry && Date.now() < retry.retryAt) return Promise.resolve();
+	const run = runCanonicalTranscriptBackfill(key, basePath, agentId).finally(() => {
+		canonicalBackfillRuns.delete(key);
+	});
+	canonicalBackfillRuns.set(key, run);
+	return run;
+}
 
-	const markerPath = getMarkerPath(basePath, agentId);
-	if (existsSync(markerPath) && markerMatches(markerPath, agentId)) {
-		canonicalBackfills.add(key);
-		return;
+async function runCanonicalTranscriptBackfill(key: string, basePath: string, agentId?: string): Promise<void> {
+	let incomplete: CanonicalBackfillGap | null = { threw: true };
+	try {
+		incomplete = await backfillCanonicalTranscriptHistory(basePath, agentId);
+	} finally {
+		if (incomplete) {
+			deferCanonicalBackfillRetry(key, basePath, agentId, incomplete);
+		} else {
+			canonicalBackfills.add(key);
+			canonicalBackfillRetries.delete(key);
+		}
 	}
+}
+
+function deferCanonicalBackfillRetry(
+	key: string,
+	basePath: string,
+	agentId: string | undefined,
+	gap: CanonicalBackfillGap,
+): void {
+	const attempts = (canonicalBackfillRetries.get(key)?.attempts ?? 0) + 1;
+	const retryInMs = Math.min(CANONICAL_BACKFILL_RETRY_BASE_MS * 2 ** (attempts - 1), CANONICAL_BACKFILL_RETRY_MAX_MS);
+	canonicalBackfillRetries.set(key, { attempts, retryAt: Date.now() + retryInMs });
+	logger.warn("transcripts", "Canonical transcript backfill incomplete; retry deferred", {
+		agentId: agentId ?? "*",
+		basePath,
+		...gap,
+		attempts,
+		retryInMs,
+	});
+}
+
+async function backfillCanonicalTranscriptHistory(
+	basePath: string,
+	agentId?: string,
+): Promise<CanonicalBackfillGap | null> {
+	const markerPath = getMarkerPath(basePath, agentId);
+	if (existsSync(markerPath) && markerMatches(markerPath, agentId)) return null;
 
 	const getSeen = createBackfillSeenReader(basePath, agentId);
-	const failures = await backfillMarkdownTranscriptArtifacts(basePath, agentId, getSeen);
+	const markdownFailures = await backfillMarkdownTranscriptArtifacts(basePath, agentId, getSeen);
 	const databaseOk = await backfillDatabaseTranscripts(basePath, agentId, getSeen);
-	if (failures > 0 || !databaseOk) {
-		logger.warn("transcripts", "Canonical transcript backfill incomplete; will retry on next write", {
-			agentId: agentId ?? "*",
-			basePath,
-			markdownFailures: failures,
-			databaseOk,
-		});
-		return;
-	}
-
-	if (!writeMarker(markerPath, agentId)) return;
-	canonicalBackfills.add(key);
+	if (markdownFailures > 0 || !databaseOk) return { markdownFailures, databaseOk };
+	return writeMarker(markerPath, agentId) ? null : { markerWritten: false };
 }
 
 function writeMarker(markerPath: string, agentId?: string): boolean {
@@ -397,7 +480,7 @@ function hasUpdatedAt(): boolean {
 		return getDbAccessor().withReadDb((db: import("./db-accessor").ReadDb) => {
 			const cols = db.prepare("PRAGMA table_info(session_transcripts)").all() as ReadonlyArray<Record<string, unknown>>;
 			return cols.some((col) => col.name === "updated_at");
-		}, "db:session-transcripts.legacy.line396");
+		}, "db:sync.session-transcripts.479");
 	} catch {
 		return false;
 	}
@@ -463,9 +546,6 @@ export function upsertSessionTranscript(
 						.get(sessionKey, agentId) as { content?: string } | null | undefined)
 				: undefined;
 			const retainedTranscript = mergeTranscriptContent(existing?.content ?? "", transcript);
-
-			// Imported sessions retain their original event time. Live harnesses do
-			// not pass one and keep the existing wall-clock behavior.
 			const now = capturedAt ?? new Date().toISOString();
 			const cols = db.prepare("PRAGMA table_info(session_transcripts)").all() as ReadonlyArray<Record<string, unknown>>;
 			const hasUpdated = cols.some((col) => col.name === "updated_at");
@@ -509,14 +589,8 @@ export function upsertSessionTranscript(
 					 VALUES (${insertColumns.map(() => "?").join(", ")})
 					 ON CONFLICT(agent_id, session_key) DO UPDATE SET ${updates.join(", ")}`,
 			).run(...values);
-			upsertMemoryContentSafetyInTx(db, {
-				agentId,
-				sourceKind: "transcript",
-				sourceId: sessionKey,
-				content: retainedTranscript,
-			});
 			return true;
-		}, "db:session-transcripts.legacy.line450");
+		}, "db:sync.session-transcripts.533");
 	} catch (error) {
 		logger.warn("transcripts", "Transcript upsert failed", {
 			error: error instanceof Error ? error.message : String(error),
@@ -597,15 +671,9 @@ export async function upsertSessionTranscriptAsync(
 						 VALUES (${insertColumns.map(() => "?").join(", ")})
 						 ON CONFLICT(agent_id, session_key) DO UPDATE SET ${updates.join(", ")}`,
 				).run(...values);
-				upsertMemoryContentSafetyInTx(db, {
-					agentId,
-					sourceKind: "transcript",
-					sourceId: sessionKey,
-					content: retainedTranscript,
-				});
 				return true;
 			},
-			{ siteToken: "db:session-transcripts.legacy.line541", operation: "transcripts.upsert", signal: options?.signal },
+			{ siteToken: "db:sync.session-transcripts.615", operation: "transcripts.upsert", signal: options?.signal },
 		);
 	} catch (error) {
 		if (options?.signal?.aborted) throw error;
@@ -623,8 +691,6 @@ function mergeTranscriptContent(existing: string, incoming: string): string {
 	if (incoming.includes(existing)) return incoming;
 	return `${existing}\n${incoming}`;
 }
-
-/** Mark one retained transcript complete inside an existing write transaction. */
 export function markSessionTranscriptCompletedInTx(
 	db: WriteDb,
 	sessionKey: string,
@@ -639,12 +705,8 @@ export function markSessionTranscriptCompletedInTx(
 	const result = db
 		.prepare(`UPDATE session_transcripts SET ${set} WHERE session_key = ? AND agent_id = ? AND completed_at IS NULL`)
 		.run(...args);
-	// bun:sqlite includes FTS-trigger writes in changes; any direct row update
-	// is a successful completion marker even when the count is greater than one.
 	return result.changes > 0;
 }
-
-/** Mark one retained transcript complete at the session-end boundary. */
 export function markSessionTranscriptCompleted(
 	sessionKey: string,
 	agentId: string,
@@ -657,7 +719,7 @@ export function markSessionTranscriptCompleted(
 		return (accessor ?? getDbAccessor()).withWriteTx((db: import("./db-accessor").WriteDb) => {
 			if (!tableExistsInDatabase(db, "session_transcripts")) return false;
 			return markSessionTranscriptCompletedInTx(db, sessionKey, agentId, completedAt);
-		}, "db:session-transcripts.legacy.line656");
+		}, "db:sync.session-transcripts.718");
 	} catch (error) {
 		logger.warn("transcripts", "Transcript completion marker failed", {
 			error: error instanceof Error ? error.message : String(error),
@@ -673,8 +735,6 @@ function tableExistsInDatabase(
 ): boolean {
 	return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) != null;
 }
-
-/** Read the stored transcript content for a session. */
 export function getStoredSessionTranscriptInfo(sessionKey: string, agentId: string): StoredTranscriptInfo | undefined {
 	if (!tableExists("session_transcripts")) return undefined;
 	const aliases = [...new Set([sessionKey, canonicalizeTranscriptLookup(sessionKey)])];
@@ -722,7 +782,7 @@ export function getStoredSessionTranscriptInfo(sessionKey: string, agentId: stri
 				completedAt: row.completed_at ?? null,
 				contentHash: row.content_hash ?? null,
 			};
-		}, "db:session-transcripts.legacy.line690");
+		}, "db:sync.session-transcripts.750");
 	} catch {
 		return undefined;
 	}
@@ -777,8 +837,6 @@ function readStoredSessionTranscriptInfo(
 		contentHash: row.content_hash ?? null,
 	};
 }
-
-/** Async transcript lookup for background recovery and maintenance paths. */
 export async function getStoredSessionTranscriptInfoAsync(
 	sessionKey: string,
 	agentId: string,
@@ -792,7 +850,7 @@ export async function getStoredSessionTranscriptInfoAsync(
 				if (!tableExistsInDatabase(db, "session_transcripts")) return undefined;
 				return readStoredSessionTranscriptInfo(db, sessionKey, agentId);
 			},
-			{ siteToken: "db:session-transcripts.legacy.line789", operation: "transcripts.lookup", signal },
+			{ siteToken: "db:sync.session-transcripts.847", operation: "transcripts.lookup", signal },
 		);
 	} catch (error) {
 		if (signal?.aborted) throw error;
@@ -816,7 +874,7 @@ export function getSessionTranscriptContent(sessionKey: string, agentId: string)
 				)
 				.get(agentId, ...aliases, sessionKey) as { content: string } | undefined;
 			return row?.content;
-		}, "db:session-transcripts.legacy.line808");
+		}, "db:sync.session-transcripts.866");
 	} catch {
 		return undefined;
 	}
@@ -830,14 +888,6 @@ export interface StaleLiveSession {
 	content: string;
 	lastActivityAt: string;
 }
-
-/**
- * Live-retained sessions whose last activity is older than `staleOlderThanMs`.
- *
- * Completion is owned by the transcript row itself. A stale session is a
- * session-end boundary, so it must not depend on a summary job or a minimum
- * transcript length to become eligible for Dreaming.
- */
 export function findStaleLiveSessions(staleOlderThanMs: number, limit = 50): StaleLiveSession[] {
 	if (staleOlderThanMs <= 0 || !tableExists("session_transcripts") || !sessionTranscriptsHasColumn("completed_at"))
 		return [];
@@ -872,7 +922,7 @@ export function findStaleLiveSessions(staleOlderThanMs: number, limit = 50): Sta
 				content: row.content,
 				lastActivityAt: row.last_activity,
 			}));
-		}, "db:session-transcripts.legacy.line847");
+		}, "db:sync.session-transcripts.897");
 	} catch {
 		return [];
 	}
@@ -920,7 +970,7 @@ export function searchTranscriptFallback(params: {
 					].join("\n"),
 				)
 				.all(...args) as unknown as TranscriptRow[];
-		}, "db:session-transcripts.legacy.line902");
+		}, "db:sync.session-transcripts.952");
 		if (exactRows.length > 0) {
 			return exactRows
 				.map((row) => ({
@@ -963,7 +1013,7 @@ export function searchTranscriptFallback(params: {
 							parts.push(`ORDER BY rank ASC, ${seenExpr} DESC LIMIT ?`);
 							args.push(limit * 2);
 							return db.prepare(parts.join("\n")).all(...args) as unknown as TranscriptRow[];
-						}, "db:session-transcripts.legacy.line947");
+						}, "db:sync.session-transcripts.997");
 
 					const hits = rows
 						.map((row) => ({
@@ -1033,7 +1083,7 @@ export function searchTranscriptFallback(params: {
 				parts.push(`ORDER BY rank DESC, ${seenExpr} DESC LIMIT ?`);
 				args.push(limit);
 				return db.prepare(parts.join("\n")).all(...args) as unknown as TranscriptRow[];
-			}, "db:session-transcripts.legacy.line1011");
+			}, "db:sync.session-transcripts.1061");
 
 		return rows
 			.map((row) => ({

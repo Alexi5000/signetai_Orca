@@ -12,7 +12,7 @@ export const RUNTIME_PATH = "plugin" as const;
 
 export const READ_TIMEOUT = 5_000;
 export const WRITE_TIMEOUT = 10_000;
-export const PROMPT_SUBMIT_TIMEOUT = READ_TIMEOUT;
+export const PROMPT_SUBMIT_TIMEOUT_ENV = "SIGNET_PROMPT_SUBMIT_TIMEOUT";
 export const SESSION_START_TIMEOUT_ENV = "SIGNET_SESSION_START_TIMEOUT";
 export const FETCH_TIMEOUT_ENV = "SIGNET_FETCH_TIMEOUT";
 
@@ -24,10 +24,6 @@ export interface PreCompactionResult {
 	readonly guidelines?: string;
 	readonly summaryPrompt?: string;
 }
-
-// The upstream Oh My Pi package does not currently type-check cleanly as a
-// dependency in this monorepo. Model only the runtime surface this extension
-// actually consumes so `tsc --noEmit` still verifies our integration.
 export type OmpMessageAttribution = "user" | "agent";
 
 export interface OmpAgentMessage extends BaseAgentMessage {

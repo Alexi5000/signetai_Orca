@@ -98,7 +98,7 @@ export function registerAppCommands(program: Command, deps: AppDeps): void {
 		.option("--network-mode <mode>", "Daemon network mode in non-interactive mode (localhost, tailscale)")
 		.option(
 			"--harness <harness>",
-			"Harness to configure (repeatable or comma-separated: claude-code, codex, opencode, openclaw, oh-my-pi, pi, hermes-agent, gemini)",
+			"Harness to configure (repeatable or comma-separated: claude-code, codex, opencode, openclaw, oh-my-pi, pi, hermes-agent, gemini, muse-code)",
 			deps.collectListOption,
 			[],
 		)
@@ -142,7 +142,10 @@ export function registerAppCommands(program: Command, deps: AppDeps): void {
 		.option("--file <path>", "Apply a setup plan from a JSON file (headless, no prompts)")
 		.option("--json <plan>", "Apply an inline setup plan JSON string (headless, no prompts)")
 		.option("--dry-run", "Resolve and print the setup plan, then exit without applying")
-		.option("--enable-dreaming", "Enable background memory consolidation (dreaming)")
+		.option(
+			"--enable-dreaming",
+			"Enable background memory consolidation for an existing workspace (fresh setups default on and ask during provider/model onboarding)",
+		)
 		.option("--remote-url <url>", "Point this workspace at a remote daemon instead of starting a local one")
 		.option(
 			"--obsidian-source <path[::name]>",
@@ -217,13 +220,6 @@ interface DefaultActionDeps {
 	readonly signetBanner: () => string;
 	readonly statusDeps: unknown;
 }
-
-/**
- * Registers the top-level default action (bare `signet` invocation).
- *
- * Commander routes unmatched operands (unknown commands) to this action; reject
- * them with a non-zero exit instead of silently rendering the status banner.
- */
 export function registerDefaultAction(program: Command, deps: DefaultActionDeps): void {
 	program.action(async (_options: unknown, command: Command) => {
 		if (command.args.length > 0) {

@@ -1,15 +1,30 @@
+export type ModelProvider = "openai" | "anthropic" | "google" | "zai"
+
+export interface ModelPricing {
+  inputPerMillion: number
+  outputPerMillion: number
+  cachedInputPerMillion?: number
+}
+
 export interface ModelConfig {
   id: string
-  provider: "openai" | "anthropic" | "google"
+  provider: ModelProvider
   displayName: string
   supportsTemperature: boolean
   defaultTemperature: number
   maxTokensParam: "maxTokens" | "max_completion_tokens" | "maxOutputTokens"
   defaultMaxTokens: number
+  thinking?: "enabled" | "disabled"
+  pricing?: ModelPricing
+}
+
+const GLM_5_3_FLASH_PRICING: ModelPricing = {
+  inputPerMillion: 0.15,
+  outputPerMillion: 0.5,
+  cachedInputPerMillion: 0.03,
 }
 
 export const MODEL_CONFIGS: Record<string, ModelConfig> = {
-  // OpenAI - Standard models (support temperature)
   "gpt-4o": {
     id: "gpt-4o",
     provider: "openai",
@@ -55,8 +70,6 @@ export const MODEL_CONFIGS: Record<string, ModelConfig> = {
     maxTokensParam: "maxTokens",
     defaultMaxTokens: 1000,
   },
-
-  // OpenAI - Reasoning models (NO temperature support)
   "gpt-5": {
     id: "gpt-5",
     provider: "openai",
@@ -129,8 +142,6 @@ export const MODEL_CONFIGS: Record<string, ModelConfig> = {
     maxTokensParam: "max_completion_tokens",
     defaultMaxTokens: 1000,
   },
-
-  // Anthropic - All Claude models (support temperature)
   "opus-4.5": {
     id: "claude-opus-4-5-20251101",
     provider: "anthropic",
@@ -176,8 +187,6 @@ export const MODEL_CONFIGS: Record<string, ModelConfig> = {
     maxTokensParam: "maxTokens",
     defaultMaxTokens: 1000,
   },
-
-  // Google - Gemini 2.x (support temperature)
   "gemini-2.5-pro": {
     id: "gemini-2.5-pro",
     provider: "google",
@@ -214,8 +223,6 @@ export const MODEL_CONFIGS: Record<string, ModelConfig> = {
     maxTokensParam: "maxTokens",
     defaultMaxTokens: 1000,
   },
-
-  // Google - Gemini 3 (MUST use temperature=1, lower causes issues)
   "gemini-3-pro-preview": {
     id: "gemini-3-pro-preview",
     provider: "google",
@@ -225,14 +232,31 @@ export const MODEL_CONFIGS: Record<string, ModelConfig> = {
     maxTokensParam: "maxTokens",
     defaultMaxTokens: 1000,
   },
+  "glm-5.3-flash": {
+    id: "glm-5.3-flash",
+    provider: "zai",
+    displayName: "GLM-5.3-Flash",
+    supportsTemperature: true,
+    defaultTemperature: 0,
+    maxTokensParam: "maxTokens",
+    defaultMaxTokens: 1000,
+    thinking: "disabled",
+    pricing: GLM_5_3_FLASH_PRICING,
+  },
+  "glm-5.3-flash-thinking": {
+    id: "glm-5.3-flash",
+    provider: "zai",
+    displayName: "GLM-5.3-Flash (thinking)",
+    supportsTemperature: false,
+    defaultTemperature: 1,
+    maxTokensParam: "maxTokens",
+    defaultMaxTokens: 16000,
+    thinking: "enabled",
+    pricing: GLM_5_3_FLASH_PRICING,
+  },
 }
 
 export const DEFAULT_ANSWERING_MODEL = "gpt-4o"
-export const DEFAULT_JUDGE_MODELS: Record<string, string> = {
-  openai: "gpt-4o",
-  anthropic: "sonnet-4",
-  google: "gemini-2.5-flash",
-}
 
 export function getModelConfig(alias: string): ModelConfig {
   const lowerAlias = alias.toLowerCase()
@@ -240,11 +264,6 @@ export function getModelConfig(alias: string): ModelConfig {
   if (MODEL_CONFIGS[lowerAlias]) {
     return MODEL_CONFIGS[lowerAlias]
   }
-
-  // Fallback for unknown models - try to infer from prefix/name. Local
-  // OpenAI-compatible servers such as llama.cpp often reject temperature for
-  // GGUF models even though they expose an OpenAI-shaped API. Keep benchmark
-  // prompts deterministic by omitting unsupported temperature params.
   if (
     lowerAlias.startsWith("gpt-5") ||
     lowerAlias.startsWith("o1") ||
@@ -273,6 +292,18 @@ export function getModelConfig(alias: string): ModelConfig {
       defaultTemperature: 0,
       maxTokensParam: "maxTokens",
       defaultMaxTokens: 1000,
+    }
+  }
+  if (lowerAlias.startsWith("glm-")) {
+    return {
+      id: alias,
+      provider: "zai",
+      displayName: alias,
+      supportsTemperature: true,
+      defaultTemperature: 0,
+      maxTokensParam: "maxTokens",
+      defaultMaxTokens: 1000,
+      thinking: "disabled",
     }
   }
   if (lowerAlias.startsWith("claude-")) {
@@ -308,8 +339,6 @@ export function getModelConfig(alias: string): ModelConfig {
       defaultMaxTokens: 1000,
     }
   }
-
-  // Default fallback
   return {
     id: alias,
     provider: "openai",
@@ -320,8 +349,6 @@ export function getModelConfig(alias: string): ModelConfig {
     defaultMaxTokens: 1000,
   }
 }
-
-// Legacy exports for backward compatibility
 export const MODEL_ALIASES = MODEL_CONFIGS
 
 export function resolveModel(alias: string): ModelConfig {
@@ -332,7 +359,7 @@ export function getModelId(alias: string): string {
   return getModelConfig(alias).id
 }
 
-export function getModelProvider(alias: string): "openai" | "anthropic" | "google" {
+export function getModelProvider(alias: string): ModelProvider {
   return getModelConfig(alias).provider
 }
 
@@ -340,7 +367,7 @@ export function listAvailableModels(): string[] {
   return Object.keys(MODEL_CONFIGS)
 }
 
-export function listModelsByProvider(provider: "openai" | "anthropic" | "google"): string[] {
+export function listModelsByProvider(provider: ModelProvider): string[] {
   return Object.entries(MODEL_CONFIGS)
     .filter(([_, config]) => config.provider === provider)
     .map(([alias]) => alias)

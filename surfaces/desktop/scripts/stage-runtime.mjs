@@ -10,6 +10,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	renameSync,
 	statSync,
@@ -122,6 +123,11 @@ export function assertBunRuntime(
 	}
 }
 
+export function stageBunRuntime(source, destination, platform) {
+	cpSync(realpathSync(source), destination);
+	if (platform !== "win32") chmodSync(destination, 0o755);
+}
+
 export function platformVecPackage(platform, arch) {
 	const os = platform === "win32" ? "windows" : platform;
 	return `sqlite-vec-${os}-${arch}`;
@@ -129,6 +135,20 @@ export function platformVecPackage(platform, arch) {
 
 function pkgVersion(pkg, name) {
 	return pkg.dependencies?.[name] ?? pkg.optionalDependencies?.[name] ?? pkg.devDependencies?.[name] ?? null;
+}
+
+export function runtimeDependencies(daemonPkg, corePkg, platform, arch) {
+	const vecPackage = platformVecPackage(platform, arch);
+	const dependencies = {};
+	for (const name of ["@firecrawl/anydoc", "tiktoken"]) {
+		const version = pkgVersion(daemonPkg, name);
+		if (version) dependencies[name] = version;
+	}
+	for (const name of ["@napi-rs/keyring", "sqlite-vec", vecPackage]) {
+		const version = pkgVersion(corePkg, name);
+		if (version) dependencies[name] = version;
+	}
+	return dependencies;
 }
 
 function resourceLockPath(target) {
@@ -294,13 +314,7 @@ export function stageRuntime() {
 		mkdirSync(runtimeOut, { recursive: true });
 
 		const bunDest = resolve(runtimeOut, target === "win32" ? "bun.exe" : "bun");
-		cpSync(bunSrc, bunDest);
-		if (target !== "win32") chmodSync(bunDest, 0o755);
-
-		// Stage every built daemon entrypoint and native asset rather than a
-		// hardcoded subset. The daemon resolves its workers (db-owner, harness
-		// install, dreaming tokens, transcript recovery, ...) as siblings of
-		// daemon.js at runtime; missing files here break the packaged app at boot.
+		stageBunRuntime(bunSrc, bunDest, target);
 		mkdirSync(resolve(daemonOut, "dist"), { recursive: true });
 		const daemonDist = resolve(repoRoot, "platform/daemon/dist");
 		for (const entry of readdirSync(daemonDist)) {
@@ -310,11 +324,6 @@ export function stageRuntime() {
 		}
 		cpSync(resolve(repoRoot, "platform/daemon/dashboard"), resolve(daemonOut, "dashboard"), { recursive: true });
 		cpSync(resolve(repoRoot, "platform/daemon/skills"), resolve(daemonOut, "skills"), { recursive: true });
-
-		// Connector assets that live on disk in the connector package (not bundled
-		// into dist JS). The hermes-agent connector copies its Python plugin from
-		// here during harness install; the desktop daemon points
-		// SIGNET_CONNECTOR_ASSETS_DIR at this tree.
 		const connectorsOut = resolve(daemonOut, "connectors");
 		const hermesPluginSrc = resolve(repoRoot, "integrations/hermes-agent/connector/hermes-plugin");
 		if (existsSync(hermesPluginSrc)) {
@@ -326,19 +335,10 @@ export function stageRuntime() {
 		const daemonPkg = readJson(daemonPkgPath);
 		const corePkg = readJson(corePkgPath);
 		const vecPkg = platformVecPackage(target, bunArch);
-		const vecVersion = pkgVersion(corePkg, vecPkg);
-		if (vecVersion === null) {
+		if (pkgVersion(corePkg, vecPkg) === null) {
 			throw new Error(`No sqlite-vec binary package is available for ${target}/${bunArch}`);
 		}
-		const dependencies = {};
-		for (const name of ["@firecrawl/anydoc", "tiktoken"]) {
-			const version = pkgVersion(daemonPkg, name);
-			if (version) dependencies[name] = version;
-		}
-		for (const name of ["sqlite-vec", vecPkg]) {
-			const version = pkgVersion(corePkg, name);
-			if (version) dependencies[name] = version;
-		}
+		const dependencies = runtimeDependencies(daemonPkg, corePkg, target, bunArch);
 
 		writeFileSync(
 			resolve(daemonOut, "package.json"),

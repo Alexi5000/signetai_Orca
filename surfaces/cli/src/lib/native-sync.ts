@@ -10,7 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { parseSimpleYaml } from "@signet/core";
+import { parseSimpleYaml, resolveWorkspaceLayout } from "@signet/core";
 import { sleep } from "./runtime.js";
 
 const NATIVE_SYNC_LOCK_FILENAME = "sync-native.lock";
@@ -56,7 +56,6 @@ export function embeddingProvider(basePath: string): EmbeddingProvider {
 			}
 		} catch (error) {
 			if (error instanceof RetiredEmbeddingConfigError) throw error;
-			// Malformed config — keep scanning fallbacks.
 		}
 	}
 	return "native";
@@ -84,7 +83,7 @@ function isAlive(pid: number): boolean {
 }
 
 function nativeSyncLockPath(basePath: string): string {
-	return join(basePath, ".daemon", NATIVE_SYNC_LOCK_FILENAME);
+	return join(resolveWorkspaceLayout(basePath).runtime, NATIVE_SYNC_LOCK_FILENAME);
 }
 
 function clearStaleNativeSyncLock(path: string): boolean {
@@ -95,9 +94,7 @@ function clearStaleNativeSyncLock(path: string): boolean {
 			rmSync(path, { force: true });
 			return true;
 		}
-	} catch {
-		// Best-effort stale-lock detection.
-	}
+	} catch {}
 
 	try {
 		const age = Date.now() - statSync(path).mtimeMs;
@@ -105,9 +102,7 @@ function clearStaleNativeSyncLock(path: string): boolean {
 			rmSync(path, { force: true });
 			return true;
 		}
-	} catch {
-		// Lock disappeared between checks.
-	}
+	} catch {}
 
 	return false;
 }
@@ -145,8 +140,6 @@ export async function acquireNativeSyncLock(basePath: string): Promise<{
 export function releaseNativeSyncLock(lock: { readonly fd: number; readonly path: string }): void {
 	try {
 		closeSync(lock.fd);
-	} catch {
-		// Ignore.
-	}
+	} catch {}
 	rmSync(lock.path, { force: true });
 }

@@ -1,0 +1,554 @@
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { ConnectSourceDialog } from "@/components/sources/connect-source-dialog";
+import { type SignetSource, api } from "@/lib/api";
+import { ViewProvider } from "@/lib/view-context";
+import { Window } from "happy-dom";
+import { installDashboardDomGlobals } from "@/test/dom-globals";
+import { act } from "react";
+import { type Root, createRoot } from "react-dom/client";
+import { HomeSourcesPanel, sourceIssue } from "./sources";
+
+const originalImportSources = api.importSources;
+const originalAddSource = api.addSource;
+const originalPickFiles = api.pickFiles;
+const originalGetSourceSnapshot = api.getSourceSnapshot;
+const originalRemoveSource = api.removeSource;
+const originalGetAgents = api.getAgents;
+const originalGetStatus = api.getStatus;
+const originalFetch = globalThis.fetch;
+let domWindow: Window;
+let restoreDomGlobals = () => {};
+
+let importCall: { files: readonly File[]; duplicateMode: string; paths: readonly string[] } | null = null;
+let sourcesResponse: { version: number; sources: SignetSource[] } = { version: 1, sources: [] };
+
+function flush(): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function mount(element: React.ReactNode): Promise<{ container: HTMLElement; root: Root }> {
+	const container = document.createElement("div");
+	document.body.appendChild(container);
+	const root = createRoot(container);
+	await act(async () => {
+		root.render(element);
+		await flush();
+	});
+	return { container, root };
+}
+
+async function click(element: Element): Promise<void> {
+	await act(async () => {
+		(element as HTMLElement).click();
+		await flush();
+	});
+}
+async function expandSources(container: HTMLElement): Promise<void> {
+	const toggle = container.querySelector('button[aria-expanded="false"][aria-labelledby="home-sources-title"]');
+	if (!toggle) throw new Error("Sources setup row not found");
+	await click(toggle);
+}
+
+function button(container: HTMLElement, label: string): HTMLButtonElement {
+	const match = [...container.querySelectorAll("button")].find((candidate) => candidate.textContent?.includes(label));
+	if (!(match instanceof HTMLButtonElement)) throw new Error(`button not found: ${label}`);
+	return match;
+}
+
+beforeAll(() => {
+	domWindow = new Window();
+	restoreDomGlobals = installDashboardDomGlobals(domWindow);
+	globalThis.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input).endsWith("/api/sources")) {
+			return new Response(JSON.stringify(sourcesResponse), { status: 200 });
+		}
+		return new Response("not found", { status: 404 });
+	}) as typeof fetch;
+});
+
+beforeEach(() => {
+	importCall = null;
+	sourcesResponse = { version: 1, sources: [] };
+	api.importSources = async (files, duplicateMode, paths) => {
+		importCall = { files, duplicateMode, paths };
+		return {
+			ok: true,
+			data: {
+				imported: 1,
+				failed: 0,
+				files: [
+					{
+						fileName: "notes.md",
+						status: "imported",
+						sourceId: "source-1",
+						format: "markdown",
+						duplicate: false,
+						extraction: { documentEntityId: "entity-1" },
+					},
+				],
+			},
+		};
+	};
+	api.pickFiles = async () => ({ ok: true, paths: ["/tmp/notes.md"] });
+	api.getSourceSnapshot = async () => ({});
+	api.removeSource = async () => ({ ok: true });
+});
+
+afterAll(() => {
+	api.importSources = originalImportSources;
+	api.addSource = originalAddSource;
+	api.pickFiles = originalPickFiles;
+	api.getSourceSnapshot = originalGetSourceSnapshot;
+	api.removeSource = originalRemoveSource;
+	api.getAgents = originalGetAgents;
+	api.getStatus = originalGetStatus;
+	globalThis.fetch = originalFetch;
+	restoreDomGlobals();
+	domWindow.close();
+});
+
+function sourceFixture(
+	id: string,
+	kind: string,
+	name: string,
+	health: SignetSource["health"]["status"] = "healthy",
+	indexJob?: SignetSource["indexJob"],
+): SignetSource {
+	return {
+		id,
+		kind,
+		name,
+		root: kind === "import" ? name : `/vault/${name}`,
+		enabled: true,
+		mode: "read-only",
+		createdAt: "2026-08-10T00:00:00.000Z",
+		updatedAt: "2026-08-10T00:00:00.000Z",
+		stats: { artifacts: 3, chunks: 4, indexed: 5 },
+		health: {
+			status: health,
+			failures: health === "degraded" ? { total: 1, recoverable: 1 } : { total: 0, recoverable: 0 },
+			...(kind === "import"
+				? {
+						semantic: {
+							entities: 1,
+							aspects: 2,
+							attributes: 3,
+							dependencies: 0,
+							communities: 0,
+							total: 6,
+							documentEntityId: "entity-1",
+						},
+						importExtraction: { documentEntityId: "entity-1" },
+					}
+				: {}),
+		},
+		indexJob,
+		...(kind === "import"
+			? {
+					providerSettings: {
+						fileName: name,
+						format: name.endsWith(".pdf") ? "pdf" : "markdown",
+						contentHash: id,
+						agentId: "sources-test-agent",
+					},
+				}
+			: {}),
+	};
+}
+
+describe("sources grouping", () => {
+	test("keeps workspace import controls out of the Sources home panel", async () => {
+		const mounted = await mount(
+			<ViewProvider>
+				<HomeSourcesPanel sources={[]} loading={false} onRefresh={() => {}} />
+			</ViewProvider>,
+		);
+		expect(mounted.container.querySelector('[data-testid="import-inbox-card"]')).toBeNull();
+		expect(mounted.container.textContent).not.toContain("Durable imports");
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+
+	test("does not render blank extraction counts from an older daemon payload", async () => {
+		const source = sourceFixture("import:legacy", "import", "legacy.md");
+		source.health = {
+			status: "healthy",
+			semantic: {
+				entities: 1,
+				attributes: 42,
+				dependencies: 0,
+				communities: 0,
+				total: 43,
+				documentEntityId: null,
+			} as SignetSource["health"]["semantic"],
+		};
+		sourcesResponse = { version: 1, sources: [source] };
+		const mounted = await mount(
+			<ViewProvider>
+				<HomeSourcesPanel sources={sourcesResponse.sources} loading={false} onRefresh={() => {}} />
+			</ViewProvider>,
+		);
+		await expandSources(mounted.container);
+
+		expect(mounted.container.textContent).toContain("import result unavailable");
+		expect(mounted.container.textContent).not.toContain("undefined aspects");
+
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+
+	test("uses the durable import outcome instead of broader source-attributed semantic rows", async () => {
+		const source = sourceFixture("import:outcome", "import", "outcome.md");
+		source.health = {
+			status: "healthy",
+			semantic: {
+				entities: 2,
+				aspects: 7,
+				attributes: 42,
+				dependencies: 0,
+				communities: 0,
+				total: 51,
+				documentEntityId: "later-dreaming-entity",
+			},
+			importExtraction: { documentEntityId: "entity-1" },
+		};
+		sourcesResponse = { version: 1, sources: [source] };
+		const mounted = await mount(
+			<ViewProvider>
+				<HomeSourcesPanel sources={sourcesResponse.sources} loading={false} onRefresh={() => {}} />
+			</ViewProvider>,
+		);
+		await expandSources(mounted.container);
+
+		expect(mounted.container.textContent).toContain("document indexed · read by Dreaming");
+		expect(mounted.container.textContent).not.toContain("42 attributes");
+
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+
+	test("Home Sources has one Connect a source entry point that opens the centered dialog with file import reachable", async () => {
+		const mounted = await mount(
+			<ViewProvider>
+				<HomeSourcesPanel sources={sourcesResponse.sources} loading={false} onRefresh={() => {}} />
+			</ViewProvider>,
+		);
+		await expandSources(mounted.container);
+		const entries = [...mounted.container.querySelectorAll("button")].filter((candidate) =>
+			candidate.textContent?.includes("Connect a source"),
+		);
+		expect(entries).toHaveLength(1);
+
+		await click(entries[0]);
+		expect(mounted.container.querySelector("dialog.cs-panel")).not.toBeNull();
+		await click(button(mounted.container, "Files"));
+		expect(button(mounted.container, "Choose one or more files")).not.toBeNull();
+		expect(mounted.container.textContent).toContain("Import files");
+
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+
+	test("Home owns source management and defers source stats to disclosure", async () => {
+		const source = sourceFixture("obsidian:home", "obsidian", "Vault");
+		const mounted = await mount(
+			<ViewProvider>
+				<HomeSourcesPanel sources={[source]} loading={false} onRefresh={() => undefined} />
+			</ViewProvider>,
+		);
+
+		expect(mounted.container.textContent).toContain("Vault");
+		expect(mounted.container.querySelector("details")).toBeNull();
+		await expandSources(mounted.container);
+		expect(mounted.container.querySelector("details")?.open).toBe(false);
+
+		const summary = mounted.container.querySelector("summary");
+		if (!(summary instanceof HTMLElement)) throw new Error("Source disclosure not found");
+		await click(summary);
+		expect(mounted.container.textContent).toContain("artifacts");
+		expect(mounted.container.querySelector('[aria-label="Re-index"]')).not.toBeNull();
+
+		await click(button(mounted.container, "Connect a source"));
+		expect(mounted.container.querySelector("dialog.cs-panel")).not.toBeNull();
+
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+
+	test("Home distinguishes a pending re-index request from completion and reports failure inline", async () => {
+		const original = api.reindexSource;
+		let resolve!: (result: { ok: boolean; error?: string }) => void;
+		api.reindexSource = () =>
+			new Promise((done) => {
+				resolve = done;
+			});
+		let refreshes = 0;
+		const mounted = await mount(
+			<ViewProvider>
+				<HomeSourcesPanel
+					sources={[sourceFixture("test", "obsidian", "Test")]}
+					loading={false}
+					onRefresh={() => {
+						refreshes++;
+					}}
+				/>
+			</ViewProvider>,
+		);
+		try {
+			await expandSources(mounted.container);
+			const reindex = mounted.container.querySelector('[aria-label="Re-index"]');
+			if (!reindex) throw new Error("Re-index action is missing");
+			await click(reindex);
+			expect(mounted.container.textContent).toContain("Requesting re-index…");
+			expect(mounted.container.querySelector('[aria-label="Re-index"] svg')?.classList.contains("animate-spin")).toBe(
+				true,
+			);
+			await act(async () => resolve({ ok: true }));
+			expect(mounted.container.textContent).toContain("Re-index requested");
+			expect(refreshes).toBe(1);
+			await click(reindex);
+			await act(async () => resolve({ ok: false, error: "Source unavailable" }));
+			expect(mounted.container.querySelector('[role="alert"]')?.textContent).toBe("Source unavailable");
+			expect(mounted.container.textContent).not.toContain("Re-index requested");
+		} finally {
+			api.reindexSource = original;
+			await act(async () => mounted.root.unmount());
+			mounted.container.remove();
+		}
+	});
+
+	test("selecting a connector keeps its existing field and submit contract", async () => {
+		const mounted = await mount(<ConnectSourceDialog open onClose={() => undefined} onConnected={() => undefined} />);
+		await click(button(mounted.container, "GitHub"));
+		expect(mounted.container.textContent).toContain("Connect GitHub");
+		expect(mounted.container.querySelector('[aria-label="Repository"]')).not.toBeNull();
+		expect(button(mounted.container, "Connect & index").disabled).toBe(false);
+
+		await click(button(mounted.container, "Connect & index"));
+		expect(mounted.container.textContent).toContain("Use owner/repo or owner/*");
+
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+
+	test("web import setup is URL-only and shows provenance guidance", async () => {
+		const mounted = await mount(<ConnectSourceDialog open onClose={() => undefined} onConnected={() => undefined} />);
+		await click(button(mounted.container, "Web page"));
+
+		expect(mounted.container.querySelector('[aria-label="Public URL"]')).not.toBeNull();
+		expect(mounted.container.textContent).toContain("Only public http(s) pages are fetched");
+		expect(mounted.container.textContent).not.toContain("Display name");
+		expect(mounted.container.textContent).not.toContain("Token ref");
+
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+
+	test("transcript imports send the selected agent and duplicate mode to the daemon", async () => {
+		const calls: RequestInit[] = [];
+		const paths: string[] = [];
+		const previousFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			paths.push(String(input));
+			calls.push(init ?? {});
+			return new Response(
+				JSON.stringify({ id: "job-1", jobId: "job-1", kind: "import", state: "staging", files: [] }),
+				{ status: 201 },
+			);
+		}) as typeof fetch;
+		try {
+			const result = await api.createSourceImport("agent-a", [new File(["{}"], "transcript.jsonl")], "reimport");
+			expect(result.error).toBeNull();
+			expect(paths[0]).toContain("/api/sources/imports?agentId=agent-a");
+			expect(JSON.parse(String(calls[0]?.body))).toMatchObject({
+				schemaId: "signet-export",
+				duplicateMode: "reimport",
+			});
+
+			const started = await api.controlSourceImport("job-1", "start", "agent-b");
+			expect(started?.jobId).toBe("job-1");
+			expect(paths[1]).toContain("/api/sources/imports/job-1/start?agentId=agent-b");
+		} finally {
+			globalThis.fetch = previousFetch;
+		}
+	});
+
+	test("transcript import falls back to the active daemon agent when the roster is unavailable", async () => {
+		const previousGetAgents = api.getAgents;
+		const previousGetStatus = api.getStatus;
+		let agentCalls = 0;
+		let statusCalls = 0;
+		api.getAgents = async () => {
+			agentCalls++;
+			return { data: { agents: [] }, error: null };
+		};
+		api.getStatus = async () => {
+			statusCalls++;
+			return {
+				status: "ok",
+				version: "test",
+				uptime: 1,
+				port: 3850,
+				host: "127.0.0.1",
+				bindHost: "127.0.0.1",
+				networkMode: "local",
+				agentId: "agent-a",
+				agentsDir: "/tmp/agents",
+			};
+		};
+		let mounted: Awaited<ReturnType<typeof mount>> | undefined;
+		try {
+			mounted = await mount(
+				<ConnectSourceDialog open initialKind="transcripts" onClose={() => undefined} onConnected={() => undefined} />,
+			);
+			await act(async () => {
+				await flush();
+				await flush();
+			});
+			const trigger = mounted.container.querySelector('[aria-label="Target agent"]');
+			if (!(trigger instanceof HTMLElement)) throw new Error("target agent selector not found");
+			if (agentCalls !== 1 || statusCalls !== 1)
+				throw new Error(`agent calls: ${agentCalls}, status calls: ${statusCalls}`);
+			const fileInput = mounted.container.querySelector('input[type="file"]');
+			if (!(fileInput instanceof HTMLInputElement)) throw new Error("transcript file input not found");
+			Object.defineProperty(fileInput, "files", {
+				configurable: true,
+				value: [new File(["{}"], "transcript.jsonl")],
+			});
+			const view = fileInput.ownerDocument.defaultView;
+			if (!view) throw new Error("transcript file input has no window");
+			await act(async () => {
+				fileInput.dispatchEvent(new view.Event("change", { bubbles: true }));
+				await flush();
+			});
+			expect(button(mounted.container, "Import & index").disabled).toBe(false);
+		} finally {
+			api.getAgents = previousGetAgents;
+			api.getStatus = previousGetStatus;
+			await act(async () => mounted?.root.unmount());
+			mounted?.container.remove();
+		}
+	});
+
+	test("transcript import shows a retry when agent responses are malformed", async () => {
+		const previousGetAgents = api.getAgents;
+		const previousGetStatus = api.getStatus;
+		api.getAgents = async () => ({ data: JSON.parse('{"agents":{}}'), error: null });
+		api.getStatus = async () => null;
+		let mounted: Awaited<ReturnType<typeof mount>> | undefined;
+		try {
+			mounted = await mount(
+				<ConnectSourceDialog open initialKind="transcripts" onClose={() => undefined} onConnected={() => undefined} />,
+			);
+			await act(async () => {
+				await flush();
+				await flush();
+			});
+			expect(mounted.container.textContent).toContain("No agents are available. Try again.");
+			expect(button(mounted.container, "Retry agent list")).not.toBeNull();
+		} finally {
+			api.getAgents = previousGetAgents;
+			api.getStatus = previousGetStatus;
+			await act(async () => mounted?.root.unmount());
+			mounted?.container.remove();
+		}
+	});
+
+	test("desktop file picking preserves filesystem paths and duplicate mode through import", async () => {
+		const mounted = await mount(<ConnectSourceDialog open onClose={() => undefined} onConnected={() => undefined} />);
+		await click(button(mounted.container, "Files"));
+		await click(button(mounted.container, "Choose from desktop"));
+		expect(mounted.container.textContent).toContain("notes.md · desktop path");
+		await click(button(mounted.container, "Import & index"));
+		expect(importCall).toEqual({ files: [], duplicateMode: "skip", paths: ["/tmp/notes.md"] });
+		expect(mounted.container.textContent).toContain("indexed; document linked");
+
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+
+	test("cancel and backdrop close use the shared modal boundary", async () => {
+		let closed = 0;
+		const mounted = await mount(
+			<ConnectSourceDialog open onClose={() => (closed += 1)} onConnected={() => undefined} />,
+		);
+		await click(button(mounted.container, "Close"));
+		expect(closed).toBe(1);
+		const backdrop = mounted.container.querySelector(".cs-backdrop");
+		if (!(backdrop instanceof HTMLElement)) throw new Error("backdrop not found");
+		await act(async () => {
+			backdrop.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+			await flush();
+		});
+		expect(closed).toBe(2);
+		await act(async () => {
+			window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+			await flush();
+		});
+		expect(closed).toBe(3);
+
+		await act(async () => mounted.root.unmount());
+		mounted.container.remove();
+	});
+});
+
+describe("source health explanations", () => {
+	const withHealth = (kind: string, health: SignetSource["health"]): SignetSource => ({
+		...sourceFixture(`${kind}:case`, kind, "Case"),
+		health,
+	});
+
+	test("a failed diagnostics check is explained but never presented as the user's problem", () => {
+		const issue = sourceIssue(
+			withHealth("obsidian", { status: "unknown", error: "Source health diagnostics failed: result too large" }),
+		);
+		expect(issue).toMatchObject({ tone: "neutral", actionable: false, fix: "details" });
+		expect(issue?.detail).toContain("result too large");
+	});
+
+	test("retryable sync failures offer re-index only for kinds that support it", () => {
+		const failed = { status: "degraded", failures: { total: 3, recoverable: 2 } } as const;
+		expect(sourceIssue(withHealth("obsidian", failed))).toMatchObject({
+			title: "3 items failed to sync",
+			detail: "2 can be retried by re-indexing.",
+			fix: "reindex",
+			actionable: true,
+		});
+		expect(sourceIssue(withHealth("import", failed))?.fix).toBe("details");
+		expect(
+			sourceIssue(withHealth("obsidian", { status: "degraded", failures: { total: 1, recoverable: 0 } }))?.fix,
+		).toBe("details");
+	});
+
+	test("permission denial carries the daemon's guidance", () => {
+		const issue = sourceIssue(
+			withHealth("obsidian", {
+				status: "unhealthy",
+				permission: { status: "denied", issues: [{ path: "/vault", guidance: "Grant Full Disk Access." }] },
+			}),
+		);
+		expect(issue).toMatchObject({
+			tone: "error",
+			title: "Signet can't read this folder",
+			detail: "Grant Full Disk Access.",
+		});
+	});
+
+	test("stale sync and deleted residue name what was found", () => {
+		expect(
+			sourceIssue(withHealth("discord", { status: "degraded", checkpoints: { total: 4, partial: 1, stale: 2 } })),
+		).toMatchObject({ title: "Sync didn't finish", detail: "2 stale and 1 partial checkpoints.", fix: "reindex" });
+		expect(
+			sourceIssue(withHealth("discord", { status: "degraded", purge: { deletedArtifacts: 0, orphanChunks: 1 } })),
+		).toMatchObject({
+			title: "Index still holds data from deleted items",
+			detail: "1 orphaned chunk.",
+			fix: "details",
+		});
+	});
+
+	test("healthy and empty sources have nothing to explain", () => {
+		expect(sourceIssue(withHealth("obsidian", { status: "healthy" }))).toBeNull();
+		expect(sourceIssue(withHealth("obsidian", { status: "empty" }))).toBeNull();
+	});
+});

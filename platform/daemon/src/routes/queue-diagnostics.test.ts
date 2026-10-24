@@ -1,7 +1,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDbOwnerMaintenance, registerDbOwnerMaintenance, type DbOwnerMaintenance } from "../db-owner-maintenance";
+import {
+	closeRegisteredDbOwnerMaintenance,
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+	type DbOwnerMaintenance,
+} from "../db-owner-maintenance";
 const owners: Array<{ owner: DbOwnerMaintenance; directory: string }> = [];
 /**
  * Issue #901 — regression tests for /api/diagnostics/queue + repair.
@@ -74,7 +79,10 @@ interface DbEnv {
 	app: Hono;
 }
 
-function setup(authConfig?: NonNullable<Parameters<typeof registerQueueDiagnosticsRoutes>[1]>["authConfig"]): DbEnv {
+async function setup(
+	authConfig?: NonNullable<Parameters<typeof registerQueueDiagnosticsRoutes>[1]>["authConfig"],
+): Promise<DbEnv> {
+	await closeRegisteredDbOwnerMaintenance();
 	const directory = mkdtempSync(join(tmpdir(), "queue-owner-test-"));
 	const dbPath = join(directory, "memory.db");
 	const db = new Database(dbPath);
@@ -93,8 +101,8 @@ function setup(authConfig?: NonNullable<Parameters<typeof registerQueueDiagnosti
 
 describe("/api/diagnostics/queue", () => {
 	let env: DbEnv;
-	beforeEach(() => {
-		env = setup();
+	beforeEach(async () => {
+		env = await setup();
 	});
 	afterEach(async () => {
 		env.db.close();
@@ -102,11 +110,11 @@ describe("/api/diagnostics/queue", () => {
 			await item.owner.close();
 			rmSync(item.directory, { recursive: true, force: true });
 		}
-		registerDbOwnerMaintenance(null);
+		await closeRegisteredDbOwnerMaintenance();
 	});
 
 	it("requires admin permission in team mode", async () => {
-		const guarded = setup({ mode: "team" } as NonNullable<
+		const guarded = await setup({ mode: "team" } as NonNullable<
 			Parameters<typeof registerQueueDiagnosticsRoutes>[1]
 		>["authConfig"]);
 		try {
@@ -175,8 +183,8 @@ describe("/api/diagnostics/queue", () => {
 
 describe("POST /api/diagnostics/queue/repair", () => {
 	let env: DbEnv;
-	beforeEach(() => {
-		env = setup();
+	beforeEach(async () => {
+		env = await setup();
 	});
 	afterEach(async () => {
 		env.db.close();
@@ -184,7 +192,7 @@ describe("POST /api/diagnostics/queue/repair", () => {
 			await item.owner.close();
 			rmSync(item.directory, { recursive: true, force: true });
 		}
-		registerDbOwnerMaintenance(null);
+		await closeRegisteredDbOwnerMaintenance();
 	});
 
 	it("rejects retired summary repair tables with an actionable status", async () => {
@@ -226,6 +234,9 @@ describe("repair action integration via the new dispatch path", () => {
 					throw new Error("simulated degraded runtime: DbAccessor is closed");
 				},
 				withWriteTx: () => {
+					throw new Error("simulated degraded runtime: DbAccessor is closed");
+				},
+				withReadDbAsync: async () => {
 					throw new Error("simulated degraded runtime: DbAccessor is closed");
 				},
 				withWriteTxAsync: async () => {

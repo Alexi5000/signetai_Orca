@@ -1,22 +1,5 @@
 import { rmSync } from "node:fs";
-
-/**
- * Daemon build script — dual-runtime: Bun.build under Bun, esbuild under Node.
- * Aliases native packages that break when bundled (baked paths to .node/.wasm binaries).
- */
-
-const EXTERNAL_BUN = ["@firecrawl/anydoc"];
-
-const EXTERNAL_NODE = [
-	"better-sqlite3",
-	"bun",
-	"bun:sqlite",
-	"@1password/sdk",
-	"@firecrawl/anydoc",
-	"libsodium-wrappers",
-	"onnxruntime-node",
-	"@huggingface/transformers",
-];
+import { EXTERNAL_BUN, EXTERNAL_NODE } from "./build-externals";
 
 const ALIAS: Record<string, string> = {
 	sharp: "./src/shims/sharp.ts",
@@ -29,6 +12,7 @@ const targets: Array<{
 	{ entrypoint: "./src/daemon.ts", outfile: "./dist/daemon.js" },
 	{ entrypoint: "./src/mcp-stdio.ts", outfile: "./dist/mcp-stdio.js" },
 	{ entrypoint: "./src/index.ts", outfile: "./dist/index.js" },
+	{ entrypoint: "../core/src/secrets-keyring-child.ts", outfile: "./dist/secrets-keyring-child.js" },
 	{ entrypoint: "./src/synthesis-render-worker.ts", outfile: "./dist/synthesis-render-worker.js" },
 	{ entrypoint: "./src/database-integrity-worker.ts", outfile: "./dist/database-integrity-worker.js" },
 	{ entrypoint: "./src/db-owner-worker.ts", outfile: "./dist/db-owner-worker.js" },
@@ -37,6 +21,7 @@ const targets: Array<{
 	{ entrypoint: "./src/harness-install-worker.ts", outfile: "./dist/harness-install-worker.js" },
 	{ entrypoint: "./src/harness-health-worker.ts", outfile: "./dist/harness-health-worker.js" },
 	{ entrypoint: "./src/pipeline/dreaming-token-worker.ts", outfile: "./dist/dreaming-token-worker.js" },
+	{ entrypoint: "./src/pipeline/pi-agent-worker.ts", outfile: "./dist/pi-agent-worker.js" },
 	{ entrypoint: "./src/transcript-recovery-child.ts", outfile: "./dist/transcript-recovery-child.js" },
 	{ entrypoint: "./src/transcript-recovery-supervisor.ts", outfile: "./dist/transcript-recovery-supervisor.js" },
 ];
@@ -54,7 +39,10 @@ if (isBun) {
 		const result = await Bun.build({
 			entrypoints: [entrypoint],
 			outdir: ".",
-			naming: outfile,
+			naming: {
+				entry: outfile,
+				asset: "dist/[name].[ext]",
+			},
 			target: "bun",
 			format: "esm",
 			external: EXTERNAL_BUN,
@@ -87,6 +75,8 @@ if (isBun) {
 				target: "node20",
 				external: EXTERNAL_NODE,
 				alias: ALIAS,
+				loader: { ".wasm": "file" },
+				assetNames: "[name]",
 				format: "esm",
 				sourcemap: profileBuild ? "external" : false,
 				banner: {

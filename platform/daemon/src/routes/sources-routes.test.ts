@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -7,6 +7,7 @@ import {
 	addImportedSource,
 	addObsidianSource,
 	loadSourcesConfig,
+	notionSourceId,
 	removeSourceIfGeneration,
 } from "@signet/core";
 import { Hono } from "hono";
@@ -20,12 +21,15 @@ import type {
 	NativeMemorySyncResult,
 } from "../native-memory-sources";
 import { indexSourceArtifactStructure } from "../source-artifact-graph";
+import type { importSourceSnapshot } from "../source-snapshots";
+import { beginSourceDeletion, beginSourceMutation, isSourceOperationInFlight } from "../source-deletion-lock";
 import {
 	beginSourceIndexJob,
 	clearSourceIndexProgressForTests,
 	completeSourceIndexJob,
 	completeSourceIndexJobFromProgress,
 	getSourceIndexJob,
+	isSourceIndexInFlight,
 	markSourceIndexInFlight,
 	markSourceIndexJobRunning,
 	updateSourceIndexJobProgress,
@@ -79,10 +83,12 @@ describe("Sources routes", () => {
 			indexed?: number;
 			purged?: number;
 			syncGate?: Promise<void>;
+			purgeGate?: Promise<void>;
 			syncError?: unknown;
 			pausedSync?: boolean;
 			pausedBeforeScan?: boolean;
 			recordIndexOperation?: (input: SourceIndexTelemetryInput) => Promise<void>;
+			importSourceSnapshot?: typeof importSourceSnapshot;
 			onPurge?: () => void;
 			onSyncStart?: () => void;
 			pickerExecFile?: (
@@ -147,16 +153,18 @@ describe("Sources routes", () => {
 					close: async () => {},
 				} satisfies NativeMemoryBridgeHandle;
 			},
-			purgeNativeSource: (source, agentId) => {
+			purgeNativeSource: async (source, agentId) => {
 				expect(source.sourceId).toStartWith("obsidian:");
 				expect(agentId).toBe(process.env.SIGNET_AGENT_ID?.trim() || "default");
 				options.onPurge?.();
+				if (options.purgeGate) await options.purgeGate;
 				return options.purged ?? 7;
 			},
 			pickerExecFile: options.pickerExecFile,
 			pickerPlatform: options.pickerPlatform,
 			platform: options.platform,
 			recordIndexOperation: options.recordIndexOperation,
+			importSourceSnapshot: options.importSourceSnapshot,
 		});
 		return app;
 	}
@@ -248,9 +256,6 @@ describe("Sources routes", () => {
 				2,
 			)}\n`,
 		);
-
-		// This app is the production source route registration used after the
-		// daemon is ready. Cleanup is intentionally not run before these reads.
 		const app = makeApp();
 		const list = await app.request("/api/sources");
 		expect(list.status).toBe(200);
@@ -664,6 +669,65 @@ describe("Sources routes", () => {
 		expect(loadSourcesConfig(dir).sources[0]?.kind).toBe("web");
 	});
 
+	it("connects a Notion source and queues the shared source index job", async () => {
+		globalThis.fetch = mock(() =>
+			Promise.resolve(Response.json({ object: "list", results: [], next_cursor: null, has_more: false })),
+		) as typeof fetch;
+
+		const res = await makeApp().request("/api/sources/notion", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ tokenRef: "NOTION_TOKEN", name: "Route Notion", maxPages: 25 }),
+		});
+
+		expect(res.status).toBe(202);
+		const body = (await res.json()) as {
+			source: { id: string; kind: string; name: string; providerSettings?: Record<string, unknown> };
+			queued: boolean;
+		};
+		expect(body.queued).toBe(true);
+		expect(body.source).toMatchObject({ kind: "notion", name: "Route Notion" });
+		expect(body.source.providerSettings).toEqual({ tokenRef: "NOTION_TOKEN", maxPages: 25 });
+		expect(loadSourcesConfig(dir).sources.map((source) => source.id)).toEqual([body.source.id]);
+	});
+
+	it("rejects malformed Notion source bodies before writing config", async () => {
+		for (const payload of [
+			null,
+			[],
+			{},
+			{ tokenRef: 42 },
+			{ tokenRef: "NOTION_TOKEN", name: ["x"] },
+			{ tokenRef: "NOTION_TOKEN", maxPages: "25" },
+			{ tokenRef: "NOTION_TOKEN", maxPages: 0 },
+			{ tokenRef: `ntn_${"a".repeat(46)}` },
+		]) {
+			const res = await makeApp().request("/api/sources/notion", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(payload),
+			});
+			expect(res.status).toBe(400);
+		}
+		expect(loadSourcesConfig(dir).sources).toHaveLength(0);
+	});
+
+	it("returns 409 for a Notion source whose mutation lease is held", async () => {
+		const releaseDeletion = beginSourceDeletion(notionSourceId("NOTION_TOKEN"));
+		expect(releaseDeletion).toBeTypeOf("function");
+		try {
+			const res = await makeApp().request("/api/sources/notion", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ tokenRef: "  NOTION_TOKEN  " }),
+			});
+			expect(res.status).toBe(409);
+			expect(loadSourcesConfig(dir).sources).toHaveLength(0);
+		} finally {
+			releaseDeletion?.();
+		}
+	});
+
 	it("rejects raw Discord tokens at the route boundary", async () => {
 		const res = await makeApp().request("/api/sources/discord", {
 			method: "POST",
@@ -864,10 +928,19 @@ describe("Sources routes", () => {
 		).json()) as { source: { id: string } };
 		await waitFor(() => syncCalls === 1);
 
-		expect(
-			(await app.request(`/api/sources/${encodeURIComponent(first.source.id)}`, { method: "DELETE" })).status,
-		).toBe(200);
+		const deletion = await app.request(`/api/sources/${encodeURIComponent(first.source.id)}`, { method: "DELETE" });
+		expect(deletion.status).toBe(200);
+		expect(await deletion.json()).toMatchObject({ cleanupPending: true });
 		expect(purges).toBe(1);
+		const blockedReconnect = await app.request("/api/sources/obsidian", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ path: vault, name: "Reconnect Vault" }),
+		});
+		expect(blockedReconnect.status).toBe(409);
+
+		releaseFirstScan();
+		await waitFor(() => !isSourceIndexInFlight(first.source.id));
 		const reconnect = (await (
 			await app.request("/api/sources/obsidian", {
 				method: "POST",
@@ -877,7 +950,6 @@ describe("Sources routes", () => {
 		).json()) as { source: { id: string } };
 		expect(reconnect.source.id).toBe(first.source.id);
 
-		releaseFirstScan();
 		await waitFor(() => syncCalls === 2);
 		await waitFor(() => loadSourcesConfig(dir).sources[0]?.lastIndexedAt !== undefined);
 
@@ -910,10 +982,6 @@ describe("Sources routes", () => {
 			(await app.request(`/api/sources/${encodeURIComponent(added.source.id)}`, { method: "DELETE" })).status,
 		).toBe(200);
 		expect(runtimePurges).toBe(1);
-
-		// Route registration runs before the DB accessor is initialized, so it
-		// must not purge tombstones: the old behavior crashed the daemon with
-		// "DbAccessor not initialised" whenever a tombstone existed at boot.
 		const restarted = new Hono();
 		expect(() =>
 			registerSourcesRoutes(restarted, {
@@ -924,16 +992,68 @@ describe("Sources routes", () => {
 			}),
 		).not.toThrow();
 		expect(runtimePurges).toBe(1);
-
-		// The startup sequence runs the purge after DB init.
 		await cleanupSourceDeletionTombstones(dir, () => {
 			startupPurges++;
 			return 1;
 		});
-		expect(startupPurges).toBe(1);
+		expect(startupPurges).toBe(0);
 
 		releaseScan();
 		await waitFor(() => runtimePurges === 2);
+	});
+
+	it("serializes startup tombstone cleanup against source reconnect", async () => {
+		const added = addObsidianSource({ root: vault, name: "Startup lock vault" }, dir);
+		expect(added.ok).toBe(true);
+		if (added.ok === false) throw new Error(added.error);
+		const removed = removeSourceIfGeneration(added.source.id, added.source.generation, dir);
+		expect(removed.ok && removed.removed).toBe(true);
+		const tombstonePath = join(dir, ".daemon", "source-deletion-tombstones.json");
+		mkdirSync(join(dir, ".daemon"), { recursive: true });
+		writeFileSync(
+			tombstonePath,
+			`${JSON.stringify(
+				[
+					{
+						id: "tombstone-startup-lock",
+						source: added.source,
+						agentId: "default",
+						deletedAt: new Date().toISOString(),
+					},
+				],
+				null,
+				2,
+			)}\n`,
+		);
+
+		let releasePurge = () => {};
+		let resolvePurgeStarted!: () => void;
+		const purgeStarted = new Promise<void>((resolve) => {
+			resolvePurgeStarted = resolve;
+		});
+		const purgeGate = new Promise<void>((resolve) => {
+			releasePurge = resolve;
+		});
+		const cleanup = cleanupSourceDeletionTombstones(dir, async () => {
+			resolvePurgeStarted();
+			await purgeGate;
+			return 1;
+		});
+		try {
+			await purgeStarted;
+			const reconnect = await makeApp().request("/api/sources/obsidian", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ path: vault, name: "Startup lock vault" }),
+			});
+			expect(reconnect.status).toBe(409);
+			releasePurge();
+			await cleanup;
+			expect(JSON.parse(readFileSync(tombstonePath, "utf8"))).toHaveLength(0);
+		} finally {
+			releasePurge();
+			await cleanup;
+		}
 	});
 
 	it("defers a failed tombstone purge instead of crashing startup", async () => {
@@ -960,7 +1080,6 @@ describe("Sources routes", () => {
 			throw new Error("embedding store unavailable");
 		});
 		expect(attempts).toBe(1);
-		// The tombstone survives a failed purge so the next boot retries it.
 		expect(JSON.parse(readFileSync(tombstonePath, "utf8"))).toHaveLength(1);
 
 		await cleanupSourceDeletionTombstones(dir, () => 1);
@@ -1220,6 +1339,97 @@ describe("Sources routes", () => {
 		);
 	});
 
+	it("serializes snapshot import against source deletion", async () => {
+		const added = addObsidianSource({ name: "Snapshot race", root: vault }, dir);
+		expect(added.ok).toBe(true);
+		if (added.ok === false) throw new Error(added.error);
+
+		let resolveStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			resolveStarted = resolve;
+		});
+		let releaseSnapshot!: () => void;
+		const snapshotGate = new Promise<void>((resolve) => {
+			releaseSnapshot = resolve;
+		});
+		const importSnapshot: typeof importSourceSnapshot = async () => {
+			resolveStarted();
+			await snapshotGate;
+			return { ok: true, imported: 0, skipped: { localDiscordArtifacts: 0 } };
+		};
+		const app = makeApp({ importSourceSnapshot: importSnapshot });
+		const importRequest = app.request(`/api/sources/${encodeURIComponent(added.source.id)}/snapshot/import`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: "{}",
+		});
+		await started;
+
+		const deleteWhileImporting = await app.request(`/api/sources/${encodeURIComponent(added.source.id)}`, {
+			method: "DELETE",
+		});
+		expect(deleteWhileImporting.status).toBe(409);
+
+		releaseSnapshot();
+		expect((await importRequest).status).toBe(200);
+		expect(
+			(await app.request(`/api/sources/${encodeURIComponent(added.source.id)}`, { method: "DELETE" })).status,
+		).toBe(200);
+	});
+
+	it("scopes source operation leases by source id", () => {
+		const releaseDeletion = beginSourceDeletion("source-a");
+		expect(releaseDeletion).toBeTypeOf("function");
+		expect(isSourceOperationInFlight("source-a")).toBe(true);
+		expect(isSourceOperationInFlight("source-b")).toBe(false);
+		expect(beginSourceMutation("source-a")).toBeUndefined();
+		const releaseOtherMutation = beginSourceMutation("source-b");
+		expect(releaseOtherMutation).toBeTypeOf("function");
+		releaseOtherMutation?.();
+		releaseDeletion?.();
+	});
+	it("canonicalizes Obsidian reconnect identity before locking", async () => {
+		const added = addObsidianSource({ name: "Canonical source", root: vault }, dir);
+		expect(added.ok).toBe(true);
+		if (added.ok === false) throw new Error(added.error);
+		const releaseDeletion = beginSourceDeletion(added.source.id);
+		expect(releaseDeletion).toBeTypeOf("function");
+		try {
+			const reconnect = await makeApp().request("/api/sources/obsidian", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ path: `  ${vault}  `, name: "Canonical source" }),
+			});
+			expect(reconnect.status).toBe(409);
+			expect(await reconnect.json()).toEqual({ error: "Source operation is in progress; retry after it completes" });
+		} finally {
+			releaseDeletion?.();
+		}
+	});
+	it("matches core's Obsidian identity for tilde-prefixed paths", async () => {
+		const previousCwd = process.cwd();
+		const tempCwd = mkdtempSync(join(tmpdir(), "signet-sources-cwd-"));
+		mkdirSync(join(tempCwd, "~", "vault"), { recursive: true });
+		let releaseDeletion: (() => void) | undefined;
+		try {
+			process.chdir(tempCwd);
+			const added = addObsidianSource({ name: "Tilde source", root: "~/vault" }, dir);
+			expect(added.ok).toBe(true);
+			if (added.ok === false) throw new Error(added.error);
+			releaseDeletion = beginSourceDeletion(added.source.id);
+			expect(releaseDeletion).toBeTypeOf("function");
+			const reconnect = await makeApp().request("/api/sources/obsidian", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ path: "~/vault", name: "Tilde source" }),
+			});
+			expect(reconnect.status).toBe(409);
+		} finally {
+			releaseDeletion?.();
+			process.chdir(previousCwd);
+			rmSync(tempCwd, { recursive: true, force: true });
+		}
+	});
 	it("imports source snapshots through existing source artifact provenance", async () => {
 		const added = addDiscordSource(
 			{ guildIds: ["123456789012345678"], tokenRef: "DISCORD_BOT_TOKEN", name: "Import Discord" },
@@ -1243,6 +1453,24 @@ describe("Sources routes", () => {
 			sourceRoot: added.source.root,
 			sourcePath: "discord://guild/123/channel/456/message/stale",
 			content: "# Stale Message\n\nThis stale graph claim should disappear after snapshot import.",
+		});
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO entities (id, name, canonical_name, entity_type, agent_id, mentions, created_at, updated_at)
+				 VALUES ('snapshot-person', 'Stale Author', 'stale author', 'person', 'default', 1, datetime('now'), datetime('now'))`,
+			).run();
+			db.prepare(
+				`INSERT INTO entity_aspects (id, entity_id, agent_id, name, canonical_name, weight, created_at, updated_at)
+				 VALUES ('snapshot-aspect', 'snapshot-person', 'default', 'messages', 'messages', 0.5, datetime('now'), datetime('now'))`,
+			).run();
+			db.prepare(
+				`INSERT INTO entity_attributes
+				 (id, aspect_id, agent_id, kind, content, normalized_content, confidence, importance, status, group_key,
+				  claim_key, version, created_at, updated_at, source_id, source_kind, source_path, source_root)
+				 VALUES ('snapshot-dreamed-claim', 'snapshot-aspect', 'default', 'attribute', 'Posted the stale message',
+				  'posted the stale message', 0.8, 0.5, 'active', 'general', 'posted', 1, datetime('now'), datetime('now'),
+				  ?, 'source_discord_message', 'discord://guild/123/channel/456/message/stale', 'dreaming')`,
+			).run(added.source.id);
 		});
 		insertSourceChunk({
 			id: "snapshot-stale-discord-chunk",
@@ -1309,8 +1537,18 @@ describe("Sources routes", () => {
 				.all("default", added.source.id) as Array<{ source_path: string; content: string }>,
 		}));
 		expect(graph.documentPaths).toEqual(["discord://guild/123/channel/456/message/fresh"]);
-		expect(graph.attributes.some((row) => row.content.includes("Fresh imported Discord message"))).toBe(true);
-		expect(graph.attributes.some((row) => row.content.includes("stale graph claim"))).toBe(false);
+		expect(graph.attributes).toEqual([
+			{ source_path: "discord://guild/123/channel/456/message/stale", content: "Posted the stale message" },
+		]);
+		const flag = getDbAccessor().withReadDb(
+			(db) =>
+				db
+					.prepare(
+						"SELECT json_extract(details_json, '$.reason') AS reason FROM dreaming_attention WHERE subject_ref = 'attribute:snapshot-dreamed-claim'",
+					)
+					.get() as { reason: string } | null,
+		);
+		expect(flag?.reason).toBe("source_removed");
 	});
 
 	it("preserves local Discord cache DM artifacts during default snapshot import", async () => {
@@ -1594,7 +1832,18 @@ describe("Sources routes", () => {
 		const agentId = "import-health-agent";
 		process.env.SIGNET_AGENT_ID = agentId;
 		const app = makeApp();
-		registerImportRoutes(app);
+		registerImportRoutes(app, {
+			durableImportAdmission: {
+				admit: async ({ fileName, bytes }) => ({
+					key: `test:${fileName}`,
+					originalPath: join(dir, "retained", fileName),
+					sha256: "test",
+					size: bytes.byteLength,
+				}),
+				begin: async () => {},
+				complete: async () => {},
+			},
+		});
 		const file = new File(["# Imported outcome\n\n## Result\n\nThe import produced a durable result."], "outcome.md", {
 			type: "text/markdown",
 		});
@@ -1605,7 +1854,7 @@ describe("Sources routes", () => {
 		const importedBody = (await imported.json()) as {
 			files: Array<{
 				sourceId: string;
-				extraction: { documentEntityId: string | null; aspectsCreated: number; attributesCreated: number };
+				extraction: { documentEntityId: string | null };
 			}>;
 		};
 		const importedFile = importedBody.files[0];
@@ -1619,7 +1868,7 @@ describe("Sources routes", () => {
 					id: string;
 					health?: {
 						semantic?: { attributes: number };
-						importExtraction?: { documentEntityId: string | null; aspectsCreated: number; attributesCreated: number };
+						importExtraction?: { documentEntityId: string | null };
 					};
 				}>;
 			};
@@ -1661,7 +1910,7 @@ describe("Sources routes", () => {
 		});
 
 		const afterDreaming = await readHealth();
-		expect(afterDreaming?.semantic?.attributes).toBeGreaterThan(first.attributesCreated);
+		expect(afterDreaming?.semantic?.attributes).toBeGreaterThan(0);
 		expect(afterDreaming?.importExtraction).toEqual(first);
 		const duplicateForm = new FormData();
 		duplicateForm.append("files", file);
@@ -1795,6 +2044,58 @@ describe("Sources routes", () => {
 		});
 	});
 
+	it("counts orphan chunks for sources whose chunk text exceeds one owner result", async () => {
+		const added = addDiscordSource(
+			{
+				guildIds: ["123456789012345678"],
+				tokenRef: "DISCORD_BOT_TOKEN",
+				name: "Large Discord",
+			},
+			dir,
+		);
+		expect(added.ok).toBe(true);
+		if (added.ok === false) throw new Error(added.error);
+
+		insertSourceArtifact({
+			sourceId: added.source.id,
+			sourceRoot: added.source.root,
+			sourcePath: "discord://guild/123/channel/456/message/live",
+			sourceKind: "source_discord_message",
+			content: "live message",
+			metaJson: "{}",
+		});
+		const body = "x".repeat(1_200);
+		getDbAccessor().withWriteTx((db) => {
+			const insert = db.prepare(
+				`INSERT INTO embeddings
+				 (id, content_hash, vector, dimensions, source_type, source_id, chunk_text, created_at, agent_id)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			);
+			for (let i = 0; i < 1_005; i++) {
+				const orphan = i % 201 === 200;
+				insert.run(
+					`large-chunk-${i}`,
+					`large-chunk-${i}-hash`,
+					new Uint8Array([0]),
+					1,
+					"source_chunk",
+					`${added.source.id}:guild/123/channel/456/message/${orphan ? `deleted-${i}` : "live"}#${i}`,
+					orphan ? body : `source_path: discord://guild/123/channel/456/message/live\n\n${body}`,
+					"2026-05-24T00:00:00.000Z",
+					"default",
+				);
+			}
+		});
+
+		const res = await makeApp().request(`/api/sources/${encodeURIComponent(added.source.id)}/health`);
+		expect(res.status).toBe(200);
+		const result = (await res.json()) as {
+			health?: { status?: string; error?: string; purge?: { orphanChunks?: number } };
+		};
+		expect(result.health?.error).toBeUndefined();
+		expect(result.health).toMatchObject({ status: "degraded", purge: { orphanChunks: 5 } });
+	});
+
 	it("degrades source health when only deleted artifact residue remains", async () => {
 		const added = addDiscordSource(
 			{
@@ -1838,7 +2139,7 @@ describe("Sources routes", () => {
 		expect(((await res.json()) as { error: string }).error).toContain("Source not found");
 	});
 
-	it("marks source health unhealthy when diagnostics queries fail", async () => {
+	it("reports source health as unknown when diagnostics queries fail", async () => {
 		const added = addDiscordSource(
 			{
 				guildIds: ["123456789012345678"],
@@ -1857,11 +2158,11 @@ describe("Sources routes", () => {
 		const res = await makeApp().request(`/api/sources/${encodeURIComponent(added.source.id)}/health`);
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { health?: { status?: string; error?: string } };
-		expect(body.health?.status).toBe("unhealthy");
+		expect(body.health?.status).toBe("unknown");
 		expect(body.health?.error).toContain("Source health diagnostics failed");
 	});
 
-	it("marks source health unhealthy when semantic diagnostics queries fail", async () => {
+	it("reports source health as unknown when semantic diagnostics queries fail", async () => {
 		const added = addDiscordSource(
 			{
 				guildIds: ["123456789012345678"],
@@ -1880,7 +2181,7 @@ describe("Sources routes", () => {
 		const res = await makeApp().request(`/api/sources/${encodeURIComponent(added.source.id)}/health`);
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { health?: { status?: string; error?: string } };
-		expect(body.health?.status).toBe("unhealthy");
+		expect(body.health?.status).toBe("unknown");
 		expect(body.health?.error).toContain("Source health diagnostics failed");
 	});
 
@@ -1921,6 +2222,35 @@ describe("Sources routes", () => {
 		expect(loadSourcesConfig(dir).sources).toHaveLength(0);
 	});
 
+	it("rejects source reconfiguration while deletion is purging", async () => {
+		const added = addObsidianSource({ root: vault, name: "Locked Vault" }, dir);
+		expect(added.ok).toBe(true);
+		if (added.ok === false) throw new Error(added.error);
+		let releasePurge!: () => void;
+		const purgeGate = new Promise<void>((resolve) => {
+			releasePurge = resolve;
+		});
+		let markPurgeStarted!: () => void;
+		const purgeStarted = new Promise<void>((resolve) => {
+			markPurgeStarted = resolve;
+		});
+		const app = makeApp({ purgeGate, onPurge: markPurgeStarted });
+		const deletion = app.request(`/api/sources/${encodeURIComponent(added.source.id)}`, { method: "DELETE" });
+		await purgeStarted;
+
+		const reconnect = await app.request("/api/sources/obsidian", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ path: vault, name: "Reconnected Vault" }),
+		});
+		expect(reconnect.status).toBe(409);
+		expect(await reconnect.json()).toEqual({ error: "Source operation is in progress; retry after it completes" });
+
+		releasePurge();
+		expect((await deletion).status).toBe(200);
+		expect(loadSourcesConfig(dir).sources).toHaveLength(0);
+	});
+
 	it("resumes deletion after a lifecycle owner failure without stranding source artifacts", async () => {
 		const added = addObsidianSource({ root: vault, name: "Retryable Vault" }, dir);
 		expect(added.ok).toBe(true);
@@ -1939,8 +2269,10 @@ describe("Sources routes", () => {
 
 		const app = makeApp({ purged: 11 });
 		const first = await app.request(`/api/sources/${encodeURIComponent(added.source.id)}`, { method: "DELETE" });
-		expect(first.status).toBe(500);
+		expect(first.status).toBe(202);
+		expect(await first.json()).toMatchObject({ pending: true, purged: 0, source: { id: added.source.id } });
 		expect(loadSourcesConfig(dir).sources).toHaveLength(1);
+		expect((await (await app.request("/api/sources")).json()) as { sources: unknown[] }).toMatchObject({ sources: [] });
 		expect(JSON.parse(readFileSync(join(dir, ".daemon", "source-deletion-tombstones.json"), "utf8"))).toHaveLength(1);
 
 		await dbOwnerBatch([ownerStatement("DROP TRIGGER reject_source_lifecycle_delete")], {
@@ -1958,6 +2290,31 @@ describe("Sources routes", () => {
 				(db) => db.prepare("SELECT COUNT(*) AS count FROM source_lifecycle_state").get() as { count: number },
 			).count,
 		).toBe(0);
+	});
+
+	it("reports deletion success when only tombstone cleanup is deferred", async () => {
+		const added = addObsidianSource({ root: vault, name: "Marker Retry Vault" }, dir);
+		expect(added.ok).toBe(true);
+		if (added.ok === false) throw new Error(added.error);
+
+		const tombstoneDir = join(dir, ".daemon");
+		mkdirSync(tombstoneDir, { recursive: true });
+		const app = makeApp({
+			onPurge: () => chmodSync(tombstoneDir, 0o500),
+		});
+		try {
+			const response = await app.request(`/api/sources/${encodeURIComponent(added.source.id)}`, { method: "DELETE" });
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({
+				cleanupPending: true,
+				purged: 7,
+				source: { id: added.source.id },
+			});
+			expect(loadSourcesConfig(dir).sources).toHaveLength(0);
+			expect(JSON.parse(readFileSync(join(tombstoneDir, "source-deletion-tombstones.json"), "utf8"))).toHaveLength(1);
+		} finally {
+			chmodSync(tombstoneDir, 0o700);
+		}
 	});
 
 	it("returns a clear 404 for disconnecting an unknown source", async () => {

@@ -19,6 +19,7 @@ import {
 	isChildOf,
 	isJsonObject,
 	isSignetGeneratedFile,
+	resolveSignetMcpCommand,
 	resolveSignetWorkspacePath,
 } from "@signet/connector-base";
 import { expandHome, hasValidIdentity, loadIdentityMode } from "@signet/core";
@@ -99,15 +100,12 @@ export class GeminiConnector extends BaseConnector {
 		} else {
 			configsPatched.push(this.getConfigPath());
 		}
-
-		// Generate GEMINI.md from identity files only when identity is managed
 		if (identityMode === "managed") {
 			const geminiMdPath = this.generateGeminiMd(expandedBasePath);
 			if (geminiMdPath) {
 				filesWritten.push(geminiMdPath);
 			}
 		} else {
-			// Clean up any previously Signet-generated GEMINI.md when identity is off/passthrough
 			const staleGeminiMd = this.getGeminiMdPath();
 			if (existsSync(staleGeminiMd)) {
 				try {
@@ -115,9 +113,7 @@ export class GeminiConnector extends BaseConnector {
 					if (isSignetGeneratedFile(raw)) {
 						rmSync(staleGeminiMd);
 					}
-				} catch {
-					// Non-fatal
-				}
+				} catch {}
 			}
 		}
 
@@ -204,6 +200,8 @@ export class GeminiConnector extends BaseConnector {
 
 	private registerMcpServer(geminiHome: string): string | null {
 		const settingsPath = join(geminiHome, "settings.json");
+		const mcp = resolveSignetMcpCommand();
+		const signet = { command: mcp.command, args: [...mcp.args], ...(mcp.env ? { env: { ...mcp.env } } : {}) };
 
 		if (existsSync(settingsPath)) {
 			const settings = readGeminiSettings(settingsPath);
@@ -214,10 +212,7 @@ export class GeminiConnector extends BaseConnector {
 			const existingMcp = isJsonObject(settings.mcpServers) ? (settings.mcpServers as JsonObject) : {};
 			settings.mcpServers = {
 				...existingMcp,
-				signet: {
-					command: "signet-mcp",
-					args: [],
-				},
+				signet,
 			};
 
 			atomicWriteJson(settingsPath, settings);
@@ -226,10 +221,7 @@ export class GeminiConnector extends BaseConnector {
 
 		const settings: JsonObject = {
 			mcpServers: {
-				signet: {
-					command: "signet-mcp",
-					args: [],
-				},
+				signet,
 			},
 		};
 

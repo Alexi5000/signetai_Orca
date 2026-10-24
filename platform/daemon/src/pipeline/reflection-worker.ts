@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type PipelineReflectionsConfig, resolveDefaultBasePath, scanMemoryContent } from "@signet/core";
+import {
+	type PipelineReflectionsConfig,
+	redactCredentials,
+	resolveDefaultBasePath,
+	resolveWorkspaceLayout,
+} from "@signet/core";
 import { getDbAccessor } from "../db-accessor";
 import { getDbOwner } from "../db-owner-runtime";
 import { ownerReadAll } from "../db-owner-sql";
 import { getInferenceProvider } from "../llm";
 import { logger } from "../logger";
-import { isMemoryContentContextEligible } from "../memory-content-safety";
 
 type ReflectionDeps = {
 	readonly getDbAccessor: typeof getDbAccessor;
@@ -23,16 +27,15 @@ const DEFAULT_DEPS: ReflectionDeps = {
 
 const POLL_INTERVAL_MS = 300_000;
 const DAILY_BRIEF_MEMORY_BATCH_SIZE = 50;
-/** Hard ceiling per brief, enforced at parse time and requested in the prompt. */
 export const BRIEF_MAX_CHARS = 236;
 
-function getAgentsDir(): string {
-	return resolveDefaultBasePath();
+function getRuntimeDir(): string {
+	return resolveWorkspaceLayout(resolveDefaultBasePath()).runtime;
 }
 
 function getLastReflectionPath(agentId: string): string {
 	const key = agentId === "default" ? "default" : encodeURIComponent(agentId);
-	return join(getAgentsDir(), ".daemon", `last-reflection.${key}.json`);
+	return join(getRuntimeDir(), `last-reflection.${key}.json`);
 }
 
 function readLastReflectionTime(agentId: string): string | null {
@@ -48,7 +51,7 @@ function readLastReflectionTime(agentId: string): string | null {
 
 function writeLastReflectionTime(agentId: string, date: string): void {
 	try {
-		const dir = join(getAgentsDir(), ".daemon");
+		const dir = getRuntimeDir();
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(getLastReflectionPath(agentId), JSON.stringify({ lastDate: date }));
 	} catch (e) {
@@ -57,12 +60,6 @@ function writeLastReflectionTime(agentId: string, date: string): void {
 		});
 	}
 }
-
-// -- Timezone-aware calendar math -------------------------------------------
-// The daily schedule fires in the user's detected timezone (daemon local time
-// by default). Plain setHours() + toISOString() mixes local and UTC calendar
-// days, so "today" and "6am" must be computed through Intl with the configured
-// IANA timezone, DST included.
 
 type ZonedParts = {
 	readonly year: number;
@@ -107,12 +104,6 @@ function zonedParts(timeZone: string, instant: Date): ZonedParts {
 		second: Number(values.second),
 	};
 }
-
-/**
- * The instant whose wall clock in `timeZone` reads (y, m0, d) at hh:mm.
- * Refines the UTC offset by round-tripping through Intl, which converges in
- * two or three iterations and stays correct across DST boundaries.
- */
 function zonedDateTime(
 	timeZone: string,
 	year: number,
@@ -130,14 +121,10 @@ function zonedDateTime(
 	}
 	return new Date(guess);
 }
-
-/** Calendar date (YYYY-MM-DD) of `now` in `timeZone`. */
 export function todayDateInTimeZone(timeZone: string, now = new Date()): string {
 	const parts = zonedParts(timeZone, now);
 	return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
-
-/** Today's wall-clock occurrence of `M H * * *` in `timeZone`; null for non-daily schedules. */
 function scheduledTimeFor(schedule: string, timeZone: string, now = new Date()): Date | null {
 	const parts = schedule.trim().split(/\s+/);
 	if (parts.length !== 5 || parts[2] !== "*" || parts[3] !== "*" || parts[4] !== "*") return null;
@@ -147,8 +134,6 @@ function scheduledTimeFor(schedule: string, timeZone: string, now = new Date()):
 		return null;
 	}
 	const local = zonedParts(timeZone, now);
-	// Today's occurrence, even when already past: the delay logic uses the
-	// pastness to decide "due now" (catch up after the slot was missed).
 	return zonedDateTime(timeZone, local.year, local.month - 1, local.day, hour, minute);
 }
 
@@ -163,8 +148,6 @@ export function nextReflectionDelayMs(
 
 	const date = todayDateInTimeZone(timeZone, now);
 	if (lastDate === date) {
-		// Already generated today: sleep until tomorrow's slot, computed in the
-		// same timezone so DST transitions do not drift the wake-up by an hour.
 		const local = zonedParts(timeZone, now);
 		const scheduledParts = zonedParts(timeZone, scheduled);
 		const tomorrow = zonedDateTime(
@@ -229,12 +212,6 @@ function isQuestionLedInsight(text: string): boolean {
 }
 
 export function buildReflectionPrompt(context: ReflectionSourceContext, count = 1): string {
-	const safeMemories = context.memories.filter((memory) => scanMemoryContent(memory.content).contextEligible);
-	const safeExistingReflections = context.existingReflections.filter(
-		(reflection) =>
-			scanMemoryContent(reflection.summary).contextEligible &&
-			(reflection.question === null || scanMemoryContent(reflection.question).contextEligible),
-	);
 	const plural = count === 1 ? "brief" : "briefs";
 	const lines: string[] = [
 		"You write the daily brief for a local memory tool. Below is a raw bundle of the user's recent saved memories, picked mechanically, not curated for a topic. Treat it as evidence, not a theme.",
@@ -262,9 +239,9 @@ export function buildReflectionPrompt(context: ReflectionSourceContext, count = 
 		"",
 	];
 
-	if (safeExistingReflections.length > 0) {
+	if (context.existingReflections.length > 0) {
 		lines.push("Existing brief items to avoid repeating:");
-		for (const r of safeExistingReflections.slice(0, 12)) {
+		for (const r of context.existingReflections.slice(0, 12)) {
 			lines.push(`  [${r.createdAt.slice(0, 10)}] ${trimLine(r.summary, 220)}`);
 			if (r.question && normalizeInsight(r.question) !== normalizeInsight(r.summary)) {
 				lines.push(`  [${r.createdAt.slice(0, 10)}] ${trimLine(r.question, 220)}`);
@@ -274,13 +251,13 @@ export function buildReflectionPrompt(context: ReflectionSourceContext, count = 
 	}
 
 	lines.push("Recent saved memories:");
-	for (const m of safeMemories) {
+	for (const m of context.memories) {
 		const date = m.createdAt.slice(0, 10);
-		const tags = m.tags && scanMemoryContent(m.tags).contextEligible ? `[${m.tags}] ` : "";
+		const tags = m.tags ? `[${m.tags}] ` : "";
 		lines.push(`  [${date}] (${m.type}) ${tags}${trimLine(m.content, 500)}`);
 	}
 
-	return lines.join("\n");
+	return redactCredentials(lines.join("\n"));
 }
 
 export function parseReflectionResponse(text: string): { summary: string; patterns: string[]; question?: string } {
@@ -379,23 +356,14 @@ export function collectReflectionContext(
 			tags: string | null;
 			created_at: string;
 		}[];
-		return rows
-			.filter((row) =>
-				isMemoryContentContextEligible(db, {
-					agentId,
-					sourceKind: "memory",
-					sourceId: row.id,
-					content: row.content,
-				}),
-			)
-			.map((r) => ({
-				id: r.id,
-				content: r.content,
-				type: r.type,
-				tags: r.tags ?? "",
-				createdAt: r.created_at,
-			}));
-	}, "pipeline/reflection-worker.ts:368");
+		return rows.map((r) => ({
+			id: r.id,
+			content: r.content,
+			type: r.type,
+			tags: r.tags ?? "",
+			createdAt: r.created_at,
+		}));
+	}, "pipeline/reflection-worker.ts:345");
 
 	// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
 	const existingReflections = dbAccessor.withReadDb((db: import("../db-accessor").ReadDb) => {
@@ -406,14 +374,8 @@ export function collectReflectionContext(
              ORDER BY created_at DESC LIMIT 24`,
 			)
 			.all(agentId) as { id: string; question: string | null; summary: string; created_at: string }[];
-		return rows
-			.filter(
-				(row) =>
-					scanMemoryContent(row.summary).contextEligible &&
-					(row.question === null || scanMemoryContent(row.question).contextEligible),
-			)
-			.map((r) => ({ id: r.id, question: r.question, summary: r.summary, createdAt: r.created_at }));
-	}, "pipeline/reflection-worker.ts:401");
+		return rows.map((r) => ({ id: r.id, question: r.question, summary: r.summary, createdAt: r.created_at }));
+	}, "pipeline/reflection-worker.ts:369");
 
 	return { memories, summaries: [], transcripts: [], graphFacts: [], existingReflections };
 }
@@ -437,12 +399,6 @@ export async function generateDailyBriefInsights(
 			.filter(Boolean),
 	);
 	const insights = parseDailyBriefInsights(raw, Math.max(count * 2, count))
-		.filter(
-			(insight) =>
-				scanMemoryContent(insight.summary).contextEligible &&
-				(insight.question === undefined || scanMemoryContent(insight.question).contextEligible) &&
-				insight.patterns.every((pattern) => scanMemoryContent(pattern).contextEligible),
-		)
 		.filter((insight) => {
 			const key = normalizeInsight(insight.summary);
 			if (!key || existing.has(key)) return false;
@@ -485,7 +441,7 @@ export async function generateDailyBriefInsights(
 				);
 			if (result.changes > 0) ids.push(id);
 		}
-	}, "pipeline/reflection-worker.ts:463");
+	}, "pipeline/reflection-worker.ts:419");
 
 	return ids;
 }

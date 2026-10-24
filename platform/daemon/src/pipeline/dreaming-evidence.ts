@@ -1,36 +1,34 @@
-import { MEMORY_CONTENT_WITHHELD_NOTICE, scanMemoryContent } from "@signet/core";
+import { redactCredentials } from "@signet/core";
 import type { EpisodicSourceRecord } from "../episodic-sources";
-
-/** A rendered immutable source record that a Dreaming agent may cite. */
 export interface DreamingAgentEvidence {
-	/** Canonical episodic selector (`memory:<id>`, `artifact:<id>`, etc.). */
 	readonly sourceRef: string;
-	/** Canonical rendered evidence the quote must be an exact substring of. */
 	readonly content: string;
-	/** Provenance tuple stamped onto derived rows (source entry provenance). */
 	readonly sourceKind: string;
 	readonly sourceId: string;
 	readonly sourcePath: string | null;
-	/** Configured Signet source entry id, when known. */
 	readonly sourceEntryId: string | null;
 }
-
-/** One exact, resumable slice of immutable episodic evidence. */
 export interface DreamingEvidenceFragment {
 	readonly source: EpisodicSourceRecord;
-	/** The exact text exposed to the agent and accepted for citations. */
 	readonly content: string;
-	/** Character offsets into renderDreamingEvidence(source). */
 	readonly start: number;
 	readonly end: number;
 	readonly sourceLength: number;
 }
+function boundaryEndAt(content: string, index: number): number | null {
+	const character = content[index];
+	const previous = content[index - 1];
+	if (character === undefined || previous === undefined) return null;
+	if (!((character === "\n" && previous === "\n") || (/\s/.test(character) && /[.!?]/.test(previous)))) return null;
+	let boundaryEnd = index + 1;
+	while (boundaryEnd < content.length) {
+		const next = content[boundaryEnd];
+		if (next === undefined || !/\s/.test(next)) break;
+		boundaryEnd += 1;
+	}
+	return boundaryEnd;
+}
 
-/**
- * Return the next safe-boundary fragment without dropping or normalizing a
- * character. The cursor stores absolute offsets, so a later pass can resume
- * even if the configured context budget changes.
- */
 export function nextDreamingEvidenceFragment(
 	source: EpisodicSourceRecord,
 	start: number,
@@ -42,35 +40,34 @@ export function nextDreamingEvidenceFragment(
 	let end = cappedEnd;
 	if (cappedEnd < content.length) {
 		for (let index = cappedEnd - 1; index > start; index -= 1) {
-			const character = content[index];
-			const previous = content[index - 1];
-			if (character === undefined || previous === undefined) continue;
-			if ((character === "\n" && previous === "\n") || (/\s/.test(character) && /[.!?]/.test(previous))) {
-				let boundaryEnd = index + 1;
-				while (boundaryEnd < content.length) {
-					const next = content[boundaryEnd];
-					if (next === undefined || !/\s/.test(next)) break;
-					boundaryEnd += 1;
-				}
-				if (boundaryEnd <= cappedEnd && content.slice(start, boundaryEnd).trim().length > 0) {
-					end = boundaryEnd;
-					break;
-				}
+			const boundaryEnd = boundaryEndAt(content, index);
+			if (boundaryEnd !== null && boundaryEnd <= cappedEnd && content.slice(start, boundaryEnd).trim().length > 0) {
+				end = boundaryEnd;
+				break;
 			}
 		}
 	}
 	return { source, content: content.slice(start, end), start, end, sourceLength: content.length };
 }
 
+export function dreamingEvidenceResumeStart(
+	source: EpisodicSourceRecord,
+	reviewedEnd: number,
+	overlapChars: number,
+): number {
+	const content = renderDreamingEvidence(source);
+	const start = Math.max(0, Math.min(reviewedEnd, content.length) - Math.max(0, Math.floor(overlapChars)));
+	for (let index = start - 1; index > Math.max(0, start - overlapChars); index -= 1) {
+		const boundaryEnd = boundaryEndAt(content, index);
+		if (boundaryEnd !== null && boundaryEnd <= start) return boundaryEnd;
+	}
+	return start;
+}
+
 export function completeDreamingEvidenceFragment(source: EpisodicSourceRecord): DreamingEvidenceFragment {
 	const content = renderDreamingEvidence(source);
 	return { source, content, start: 0, end: content.length, sourceLength: content.length };
 }
-
-/**
- * Render structured evidence preserved beside an immutable episodic record.
- * This is the canonical text exposed to Dreaming and accepted for citations.
- */
 export function renderDreamingEvidenceMeta(evidenceMeta: string | null): string {
 	if (!evidenceMeta) return "";
 	let parsed: unknown;
@@ -291,7 +288,7 @@ function sanitizePlainTranscript(content: string): string {
 		if (omittingReasoning || omittingToolOutput) continue;
 		if (/^(?:tool[_ -]?(?:call|use)|function[_ -]?call)\b/i.test(trimmed)) {
 			const name = trimmed.split(/\s*[:=]\s*/, 2)[1]?.trim() || "tool";
-			kept.push(`[tool call: ${name.replace(/[\s\[({].*$/, "")}]`);
+			kept.push(`[tool call: ${name.replace(/[\s[({].*$/, "")}]`);
 			continue;
 		}
 		kept.push(line);
@@ -301,8 +298,6 @@ function sanitizePlainTranscript(content: string): string {
 		.replace(/\n{3,}/g, "\n\n")
 		.trim();
 }
-
-/** Return whether a structured line contains no Dreaming-visible evidence. */
 function isJsonTranscriptExcluded(value: unknown): boolean {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const record = value as Record<string, unknown>;
@@ -326,12 +321,6 @@ function isJsonTranscriptExcluded(value: unknown): boolean {
 		)
 	);
 }
-
-/**
- * Project a canonical transcript for Dreaming without mutating the retained
- * transcript. Tool calls remain as one-line markers; tool outputs and
- * reasoning blocks are omitted before the exact-quote gate sees the source.
- */
 export function sanitizeTranscriptForDreaming(content: string): string {
 	const lines = content.split(/\r?\n/);
 	const nonEmptyLines = lines.filter((line) => line.trim().length > 0);
@@ -347,15 +336,9 @@ export function sanitizeTranscriptForDreaming(content: string): string {
 				recognizedJsonLines += 1;
 				jsonLines.push(...rendered);
 			}
-		} catch {
-			// A plain line means this is not a pure JSONL transcript.
-		}
+		} catch {}
 	}
 	if (parsedLines === nonEmptyLines.length && recognizedJsonLines > 0) return jsonLines.join("\n").trim();
-
-	// Mixed transcripts retain prose and still apply structured tool-output
-	// filtering line by line. Unknown JSON objects stay as source text rather
-	// than causing the entire human-readable transcript to disappear.
 	const mixedLines = lines.flatMap((line) => {
 		const trimmed = line.trim();
 		if (trimmed.length === 0) return [line];
@@ -364,54 +347,32 @@ export function sanitizeTranscriptForDreaming(content: string): string {
 			const rendered = jsonTranscriptLine(parsed);
 			if (rendered.length > 0) return rendered;
 			if (isJsonTranscriptExcluded(parsed)) return [];
-		} catch {
-			// Keep non-JSON prose for the plain sanitizer.
-		}
+		} catch {}
 		return [line];
 	});
 	return sanitizePlainTranscript(mixedLines.join("\n"));
 }
-
-/** The complete immutable evidence text Dreaming presents and citation checks. */
 export function renderDreamingEvidence(source: EpisodicSourceRecord): string {
 	const content =
 		source.kind === "transcript" || source.sourceKind === "transcript"
 			? sanitizeTranscriptForDreaming(source.content)
 			: source.content;
-	// Scan both the retained source and the projected form. Sanitizing a
-	// transcript is a presentation step, not permission to forget that hostile
-	// source content exists. The source remains available to audit, but no
-	// prompt-facing Dreaming projection may carry it.
-	if (!scanMemoryContent(source.content).contextEligible || !scanMemoryContent(content).contextEligible) {
-		return MEMORY_CONTENT_WITHHELD_NOTICE;
-	}
 	const metadata = renderDreamingEvidenceMeta(source.evidenceMeta);
-	const rendered = metadata ? `${content}\n${metadata}` : content;
-	return scanMemoryContent(rendered).contextEligible ? rendered : MEMORY_CONTENT_WITHHELD_NOTICE;
+	return redactCredentials(metadata ? `${content}\n${metadata}` : content);
 }
-
-/**
- * Convert the exact evidence passed to a Dreaming session into citation
- * records. The content is deliberately rendered here, once, so agents and
- * the write tool validate against the same structured text.
- */
 export function createDreamingAgentEvidence(
 	evidence: readonly (EpisodicSourceRecord | DreamingEvidenceFragment)[],
 ): readonly DreamingAgentEvidence[] {
-	return evidence.flatMap((item) => {
+	return evidence.map((item) => {
 		const fragment = "source" in item ? item : completeDreamingEvidenceFragment(item);
 		const { source } = fragment;
-		if (fragment.content === MEMORY_CONTENT_WITHHELD_NOTICE || !scanMemoryContent(fragment.content).contextEligible)
-			return [];
-		return [
-			{
-				sourceRef: `${source.kind}:${source.id}`,
-				content: fragment.content,
-				sourceKind: source.sourceKind,
-				sourceId: source.sourceId,
-				sourcePath: source.sourcePath,
-				sourceEntryId: source.sourceEntryId,
-			},
-		];
+		return {
+			sourceRef: `${source.kind}:${source.id}`,
+			content: fragment.content,
+			sourceKind: source.sourceKind,
+			sourceId: source.sourceId,
+			sourcePath: source.sourcePath,
+			sourceEntryId: source.sourceEntryId,
+		};
 	});
 }

@@ -159,9 +159,7 @@ function materializeEmbeddedWorker(path: string, content: Buffer): void {
 				} else if (attempt === 0) {
 					try {
 						unlinkSync(path);
-					} catch {
-						// Another publisher may be repairing the same hash-keyed path.
-					}
+					} catch {}
 				}
 			}
 		}
@@ -181,10 +179,6 @@ export function resolveEmbeddedWorkerPath(name: string): string | null {
 	materializeEmbeddedWorker(path, Buffer.from(worker.contentBase64, "base64"));
 	return path;
 }
-
-// Materializes an embedded native `.node` addon so callers can `require()` it
-// by absolute path -- some N-API packages (e.g. `@napi-rs/keyring`) don't
-// survive Bun `--compile` bundling by package name.
 export function materializeEmbeddedNativeAddon(name: string): string | null {
 	const asset = (nativeRuntimeAssets().nativeAddons ?? []).find((a) => a.name === name);
 	if (!asset) return null;
@@ -204,16 +198,12 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 			try {
 				const entryHash = createHash("sha256").update(readFileSync(entryPath)).digest("hex").slice(0, 16);
 				isValidHashFile = entry.endsWith(`${entryHash}.node`);
-			} catch {
-				// An unreadable destination is corrupt and eligible for one-shot cleanup.
-			}
+			} catch {}
 		}
 		if (isValidHashFile) continue;
 		try {
 			unlinkSync(entryPath);
-		} catch {
-			// A stale addon may still be loaded on Windows; retry next start.
-		}
+		} catch {}
 	}
 	const valid = () =>
 		existsSync(path) && createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 16) === hash;
@@ -222,9 +212,6 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 		const tempPath = join(tempDir, "addon.node");
 		try {
 			writeFileSync(tempPath, content, { flag: "wx" });
-			// The temp is fully written before rename, so the loader never sees
-			// partial content. Hash-keyed names mean we never replace a live file.
-			// Concurrent identical publishers converge on one valid destination.
 			let published = false;
 			for (let attempt = 0; attempt < 2 && !published; attempt += 1) {
 				try {
@@ -236,12 +223,9 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 					if (valid()) {
 						published = true;
 					} else if (attempt === 0) {
-						// A corrupt destination is not loadable/locked; replace it once.
 						try {
 							unlinkSync(path);
-						} catch {
-							/* another publisher may be repairing it */
-						}
+						} catch {}
 					}
 				}
 			}
@@ -249,6 +233,38 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
+	}
+	return path;
+}
+
+export function materializeEmbeddedNativeLibrary(name: string, fileName: string): string | null {
+	const asset = (nativeRuntimeAssets().nativeAddons ?? []).find((a) => a.name === name);
+	if (!asset) return null;
+
+	const content = Buffer.from(asset.contentBase64, "base64");
+	const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
+	const safeName = name.replace(/[^a-zA-Z0-9_.-]/g, "_");
+	const root = join(tmpdir(), "signet-native-addons");
+	const dir = join(root, `${safeName}-${hash}`);
+	const path = join(dir, fileName);
+	mkdirSync(dir, { recursive: true });
+	for (const entry of readdirSync(root)) {
+		if (!entry.startsWith(`${safeName}-`) || entry === `${safeName}-${hash}`) continue;
+		try {
+			rmSync(join(root, entry), { recursive: true, force: true });
+		} catch {}
+	}
+	const valid = () =>
+		existsSync(path) && createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 16) === hash;
+	if (!valid()) {
+		const tempPath = join(dir, `.${fileName}.${process.pid}.tmp`);
+		try {
+			writeFileSync(tempPath, content);
+			renameSync(tempPath, path);
+		} finally {
+			rmSync(tempPath, { force: true });
+		}
+		if (!valid()) throw new Error(`Unable to publish native library: ${path}`);
 	}
 	return path;
 }

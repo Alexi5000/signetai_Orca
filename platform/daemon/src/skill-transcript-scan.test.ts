@@ -35,7 +35,6 @@ const FIXTURE_JSONL = [
 		cwd: "/test",
 		message: { content: [{ type: "tool_result", tool_use_id: "toolu_BBB", is_error: false }] },
 	}),
-	// toolu_CCC has NO matching tool_result — must be skipped
 	JSON.stringify({
 		sessionId: "sess-scan-1",
 		timestamp: "2024-01-01T00:00:04.000Z",
@@ -61,9 +60,9 @@ describe("recordSkillsFromTranscript", () => {
 		writeFileSync(fixturePath, FIXTURE_JSONL);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		db.close();
-		closeDbAccessor();
+		await closeDbAccessor();
 		rmSync(dbPath, { force: true });
 		rmSync(fixturePath, { force: true });
 		cleanupTestTempDir(scratchDir);
@@ -186,8 +185,6 @@ describe("recordSkillsFromTranscript", () => {
 			agentId: "default",
 			origin: "scan",
 		});
-
-		// Second call with identical args — INSERT OR IGNORE must hold
 		recordSkillsFromTranscript({
 			transcriptPath: fixturePath,
 			harness: "claude-code",

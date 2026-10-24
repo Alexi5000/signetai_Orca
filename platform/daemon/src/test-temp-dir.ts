@@ -28,9 +28,7 @@ function cleanupRegisteredDirs(): void {
 		registered.delete(dir);
 		try {
 			rmSync(dir, { recursive: true, force: true });
-		} catch {
-			// Best-effort only — never mask the original failure.
-		}
+		} catch {}
 	}
 }
 
@@ -38,9 +36,6 @@ function installCleanupHandlers(): void {
 	if (cleanupHandlersInstalled) return;
 	cleanupHandlersInstalled = true;
 	process.on("exit", cleanupRegisteredDirs);
-	// SIGINT/SIGTERM: clean every registered dir, then exit with the
-	// conventional signal status. One process-wide handler avoids leaving
-	// later dirs behind when process.exit stops listener dispatch.
 	process.once("SIGINT", () => {
 		cleanupRegisteredDirs();
 		process.exit(130);
@@ -50,13 +45,9 @@ function installCleanupHandlers(): void {
 		process.exit(143);
 	});
 }
-
-/** Remove a temp dir now (used by afterAll for normal-path cleanup). */
 export function cleanupTestTempDir(dir: string): void {
 	if (registered.has(dir)) registered.delete(dir);
 	try {
 		rmSync(dir, { recursive: true, force: true });
-	} catch {
-		// Best-effort only.
-	}
+	} catch {}
 }

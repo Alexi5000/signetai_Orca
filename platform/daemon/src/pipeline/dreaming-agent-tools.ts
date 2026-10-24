@@ -1,41 +1,91 @@
-/** Pi AgentSession binding for the canonical Dreaming capability registry. */
 import * as Type from "typebox";
-import type { TSchema } from "typebox";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { PiAgentTool } from "./pi-agent-protocol";
 import { z } from "zod";
-import type { CreateDreamingCapabilitiesParams, DreamingCapabilityResult } from "./dreaming-capabilities";
+import type {
+	CreateDreamingCapabilitiesParams,
+	DreamingCapabilityResult,
+	DreamingCapabilityId,
+} from "./dreaming-capabilities";
 import { createDreamingCapabilities } from "./dreaming-capabilities";
 
 export type { DreamingAgentEvidence } from "./dreaming-evidence";
 export type { DreamingCapabilityResult as DreamingAgentToolResult } from "./dreaming-capabilities";
-export type CreateDreamingAgentToolsParams = CreateDreamingCapabilitiesParams;
+export interface CreateDreamingAgentToolsParams extends CreateDreamingCapabilitiesParams {
+	readonly capabilityIds?: readonly DreamingCapabilityId[];
+	readonly allowedAgentIds: readonly string[];
+	readonly codemode?: boolean;
+}
+
+export const DREAMING_CODEMODE_TOOL_IDS: ReadonlySet<DreamingCapabilityId> = new Set<DreamingCapabilityId>([
+	"search_entities",
+	"get_entity",
+	"list_aspect_claims",
+	"validate_proposal",
+	"attention_list",
+	"zoom_history",
+]);
+
+function scopedInput(value: unknown, allowed: ReadonlySet<string>): void {
+	if (typeof value !== "object" || value === null) return;
+	if ("agentId" in value && (typeof value.agentId !== "string" || !allowed.has(value.agentId)))
+		throw new Error("Tool agent scope must be one of this pass's agents");
+	for (const item of Object.values(value)) scopedInput(item, allowed);
+}
 
 function textResult(payload: DreamingCapabilityResult): { readonly type: "text"; readonly text: string } {
 	return { type: "text", text: JSON.stringify(payload) };
 }
-
-/**
- * Bind every registry capability to an isolated Pi session. The schema is
- * generated from the registry's Zod source of truth; invoke performs the
- * same validation again at the daemon boundary before any read or write.
- */
-export function createDreamingAgentTools(params: CreateDreamingAgentToolsParams): readonly ToolDefinition<TSchema>[] {
-	return createDreamingCapabilities(params).map((capability) => ({
-		name: capability.id,
-		label: capability.title,
-		description: capability.description,
-		parameters: Type.Unsafe(z.toJSONSchema(capability.inputSchema)),
-		async execute(toolCallId, rawParams) {
-			const startedAt = Date.now();
-			const result = await capability.invoke(rawParams);
-			await params.onToolCall?.({
-				toolCallId,
-				tool: capability.id,
-				input: rawParams,
-				output: result,
-				latencyMs: Date.now() - startedAt,
-			});
-			return { content: [textResult(result)], details: { tool: capability.id } };
-		},
-	}));
+export function createDreamingAgentTools(params: CreateDreamingAgentToolsParams): readonly PiAgentTool[] {
+	return createDreamingCapabilities({ ...params, allowedScopes: params.allowedAgentIds })
+		.filter((capability) => !params.capabilityIds || params.capabilityIds.includes(capability.id))
+		.map((capability) => {
+			const schema = z.toJSONSchema(capability.inputSchema);
+			const allowed = new Set(params.allowedAgentIds);
+			const agentIdSchema =
+				params.allowedAgentIds.length === 1
+					? { type: "string", const: params.allowedAgentIds[0] }
+					: { type: "string", enum: [...params.allowedAgentIds] };
+			const defaultsToSessionAgent = allowed.has(params.agentId);
+			const parameters = {
+				...schema,
+				properties: { ...schema.properties, agentId: agentIdSchema },
+				required:
+					defaultsToSessionAgent && params.allowedAgentIds.length > 1
+						? (schema.required ?? [])
+						: [...new Set([...(schema.required ?? []), "agentId"])],
+			};
+			return {
+				name: capability.id,
+				label: capability.title,
+				description:
+					params.allowedAgentIds.length === 1
+						? `${capability.description} This session is restricted to agent ${params.allowedAgentIds[0]}.`
+						: capability.description,
+				parameters: Type.Unsafe(parameters),
+				...(params.codemode
+					? {
+							exposure: DREAMING_CODEMODE_TOOL_IDS.has(capability.id) ? ("codemode" as const) : ("model-only" as const),
+						}
+					: {}),
+				async execute(toolCallId, rawParams) {
+					const startedAt = Date.now();
+					if (
+						typeof rawParams !== "object" ||
+						rawParams === null ||
+						(!("agentId" in rawParams) && !defaultsToSessionAgent)
+					)
+						throw new Error("Tool agent scope must be one of this pass's agents");
+					scopedInput(rawParams, allowed);
+					const result = await capability.invoke(rawParams);
+					await params.onToolCall?.({
+						toolCallId,
+						tool: capability.id,
+						input: rawParams,
+						output: result,
+						latencyMs: Date.now() - startedAt,
+					});
+					return { content: [textResult(result)], details: { tool: capability.id } };
+				},
+			};
+		});
 }

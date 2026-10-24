@@ -250,18 +250,6 @@ The response contains `agentId`, `inference` (`active`, `agentSessions`,
 `mcp` (`inFlight`, `oldestAgeMs`, and `maxInFlight`). MCP requests are admitted
 at most 8 at a time.
 
-### GET /api/diagnostics/memory-content-safety
-
-Return bounded, agent-scoped content-safety ledger diagnostics. The response
-includes counts by source kind and status plus source identifiers, reason codes,
-policy version, and scan time. It does not return raw content; use an
-authorized `GET /api/memory/:id` or source inspection endpoint when the
-retained evidence itself must be audited.
-
-Query parameters are `agentId`, `status` (`clean`, `tainted`, or `blocked`),
-`sourceKind` (`memory`, `artifact`, `transcript`, `summary`, or `source_chunk`),
-`limit` (1–200, default 100), and `offset` (0–100000, default 0).
-
 ### GET /api/diagnostics/database/schema
 
 Read-only SQLite schema explorer data for the dashboard database table view.
@@ -357,9 +345,9 @@ reached `max_attempts` are moved to `dead` instead of being requeued again.
 
 ### POST /api/repair/check-fts
 
-Check FTS5 index consistency against the memories table and detect legacy
-tokenizer drift. Optionally repair mismatches by rebuilding the index or
-recreating `memories_fts` with the canonical `unicode61` tokenizer.
+Check FTS5 index consistency against the memories table and detect tokenizer
+drift. Optionally repair mismatches by rebuilding the index or recreating
+`memories_fts` with the canonical `porter unicode61` tokenizer.
 
 **Request body** (optional)
 
@@ -413,30 +401,49 @@ Requires `admin` permission.
 
 ### POST /api/repair/re-embed
 
-Batch re-embeds memories that are missing vector embeddings. Processes
-up to `batchSize` memories per call. Requires `admin` permission.
-Rate-limited — returns `429` when the limit is exceeded.
+Batch re-embeds memories that are missing vector embeddings. Processes at most
+20 memories per call, subject to the durable cooldown, hourly budget, byte
+budget, and run-time budget. Requires `admin` permission. Rate-limited — returns
+`429` when the limit is exceeded.
+
+A full sweep uses `fullSweep: true` and returns an `operationId`. Repeat the
+request with that operation ID after the reported cooldown to resume the next
+bounded batch. Checkpoint state survives daemon restarts. Provider failures,
+request cancellation, and budget exhaustion leave the operation resumable;
+profile changes or cross-agent hash conflicts fail the operation explicitly.
 
 **Request body**
 
 ```json
 {
-  "batchSize": 50,
+  "batchSize": 20,
+  "fullSweep": true,
+  "operationId": "embedding-repair-...",
+  "maxVectorBytes": 4194304,
+  "runBudgetMs": 30000,
   "dryRun": false
 }
 ```
 
-`batchSize` defaults to `50`. `dryRun: true` reports what would be
-embedded without calling the embedding provider.
+`batchSize` defaults to `20`, the server maximum. When supplied, it must be a
+positive integer. `maxVectorBytes` and `runBudgetMs` are bounded by server-side
+ceilings. `dryRun: true` reports what would be embedded without calling the
+embedding provider.
 
 **Response**
 
 ```json
 {
-  "action": "reEmbedMissingVectors",
+  "action": "reembedMissingMemories",
   "success": true,
-  "affected": 42,
-  "message": "re-embedded 42 memories"
+  "affected": 20,
+  "message": "re-embedded 20 of 20 memories in one bounded batch (22 still missing)",
+  "details": {
+    "operationId": "embedding-repair-...",
+    "status": "running",
+    "remaining": 22,
+    "batches": 1
+  }
 }
 ```
 
@@ -486,8 +493,29 @@ agent.
 
 ### POST /api/repair/clean-orphans
 
-Remove embedding rows that reference memories which no longer exist.
+Remove embedding rows that reference memories which no longer exist. The
+operation is scoped to the resolved `agentId` and runs through a durable,
+keyset-paginated owner checkpoint. Repeat the request until `status` is
+`complete`; a client disconnect or owner restart resumes from the same
+checkpoint. It only removes derived vector rows whose canonical embedding is
+owned by the same scope; vector rows with no canonical owner are retained.
+Global reconciliation is not accepted by this endpoint.
 Rate-limited. Requires `admin` permission.
+
+**Request body** (optional)
+
+```json
+{
+  "agentId": "default",
+  "batchSize": 50,
+  "maxVectorBytes": 262144,
+  "maxBatches": 20
+}
+```
+
+The server hard-caps every owner job at 50 rows, 256 KiB of vector payload,
+2 seconds, and 100 estimated work units. Request values can lower those
+ceilings but cannot raise them.
 
 **Response**
 
@@ -496,9 +524,59 @@ Rate-limited. Requires `admin` permission.
   "action": "cleanOrphanedEmbeddings",
   "success": true,
   "affected": 12,
-  "message": "cleaned 12 orphaned embeddings"
+  "operation": "clean-orphans",
+  "agentId": "default",
+  "checkpointId": "vector-repair-...",
+  "phase": "complete",
+  "status": "complete",
+  "processed": 12,
+  "skipped": 0,
+  "failed": 0,
+  "remaining": 0,
+  "remainingStatus": "none",
+  "message": "cleaned orphaned embeddings; processed 12, no work remaining; checkpoint vector-repair-..."
 }
 ```
+
+### POST /api/repair/resync-vec
+
+Reconcile the derived `vec_embeddings` index with canonical `embeddings` for
+one resolved agent by inserting canonical vectors that are missing from the
+index. A scoped request does not remove derived rows that have no canonical
+embedding: those rows have no provable agent owner and are retained rather
+than risking cross-agent deletion. Each owner transaction is a bounded page
+and advances the durable checkpoint atomically with its mutations and semantic
+repair audit. Repeat the request while `status` is `running`.
+
+The same hard server ceilings apply: 50 rows, 256 KiB of vector payload, a
+2-second owner deadline, and 100 estimated work units per job. Malformed or
+oversized canonical vectors beyond the hard 256 KiB ceiling are quarantined
+when the quarantine table is available and reported as `skipped`; a valid
+vector that does not fit the caller's lower per-batch byte budget is deferred
+without quarantine. Retryable owner write failures retain the cursor and are
+reported as `failed`.
+
+**Request body** (optional)
+
+```json
+{
+  "agentId": "default",
+  "batchSize": 50,
+  "maxVectorBytes": 262144,
+  "maxBatches": 20
+}
+```
+
+**Response**
+
+The response includes `processed`, `skipped`, `failed`, `remaining`,
+`remainingStatus`, `checkpointId`, `phase`, and `status` in addition to the usual repair action
+fields. `remaining` is a bounded presence marker: `0` means no matching work
+remains and `1` means the owner found some work; it is not an exact count.
+`status: "running"` is a successful bounded-progress response at HTTP 200 and
+must be resumed with the same resolved scope. `agentId` is always the resolved
+scope; `allAgents` and `scope: "all"` are rejected rather than broadening the
+operation.
 
 ### GET /api/repair/dedup-stats
 
@@ -576,6 +654,58 @@ count that would remain if the preview were applied.
 }
 ```
 
+### POST /api/repair/prune-generic-entities
+
+Remove non-concrete, unpinned entities for the resolved agent. Scanning uses a
+bounded inspection budget and can return a cursor for a later request.
+
+**Request body**
+
+```json
+{
+  "agentId": "default",
+  "candidateLimit": 100,
+  "inspectionLimit": 1000,
+  "cursor": {
+    "updatedAt": "2026-05-11T18:00:00.000Z",
+    "id": "ent-123"
+  },
+  "dryRun": true
+}
+```
+
+`candidateLimit` defaults to `100` and is capped at `500`. It limits matching
+entities. `inspectionLimit` defaults to `1000` and is capped at `5000`; it
+limits all inspected entities independently of matches. `cursor` is optional
+and resumes after the supplied `(updatedAt, id)` position. Dry-run is enabled
+by default. Each request also has a server-owned scan time budget; expiration
+returns a partial response with the cursor. The response `reason` identifies
+whether scanning stopped at a limit, deadline, cancellation, or system pressure.
+
+**Partial response**
+
+```json
+{
+  "action": "pruneGenericEntities",
+  "success": true,
+  "affected": 0,
+  "message": "dry-run: would delete 0 generic/non-concrete entities; partial scan after 1000 inspected row(s), resume with cursor",
+  "details": {
+    "status": "partial",
+    "complete": false,
+    "candidateLimit": 100,
+    "inspectionLimit": 1000,
+    "inspected": 1000,
+    "matched": 0,
+    "remaining": "unknown",
+    "reason": "inspection_limit",
+    "cursor": {
+      "updatedAt": "2026-05-11T18:00:00.000Z",
+      "id": "ent-123"
+    }
+  }
+}
+```
 
 ## Pipeline
 
@@ -628,6 +758,8 @@ Known `mode` values: `controlled-write`, `shadow`, `frozen`, `paused`,
 ```
 
 Mode is one of: `disabled`, `frozen`, `shadow`, `paused`, `controlled-write`.
+
+When DB-owner maintenance is unavailable before startup completes, this endpoint returns 503 instead of reading SQLite from the request process. During owner shutdown, queue counts are intentionally returned as empty maps while the owner drains.
 
 `databaseMaintenance.vacuumConversion` reports the durable legacy SQLite
 conversion state. Existing databases enter `pending` after migrations and are
@@ -685,3 +817,7 @@ Requires `admin` permission and uses the admin rate limit bucket.
 
 `changed` is `false` when the persisted pause flag already matches the
 requested state.
+
+Pause and resume are the only API routes that change `memory.pipelineV2.paused`.
+`POST /api/config` rejects an `agent.yaml` save that changes it, so the persisted
+flag and the running pipeline cannot drift apart.

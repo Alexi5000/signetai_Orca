@@ -20,8 +20,14 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveWorkspaceSourceRepoPath, syncWorkspaceSourceRepo, writeFileExclusiveSync } from "@signet/core";
+import {
+	resolveWorkspaceSourceRepoPath,
+	writeFileExclusiveSync,
+	syncWorkspaceSourceRepo,
+	type WorkspaceSourceRepoSyncResult,
+} from "@signet/core";
 import { resolveAgentsDir } from "../lib/workspace.js";
+import { assertDesktopBunVersion, readDesktopBunVersion } from "./desktop-bun.js";
 
 export interface DesktopCommandOptions {
 	readonly repo?: string;
@@ -35,6 +41,8 @@ export interface DesktopInstallOptions extends DesktopCommandOptions {
 export interface DesktopBuildResult {
 	readonly repo: string;
 	readonly releaseDir: string;
+	readonly localChanges?: "none" | "generated-only" | "left-in-place" | "stashed";
+	readonly stashRef?: string;
 }
 
 export interface DesktopLinuxInstallResult extends DesktopBuildResult {
@@ -55,17 +63,21 @@ export interface DesktopWindowsInstallResult extends DesktopBuildResult {
 	readonly appDir: string;
 	readonly executable: string;
 	readonly programsDir: string;
+	readonly startMenuShortcut?: string;
+	readonly retiredLegacyAppDir?: string;
 	readonly workspace: string;
 }
 
 export type DesktopInstallResult = DesktopLinuxInstallResult | DesktopMacInstallResult | DesktopWindowsInstallResult;
 
 interface DesktopCommandContext {
+	readonly bunVersion?: () => string;
 	readonly cwd?: string;
 	readonly env?: NodeJS.ProcessEnv;
 	readonly home?: string;
 	readonly platform?: NodeJS.Platform;
 	readonly runner?: CommandRunner;
+	readonly shortcutRunner?: CommandRunner;
 	readonly syncWorkspaceSourceRepo?: typeof syncWorkspaceSourceRepo;
 }
 
@@ -78,14 +90,31 @@ interface CommandResult {
 type CommandRunner = (
 	cmd: string,
 	args: readonly string[],
-	opts: { readonly cwd: string; readonly env: NodeJS.ProcessEnv },
+	opts: {
+		readonly cwd: string;
+		readonly env: NodeJS.ProcessEnv;
+		readonly windowsVerbatimArguments?: boolean;
+	},
 ) => CommandResult;
+
+interface PreparedDesktopSourceCheckout {
+	readonly repo: string;
+	readonly sourceSync?: WorkspaceSourceRepoSyncResult;
+}
 
 const defaultRunner: CommandRunner = (cmd, args, opts) =>
 	spawnSync(cmd, [...args], {
 		cwd: opts.cwd,
 		env: opts.env,
 		stdio: "inherit",
+		windowsVerbatimArguments: opts.windowsVerbatimArguments,
+	});
+
+const defaultShortcutRunner: CommandRunner = (cmd, args, opts) =>
+	spawnSync(cmd, [...args], {
+		cwd: opts.cwd,
+		env: opts.env,
+		stdio: "ignore",
 	});
 
 export function resolveDesktopSourceCheckout(
@@ -124,64 +153,138 @@ function desktopSourceCheckoutCandidates(ctx: Pick<DesktopCommandContext, "cwd" 
 	});
 }
 
-function prepareDesktopSourceCheckout(options: DesktopCommandOptions, ctx: DesktopCommandContext): string {
+function prepareDesktopSourceCheckout(
+	options: DesktopCommandOptions,
+	ctx: DesktopCommandContext,
+): PreparedDesktopSourceCheckout {
 	const env = ctx.env ?? process.env;
 	const explicit = options.repo?.trim() || env.SIGNET_SOURCE_DIR?.trim();
-	if (explicit || options.skipSourceSync) return resolveDesktopSourceCheckout(options.repo, ctx);
+	if (explicit || options.skipSourceSync) {
+		return { repo: resolveDesktopSourceCheckout(options.repo, ctx) };
+	}
 
 	const workspace = resolveAgentsDir(env).path;
-	const sync = (ctx.syncWorkspaceSourceRepo ?? syncWorkspaceSourceRepo)(workspace, { cloneIfMissing: true });
+	const sync = (ctx.syncWorkspaceSourceRepo ?? syncWorkspaceSourceRepo)(workspace, {
+		cloneIfMissing: true,
+		localChanges: "stash",
+	});
 	if (!["cloned", "pulled", "current"].includes(sync.status)) {
-		throw new Error(`Could not update Signet source checkout before desktop build: ${sync.message}`);
+		throw new Error(sourceSyncFailureMessage(sync));
 	}
-	return sync.path;
+	return { repo: sync.path, sourceSync: sync };
 }
 
 export function buildDesktopFromSource(
 	options: DesktopCommandOptions = {},
 	ctx: DesktopCommandContext = {},
 ): DesktopBuildResult {
-	const repo = prepareDesktopSourceCheckout(options, ctx);
+	assertDesktopBunVersion((ctx.bunVersion ?? (() => readDesktopBunVersion(ctx.env)))());
+	const prepared = prepareDesktopSourceCheckout(options, ctx);
+	try {
+		buildDesktopAtRepo(prepared.repo, ctx);
+	} catch (error) {
+		throw sourceSyncFailure(error, prepared);
+	}
+
+	return withSourceSyncMetadata(
+		{ repo: prepared.repo, releaseDir: desktopReleaseDir(prepared.repo) },
+		prepared.sourceSync,
+	);
+}
+
+function buildDesktopAtRepo(repo: string, ctx: DesktopCommandContext): void {
 	const runner = ctx.runner ?? defaultRunner;
 	const env = ctx.env ?? process.env;
 
 	runChecked(runner, "bun", ["install"], repo, env);
 	runChecked(runner, "bun", ["run", "build:desktop"], repo, env);
-
-	return { repo, releaseDir: desktopReleaseDir(repo) };
 }
 
 export function installDesktopFromSource(
 	options: DesktopInstallOptions = {},
 	ctx: DesktopCommandContext = {},
 ): DesktopInstallResult {
-	const repo = options.skipBuild
-		? resolveDesktopSourceCheckout(options.repo, ctx)
+	if (!options.skipBuild) {
+		assertDesktopBunVersion((ctx.bunVersion ?? (() => readDesktopBunVersion(ctx.env)))());
+	}
+	const prepared = options.skipBuild
+		? { repo: resolveDesktopSourceCheckout(options.repo, ctx) }
 		: prepareDesktopSourceCheckout(options, ctx);
 	const workspace = resolveAgentsDir(ctx.env ?? process.env).path;
-	if (!options.skipBuild) {
-		buildDesktopFromSource({ repo, skipSourceSync: true }, ctx);
-	}
+	try {
+		if (!options.skipBuild) {
+			buildDesktopAtRepo(prepared.repo, ctx);
+		}
 
-	const platform = ctx.platform ?? process.platform;
-	const home = ctx.home ?? homedir();
-	if (platform === "darwin") {
-		return installMacDesktopApp(repo, home, workspace);
-	}
-	if (platform === "win32") {
-		const localAppData = ctx.env?.LOCALAPPDATA?.trim() || join(home, "AppData", "Local");
-		return installWindowsDesktopApp(repo, home, workspace, localAppData);
-	}
-	if (platform !== "linux") {
-		throw new Error(
-			`signet desktop install supports macOS, Windows, and Linux installs. Build artifacts are in ${desktopReleaseDir(repo)}.`,
-		);
-	}
+		const platform = ctx.platform ?? process.platform;
+		const home = ctx.home ?? homedir();
+		if (platform === "darwin") {
+			return withSourceSyncMetadata(installMacDesktopApp(prepared.repo, home, workspace), prepared.sourceSync);
+		}
+		if (platform === "win32") {
+			const localAppData = ctx.env?.LOCALAPPDATA?.trim() || join(home, "AppData", "Local");
+			const appData = ctx.env?.APPDATA?.trim() || join(home, "AppData", "Roaming");
+			const startMenuShortcut = join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Signet.lnk");
+			return withSourceSyncMetadata(
+				installWindowsDesktopApp(prepared.repo, home, workspace, localAppData, {
+					startMenuShortcut,
+					shortcutRunner: ctx.shortcutRunner,
+					legacyUninstallRunner: ctx.runner,
+					env: ctx.env,
+					platform,
+				}),
+				prepared.sourceSync,
+			);
+		}
+		if (platform !== "linux") {
+			throw new Error(
+				`signet desktop install supports macOS, Windows, and Linux installs. Build artifacts are in ${desktopReleaseDir(prepared.repo)}.`,
+			);
+		}
 
-	return installLinuxDesktopApp(repo, home, workspace);
+		return withSourceSyncMetadata(installLinuxDesktopApp(prepared.repo, home, workspace), prepared.sourceSync);
+	} catch (error) {
+		throw sourceSyncFailure(error, prepared);
+	}
+}
+
+function withSourceSyncMetadata<T extends DesktopBuildResult>(
+	result: T,
+	sourceSync: WorkspaceSourceRepoSyncResult | undefined,
+): T {
+	if (!sourceSync?.localChanges || sourceSync.localChanges === "none") return result;
+	return {
+		...result,
+		localChanges: sourceSync.localChanges,
+		...(sourceSync.stashRef ? { stashRef: sourceSync.stashRef } : {}),
+	};
+}
+
+function sourceSyncFailureMessage(sync: WorkspaceSourceRepoSyncResult): string {
+	const recovery = sync.stashRef ? `\n${sourceChangesRecoveryMessage(sync.path, sync.stashRef)}` : "";
+	return `Could not update Signet source checkout before desktop build: ${sync.message}${recovery}`;
+}
+
+function sourceSyncFailure(error: unknown, prepared: PreparedDesktopSourceCheckout): Error {
+	const original = error instanceof Error ? error : new Error(String(error));
+	const stashRef = prepared.sourceSync?.stashRef;
+	if (!stashRef) return original;
+	return new Error(`${original.message}\n${sourceChangesRecoveryMessage(prepared.repo, stashRef)}`);
+}
+
+function sourceChangesRecoveryMessage(repo: string, stashRef: string): string {
+	return `Local source changes were preserved in stash ${stashRef}. Restore with: git -C "${repo}" stash apply ${stashRef}`;
 }
 
 const MAC_APP_MARKER = "ai.signet.app";
+
+interface WindowsDesktopInstallOptions {
+	readonly startMenuShortcut?: string;
+	readonly shortcutRunner?: CommandRunner;
+	readonly legacyUninstallRunner?: CommandRunner;
+	readonly env?: NodeJS.ProcessEnv;
+	readonly platform?: NodeJS.Platform;
+}
 
 export function installMacDesktopApp(
 	repo: string,
@@ -203,23 +306,24 @@ export function installMacDesktopApp(
 		source,
 		appBundle,
 		isSignetAppBundle,
-		(sourcePath, temporaryPath) => cpSync(sourcePath, temporaryPath, { recursive: true }),
+		(sourcePath, temporaryPath) => {
+			if (process.platform === "darwin") {
+				runChecked(defaultRunner, "/usr/bin/ditto", [sourcePath, temporaryPath], repo, process.env);
+			} else {
+				cpSync(sourcePath, temporaryPath, { recursive: true, verbatimSymlinks: true });
+			}
+		},
 		"app",
 	);
 
 	return { repo, releaseDir, appBundle, applicationsDir, workspace };
 }
-
-/**
- * Install the unpacked Windows build into a user-owned program directory.
- * The directory is intentionally distinct from the native CLI's
- * %LOCALAPPDATA%\\Programs\\Signet\\signet.exe path.
- */
 export function installWindowsDesktopApp(
 	repo: string,
 	home: string,
 	workspace = resolveAgentsDir().path,
 	localAppData = join(home, "AppData", "Local"),
+	options: WindowsDesktopInstallOptions = {},
 ): DesktopWindowsInstallResult {
 	const releaseDir = desktopReleaseDir(repo);
 	const source = findWindowsAppDirectory(releaseDir, process.arch);
@@ -244,15 +348,136 @@ export function installWindowsDesktopApp(
 	if (!executable) {
 		throw new Error(`Installed Windows Signet app is missing its executable at ${appDir}.`);
 	}
-	return { repo, releaseDir, appDir, executable, programsDir, workspace };
+	const legacyAppDir = join(programsDir, "@signetdesktop");
+	let retiredLegacyAppDir: string | undefined;
+	let legacyUninstallError: Error | undefined;
+	if ((options.platform ?? process.platform) === "win32") {
+		try {
+			retiredLegacyAppDir = uninstallLegacyWindowsDesktopApp(
+				legacyAppDir,
+				options.env ?? process.env,
+				options.legacyUninstallRunner ?? defaultRunner,
+			);
+		} catch (error) {
+			legacyUninstallError = error instanceof Error ? error : new Error(String(error));
+		}
+	}
+
+	let shortcutError: Error | undefined;
+	if (options.startMenuShortcut && (options.platform ?? process.platform) === "win32") {
+		try {
+			writeWindowsStartMenuShortcut(
+				executable,
+				options.startMenuShortcut,
+				options.env ?? process.env,
+				options.shortcutRunner ?? defaultShortcutRunner,
+			);
+		} catch (error) {
+			shortcutError = error instanceof Error ? error : new Error(String(error));
+		}
+	}
+	if (legacyUninstallError) {
+		const shortcutDetail = shortcutError ? ` Start Menu shortcut refresh also failed: ${shortcutError.message}.` : "";
+		throw new Error(
+			`The new Signet desktop app is installed at ${executable}, but removal of the legacy app at ${legacyAppDir} could not be confirmed. Rerun desktop install to retry legacy cleanup.${shortcutDetail} Details: ${legacyUninstallError.message}`,
+			{ cause: legacyUninstallError },
+		);
+	}
+	if (shortcutError) throw shortcutError;
+
+	return {
+		repo,
+		releaseDir,
+		appDir,
+		executable,
+		programsDir,
+		startMenuShortcut: options.startMenuShortcut,
+		...(retiredLegacyAppDir ? { retiredLegacyAppDir } : {}),
+		workspace,
+	};
 }
 
-/**
- * Replace a managed file or directory without deleting the previous install
- * until the replacement has been copied successfully. The temporary and
- * backup paths stay beside the target so directory renames remain atomic on
- * the same filesystem on both macOS and Windows.
- */
+function uninstallLegacyWindowsDesktopApp(
+	legacyAppDir: string,
+	env: NodeJS.ProcessEnv,
+	runner: CommandRunner,
+): string | undefined {
+	if (!existsSync(legacyAppDir) || !isSignetWindowsAppDirectory(legacyAppDir)) return undefined;
+	const uninstaller = readdirSync(legacyAppDir, { withFileTypes: true }).find(
+		(entry) => entry.isFile() && entry.name.toLowerCase() === "uninstall signet.exe",
+	);
+	if (!uninstaller) {
+		throw new Error(
+			`Found an older Signet desktop install at ${legacyAppDir}, but it has no uninstaller. Remove that install from Windows Settings before continuing.`,
+		);
+	}
+	runChecked(
+		runner,
+		join(legacyAppDir, uninstaller.name),
+		["/S", "/currentuser", `_?=${legacyAppDir}`],
+		legacyAppDir,
+		{
+			...process.env,
+			...env,
+		},
+		{ windowsVerbatimArguments: true },
+	);
+	if (legacySignetAppMarkersRemain(legacyAppDir)) {
+		throw new Error(
+			`The older Signet desktop install at ${legacyAppDir} is still present after uninstall. Close Signet from the system tray, then run desktop install again.`,
+		);
+	}
+	rmSync(join(legacyAppDir, uninstaller.name), { force: true });
+	return legacyAppDir;
+}
+
+const WINDOWS_START_MENU_SHORTCUT_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$shortcutPath = $env:SIGNET_DESKTOP_SHORTCUT
+$targetPath = $env:SIGNET_DESKTOP_TARGET
+if ([string]::IsNullOrWhiteSpace($shortcutPath) -or [string]::IsNullOrWhiteSpace($targetPath)) {
+    throw 'Signet desktop shortcut paths are missing.'
+}
+$parent = Split-Path -Parent $shortcutPath
+New-Item -ItemType Directory -Force -Path $parent | Out-Null
+$shell = New-Object -ComObject WScript.Shell
+if (Test-Path -LiteralPath $shortcutPath) {
+    $existing = $shell.CreateShortcut($shortcutPath)
+    $existingTarget = [string]$existing.TargetPath
+    if ($existingTarget -and $existingTarget -notmatch '(?i)\\(?:@signetdesktop|Signet Desktop)\\signet\.exe$') {
+        throw "Refusing to replace unrelated shortcut at $shortcutPath."
+    }
+}
+$link = $shell.CreateShortcut($shortcutPath)
+$link.TargetPath = $targetPath
+$link.WorkingDirectory = Split-Path -Parent $targetPath
+$link.Description = 'Signet desktop app'
+$link.IconLocation = "$targetPath,0"
+$link.Save()
+`;
+
+function writeWindowsStartMenuShortcut(
+	executable: string,
+	shortcutPath: string,
+	env: NodeJS.ProcessEnv,
+	runner: CommandRunner,
+): void {
+	const args = [
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		WINDOWS_START_MENU_SHORTCUT_SCRIPT,
+	] as const;
+	runChecked(runner, "powershell.exe", args, dirname(executable), {
+		...process.env,
+		...env,
+		SIGNET_DESKTOP_SHORTCUT: shortcutPath,
+		SIGNET_DESKTOP_TARGET: executable,
+	});
+}
 function replaceManagedPath(
 	source: string,
 	target: string,
@@ -325,10 +550,6 @@ function isSignetAppBundle(path: string): boolean {
 }
 
 function findMacAppBundle(releaseDir: string, arch: string): string | null {
-	// Electron-builder's unpacked output lives in layout directories such as
-	// release/mac/Signet.app or release/mac_arm64/Signet.app. Recurse only a
-	// bounded depth and verify the executable's Mach-O architecture so a
-	// foreign-arch artifact is never installed.
 	return findNewestCandidate(
 		releaseDir,
 		macAppBundleCandidates(releaseDir, 3),
@@ -348,9 +569,7 @@ function findNewestCandidate(
 		try {
 			const mtime = statSync(candidate).mtimeMs;
 			if (!best || mtime > best.mtime) best = { path: candidate, mtime };
-		} catch {
-			// The release directory can change while a build is being cleaned up.
-		}
+		} catch {}
 	}
 	return best?.path ?? null;
 }
@@ -374,8 +593,6 @@ function* macAppBundleCandidates(root: string, depth: number): Generator<string>
 		yield* macAppBundleCandidates(path, depth - 1);
 	}
 }
-
-/** Reads the Mach-O cputype from the bundle's main executable. */
 function macAppBundleMatchesArch(path: string, arch: string): boolean {
 	const executable = macBundleExecutable(path);
 	if (executable === null) return false;
@@ -435,22 +652,25 @@ function macBundleExecutable(path: string): string | null {
 const WINDOWS_PACKAGE_MARKERS = [Buffer.from('"name": "@signet/desktop"'), Buffer.from('"name":"@signet/desktop"')];
 
 function isSignetWindowsAppDirectory(path: string): boolean {
-	const executable = windowsAppExecutable(path);
-	if (!executable) return false;
+	return isSignetWindowsAppPackage(path);
+}
+
+function isSignetWindowsAppPackage(path: string): boolean {
 	const asar = join(path, "resources", "app.asar");
 	try {
 		const contents = readFileSync(asar);
 		if (WINDOWS_PACKAGE_MARKERS.some((marker) => contents.includes(marker))) return true;
-	} catch {
-		// An unpacked Electron directory can expose app/package.json instead of
-		// app.asar during local builds.
-	}
+	} catch {}
 	try {
 		const packageJson = readJson(join(path, "resources", "app", "package.json"));
 		return jsonString(packageJson, "name") === "@signet/desktop";
 	} catch {
 		return false;
 	}
+}
+
+function legacySignetAppMarkersRemain(path: string): boolean {
+	return windowsAppExecutable(path) !== null || isSignetWindowsAppPackage(path);
 }
 
 function windowsAppExecutable(path: string): string | null {
@@ -640,8 +860,9 @@ function runChecked(
 	args: readonly string[],
 	cwd: string,
 	env: NodeJS.ProcessEnv,
+	spawnOptions: { readonly windowsVerbatimArguments?: boolean } = {},
 ): void {
-	const result = runner(cmd, args, { cwd, env });
+	const result = runner(cmd, args, { cwd, env, ...spawnOptions });
 	if (result.error) {
 		throw result.error;
 	}

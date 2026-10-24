@@ -1,7 +1,3 @@
-/**
- * Agent ID resolution helpers.
- */
-
 import type { AgentRosterReadPolicy } from "@signet/core";
 import { registerDbAccessorCloseParticipant } from "./db-accessor-lifecycle";
 import { getDbAccessorPath } from "./db-accessor";
@@ -12,20 +8,10 @@ export interface AgentScope {
 	readonly readPolicy: AgentRosterReadPolicy;
 	readonly policyGroup: string | null;
 }
-
-/**
- * Resolve default daemon agent ID from environment.
- */
 export function defaultAgentId(env: NodeJS.ProcessEnv = process.env): string {
 	const configured = env.SIGNET_AGENT_ID?.trim();
 	return configured && configured.length > 0 ? configured : "default";
 }
-
-/**
- * Resolve the agent ID from a request body.
- * Falls back to parsing OpenClaw's "agent:{id}:{rest}" session key format.
- * Final fallback: configured daemon agent or "default".
- */
 export function resolveAgentId(
 	body: { agentId?: string; sessionKey?: string },
 	env: NodeJS.ProcessEnv = process.env,
@@ -68,8 +54,6 @@ const isolatedScope: AgentScope = { readPolicy: "isolated", policyGroup: null };
 function normalizedAgentId(agentId: string): string {
 	return agentId.trim() || "default";
 }
-
-/** Drop the cached policy for one agent, or all policies after roster changes. */
 export function invalidateAgentScopeCache(agentId?: string): void {
 	agentScopeGeneration += 1;
 	if (agentId === undefined) {
@@ -84,14 +68,6 @@ registerDbAccessorCloseParticipant({
 	order: 200,
 	close: () => invalidateAgentScopeCache(),
 });
-
-/**
- * Read an agent's policy through the async DB boundary.
- *
- * Scope reads are frequent on request paths, so unchanged policies are kept
- * briefly in-process. In-flight reads are coalesced, while explicit roster
- * mutations can invalidate the entry immediately.
- */
 export async function getAgentScope(agentId: string): Promise<AgentScope> {
 	const id = normalizedAgentId(agentId);
 	while (true) {
@@ -142,10 +118,7 @@ export async function getAgentScope(agentId: string): Promise<AgentScope> {
 	}
 }
 
-export async function ensureAgentRegistered(
-	agentId: string,
-	readPolicy: AgentRosterReadPolicy = "shared",
-): Promise<void> {
+export async function ensureAgentRegistered(agentId: string): Promise<void> {
 	const id = normalizedAgentId(agentId);
 	const now = new Date().toISOString();
 	try {
@@ -153,9 +126,9 @@ export async function ensureAgentRegistered(
 		await ownerRun(
 			owner,
 			`INSERT INTO agents (id, name, read_policy, policy_group, created_at, updated_at)
-			 VALUES (?, ?, ?, NULL, ?, ?)
+			 VALUES (?, ?, 'isolated', NULL, ?, ?)
 			 ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`,
-			[id, id, readPolicy, now, now],
+			[id, id, now, now],
 			{
 				operation: "agent-scope.register",
 				lane: "write",

@@ -1,16 +1,17 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getWorkspaceConfigPath, resolveAgentsDir, writeConfiguredWorkspacePath } from "./workspace.js";
+import {
+	getWorkspaceConfigPath,
+	isDesktopWorkspacePath,
+	resolveAgentsDir,
+	writeConfiguredWorkspacePath,
+} from "./workspace.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
-
-// Strip both workspace env vars from the host so precedence/fallback tests are
-// deterministic regardless of the developer shell (the resolver honors
-// SIGNET_PATH then SIGNET_WORKSPACE).
 function cleanEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 	return { ...process.env, SIGNET_PATH: "", SIGNET_WORKSPACE: "", ...overrides };
 }
@@ -73,5 +74,24 @@ describe("workspace path resolution", () => {
 		}
 		expect(raw.workspace).toBe(target);
 		expect(raw.version).toBe(1);
+	});
+
+	it("offers Desktop handoff only for the resolved non-overridden workspace", () => {
+		const root = mkdtempSync(join(tmpdir(), "signet-workspace-desktop-"));
+		try {
+			const env = cleanEnv({ XDG_CONFIG_HOME: join(root, "config") });
+			const defaultPath = join(root, ".agents");
+
+			expect(isDesktopWorkspacePath(defaultPath, { env, home: root })).toBe(true);
+			expect(isDesktopWorkspacePath(join(root, "custom"), { env, home: root })).toBe(false);
+			expect(
+				isDesktopWorkspacePath(defaultPath, {
+					env: { ...env, SIGNET_PATH: join(root, "custom") },
+					home: root,
+				}),
+			).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

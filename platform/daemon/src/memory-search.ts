@@ -1,28 +1,16 @@
-/**
- * Hybrid recall search orchestration.
- *
- * This module turns a user query into a bounded, authorized recall response.
- * The route handler in daemon.ts owns HTTP parsing and permissions; this file
- * owns retrieval mechanics, score shaping, fallback sources, and response
- * assembly.
- *
- * The critical invariant is ordering: broad candidate IDs may come from vector
- * search, graph traversal, or source rescue paths, but memory content must not
- * be loaded for reranking, dampening, summaries, expansion, or access tracking
- * until the shared scope/project/agent filter has authorized those IDs.
- */
-
 import { createHash } from "node:crypto";
 import {
 	type AccountingProvenance,
 	type AccountingSummaryProvenance,
 	type AgentRosterReadPolicy,
+	activeVectorProjectionTable,
 	LEGACY_OBSIDIAN_CHUNK_SOURCE_TYPE,
 	type LlmUsage,
 	type RecallSurface,
 	type RecallTemporalMeta,
 	SOURCE_CHUNK_SOURCE_TYPE,
-	scanMemoryContent,
+	redactCredentials,
+	redactCredentialsDeep,
 	type VectorSearchCompleteness,
 } from "@signet/core";
 import { normalizeAndHashContent } from "./content-normalization";
@@ -31,14 +19,24 @@ import type { DbOwnerClient } from "./db-owner-client";
 import { vectorSearchThroughDbOwner } from "./db-owner-recall";
 import { ownerBytesFromHex, ownerReadAll, ownerReadOne } from "./db-owner-sql";
 import { getDbOwner, getDbRecallOwner } from "./db-owner-runtime";
-import { DB_OWNER_MAX_WORK_UNITS } from "./db-owner-protocol";
-import type { EmbeddingRole } from "./embedding-profile";
+import { DB_OWNER_MAX_RESULT_BYTES, DB_OWNER_MAX_WORK_UNITS } from "./db-owner-protocol";
+import {
+	embeddingProfileFingerprint,
+	embeddingProfileFingerprintsEqual,
+	type EmbeddingRole,
+} from "./embedding-profile";
+import { parseEmbeddingIndexStateRow, type EmbeddingIndexStateRow } from "./embedding-index-state";
+import {
+	buildMemorySearchFilterClause as buildFilterClause,
+	currentMemorySql,
+	hasMemoryMetadataFilters,
+	hasRestrictedMemoryContentFilters,
+	type MemorySearchFilterClause as FilterClause,
+} from "./memory-search-filters";
 import { isFtsIndexIncomplete } from "./fts-index-state";
 import { getLlmProvider } from "./llm";
 import { logger } from "./logger";
-import { buildAgentScopeClause } from "./memory-access-scope";
 import type { EmbeddingConfig, MemorySearchConfig, ResolvedMemoryConfig } from "./memory-config";
-import { isMemoryContentContextEligible } from "./memory-content-safety";
 import { NATIVE_MEMORY_BRIDGE_SOURCE_NODE_ID } from "./native-memory-constants";
 import { constructContextBlocksViaOwner } from "./pipeline/context-construction";
 import { DEFAULT_DAMPENING, type ScoredRow, applyDampening } from "./pipeline/dampening";
@@ -52,6 +50,8 @@ import {
 import { type RerankCandidate, noopReranker, rerank } from "./pipeline/reranker";
 import { createEmbeddingReranker } from "./pipeline/reranker-embedding";
 import { createLlmReranker, summarizeRecallWithLlm } from "./pipeline/reranker-llm";
+import { type RerankOutcome, createCrossEncoderReranker } from "./pipeline/reranker-cross-encoder";
+import { nativeRerank } from "./native-rerank";
 import { FTS_STOP } from "./pipeline/stop-words";
 import {
 	type EvidenceCandidateInput,
@@ -70,9 +70,8 @@ import { escapeLike } from "./sql-utils";
 import { getActiveTelemetry } from "./telemetry";
 import { type TemporalTimeOptions, hasFreshnessIntent, resolveTemporalRecall } from "./temporal-recall";
 
-// ---------------------------------------------------------------------------
-// Public interfaces
-// ---------------------------------------------------------------------------
+export { buildAgentScopeClause } from "./memory-access-scope";
+export { currentMemorySql };
 
 export interface RecallParams {
 	query: string;
@@ -84,9 +83,7 @@ export interface RecallParams {
 	saveAggregate?: boolean;
 	save_aggregate?: boolean;
 	agentId?: string;
-	/** Agent read policy — 'isolated' | 'shared' | 'group'. When set with agentId, filters by visibility. */
 	readPolicy?: AgentRosterReadPolicy;
-	/** Policy group name (required when readPolicy is 'group'). */
 	policyGroup?: string | null;
 	type?: string;
 	tags?: string;
@@ -98,25 +95,22 @@ export interface RecallParams {
 	time?: TemporalTimeOptions;
 	scope?: string | null;
 	expand?: boolean;
-	/** When set, restricts results to memories belonging to this project (auth scope enforcement). */
 	project?: string;
-	/** Enables per-session context dedupe when present. Sessionless recall is unchanged. */
 	sessionKey?: string;
-	/** Return already-recalled rows and annotate them instead of suppressing them. */
 	includeRecalled?: boolean;
-	/** Restrict recall to source-backed artifacts/chunks instead of normal memory rows. */
 	sourceOnly?: boolean;
-	/** Internal ledger metadata for call-site attribution. */
 	recallSurface?: string;
 	recallMode?: string;
-	/** Internal escape hatch for hooks that must claim only injected rows. */
 	claimRecallResults?: boolean;
-	/** Internal aggregate-recall guard: derived aggregate memories may be returned by normal recall, but never as aggregate evidence. */
 	excludeAggregateRecallMemories?: boolean;
-	/** Internal escape hatch for hooks that must track only injected rows elsewhere. */
 	trackRecallAccess?: boolean;
-	/** Anonymous retrieval-outcome attribution; never carries caller text. */
 	telemetrySurface?: RecallSurface;
+}
+
+export interface RecallTranscriptEvidenceMeta {
+	readonly returned: number;
+	readonly ranking?: "cross-encoder" | "keyword";
+	readonly failed?: true;
 }
 
 export interface RecallResult {
@@ -150,26 +144,18 @@ export interface RecallResponse {
 		totalReturned: number;
 		hasSupplementary: boolean;
 		noHits: boolean;
-		/** Completeness of the semantic vector channel, when it ran. */
 		vectorCompleteness?: VectorSearchCompleteness;
-		/** Maximum canonical rows inspected by a bounded fallback scan. */
 		searchedWindow?: number;
-		/** True when graph traversal timed out or failed after bounded fallback. */
+		sourceVectorSearch?: SourceChunkVectorDiagnostics;
+		reranker?: RerankOutcome;
 		graphPartial?: boolean;
-		/** Operational graph failure, when one was observed. */
+		transcriptEvidence?: RecallTranscriptEvidenceMeta;
 		graphError?: {
 			channel: "graph_traversal";
 			code: string | number | null;
 			message: string;
 		};
-		/** Most specific known degradation reason for partial recall. */
 		degradation?: "fts_incomplete" | "graph_traversal_timeout" | "graph_traversal_failed";
-		/**
-		 * True when lexical coverage is known incomplete because FTS rows are
-		 * missing. The response remains successful and may contain bounded bridge
-		 * results. This is distinct from aggregate.partial, which describes
-		 * incomplete aggregate planning or synthesis.
-		 */
 		partial?: boolean;
 		timings: RecallTimings;
 		temporal?: RecallTemporalMeta;
@@ -183,7 +169,6 @@ export interface RecallResponse {
 		queries: readonly string[];
 		sourceMemoryIds: readonly string[];
 		stoppedReason: "complete" | "no_evidence" | "router_unavailable" | "synthesis_failed";
-		/** True when aggregate planning or synthesis stopped after partial evidence. */
 		partial?: boolean;
 		message?: string;
 		usage?: AggregateRecallUsage;
@@ -286,107 +271,6 @@ function createRecallTimingCollector(): {
 	};
 }
 
-export { buildAgentScopeClause } from "./memory-access-scope";
-
-// ---------------------------------------------------------------------------
-// Filter clause builder (private)
-// ---------------------------------------------------------------------------
-
-interface FilterClause {
-	sql: string;
-	args: unknown[];
-}
-
-function buildFilterClause(params: RecallParams): FilterClause {
-	const parts: string[] = [];
-	const args: unknown[] = [];
-
-	// Scope isolation: explicit scope filters to that scope, undefined
-	// defaults to excluding all scoped memories from normal searches.
-	if (params.scope !== undefined) {
-		if (params.scope === null) {
-			parts.push("m.scope IS NULL");
-		} else {
-			parts.push("m.scope = ?");
-			args.push(params.scope);
-		}
-	} else {
-		parts.push("m.scope IS NULL");
-	}
-
-	if (params.type) {
-		parts.push("m.type = ?");
-		args.push(params.type);
-	}
-	if (params.tags) {
-		for (const t of params.tags
-			.split(",")
-			.map((s) => s.trim())
-			.filter(Boolean)) {
-			parts.push("m.tags LIKE ? ESCAPE '\\'");
-			args.push(`%${escapeLike(t)}%`);
-		}
-	}
-	if (params.who) {
-		parts.push("m.who = ?");
-		args.push(params.who);
-	}
-	if (params.pinned) {
-		parts.push("m.pinned = 1");
-	}
-	if (typeof params.importance_min === "number") {
-		parts.push("m.importance >= ?");
-		args.push(params.importance_min);
-	}
-	if (params.aggregate === true || params.excludeAggregateRecallMemories === true) {
-		parts.push("COALESCE(m.source_type, '') != 'aggregate-recall'");
-	}
-	if (params.since) {
-		parts.push("m.created_at >= ?");
-		args.push(params.since);
-	}
-	if (params.until) {
-		parts.push("m.created_at <= ?");
-		args.push(params.until);
-	}
-	// Auth scope enforcement: restrict to token's project when present.
-	if (params.project) {
-		parts.push("m.project = ?");
-		args.push(params.project);
-	}
-
-	const base: FilterClause = {
-		sql: parts.length ? ` AND ${parts.join(" AND ")}` : "",
-		args,
-	};
-
-	// Agent visibility filtering defaults to isolated when an agent is known.
-	if (params.agentId) {
-		const scope = buildAgentScopeClause(params.agentId, params.readPolicy ?? "isolated", params.policyGroup ?? null);
-		return { sql: base.sql + scope.sql, args: [...base.args, ...scope.args] };
-	}
-
-	return base;
-}
-
-function hasMemoryMetadataFilters(params: RecallParams): boolean {
-	const hasTags =
-		params.tags
-			?.split(",")
-			.map((tag) => tag.trim())
-			.some(Boolean) === true;
-	return (
-		params.type !== undefined ||
-		hasTags ||
-		params.who !== undefined ||
-		params.pinned === true ||
-		typeof params.importance_min === "number" ||
-		params.since !== undefined ||
-		params.until !== undefined ||
-		params.scope !== undefined
-	);
-}
-
 function canUseOntologyClaimRecall(params: RecallParams): boolean {
 	return params.sourceOnly !== true && !params.project && !hasMemoryMetadataFilters(params);
 }
@@ -452,7 +336,7 @@ function ontologyClaimContent(candidate: StructuredClaimCandidate): string {
 }
 
 function ontologyClaimToRecallResult(candidate: StructuredClaimCandidate, truncateChars: number): RecallResult {
-	const content = ontologyClaimContent(candidate);
+	const content = redactCredentials(ontologyClaimContent(candidate));
 	const truncated = content.length > truncateChars;
 	const sourcePath = ontologyClaimSourcePath(candidate);
 	return {
@@ -460,10 +344,6 @@ function ontologyClaimToRecallResult(candidate: StructuredClaimCandidate, trunca
 		content: truncated ? `${content.slice(0, truncateChars)} [truncated]` : content,
 		content_length: content.length,
 		truncated,
-		// Source-provenanced active ontology claims represent Dreaming's current
-		// structured truth. Only high-overlap claims are admitted upstream; keep
-		// them prominent enough to beat stale synthesized memories without letting
-		// low-overlap entity context into the result set.
 		score: Math.round(Math.max(0.01, Math.min(1.45, 1 + candidate.score * 0.45)) * 100) / 100,
 		source: "ontology_claim",
 		source_id: candidate.id,
@@ -482,18 +362,6 @@ function normalizeRecallLimit(raw: number | undefined): number {
 	if (typeof raw !== "number" || !Number.isFinite(raw)) return 10;
 	return Math.max(1, Math.min(50, Math.floor(raw)));
 }
-
-// ---------------------------------------------------------------------------
-// FTS5 query sanitization
-// ---------------------------------------------------------------------------
-
-/**
- * Sanitize a query string for FTS5 MATCH.
- *
- * Strips FTS5 syntax characters, removes stop words, and quotes each
- * token as a literal. Short queries (<=3 tokens) use implicit AND for
- * precision; longer queries use OR so BM25 IDF ranks by term importance.
- */
 export function sanitizeFtsQuery(raw: string): string {
 	const tokens = raw
 		.replace(/'/g, " ")
@@ -510,76 +378,9 @@ export function sanitizeFtsQuery(raw: string): string {
 		.filter(Boolean) as string[];
 
 	if (tokens.length === 0) return "";
-	// Short queries (<=3 content tokens): implicit AND for precision.
-	// Longer queries: OR so BM25 IDF ranks by term importance.
 	if (tokens.length <= 3) return tokens.join(" ");
 	return tokens.join(" OR ");
 }
-
-const BAKING_QUERY_TRIGGERS = new Set([
-	"bake",
-	"baked",
-	"baking",
-	"brownie",
-	"brownies",
-	"cake",
-	"cakes",
-	"chocolate",
-	"cookie",
-	"cookies",
-	"dessert",
-	"desserts",
-	"pastry",
-	"pastries",
-	"recipe",
-	"recipes",
-]);
-
-const BAKING_QUERY_EXPANSIONS = [
-	"baking",
-	"dessert",
-	"desserts",
-	"flavor",
-	"flavour",
-	"ingredient",
-	"ingredients",
-	"recipe",
-	"recipes",
-	"sugar",
-	"texture",
-] as const;
-
-const ENTERTAINMENT_QUERY_TRIGGERS = new Set([
-	"documentary",
-	"documentaries",
-	"film",
-	"films",
-	"movie",
-	"movies",
-	"netflix",
-	"show",
-	"shows",
-	"streaming",
-	"television",
-	"tv",
-	"watch",
-	"watching",
-]);
-
-const ENTERTAINMENT_QUERY_EXPANSIONS = [
-	"comedy",
-	"documentary",
-	"film",
-	"hulu",
-	"netflix",
-	"show",
-	"stand up",
-	"storytelling",
-	"streaming",
-	"television",
-	"tv",
-	"watchlist",
-] as const;
 
 function normalizeExpansionToken(raw: string): string {
 	const cleaned = raw
@@ -591,43 +392,6 @@ function normalizeExpansionToken(raw: string): string {
 	if (cleaned.endsWith("s") && cleaned.length > 3) return cleaned.slice(0, -1);
 	return cleaned;
 }
-
-/**
- * Add a small set of mechanical recall expansions for common class-to-instance
- * gaps. This intentionally stays conservative: it only fires for explicit
- * baking/recipe terms, and it feeds FTS/hints only. Semantic vector search and
- * answer generation still see the user's original query.
- */
-export function expandRecallKeywordQuery(raw: string): string {
-	const tokens = raw
-		.split(/\s+/)
-		.map(normalizeExpansionToken)
-		.filter((token) => token.length >= 2 && !FTS_STOP.has(token));
-
-	const expansions: string[] = [];
-	const existing = new Set(tokens);
-	const addMissing = (items: readonly string[]): void => {
-		for (const item of items) {
-			const normalized = normalizeExpansionToken(item);
-			if (!existing.has(normalized) && !expansions.includes(item)) expansions.push(item);
-		}
-	};
-
-	if (tokens.some((token) => BAKING_QUERY_TRIGGERS.has(token))) {
-		addMissing(BAKING_QUERY_EXPANSIONS);
-	}
-	if (tokens.some((token) => ENTERTAINMENT_QUERY_TRIGGERS.has(token))) {
-		addMissing(ENTERTAINMENT_QUERY_EXPANSIONS);
-	}
-
-	if (expansions.length === 0) return raw;
-	return `${raw} ${expansions.join(" ")}`;
-}
-
-// ---------------------------------------------------------------------------
-// Rehearsal boost (shared between traversal-primary and legacy paths)
-// ---------------------------------------------------------------------------
-
 async function applyRehearsalBoost(
 	scored: Array<{ id: string; score: number; source: string }>,
 	search: MemorySearchConfig,
@@ -696,16 +460,6 @@ function mergeCandidate(
 		rows.set(row.id, row);
 	}
 }
-
-/**
- * Eligibility for ordinary memory delivery. All owner accessors run migrations
- * before querying, so these lifecycle columns are required. Lineage/history
- * callers do not use this predicate.
- */
-export function currentMemorySql(alias = "m"): string {
-	return ` AND ${alias}.is_deleted = 0 AND ${alias}.superseded_by IS NULL AND ${alias}.stale_at IS NULL`;
-}
-
 function lexicalFallbackTerms(keywordQuery: string): string[] {
 	return [
 		...new Set(
@@ -716,8 +470,6 @@ function lexicalFallbackTerms(keywordQuery: string): string[] {
 		),
 	];
 }
-
-/** Keep synchronous lexical fallback within the DB-owner work budget. */
 export const MAX_LEXICAL_FALLBACK_SCAN_ROWS = DB_OWNER_MAX_WORK_UNITS;
 
 async function readLexicalFallbackThroughOwner(
@@ -759,50 +511,22 @@ async function readLexicalFallbackThroughOwner(
 async function authorizeScoredCandidates(
 	scored: ReadonlyArray<{ id: string; score: number; source: string }>,
 	filter: FilterClause,
+	authorizationOwner?: DbOwnerClient,
 ): Promise<Array<{ id: string; score: number; source: string }>> {
-	// Candidate collectors intentionally cast a wide net. This is the single
-	// pre-content gate for database-backed memories: after this point the IDs
-	// are safe to use in stages that read content or mutate access metadata.
 	const ids = [...new Set(scored.map((row) => row.id))];
 	if (ids.length === 0) return [];
-	const owner = await getDbOwner(getDbAccessorPath());
-	const safetyTable = await ownerReadOne<{ readonly name: string }>(
-		owner,
-		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_content_safety' LIMIT 1",
-		[],
-		{
-			operation: "memory-search.authorize-safety-schema",
-			workloadClass: "foreground",
-			estimatedWorkUnits: 1,
-			deadlineMs: 5_000,
-		},
-	);
-	const hasSafetyLedger = safetyTable !== undefined;
-	const safetySelect = hasSafetyLedger ? ", mcs.status AS safety_status, mcs.context_eligible" : "";
-	const safetyJoin = hasSafetyLedger
-		? `LEFT JOIN memory_content_safety AS mcs
-			 ON mcs.agent_id = COALESCE(NULLIF(m.agent_id, ''), 'default')
-			AND mcs.source_kind = 'memory'
-			AND mcs.source_id = m.id`
-		: "";
+	const owner = authorizationOwner ?? (await getDbOwner(getDbAccessorPath()));
 	const allowed = new Set<string>();
 	for (let offset = 0; offset < ids.length; offset += 400) {
 		const batch = ids.slice(offset, offset + 400);
 		const placeholders = batch.map(() => "?").join(", ");
-		const rows = await ownerReadAll<{
-			id: string;
-			content: string;
-			safety_status?: string;
-			context_eligible?: number;
-		}>(
+		const rows = await ownerReadAll<{ id: string }>(
 			owner,
-			`SELECT m.id, m.content${safetySelect}
+			`SELECT m.id
 			 FROM memories m
-			 ${safetyJoin}
 			 WHERE m.id IN (${placeholders})
 			   ${currentMemorySql("m")}
-			   ${filter.sql}
-			   ${hasSafetyLedger ? "AND (mcs.source_id IS NULL OR (mcs.status = 'clean' AND mcs.context_eligible = 1))" : ""}`,
+			   ${filter.sql}`,
 			[...batch, ...filter.args],
 			{
 				operation: "memory-search.authorize-candidates",
@@ -811,15 +535,73 @@ async function authorizeScoredCandidates(
 				deadlineMs: 5_000,
 			},
 		);
-		for (const row of rows) {
-			if (
-				scanMemoryContent(row.content).contextEligible &&
-				(row.safety_status == null || (row.safety_status === "clean" && row.context_eligible === 1))
-			)
-				allowed.add(row.id);
-		}
+		for (const row of rows) allowed.add(row.id);
 	}
 	return scored.filter((row) => allowed.has(row.id));
+}
+
+interface AuthorizedVectorCandidates {
+	readonly results: ReadonlyArray<{ readonly id: string; readonly score: number }>;
+	readonly completeness: VectorSearchCompleteness;
+	readonly searchedWindow?: number;
+}
+
+async function findAuthorizedVectorCandidates(
+	queryVector: Float32Array,
+	params: RecallParams,
+	cfg: ResolvedMemoryConfig,
+	filter: FilterClause,
+	execution?: RecallExecutionOptions,
+): Promise<AuthorizedVectorCandidates> {
+	const maxWork = Math.min(DB_OWNER_MAX_WORK_UNITS, 10_000);
+	const targetCount = Math.min(cfg.search.top_k, maxWork);
+	const owner = await getDbRecallOwner(getDbAccessorPath());
+	const discovered = new Set<string>();
+	const authorized = new Map<string, { readonly id: string; readonly score: number }>();
+	let usedWork = 0;
+	let requested = Math.max(1, targetCount);
+	let completeness: VectorSearchCompleteness = "complete";
+	let searchedWindow = 0;
+	let exhausted = false;
+
+	while (usedWork < maxWork) {
+		checkRecallCancellation(execution);
+		const vectorResult = await vectorSearchThroughDbOwner(owner, [...queryVector], {
+			limit: requested,
+			type: params.type,
+			excludeAggregateRecall: params.aggregate === true || params.excludeAggregateRecallMemories === true,
+			maxScanRows: requested,
+		});
+		usedWork += requested;
+		completeness = vectorResult.completeness;
+		searchedWindow = Math.max(searchedWindow, vectorResult.searchedWindow ?? vectorResult.results.length);
+		if (completeness === "unavailable") return { results: [], completeness, searchedWindow };
+
+		const fresh = vectorResult.results.flatMap((row) => {
+			if (discovered.has(row.id) || !Number.isFinite(row.score) || row.score <= 0) return [];
+			const candidate = { id: row.id, score: row.score, source: "vector" };
+			discovered.add(row.id);
+			return [candidate];
+		});
+		const scoped = await authorizeScoredCandidates(fresh, filter, owner);
+		for (const row of scoped) authorized.set(row.id, { id: row.id, score: row.score });
+		if (authorized.size >= targetCount) break;
+
+		if (vectorResult.completeness === "complete" && vectorResult.results.length < requested) {
+			exhausted = true;
+			break;
+		}
+		const remainingWork = maxWork - usedWork;
+		if (remainingWork <= 0) {
+			completeness = "recent-window";
+			break;
+		}
+		requested = Math.min(requested * 2, remainingWork);
+	}
+
+	if (!exhausted && authorized.size < targetCount && usedWork >= maxWork) completeness = "recent-window";
+	const results = [...authorized.values()].sort((left, right) => right.score - left.score).slice(0, targetCount);
+	return { results, completeness, searchedWindow };
 }
 
 async function loadObservedScores(ids: readonly string[], agentId: string): Promise<Map<string, number>> {
@@ -853,14 +635,14 @@ interface CurrentnessInfo {
 }
 
 function shortenCurrentnessContent(content: string): string {
-	const oneLine = content.replace(/\s+/g, " ").trim();
+	const oneLine = redactCredentials(content).replace(/\s+/g, " ").trim();
 	return oneLine.length > 240 ? `${oneLine.slice(0, 237)}...` : oneLine;
 }
 
 async function loadCurrentnessInfo(ids: readonly string[], agentId: string): Promise<Map<string, CurrentnessInfo>> {
 	if (ids.length === 0) return new Map();
 	const placeholders = ids.map(() => "?").join(", ");
-	const queried = await ownerReadAll<{
+	const rows = await ownerReadAll<{
 		memory_id: string;
 		content: string;
 		status: string;
@@ -887,11 +669,6 @@ async function loadCurrentnessInfo(ids: readonly string[], agentId: string): Pro
 			estimatedWorkUnits: Math.min(DB_OWNER_MAX_WORK_UNITS, ids.length),
 			deadlineMs: 5_000,
 		},
-	);
-	const rows = queried.filter(
-		(row) =>
-			scanMemoryContent(row.content).contextEligible &&
-			(row.replacement_content === null || scanMemoryContent(row.replacement_content).contextEligible),
 	);
 
 	const mutable = new Map<
@@ -976,6 +753,122 @@ interface SourceChunkVectorHit {
 	readonly project: string | null;
 }
 
+export interface SourceChunkVectorDiagnostics {
+	readonly indexedQueries: number;
+	readonly fallbackBatches: number;
+	readonly candidateRows: number;
+	readonly retainedCandidates: number;
+	readonly materializedBodies: number;
+	readonly materializedBodyBytes: number;
+	readonly workUnits: number;
+	readonly termination: "enough-eligible" | "exhausted" | "budget";
+}
+
+export interface SourceChunkVectorOutcome {
+	readonly hits: ReadonlyArray<SourceChunkVectorHit>;
+	readonly completeness: VectorSearchCompleteness;
+	readonly searchedWindow?: number;
+	readonly diagnostics: SourceChunkVectorDiagnostics;
+}
+
+export interface RecallExecutionOptions {
+	readonly signal?: AbortSignal;
+	readonly checkCancelled?: () => void;
+}
+
+const SOURCE_CHUNK_BATCH_ROWS = 64;
+const SOURCE_CHUNK_BODY_BATCH_ROWS = 64;
+const SOURCE_CHUNK_MAX_WORK_UNITS = Math.min(DB_OWNER_MAX_WORK_UNITS, 10_000);
+const MAX_SOURCE_CHUNK_BODY_BYTES = 64 * 1024;
+
+function checkRecallCancellation(options?: RecallExecutionOptions): void {
+	options?.checkCancelled?.();
+	if (options?.signal?.aborted) {
+		const error = options.signal.reason instanceof Error ? options.signal.reason : new Error("Recall cancelled");
+		error.name = "AbortError";
+		throw error;
+	}
+}
+
+function ownerVectorFromHex(value: unknown): Float32Array | null {
+	if (typeof value !== "string" || !/^(?:[0-9A-Fa-f]{2})*$/.test(value)) return null;
+	const bytes = ownerBytesFromHex(value);
+	if (bytes.byteLength === 0 || bytes.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) return null;
+	const vector = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / Float32Array.BYTES_PER_ELEMENT);
+	return vector.every(Number.isFinite) ? vector : null;
+}
+
+export interface OwnerVectorRow {
+	readonly rowid: number;
+	readonly source_id: string;
+	readonly vector_hex: string | null;
+}
+
+export function ownerVectorPageRows(dimensions: number): number {
+	const hexChars = Math.max(1, dimensions) * Float32Array.BYTES_PER_ELEMENT * 2;
+	return Math.max(1, Math.floor((DB_OWNER_MAX_RESULT_BYTES - 4096) / (hexChars + 256)));
+}
+
+export async function readOwnerVectorsBySource(
+	sourceIds: readonly string[],
+	dimensions: number,
+	read: (sql: string, params: readonly unknown[], pageRows: number) => Promise<ReadonlyArray<OwnerVectorRow>>,
+): Promise<Array<{ source_id: string; vector: Float32Array }>> {
+	const pageRows = ownerVectorPageRows(dimensions);
+	const vectors: Array<{ source_id: string; vector: Float32Array }> = [];
+	for (let offset = 0; offset < sourceIds.length; offset += pageRows) {
+		const pageIds = sourceIds.slice(offset, offset + pageRows);
+		const placeholders = pageIds.map(() => "?").join(", ");
+		let cursor = 0;
+		for (;;) {
+			const rows = await read(
+				`SELECT rowid, source_id, hex(vector) AS vector_hex FROM embeddings
+				 WHERE source_type = 'memory' AND source_id IN (${placeholders})
+				   AND dimensions = ? AND length(vector) = ? AND rowid > ?
+				 ORDER BY rowid LIMIT ?`,
+				[...pageIds, dimensions, dimensions * Float32Array.BYTES_PER_ELEMENT, cursor, pageRows],
+				pageRows,
+			);
+			for (const row of rows) {
+				const vector = ownerVectorFromHex(row.vector_hex);
+				if (vector?.length === dimensions) vectors.push({ source_id: row.source_id, vector });
+			}
+			const last = rows.at(-1);
+			if (rows.length < pageRows || last === undefined) break;
+			cursor = last.rowid;
+		}
+	}
+	return vectors;
+}
+
+function recallQueryVectorIsValid(query: Float32Array, expectedDimensions: number): boolean {
+	return query.length === expectedDimensions && query.length > 0 && query.every(Number.isFinite);
+}
+
+async function activeEmbeddingProfileIsKnown(embedding: EmbeddingConfig): Promise<boolean> {
+	const owner = await getDbOwner(getDbAccessorPath());
+	let row: EmbeddingIndexStateRow | null;
+	try {
+		row = await ownerReadOne<EmbeddingIndexStateRow>(
+			owner,
+			"SELECT active_profile_json, staging_profile_json, state, last_error FROM embedding_index_state WHERE id = 1",
+			[],
+			{
+				operation: "memory-search.embedding-profile-state",
+				workloadClass: "foreground",
+				estimatedWorkUnits: 1,
+				deadlineMs: 5_000,
+			},
+		);
+	} catch (error) {
+		if (error instanceof Error && /no such table: embedding_index_state/i.test(error.message)) return false;
+		throw error;
+	}
+	const state = parseEmbeddingIndexStateRow(row);
+	if (!state || (state.state === "building" && state.staging?.projectionRebuild === true)) return false;
+	return embeddingProfileFingerprintsEqual(embeddingProfileFingerprint(embedding), state.active.fingerprint);
+}
+
 function nativeIdSegment(value: string | null | undefined): string {
 	return (
 		value
@@ -1026,109 +919,349 @@ function sourceChunkProvider(sourceId: string): string {
 	return separator > 0 ? sourceId.slice(0, separator) : "source";
 }
 
+function isVectorIndexUnavailable(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /no such module: vec0|no such table: vec_embeddings|no such column: (?:v\.)?(?:distance|embedding)|unable to use function MATCH in requested context/i.test(
+		message,
+	);
+}
+
 function sourceChunkRecallTags(hit: SourceChunkVectorHit): string {
 	const provider = sourceChunkProvider(hit.sourceId);
 	return [provider, "source", hit.sourceType, "vector"].join(",");
 }
 
-async function buildSourceChunkVectorHits(
+export async function buildSourceChunkVectorHits(
 	queryVec: Float32Array | null,
 	existingSourceIds: ReadonlySet<string>,
 	limit: number,
 	agentId: string,
+	embedding: EmbeddingConfig,
 	project?: string,
-): Promise<SourceChunkVectorHit[]> {
-	if (!queryVec || limit <= 0) return [];
-	// Source chunk embeddings only carry agent_id plus an embedding source_id.
-	// The live artifact table carries project, but not the source root/id needed
-	// to bind an embedding to that project without filename spoofing. Skip this
-	// rescue path for project-scoped recall until the index has that strong key.
-	if (project) return [];
-	try {
-		const owner = await getDbOwner(getDbAccessorPath());
-		const embeddingColumns = await ownerReadAll<{ readonly name: string }>(owner, "PRAGMA table_info(embeddings)", [], {
-			operation: "memory-search.source-chunk-schema",
+	execution?: RecallExecutionOptions,
+): Promise<SourceChunkVectorOutcome> {
+	const hits: SourceChunkVectorHit[] = [];
+	const stats = {
+		indexedQueries: 0,
+		fallbackBatches: 0,
+		candidateRows: 0,
+		retainedCandidates: 0,
+		materializedBodies: 0,
+		materializedBodyBytes: 0,
+		workUnits: 0,
+		termination: "exhausted" as SourceChunkVectorDiagnostics["termination"],
+	};
+	const outcome = (completeness: VectorSearchCompleteness, searchedWindow?: number): SourceChunkVectorOutcome => ({
+		hits: [...hits].sort((a, b) => b.score - a.score).slice(0, limit),
+		completeness,
+		...(searchedWindow === undefined ? {} : { searchedWindow }),
+		diagnostics: { ...stats },
+	});
+	if (!queryVec || limit <= 0 || project) return outcome("complete", 0);
+	if (!recallQueryVectorIsValid(queryVec, embedding.dimensions)) return outcome("unavailable");
+
+	const profileCompatible = await activeEmbeddingProfileIsKnown(embedding);
+	if (!profileCompatible) {
+		logger.warn(
+			"memory",
+			"Source vector recall skipped because the active embedding profile is unknown or incompatible",
+		);
+		return outcome("unavailable");
+	}
+
+	const owner = await getDbOwner(getDbAccessorPath());
+	const embeddingColumns = await ownerReadAll<{ readonly name: string }>(owner, "PRAGMA table_info(embeddings)", [], {
+		operation: "memory-search.source-chunk-schema",
+		workloadClass: "foreground",
+		estimatedWorkUnits: 1,
+		deadlineMs: 5_000,
+	});
+	if (!embeddingColumns.some((column) => column.name === "agent_id")) {
+		logger.warn("memory", "Source vector recall skipped because legacy embeddings have no agent ownership column");
+		return outcome("unavailable");
+	}
+	const indexState = await ownerReadOne<{ readonly active_profile_json: unknown }>(
+		owner,
+		"SELECT active_profile_json FROM embedding_index_state WHERE id = 1",
+		[],
+		{
+			operation: "memory-search.source-chunk-projection",
 			workloadClass: "foreground",
 			estimatedWorkUnits: 1,
 			deadlineMs: 5_000,
-		});
-		const hasAgentId = embeddingColumns.some((column) => column.name === "agent_id");
-		const safetyTable = await ownerReadOne<{ readonly name: string }>(
-			owner,
-			"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_content_safety' LIMIT 1",
-			[],
-			{
-				operation: "memory-search.source-chunk-safety-schema",
-				workloadClass: "foreground",
-				estimatedWorkUnits: 1,
-				deadlineMs: 5_000,
-			},
-		);
-		const hasSafetyLedger = safetyTable != null;
-		const safetySelect = hasSafetyLedger ? ", mcs.status AS safety_status, mcs.context_eligible" : "";
-		const safetyJoin = hasSafetyLedger
-			? "LEFT JOIN memory_content_safety mcs ON mcs.agent_id = ? AND mcs.source_kind = 'source_chunk' AND mcs.source_id = e.id"
-			: "";
-		const safetyFilter = hasSafetyLedger
-			? "AND (mcs.source_id IS NULL OR (mcs.status = 'clean' AND mcs.context_eligible = 1))"
-			: "";
-		const agentFilter = hasAgentId ? "AND e.agent_id = ?" : "";
-		const params: unknown[] = hasSafetyLedger ? [agentId] : [];
-		params.push(SOURCE_CHUNK_SOURCE_TYPE, LEGACY_OBSIDIAN_CHUNK_SOURCE_TYPE);
-		if (hasAgentId) params.push(agentId);
-		const rows = await ownerReadAll<{
-			id: string;
-			source_type: string;
-			source_id: string;
-			vector_hex: string;
-			chunk_text: string;
-			created_at: string;
-			safety_status?: string | null;
-			context_eligible?: number | null;
-		}>(
-			owner,
-			`SELECT e.id, e.source_type, e.source_id, hex(e.vector) AS vector_hex, e.chunk_text, e.created_at,
-					${safetySelect.slice(2)}
-			 FROM embeddings e
-			 ${safetyJoin}
-			 WHERE e.source_type IN (?, ?)
-			   AND e.vector IS NOT NULL
-			   ${agentFilter}
-			   ${safetyFilter}`,
-			params,
-			{
-				operation: "memory-search.source-chunk-vectors",
-				workloadClass: "foreground",
-				estimatedWorkUnits: Math.min(DB_OWNER_MAX_WORK_UNITS, DB_OWNER_MAX_WORK_UNITS),
-				deadlineMs: 30_000,
-			},
-		);
-		return rows
-			.filter((row) => scanMemoryContent(row.chunk_text).contextEligible)
-			.flatMap((row) => {
-				const sourcePath = sourcePathFromChunkText(row.chunk_text);
-				return [
-					{
-						embeddingId: row.id,
+		},
+	).catch(() => undefined);
+	const vecTable = activeVectorProjectionTable({ prepare: () => ({ get: () => indexState }) });
+	const types = [SOURCE_CHUNK_SOURCE_TYPE, LEGACY_OBSIDIAN_CHUNK_SOURCE_TYPE] as const;
+	const seenIds = new Set<string>();
+	const candidateRows = new Map<
+		string,
+		{
+			readonly id: string;
+			readonly sourceId: string;
+			readonly sourceType: string;
+			readonly score: number;
+			readonly createdAt: string;
+		}
+	>();
+
+	const hydrateCandidates = async (
+		candidates: ReadonlyArray<{
+			readonly id: string;
+			readonly sourceId: string;
+			readonly sourceType: string;
+			readonly score: number;
+			readonly createdAt: string;
+		}>,
+	): Promise<void> => {
+		for (let offset = 0; offset < candidates.length; offset += SOURCE_CHUNK_BODY_BATCH_ROWS) {
+			checkRecallCancellation(execution);
+			const batch = candidates.slice(offset, offset + SOURCE_CHUNK_BODY_BATCH_ROWS);
+			if (batch.length === 0) continue;
+			const placeholders = batch.map(() => "?").join(", ");
+			const rows = await ownerReadAll<{
+				id: string;
+				source_id: string;
+				source_type: string;
+				chunk_text: string;
+				created_at: string;
+			}>(
+				owner,
+				`SELECT e.id, e.source_id, e.source_type, e.chunk_text, e.created_at
+				 FROM embeddings e
+				 WHERE e.id IN (${placeholders})
+				   AND e.agent_id = ?
+				   AND e.source_type IN (?, ?)
+				   AND length(CAST(e.chunk_text AS BLOB)) <= ?`,
+				[...batch.map((candidate) => candidate.id), agentId, ...types, MAX_SOURCE_CHUNK_BODY_BYTES],
+				{
+					operation: "memory-search.source-chunk-bodies",
+					workloadClass: "foreground",
+					estimatedWorkUnits: batch.length,
+					deadlineMs: 30_000,
+				},
+			);
+			stats.materializedBodies += rows.length;
+			for (const row of rows) {
+				stats.materializedBodyBytes += Buffer.byteLength(row.chunk_text, "utf8");
+				if (existingSourceIds.has(row.source_id)) continue;
+				const candidate = candidateRows.get(row.id);
+				if (!candidate) continue;
+				hits.push({
+					embeddingId: row.id,
+					sourceId: row.source_id,
+					sourceType: row.source_type,
+					sourcePath: sourcePathFromChunkText(row.chunk_text),
+					chunkText: redactCredentials(row.chunk_text),
+					score: candidate.score,
+					createdAt: row.created_at,
+					project: null,
+				});
+			}
+			for (const candidate of batch) candidateRows.delete(candidate.id);
+		}
+	};
+
+	let indexedSearchAvailable = true;
+	let workUsed = 0;
+	let requested = Math.min(limit, SOURCE_CHUNK_MAX_WORK_UNITS);
+	let exhausted = false;
+	while (indexedSearchAvailable && workUsed < SOURCE_CHUNK_MAX_WORK_UNITS && requested > 0) {
+		checkRecallCancellation(execution);
+		const queryBlob = Buffer.from(queryVec.buffer, queryVec.byteOffset, queryVec.byteLength);
+		try {
+			stats.indexedQueries++;
+			const rows = await ownerReadAll<{
+				id: string;
+				source_id: string;
+				source_type: string;
+				created_at: string;
+				distance: number;
+			}>(
+				owner,
+				`SELECT e.id, e.source_id, e.source_type, e.created_at, v.distance
+				 FROM ${vecTable} v
+				 JOIN embeddings e ON e.id = v.id
+				 WHERE v.embedding MATCH ? AND k = ?
+				   AND e.source_type IN (?, ?)
+				   AND e.agent_id = ?
+				   AND length(CAST(e.chunk_text AS BLOB)) <= ?
+				 ORDER BY v.distance`,
+				[queryBlob, requested, ...types, agentId, MAX_SOURCE_CHUNK_BODY_BYTES],
+				{
+					operation: "memory-search.source-chunk-knn",
+					workloadClass: "foreground",
+					estimatedWorkUnits: requested,
+					deadlineMs: 30_000,
+				},
+			);
+			stats.candidateRows += rows.length;
+			stats.workUnits += requested;
+			workUsed += requested;
+			const fresh = rows.flatMap((row) => {
+				if (seenIds.has(row.id) || !Number.isFinite(row.distance)) return [];
+				seenIds.add(row.id);
+				const score = Math.max(0, Math.min(1, 1 - row.distance));
+				if (score <= 0) return [];
+				const candidate = {
+					id: row.id,
+					sourceId: row.source_id,
+					sourceType: row.source_type,
+					score,
+					createdAt: row.created_at,
+				};
+				candidateRows.set(row.id, candidate);
+				return [candidate];
+			});
+			stats.retainedCandidates = candidateRows.size;
+			await hydrateCandidates(fresh);
+			if (hits.length >= limit) {
+				stats.termination = "enough-eligible";
+				return outcome("complete", seenIds.size);
+			}
+			if (rows.length < requested) {
+				exhausted = true;
+				break;
+			}
+			const remainingWork = SOURCE_CHUNK_MAX_WORK_UNITS - workUsed;
+			if (remainingWork <= 0) break;
+			requested = Math.min(requested * 2, remainingWork);
+		} catch (error) {
+			if (stats.indexedQueries > 1 || !isVectorIndexUnavailable(error)) throw error;
+			indexedSearchAvailable = false;
+		}
+	}
+
+	if (!indexedSearchAvailable) {
+		const heap: Array<{
+			readonly id: string;
+			readonly sourceId: string;
+			readonly sourceType: string;
+			readonly createdAt: string;
+			readonly score: number;
+		}> = [];
+		const retainedLimit = Math.min(SOURCE_CHUNK_MAX_WORK_UNITS, Math.max(limit, limit * 16));
+		let retentionLimited = false;
+		const siftDown = (index: number): void => {
+			for (;;) {
+				const left = index * 2 + 1;
+				const right = left + 1;
+				let smallest = index;
+				const leftRow = heap[left];
+				const currentRow = heap[smallest];
+				if (leftRow && currentRow && leftRow.score < currentRow.score) smallest = left;
+				const rightRow = heap[right];
+				const smallestRow = heap[smallest];
+				if (rightRow && smallestRow && rightRow.score < smallestRow.score) smallest = right;
+				if (smallest === index) return;
+				const current = heap[index];
+				const replacement = heap[smallest];
+				if (!current || !replacement) return;
+				heap[index] = replacement;
+				heap[smallest] = current;
+				index = smallest;
+			}
+		};
+		const retain = (candidate: (typeof heap)[number]): void => {
+			if (heap.length < retainedLimit) {
+				heap.push(candidate);
+				let index = heap.length - 1;
+				while (index > 0) {
+					const parent = Math.floor((index - 1) / 2);
+					const parentRow = heap[parent];
+					const currentRow = heap[index];
+					if (!parentRow || !currentRow || parentRow.score <= currentRow.score) break;
+					heap[parent] = currentRow;
+					heap[index] = parentRow;
+					index = parent;
+				}
+				return;
+			}
+			retentionLimited = true;
+			const weakest = heap[0];
+			if (!weakest || candidate.score <= weakest.score) return;
+			heap[0] = candidate;
+			siftDown(0);
+		};
+		let cursor = 0;
+		let scanComplete = false;
+		while (workUsed < SOURCE_CHUNK_MAX_WORK_UNITS) {
+			checkRecallCancellation(execution);
+			const batchLimit = Math.min(SOURCE_CHUNK_BATCH_ROWS, SOURCE_CHUNK_MAX_WORK_UNITS - workUsed);
+			const rows = await ownerReadAll<{
+				rowid: number;
+				id: string;
+				source_type: string;
+				source_id: string;
+				vector_hex: string | null;
+				created_at: string;
+			}>(
+				owner,
+				`SELECT e.rowid, e.id, e.source_type, e.source_id, hex(e.vector) AS vector_hex, e.created_at
+				 FROM embeddings e
+				 WHERE e.rowid > ? AND e.source_type IN (?, ?) AND e.agent_id = ?
+			   AND e.vector IS NOT NULL AND length(CAST(e.chunk_text AS BLOB)) <= ?
+			 ORDER BY e.rowid LIMIT ?`,
+				[cursor, ...types, agentId, MAX_SOURCE_CHUNK_BODY_BYTES, batchLimit],
+				{
+					operation: "memory-search.source-chunk-vector-batch",
+					workloadClass: "foreground",
+					estimatedWorkUnits: batchLimit,
+					deadlineMs: 30_000,
+				},
+			);
+			stats.fallbackBatches++;
+			stats.candidateRows += rows.length;
+			stats.workUnits += rows.length;
+			workUsed += rows.length;
+			if (rows.length === 0) {
+				scanComplete = true;
+				break;
+			}
+			const lastRow = rows.at(-1);
+			if (!lastRow) {
+				scanComplete = true;
+				break;
+			}
+			cursor = lastRow.rowid;
+			for (const row of rows) {
+				const vector = ownerVectorFromHex(row.vector_hex);
+				if (!vector) continue;
+				const score = cosineSimilarity(queryVec, vector);
+				if (score > 0 && !existingSourceIds.has(row.source_id))
+					retain({
+						id: row.id,
 						sourceId: row.source_id,
 						sourceType: row.source_type,
-						sourcePath,
-						chunkText: row.chunk_text,
-						score: cosineSimilarity(queryVec, new Float32Array(ownerBytesFromHex(row.vector_hex).buffer)),
 						createdAt: row.created_at,
-						project: null,
-					},
-				];
-			})
-			.filter((row) => row.score > 0 && !existingSourceIds.has(row.sourceId))
-			.sort((a, b) => b.score - a.score)
-			.slice(0, limit);
-	} catch (e) {
-		logger.warn("memory", "Source chunk vector recall failed (non-fatal)", {
-			error: e instanceof Error ? e.message : String(e),
-		});
-		return [];
+						score,
+					});
+			}
+			if (rows.length < batchLimit) {
+				scanComplete = true;
+				break;
+			}
+		}
+		heap.sort((a, b) => b.score - a.score);
+		stats.retainedCandidates = heap.length;
+		for (let offset = 0; offset < heap.length && hits.length < limit; offset += SOURCE_CHUNK_BODY_BATCH_ROWS) {
+			const batch = heap.slice(offset, offset + SOURCE_CHUNK_BODY_BATCH_ROWS);
+			for (const candidate of batch) candidateRows.set(candidate.id, candidate);
+			await hydrateCandidates(batch);
+		}
+		if (hits.length >= limit) stats.termination = "enough-eligible";
+		else if (scanComplete && !retentionLimited) stats.termination = "exhausted";
+		else stats.termination = "budget";
+		const completeness = scanComplete && (!retentionLimited || hits.length >= limit) ? "complete" : "recent-window";
+		return outcome(completeness, stats.candidateRows);
 	}
+
+	if (exhausted) {
+		stats.termination = "exhausted";
+		return outcome("complete", seenIds.size);
+	}
+	stats.termination = "budget";
+	return outcome("recent-window", seenIds.size);
 }
 
 function sessionIdFromSourceId(sourceId: string): string {
@@ -1175,30 +1308,13 @@ export function transcriptExcerpt(content: string, query: string, maxChars = 650
 	const clean = content.replace(/\s+/g, " ").trim();
 	if (clean.length <= maxChars) return clean;
 
-	const weakTerms = new Set([
-		"brand",
-		"brands",
-		"conversation",
-		"end",
-		"going",
-		"high",
-		"previous",
-		"recommend",
-		"recommendation",
-		"recommendations",
-		"remind",
-		"show",
-		"tonight",
-		"watch",
-		"wondering",
-	]);
 	const terms = expandTranscriptTerms(
-		expandRecallKeywordQuery(query)
+		query
 			.toLowerCase()
 			.split(/\W+/)
 			.map(normalizeExpansionToken)
 			.filter((term, index, all) => term.length >= 3 && !FTS_STOP.has(term) && all.indexOf(term) === index)
-			.sort((a, b) => Number(weakTerms.has(a)) - Number(weakTerms.has(b)) || b.length - a.length)
+			.sort((a, b) => b.length - a.length)
 			.slice(0, 12),
 	);
 	const lower = clean.toLowerCase();
@@ -1232,6 +1348,170 @@ export function transcriptExcerpt(content: string, query: string, maxChars = 650
 	return `${prefix}${clean.slice(start, end).trim()}${suffix}`;
 }
 
+export async function placeTranscriptEvidence(
+	results: readonly RecallResult[],
+	candidates: readonly RecallResult[],
+	maxExcerpts: number,
+	limit: number,
+	query: string,
+	score: ((query: string, documents: readonly string[]) => Promise<number[]>) | null,
+): Promise<{ results: RecallResult[]; returned: number; ranking: "cross-encoder" | "keyword" }> {
+	if (candidates.length === 0 || maxExcerpts <= 0) return { results: [...results], returned: 0, ranking: "keyword" };
+	if (score !== null) {
+		try {
+			const kept = results.slice(0, Math.max(0, Math.min(results.length, limit - maxExcerpts)));
+			const pool = [...results.slice(kept.length), ...candidates];
+			const scores = await score(
+				query,
+				pool.map((row) => row.content),
+			);
+			const ordered = pool
+				.map((row, index) => ({ row, score: scores[index] ?? Number.NEGATIVE_INFINITY }))
+				.sort((a, b) => b.score - a.score);
+			const chosen: RecallResult[] = [];
+			let excerpts = 0;
+			for (const { row } of ordered) {
+				if (kept.length + chosen.length >= limit) break;
+				const isExcerpt = row.id.startsWith("transcript:");
+				if (isExcerpt && excerpts >= maxExcerpts) continue;
+				chosen.push(row);
+				if (isExcerpt) excerpts++;
+			}
+			return { results: [...kept, ...chosen], returned: excerpts, ranking: "cross-encoder" };
+		} catch (error) {
+			logger.warn("memory", "Transcript evidence fell back to keyword placement", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	const excerpts = candidates.slice(0, maxExcerpts);
+	return {
+		results: [...results.slice(0, Math.max(0, limit - excerpts.length)), ...excerpts],
+		returned: excerpts.length,
+		ranking: "keyword",
+	};
+}
+
+export const TRANSCRIPT_PAGE_BYTES = Math.floor((DB_OWNER_MAX_RESULT_BYTES - 4096) / 2);
+export const TRANSCRIPT_EVIDENCE_MAX_PAGES = 16;
+const TRANSCRIPT_EVIDENCE_DEADLINE_MS = 30_000;
+
+async function readTranscriptContent(
+	owner: DbOwnerClient,
+	agentId: string,
+	rowid: number,
+	bytes: number,
+	deadlineAt: number,
+): Promise<{ readonly text: string; readonly complete: boolean } | null> {
+	const pages: Uint8Array[] = [];
+	const readBytes = Math.min(bytes, TRANSCRIPT_PAGE_BYTES * TRANSCRIPT_EVIDENCE_MAX_PAGES);
+	for (let start = 1; start <= readBytes; start += TRANSCRIPT_PAGE_BYTES) {
+		const remainingMs = deadlineAt - Date.now();
+		if (remainingMs <= 0) throw new Error("Transcript evidence read exceeded its deadline");
+		const page = await ownerReadOne<{ readonly chunk: string | null }>(
+			owner,
+			`SELECT hex(substr(CAST(content AS BLOB), ?, ?)) AS chunk FROM memory_artifacts
+			 WHERE rowid = ? AND agent_id = ? AND source_kind = 'transcript'
+			   AND COALESCE(is_deleted, 0) = 0 AND length(CAST(content AS BLOB)) = ?`,
+			[start, Math.min(TRANSCRIPT_PAGE_BYTES, readBytes - start + 1), rowid, agentId, bytes],
+			{
+				operation: "memory-search.transcript-evidence.content",
+				workloadClass: "foreground",
+				estimatedWorkUnits: 1,
+				deadlineMs: remainingMs,
+			},
+		);
+		if (page === null || page.chunk === null) return null;
+		pages.push(ownerBytesFromHex(page.chunk));
+	}
+	return { text: Buffer.concat(pages).toString("utf8"), complete: readBytes === bytes };
+}
+
+async function buildTranscriptEvidenceResults(
+	agentId: string,
+	project: string | undefined,
+	query: string,
+	maxResults: number,
+	existing: readonly RecallResult[],
+): Promise<RecallResult[]> {
+	const fts = sanitizeFtsQuery(query);
+	if (fts.length === 0 || maxResults <= 0) return [];
+	const represented = new Set(
+		existing.flatMap((row) => [row.session_id, row.source_id]).filter((id): id is string => !!id),
+	);
+	const owner = await getDbOwner(getDbAccessorPath());
+	const rows = await ownerReadAll<{
+		readonly session_id: string | null;
+		readonly source_id: string | null;
+		readonly source_path: string;
+		readonly harness: string | null;
+		readonly project: string | null;
+		readonly captured_at: string;
+		readonly artifact_rowid: number;
+		readonly content_bytes: number;
+		readonly rank: number;
+	}>(
+		owner,
+		`SELECT ma.session_id, ma.source_id, ma.source_path, ma.harness, ma.project,
+			COALESCE(ma.started_at, ma.captured_at) AS captured_at, ma.rowid AS artifact_rowid,
+			length(CAST(ma.content AS BLOB)) AS content_bytes, bm25(memory_artifacts_fts) AS rank
+		 FROM memory_artifacts_fts
+		 JOIN memory_artifacts ma ON ma.rowid = memory_artifacts_fts.rowid
+		 WHERE memory_artifacts_fts MATCH ?
+		   AND ma.agent_id = ?
+		   AND ma.source_kind = 'transcript'
+		   AND COALESCE(ma.is_deleted, 0) = 0
+		   ${project ? "AND (ma.project = ? OR ma.project IS NULL)" : ""}
+		 ORDER BY rank ASC LIMIT ?`,
+		[fts, agentId, ...(project ? [project] : []), maxResults + represented.size],
+		{
+			operation: "memory-search.transcript-evidence",
+			workloadClass: "foreground",
+			estimatedWorkUnits: Math.min(DB_OWNER_MAX_WORK_UNITS, maxResults + represented.size),
+			deadlineMs: 30_000,
+		},
+	);
+	const selected = rows
+		.filter((row) => {
+			const sessionId = row.session_id ?? row.source_path;
+			return !represented.has(sessionId) && !(row.source_id && represented.has(row.source_id));
+		})
+		.slice(0, maxResults);
+	const deadlineAt = Date.now() + TRANSCRIPT_EVIDENCE_DEADLINE_MS;
+	const transcripts = await Promise.all(
+		selected.map(async (row) => ({
+			row,
+			transcript: await readTranscriptContent(owner, agentId, row.artifact_rowid, row.content_bytes, deadlineAt),
+		})),
+	);
+	return transcripts.flatMap(({ row, transcript }): RecallResult[] => {
+		if (transcript === null) return [];
+		const sessionId = row.session_id ?? row.source_path;
+		const content = transcriptExcerpt(redactCredentials(transcript.text), query, 900);
+		return [
+			{
+				id: `transcript:${sessionId}`,
+				content,
+				content_length: content.length,
+				truncated: !transcript.complete || content.length < transcript.text.length,
+				score: Math.round((1 / (1 + Math.abs(row.rank))) * 100) / 100,
+				source: "transcript",
+				source_id: row.source_id ?? sessionId,
+				session_id: sessionId,
+				source_path: row.source_path,
+				type: "transcript",
+				tags: null,
+				pinned: false,
+				importance: 0.5,
+				who: row.harness ?? "transcript",
+				project: row.project,
+				created_at: row.captured_at,
+				supplementary: true,
+			},
+		];
+	});
+}
+
 async function buildNativeArtifactRecallHits(
 	params: RecallParams,
 	query: string,
@@ -1258,25 +1538,6 @@ async function buildNativeArtifactRecallHits(
 		const agentId = params.agentId ?? "default";
 		const artifactLimit = Math.max(2, Math.min(50, params.limit ?? 10) + existingSourceIds.size);
 		const artifactProject = params.project ? "AND (ma.project = ? OR ma.project IS NULL)" : "";
-		const safetyTable = await ownerReadOne<{ readonly name: string }>(
-			owner,
-			"SELECT name FROM sqlite_master WHERE type='table' AND name='memory_content_safety' LIMIT 1",
-			[],
-			{
-				operation: "memory-search.artifact-safety-schema",
-				workloadClass: "foreground",
-				estimatedWorkUnits: 1,
-				deadlineMs: 5_000,
-			},
-		);
-		const hasSafetyLedger = safetyTable != null;
-		const safetySelect = hasSafetyLedger ? ", mcs.status AS safety_status, mcs.context_eligible" : "";
-		const safetyJoin = hasSafetyLedger
-			? "LEFT JOIN memory_content_safety mcs ON mcs.agent_id = ? AND mcs.source_kind = 'artifact' AND mcs.source_id = ma.source_path"
-			: "";
-		const safetyFilter = hasSafetyLedger
-			? "AND (mcs.source_id IS NULL OR (mcs.status = 'clean' AND mcs.context_eligible = 1))"
-			: "";
 		const rows = await ownerReadAll<{
 			rowid: number;
 			source_id: string | null;
@@ -1288,17 +1549,13 @@ async function buildNativeArtifactRecallHits(
 			updated_at: string;
 			content: string;
 			rank: number;
-			safety_status?: string | null;
-			context_eligible?: number | null;
 		}>(
 			owner,
 			`SELECT ma.rowid, ma.source_id, ma.source_path, ma.source_kind, ma.harness, ma.project, ma.source_sha256,
 				COALESCE(ma.updated_at, ma.captured_at) AS updated_at, ma.content,
-				bm25(memory_artifacts_fts) AS rank,
-				${safetySelect.slice(2)}
+				bm25(memory_artifacts_fts) AS rank
 			 FROM memory_artifacts_fts
 			 JOIN memory_artifacts ma ON ma.rowid = memory_artifacts_fts.rowid
-			 ${safetyJoin}
 			 WHERE memory_artifacts_fts MATCH ?
 			   AND ma.agent_id = ?
 			   AND (ma.source_kind LIKE 'native_%' OR ma.source_kind LIKE 'source_%')
@@ -1306,16 +1563,8 @@ async function buildNativeArtifactRecallHits(
 			   AND ma.source_node_id = ?
 			   AND ma.harness IS NOT NULL
 			   ${artifactProject}
-			   ${safetyFilter}
 			 ORDER BY rank ASC, updated_at DESC LIMIT ?`,
-			[
-				...(hasSafetyLedger ? [agentId] : []),
-				fts,
-				agentId,
-				NATIVE_MEMORY_BRIDGE_SOURCE_NODE_ID,
-				...(params.project ? [params.project] : []),
-				artifactLimit,
-			],
+			[fts, agentId, NATIVE_MEMORY_BRIDGE_SOURCE_NODE_ID, ...(params.project ? [params.project] : []), artifactLimit],
 			{
 				operation: "memory-search.native-artifact-fts",
 				workloadClass: "foreground",
@@ -1324,61 +1573,56 @@ async function buildNativeArtifactRecallHits(
 			},
 		);
 
-		const mirroredHashes = new Set<string>();
+		const candidateHashesByRowid = new Map<number, string>();
+		const candidateHashes = new Set<string>();
 		if (params.sourceOnly !== true) {
+			for (const row of rows) {
+				if (row.harness !== "hermes-agent") continue;
+				const hash = normalizeAndHashContent(row.content).contentHash;
+				candidateHashesByRowid.set(row.rowid, hash);
+				candidateHashes.add(hash);
+			}
+		}
+		const mirroredHashes = new Set<string>();
+		if (candidateHashes.size > 0) {
+			const hashPlaceholders = [...candidateHashes].map(() => "?").join(", ");
 			const mirrorParts = [
-				`SELECT m.id, m.content, m.content_hash${safetySelect}`,
+				"SELECT DISTINCT m.content_hash",
 				"FROM memories m",
-				...(hasSafetyLedger
-					? [
-							"LEFT JOIN memory_content_safety mcs ON mcs.agent_id = ? AND mcs.source_kind = 'memory' AND mcs.source_id = m.id",
-						]
-					: []),
 				"WHERE m.agent_id = ?",
-				"AND COALESCE(m.is_deleted, 0) = 0",
+				`${currentMemorySql("m")}`,
 				"AND COALESCE(m.visibility, 'global') != 'archived'",
 				"AND m.source_type = 'hermes-memory-write'",
 			];
-			const mirrorArgs: unknown[] = hasSafetyLedger ? [agentId, agentId] : [agentId];
+			const mirrorArgs: unknown[] = [agentId];
 			if (params.project) {
 				mirrorParts.push("AND m.project = ?");
 				mirrorArgs.push(params.project);
 			} else mirrorParts.push("AND m.project IS NULL");
-			if (params.scope !== undefined) {
-				if (params.scope === null) mirrorParts.push("AND m.scope IS NULL");
-				else {
-					mirrorParts.push("AND m.scope = ?");
-					mirrorArgs.push(params.scope);
-				}
+			if (params.scope !== undefined && params.scope !== null) {
+				mirrorParts.push("AND m.scope = ?");
+				mirrorArgs.push(params.scope);
 			} else mirrorParts.push("AND m.scope IS NULL");
-			const mirrorRows = await ownerReadAll<{
-				id: string;
-				content: string;
-				content_hash: string | null;
-				safety_status?: string | null;
-				context_eligible?: number | null;
-			}>(owner, mirrorParts.join("\n"), mirrorArgs, {
-				operation: "memory-search.native-artifact-mirrors",
-				workloadClass: "foreground",
-				estimatedWorkUnits: Math.min(DB_OWNER_MAX_WORK_UNITS, DB_OWNER_MAX_WORK_UNITS),
-				deadlineMs: 30_000,
-			});
-			for (const mirror of mirrorRows) {
-				if (
-					scanMemoryContent(mirror.content).contextEligible &&
-					(!hasSafetyLedger ||
-						mirror.safety_status == null ||
-						(mirror.safety_status === "clean" && mirror.context_eligible === 1)) &&
-					mirror.content_hash
-				)
-					mirroredHashes.add(mirror.content_hash);
-			}
+			mirrorParts.push(`AND m.content_hash IN (${hashPlaceholders})`);
+			mirrorArgs.push(...candidateHashes);
+			const mirrorRows = await ownerReadAll<{ readonly content_hash: string | null }>(
+				owner,
+				mirrorParts.join("\n"),
+				mirrorArgs,
+				{
+					operation: "memory-search.native-artifact-mirrors",
+					workloadClass: "foreground",
+					estimatedWorkUnits: Math.min(DB_OWNER_MAX_WORK_UNITS, candidateHashes.size),
+					deadlineMs: 5_000,
+				},
+			);
+			for (const mirror of mirrorRows) if (mirror.content_hash) mirroredHashes.add(mirror.content_hash);
 		}
 
 		const seenHermesHashes = new Set<string>();
 		const dedupedRows = rows.filter((row) => {
 			if (row.harness !== "hermes-agent") return true;
-			if (mirroredHashes.has(normalizeAndHashContent(row.content).contentHash)) return false;
+			if (mirroredHashes.has(candidateHashesByRowid.get(row.rowid) ?? "")) return false;
 			if (!row.source_sha256) return true;
 			if (seenHermesHashes.has(row.source_sha256)) return false;
 			seenHermesHashes.add(row.source_sha256);
@@ -1394,32 +1638,31 @@ async function buildNativeArtifactRecallHits(
 				harness: row.harness,
 				project: row.project,
 				updatedAt: row.updated_at,
-				content: transcriptExcerpt(row.content, query, 900),
+				content: transcriptExcerpt(redactCredentials(row.content), query, 900),
 				rank: maxRank > 0 ? Math.abs(row.rank) / maxRank : 0.2,
 			}))
 			.filter((row) => row.content.length > 0 && !existingSourceIds.has(nativeArtifactPublicId(row)));
 	} catch (e) {
-		logger.warn("memory", "Native artifact recall failed (non-fatal)", {
-			error: e instanceof Error ? e.message : String(e),
-		});
-		return [];
+		logger.error("memory", "Native artifact recall query failed", e instanceof Error ? e : new Error(String(e)));
+		throw e;
 	}
 }
 
 function cosineSimilarity(query: Float32Array, memory: Float32Array): number {
-	const len = Math.min(query.length, memory.length);
+	if (query.length === 0 || query.length !== memory.length) return 0;
 	let dot = 0;
 	let queryNorm = 0;
 	let memoryNorm = 0;
-	for (let i = 0; i < len; i++) {
-		const q = query[i] ?? 0;
-		const m = memory[i] ?? 0;
+	for (let i = 0; i < query.length; i++) {
+		const q = query[i] ?? Number.NaN;
+		const m = memory[i] ?? Number.NaN;
+		if (!Number.isFinite(q) || !Number.isFinite(m)) return 0;
 		dot += q * m;
 		queryNorm += q * q;
 		memoryNorm += m * m;
 	}
 	const denom = Math.sqrt(queryNorm) * Math.sqrt(memoryNorm);
-	if (denom <= 0) return 0;
+	if (!Number.isFinite(denom) || denom <= 0) return 0;
 	return Math.max(0, Math.min(1, dot / denom));
 }
 
@@ -1437,13 +1680,9 @@ function describeRecallGraphError(error: unknown): {
 	return { code, message: error instanceof Error ? error.message : String(error) };
 }
 
-// ---------------------------------------------------------------------------
-// Main search orchestration
-// ---------------------------------------------------------------------------
-
-// Hints are synthetic retrieval scouts. Pure hint matches should rescue recall,
-// not outrank directly grounded lexical/vector/structured evidence. A hint
-// supported by direct evidence can keep its score; only hint-only rows are capped.
+function isRecallGraphDeadlineError(error: { readonly code: string | number | null }): boolean {
+	return error.code === "DB_OWNER_DEADLINE" || error.code === "DB_OWNER_CANCELLED";
+}
 const HINT_ONLY_SCORE_CAP = 0.75;
 const TEMPORAL_TOPIC_SCORE_CAP = 0.85;
 
@@ -1461,27 +1700,13 @@ function scoreTemporalTopicEvidence(query: string, content: string): number {
 	const density = matched.length / Math.max(8, contentTokens.size);
 	return Math.min(TEMPORAL_TOPIC_SCORE_CAP, 0.35 + coverage * 0.4 + density * 0.1);
 }
-
-/**
- * Run the recall pipeline.
- *
- * The stages are deliberately split into two halves:
- *
- * 1. Candidate collection: FTS, hints, vector, structured path search, and
- *    graph traversal collect IDs and scores. These stages may over-fetch.
- * 2. Authorized content handling: after `authorize_candidates`, later stages
- *    may read content, call rerankers, apply dampening/currentness, hydrate
- *    results, and update access counts.
- *
- * Keep that boundary intact. It is what prevents high-recall channels such as
- * vector search and traversal from leaking out-of-scope content into model or
- * summary paths.
- */
 export async function hybridRecall(
 	params: RecallParams,
 	cfg: ResolvedMemoryConfig,
 	embedFn: EmbedFn,
+	execution?: RecallExecutionOptions,
 ): Promise<RecallResponse> {
+	checkRecallCancellation(execution);
 	let query = params.query;
 	const limit = normalizeRecallLimit(params.limit);
 	const alpha = cfg.search.alpha;
@@ -1524,6 +1749,10 @@ export async function hybridRecall(
 		}
 		if (result.error) {
 			graphPartial = true;
+			if (isRecallGraphDeadlineError(result.error)) {
+				graphDegradation ??= "graph_traversal_timeout";
+				return;
+			}
 			graphDegradation = "graph_traversal_failed";
 			graphError = {
 				channel: "graph_traversal",
@@ -1550,7 +1779,40 @@ export async function hybridRecall(
 		}
 		return deduped.items;
 	};
+	let transcriptEvidenceAllowed = false;
 	const finish = async (response: UntimedRecallResponse): Promise<RecallResponse> => {
+		let transcriptEvidence: RecallTranscriptEvidenceMeta | undefined;
+		if (transcriptEvidenceAllowed && params.agentId) {
+			const agentId = params.agentId;
+			const textQuery = params.keywordQuery ?? query;
+			const maxExcerpts = Math.min(cfg.search.transcript_evidence_limit, limit);
+			const reranker = cfg.pipelineV2.reranker;
+			const crossEncoderModel =
+				reranker.enabled && !reranker.useExtractionModel && reranker.crossEncoderModel.length > 0
+					? reranker.crossEncoderModel
+					: null;
+			try {
+				const placed = await timings.timeAsync("transcript_evidence", async () =>
+					placeTranscriptEvidence(
+						response.results,
+						await buildTranscriptEvidenceResults(agentId, params.project, textQuery, maxExcerpts * 2, response.results),
+						maxExcerpts,
+						limit,
+						textQuery,
+						crossEncoderModel === null
+							? null
+							: (rerankQuery, documents) => nativeRerank(crossEncoderModel, rerankQuery, documents),
+					),
+				);
+				response.results = placed.results;
+				transcriptEvidence = { returned: placed.returned, ranking: placed.ranking };
+			} catch (e) {
+				transcriptEvidence = { returned: 0, failed: true };
+				logger.warn("memory", "Transcript evidence recall failed (non-fatal)", {
+					error: e instanceof Error ? e.message : String(e),
+				});
+			}
+		}
 		const deduped = applyRecallDedupe({
 			sessionKey: params.sessionKey,
 			agentId: params.agentId,
@@ -1575,18 +1837,19 @@ export async function hybridRecall(
 			noHits: response.results.length === 0,
 			...(lexicalSearchPartial || graphPartial ? { partial: true } : {}),
 			...(graphPartial ? { graphPartial: true } : {}),
+			...(transcriptEvidence ? { transcriptEvidence } : {}),
 			...(graphError ? { graphError } : {}),
 			...(graphDegradation
 				? { degradation: graphDegradation }
 				: lexicalSearchPartial
 					? { degradation: "fts_incomplete" as const }
 					: {}),
-			...(dedupeMeta.enabled ? { dedupe: dedupeMeta } : {}),
+			...(dedupeMeta.enabled || dedupeMeta.failedOpen ? { dedupe: dedupeMeta } : {}),
 		};
 		try {
 			const trackedIds = response.results.map((row) => row.id).filter((id) => !id.includes(":"));
 			if (params.trackRecallAccess !== false && trackedIds.length > 0) {
-				timings.timeAsync("access_tracking_update", async () => {
+				await timings.timeAsync("access_tracking_update", async () => {
 					const trackedPlaceholders = trackedIds.map(() => "?").join(", ");
 					await runWriteTxAsync(getDbAccessor(), (db) => {
 						db.prepare(
@@ -1649,6 +1912,16 @@ export async function hybridRecall(
 		readPolicy: params.readPolicy,
 		policyGroup: params.policyGroup,
 		project: params.project,
+		scope: params.scope,
+		type: params.type,
+		tags: params.tags,
+		who: params.who,
+		pinned: params.pinned,
+		importance_min: params.importance_min,
+		since: params.since,
+		until: params.until,
+		aggregate: params.aggregate === true,
+		excludeAggregateRecallMemories: params.excludeAggregateRecallMemories,
 		sessionKey: params.sessionKey,
 	});
 	if (temporal.response) {
@@ -1657,19 +1930,20 @@ export async function hybridRecall(
 	if (temporal.adjustedQuery) {
 		query = temporal.adjustedQuery;
 	}
+	transcriptEvidenceAllowed =
+		!temporal.meta &&
+		params.sourceOnly !== true &&
+		!hasMemoryMetadataFilters(params) &&
+		cfg.search.transcript_evidence_limit > 0;
 	const temporalCandidateSet = new Set(temporal.candidateIds ?? []);
 	const temporalCandidateMap = new Map<string, number>(
 		[...temporalCandidateSet].map((id) => [id, Math.max(minScore, 0.05)]),
 	);
-
-	// Date ranges are handled by resolveTemporalRecall above. The existing
-	// rehearsal stage gets only the distinct, keyword-based freshness signal.
 	const temporalNowMs = Date.now();
 	const freshnessIntent =
 		cfg.search.temporal_prior_enabled && !params.since && !params.until && hasFreshnessIntent(params.query);
 
-	const expandedQuery = expandRecallKeywordQuery(query);
-	const keywordQuery = sanitizeFtsQuery((params.keywordQuery ?? expandedQuery).trim());
+	const keywordQuery = sanitizeFtsQuery((params.keywordQuery ?? query).trim());
 	const queryVecPromise = (() => {
 		const embeddingStart = performance.now();
 		let promise: Promise<number[] | null>;
@@ -1681,8 +1955,6 @@ export async function hybridRecall(
 		const timed = promise.finally(() => {
 			timings.record("query_embedding_total", embeddingStart);
 		});
-		// The actual error path is handled later at query_embedding_wait, but
-		// Bun can report a fast rejection before synchronous DB work reaches it.
 		timed.catch(() => undefined);
 		return timed;
 	})();
@@ -1695,17 +1967,17 @@ export async function hybridRecall(
 	const getFocalEntities = async (
 		owner: DbOwnerClient,
 		agentId: string,
+		deadlineAt?: number,
 	): Promise<ReturnType<typeof resolveFocalEntities>> => {
 		if (focalCache?.agentId === agentId) return focalCache.value;
 		const value = await resolveFocalEntitiesViaOwner(owner, agentId, {
 			queryTokens: getGraphQueryTokens(),
 			includePinned: false,
+			deadlineAt,
 		});
 		focalCache = { agentId, value };
 		return value;
 	};
-
-	// --- BM25 keyword search via FTS5 ---
 	const bm25Map = new Map<string, number>();
 	const hintMap = new Map<string, number>();
 	const traversalEvidenceMap = new Map<string, number>();
@@ -1783,10 +2055,6 @@ export async function hybridRecall(
 			error: e instanceof Error ? e.message : String(e),
 		});
 	}
-
-	// --- Prospective hints FTS5 (bridges cue-trigger semantic gap) ---
-	// Hints are hypothetical queries generated at write time. A hint match
-	// elevates its parent memory via Math.max (not additive stacking).
 	if (cfg.pipelineV2.hints?.enabled) {
 		try {
 			await timings.timeAsync("hints_fts", async () => {
@@ -1822,18 +2090,11 @@ export async function hybridRecall(
 				}
 			});
 		} catch (e) {
-			// memory_hints_fts may not exist on pre-038 databases — silent fallback
 			logger.warn("memory", "Hints FTS query failed", {
 				error: e instanceof Error ? e.message : String(e),
 			});
 		}
 	}
-
-	// --- Query embedding (used by reranker even when vector search is skipped) ---
-	// Start embedding before the synchronous lexical/structured DB work above.
-	// Local embedding providers are often the slowest prompt-submit step, so
-	// overlapping that I/O with candidate lookup reduces wall-clock latency
-	// without changing the recall channels or final ranking math.
 	let queryVecF32: Float32Array | null = null;
 	try {
 		const queryVec = await timings.timeAsync("query_embedding_wait", () => queryVecPromise);
@@ -1841,50 +2102,40 @@ export async function hybridRecall(
 	} catch (e) {
 		logger.warn("memory", "Embedding failed", { error: String(e) });
 	}
-
-	// --- Vector search via sqlite-vec ---
-	// sqlite-vec cannot pre-filter by recall scope/project/agent policy, so
-	// constrained queries over-fetch and rely on candidate authorization.
-	// This keeps constrained queries eligible for vector similarity when graph
-	// traversal yields no focal entities.
 	const vectorMap = new Map<string, number>();
 	let vectorCompleteness: VectorSearchCompleteness | undefined;
 	let searchedWindow: number | undefined;
+	let comparableQueryVector = null as Float32Array | null;
 	if (queryVecF32) {
 		const queryVector = queryVecF32;
-		const excludeAggregateRecall = params.aggregate === true || params.excludeAggregateRecallMemories === true;
-		const vecLimit = needsPostFilter || excludeAggregateRecall ? cfg.search.top_k * 2 : cfg.search.top_k;
-		try {
-			await timings.timeAsync("vector_search", async () => {
-				const vectorResult = await vectorSearchThroughDbOwner(
-					await getDbRecallOwner(getDbAccessorPath()),
-					[...queryVector],
-					{
-						limit: vecLimit,
-						type: params.type,
-						excludeAggregateRecall,
-						maxScanRows: DB_OWNER_MAX_WORK_UNITS,
-					},
-				);
-				vectorCompleteness = vectorResult.completeness;
-				searchedWindow = vectorResult.searchedWindow;
-				for (const r of vectorResult.results) {
-					vectorMap.set(r.id, r.score);
-				}
-			});
-		} catch (e) {
-			logger.warn("memory", "Vector search failed, using keyword only", {
-				error: String(e),
-			});
+		if (!recallQueryVectorIsValid(queryVector, cfg.embedding.dimensions)) {
+			vectorCompleteness = "unavailable";
+		} else {
+			try {
+				await timings.timeAsync("vector_search", async () => {
+					if (!(await activeEmbeddingProfileIsKnown(cfg.embedding))) {
+						vectorCompleteness = "unavailable";
+						logger.warn(
+							"memory",
+							"Vector recall skipped because the active embedding profile is unknown or incompatible",
+						);
+						return;
+					}
+					comparableQueryVector = queryVector;
+					const vectorResult = await findAuthorizedVectorCandidates(queryVector, params, cfg, filter, execution);
+					vectorCompleteness = vectorResult.completeness;
+					searchedWindow = vectorResult.searchedWindow;
+					for (const candidate of vectorResult.results) vectorMap.set(candidate.id, candidate.score);
+				});
+			} catch (e) {
+				vectorCompleteness = "unavailable";
+				logger.warn("memory", "Vector search failed, using keyword only", {
+					error: String(e),
+				});
+			}
 		}
 	}
 	const semanticEvidenceMap = new Map(vectorMap);
-
-	// --- Structured path candidate search ---
-	// SEC can only reshape memories that make it into the candidate pool.
-	// Query the navigable entity/aspect/group/claim path directly so structured
-	// memories can be recalled even when their raw prose does not share enough
-	// surface text with the question.
 	const structuredCandidateMap = new Map<string, number>();
 	let ontologyClaimCandidates: StructuredClaimCandidate[] = [];
 	if (cfg.pipelineV2.graph.enabled) {
@@ -1920,8 +2171,6 @@ export async function hybridRecall(
 			}
 		}
 	}
-
-	// --- Flat search: merge BM25 + vector + structured path candidate scores ---
 	const allIds = new Set([
 		...bm25Map.keys(),
 		...hintMap.keys(),
@@ -1981,8 +2230,6 @@ export async function hybridRecall(
 
 		flatScored.sort((a, b) => b.score - a.score);
 	});
-
-	// --- Score pipeline: traversal-primary vs legacy boost ---
 	const traversalPrimary =
 		cfg.pipelineV2.graph.enabled && cfg.pipelineV2.traversal?.enabled && cfg.pipelineV2.traversal?.primary !== false;
 
@@ -1990,7 +2237,6 @@ export async function hybridRecall(
 
 	if (traversalPrimary) {
 		await timings.timeAsync("traversal_primary", async () => {
-			// Channel A: graph traversal (primary retrieval path per DP-6)
 			const traversalScored: Array<{ id: string; score: number; source: string }> = [];
 
 			if (cfg.pipelineV2.traversal) {
@@ -1999,8 +2245,9 @@ export async function hybridRecall(
 					const queryTokens = getGraphQueryTokens();
 					if (queryTokens.length > 0) {
 						const agentId = params.agentId ?? "default";
+						const traversalDeadlineAt = Date.now() + traversalCfg.timeoutMs;
 						const owner = await getGraphOwner();
-						const focal = await getFocalEntities(owner, agentId);
+						const focal = await getFocalEntities(owner, agentId, traversalDeadlineAt);
 						if (focal.error) recordGraphResult({ timedOut: false, error: focal.error });
 
 						if (focal.entityIds.length > 0) {
@@ -2013,40 +2260,34 @@ export async function hybridRecall(
 								maxTraversalPaths: traversalCfg.maxTraversalPaths,
 								minConfidence: traversalCfg.minConfidence,
 								timeoutMs: traversalCfg.timeoutMs,
+								deadlineAt: traversalDeadlineAt,
 								scope: params.scope,
 							});
 							recordGraphResult(traversal);
-
-							// Cosine re-scoring: when query embedding is available,
-							// blend structural importance with semantic similarity so
-							// traversal results rank by relevance, not just graph
-							// proximity. Without this, uniform importance (0.5/0.8)
-							// makes traversal ordering effectively random.
 							const cosineMap = new Map<string, number>();
-							if (queryVecF32 && traversal.memoryScores.size > 0) {
+							if (comparableQueryVector && traversal.memoryScores.size > 0) {
+								const qv = comparableQueryVector;
 								const ids = [...traversal.memoryScores.keys()];
-								const ph = ids.map(() => "?").join(", ");
-								let embRows: Array<{ source_id: string; vector: Buffer | null }> = [];
+								let embRows: Array<{ source_id: string; vector: Float32Array }> = [];
 								try {
-									embRows = [
-										...(await graphOwnerReadAll<{ source_id: string; vector: Buffer | null }>(
-											`SELECT source_id, vector FROM embeddings
-											 WHERE source_id IN (${ph}) AND vector IS NOT NULL`,
-											ids,
-											"memory-search.traversal.embedding-rescore",
-											ids.length,
-										)),
-									];
+									embRows = await readOwnerVectorsBySource(
+										ids,
+										cfg.embedding.dimensions,
+										async (sql, sqlParams, pageRows) =>
+											await graphOwnerReadAll<OwnerVectorRow>(
+												sql,
+												sqlParams,
+												"memory-search.traversal.embedding-rescore",
+												pageRows,
+											),
+									);
 								} catch (e) {
 									logger.warn("memory", "Traversal embedding re-scoring failed (non-fatal)", {
 										error: e instanceof Error ? e.message : String(e),
 									});
 								}
-								const qv = queryVecF32;
 								for (const row of embRows) {
-									if (!row.vector) continue;
-									const mv = new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4);
-									const cosine = cosineSimilarity(qv, mv);
+									const cosine = cosineSimilarity(qv, row.vector);
 									cosineMap.set(row.source_id, cosine);
 									semanticEvidenceMap.set(row.source_id, Math.max(semanticEvidenceMap.get(row.source_id) ?? 0, cosine));
 								}
@@ -2085,9 +2326,6 @@ export async function hybridRecall(
 					});
 				}
 			}
-
-			// Channel merge: max-fuse overlapping flat/traversal candidates so a
-			// weak graph score never discards stronger lexical/vector evidence.
 			traversalScored.sort((a, b) => b.score - a.score);
 			const candidateBudget = Math.max(limit, Math.min(cfg.search.top_k, limit * 4));
 			const flatIds = new Set(flatScored.map((row) => row.id));
@@ -2111,8 +2349,6 @@ export async function hybridRecall(
 		});
 	} else {
 		scored = flatScored;
-
-		// --- Graph boost: pull up memories linked via knowledge graph ---
 		if (cfg.pipelineV2.graph.enabled && cfg.pipelineV2.graph.boostWeight > 0) {
 			try {
 				const graphResult = await timings.timeAsync("graph_boost", async () => {
@@ -2135,8 +2371,6 @@ export async function hybridRecall(
 				});
 			}
 		}
-
-		// --- KA traversal boost: structural one-hop retrieval via KA tables ---
 		if (cfg.pipelineV2.graph.enabled && cfg.pipelineV2.traversal?.enabled) {
 			try {
 				await timings.timeAsync("traversal_boost", async () => {
@@ -2144,8 +2378,9 @@ export async function hybridRecall(
 					const queryTokens = getGraphQueryTokens();
 					if (traversalCfg && queryTokens.length > 0) {
 						const agentId = params.agentId ?? "default";
+						const traversalDeadlineAt = Date.now() + traversalCfg.timeoutMs;
 						const owner = await getGraphOwner();
-						const focal = await getFocalEntities(owner, agentId);
+						const focal = await getFocalEntities(owner, agentId, traversalDeadlineAt);
 						if (focal.error) recordGraphResult({ timedOut: false, error: focal.error });
 
 						if (focal.entityIds.length > 0) {
@@ -2158,6 +2393,7 @@ export async function hybridRecall(
 								maxTraversalPaths: traversalCfg.maxTraversalPaths,
 								minConfidence: traversalCfg.minConfidence,
 								timeoutMs: traversalCfg.timeoutMs,
+								deadlineAt: traversalDeadlineAt,
 							});
 							recordGraphResult(traversal);
 
@@ -2252,9 +2488,6 @@ export async function hybridRecall(
 	if (scored.length > 0) {
 		scored = await authorizeScoredCandidates(scored, filter);
 	}
-
-	// Everything below this point may assume `scored` only contains memory IDs
-	// visible to the caller. Keep new content-bearing stages below this line.
 	const structuredEvidenceMap = new Map(structuredCandidateMap);
 	const temporalTopicEvidenceMap = new Map<string, number>();
 	if (temporalCandidateSet.size > 0 && scored.length > 0) {
@@ -2294,11 +2527,6 @@ export async function hybridRecall(
 		}
 		scored.sort((a, b) => b.score - a.score);
 	}
-
-	// --- Structured Evidence Convolution (SEC-lite) ---
-	// Keep retrieval channels separate until after traversal/boosting. This
-	// prevents graph-only memories from outranking directly anchored evidence,
-	// while still letting prospective hints rescue class-to-instance matches.
 	if (scored.length > 0) {
 		const structuredEvidenceStart = performance.now();
 		try {
@@ -2353,8 +2581,7 @@ export async function hybridRecall(
 					contentMap = new Map(contentRows.map((row) => [row.id, row.content]));
 				}
 
-				const coverageQuery = params.keywordQuery ? query : expandedQuery;
-				scored = shapeByFacetCoverage(coverageQuery, shaped, contentMap, coverageLimit).map((row) => ({
+				scored = shapeByFacetCoverage(query, shaped, contentMap, coverageLimit).map((row) => ({
 					id: row.id,
 					score: row.score,
 					source: row.source,
@@ -2372,12 +2599,9 @@ export async function hybridRecall(
 	await timings.timeAsync("rehearsal_boost", () =>
 		applyRehearsalBoost(scored, cfg.search, { enabled: freshnessIntent, nowMs: temporalNowMs }),
 	);
-
-	// --- Optional reranker hook ---
 	let recallSummary: string | undefined;
-	// Remaining timeout budget to use for LLM summary after reranking.
-	// Set inside the reranker block; consumed after final results are assembled.
 	let summarizeLeft = 0;
+	let rerankOutcome: RerankOutcome | undefined;
 	if (cfg.pipelineV2.reranker.enabled && scored.length > 0) {
 		const rerankerStageStart = performance.now();
 		try {
@@ -2385,8 +2609,6 @@ export async function hybridRecall(
 			const topForRerank = scored.slice(0, cfg.pipelineV2.reranker.topN);
 			const rerankIds = topForRerank.map((s) => s.id);
 			const rerankPlaceholders = rerankIds.map(() => "?").join(", ");
-
-			// Fetch content for reranker — cross-encoders need document text
 			const contentRows = await getDbAccessor().withReadDbAsync(
 				async (db) =>
 					db
@@ -2404,22 +2626,29 @@ export async function hybridRecall(
 
 			const candidates: RerankCandidate[] = topForRerank.map((s) => ({
 				id: s.id,
-				content: contentMap.get(s.id) ?? "",
+				content: redactCredentials(contentMap.get(s.id) ?? ""),
 				score: s.score,
 			}));
+			const blend = queryVecF32 ? createEmbeddingReranker(getDbAccessor(), queryVecF32) : noopReranker;
+			rerankOutcome = { kind: cfg.pipelineV2.reranker.useExtractionModel ? "llm" : queryVecF32 ? "embedding" : "none" };
+			const outcome = rerankOutcome;
+			const crossEncoderModel = cfg.pipelineV2.reranker.crossEncoderModel;
 			const provider = cfg.pipelineV2.reranker.useExtractionModel
 				? createLlmReranker(getLlmProvider())
-				: queryVecF32
-					? createEmbeddingReranker(getDbAccessor(), queryVecF32)
-					: noopReranker;
+				: crossEncoderModel.length > 0
+					? createCrossEncoderReranker({
+							model: crossEncoderModel,
+							score: (rerankQuery, documents) => nativeRerank(crossEncoderModel, rerankQuery, documents),
+							fallback: blend,
+							outcome,
+						})
+					: blend;
 			const reranked = await rerank(query, candidates, provider, {
 				topN: cfg.pipelineV2.reranker.topN,
 				timeoutMs: cfg.pipelineV2.reranker.timeoutMs,
 				model: cfg.pipelineV2.reranker.model,
 				throwOnError: cfg.pipelineV2.reranker.useExtractionModel,
 			});
-			// Update scores from reranked results without collapsing calibrated
-			// relevance into rank-position placeholders.
 			const rerankedMap = new Map(reranked.map((row) => [row.id, row.score]));
 			for (const s of scored) {
 				const score = rerankedMap.get(s.id);
@@ -2436,8 +2665,6 @@ export async function hybridRecall(
 						elapsedMs: elapsed,
 					});
 				} else {
-					// Store remaining budget; summary is generated after final
-					// results are assembled so it is grounded in the recalled set.
 					summarizeLeft = left;
 				}
 			}
@@ -2454,18 +2681,11 @@ export async function hybridRecall(
 			timings.record("reranker", rerankerStageStart);
 		}
 	}
-
-	// --- Post-fusion dampening (DP-16) ---
-	// Three corrections after all scoring but before the final slice:
-	// gravity (penalize zero-term-overlap semantic hits), hub (penalize
-	// high-degree entity dominance), resolution (boost actionable types).
 	if (scored.length > 0) {
 		const dampeningStart = performance.now();
 		try {
 			const dampenIds = scored.map((s) => s.id);
 			const dampenPh = dampenIds.map(() => "?").join(", ");
-
-			// Fetch content + type for dampening analysis
 			const dampenRows = await getDbAccessor().withReadDbAsync(
 				async (db) =>
 					db
@@ -2481,10 +2701,9 @@ export async function hybridRecall(
 				{ siteToken: "db:recall.dampening.metadata" },
 			);
 			const meta = new Map(dampenRows.map((r) => [r.id, r]));
-
-			// Build entity linkage: memory_id -> set of entity_ids
 			const entities = new Map<string, Set<string>>();
 			const degrees = new Map<string, number>();
+			let agentMemoryCount: number | undefined;
 
 			if (cfg.pipelineV2.graph.enabled) {
 				const links = await graphOwnerReadAll<{
@@ -2508,8 +2727,6 @@ export async function hybridRecall(
 					set.add(row.entity_id);
 					entityIds.add(row.entity_id);
 				}
-
-				// Fetch degree (total mention count) for each linked entity
 				if (entityIds.size > 0) {
 					const eidList = [...entityIds];
 					const eidPh = eidList.map(() => "?").join(", ");
@@ -2528,10 +2745,15 @@ export async function hybridRecall(
 					for (const row of degreeRows) {
 						degrees.set(row.entity_id, row.cnt);
 					}
+					const [memoryCount] = await graphOwnerReadAll<{ cnt: number }>(
+						"SELECT COUNT(*) AS cnt FROM memories WHERE agent_id = ? AND COALESCE(is_deleted, 0) = 0",
+						[params.agentId ?? "default"],
+						"memory-search.dampening.agent-memories",
+						1,
+					);
+					agentMemoryCount = memoryCount?.cnt;
 				}
 			}
-
-			// Assemble ScoredRow array for dampening
 			const dampened = applyDampening(
 				scored
 					.map((s) => {
@@ -2546,13 +2768,12 @@ export async function hybridRecall(
 						};
 					})
 					.filter((r): r is ScoredRow => r !== null),
-				params.keywordQuery ? query : expandedQuery,
+				query,
 				DEFAULT_DAMPENING,
 				entities,
 				degrees,
+				agentMemoryCount,
 			);
-
-			// Write dampened scores back into scored array
 			const dampenedMap = new Map(dampened.map((r) => [r.id, r.score]));
 			for (const s of scored) {
 				const ds = dampenedMap.get(s.id);
@@ -2615,11 +2836,39 @@ export async function hybridRecall(
 			const bObserved = observedScores.get(b.id);
 			return (bObserved ?? b.score) - (aObserved ?? a.score);
 		});
+		if (temporalCandidateSet.size > 0 && scored.length < limit) {
+			const present = new Set(scored.map((row) => row.id));
+			const missing = [...temporalCandidateSet].filter((id) => !present.has(id));
+			if (missing.length > 0) {
+				const similarity = new Map<string, number>();
+				if (comparableQueryVector) {
+					const queryVector = comparableQueryVector;
+					let embRows: Array<{ source_id: string; vector: Float32Array }> = [];
+					try {
+						embRows = await readOwnerVectorsBySource(
+							missing,
+							cfg.embedding.dimensions,
+							async (sql, sqlParams, pageRows) =>
+								await graphOwnerReadAll<OwnerVectorRow>(sql, sqlParams, "memory-search.temporal-window-fill", pageRows),
+						);
+					} catch (e) {
+						logger.warn("memory", "Temporal window vector ordering failed (non-fatal)", {
+							error: e instanceof Error ? e.message : String(e),
+						});
+					}
+					for (const row of embRows) {
+						similarity.set(row.source_id, cosineSimilarity(queryVector, row.vector));
+					}
+				}
+				const floor = Math.min(minScore, ...scored.map((row) => row.score));
+				const fill = missing
+					.sort((a, b) => (similarity.get(b) ?? 0) - (similarity.get(a) ?? 0))
+					.slice(0, limit - scored.length)
+					.map((id, index) => ({ id, score: floor * (1 - (index + 1) / (limit * 2)), source: "temporal_window" }));
+				scored.push(...(await authorizeScoredCandidates(fill, filter)));
+			}
+		}
 	});
-
-	// Over-fetch before hydration for constrained searches. Broad candidate
-	// channels can include IDs that candidate authorization or hydration drops.
-	// 3x compensates for the expected discard rate.
 	const preHydrate = selectionDedupeEnabled
 		? Math.max(needsPostFilter ? limit * 3 : limit, Math.min(scored.length, Math.max(limit * 4, limit + 10)))
 		: needsPostFilter
@@ -2627,32 +2876,41 @@ export async function hybridRecall(
 			: limit;
 	const topIds = params.sourceOnly === true ? [] : scored.slice(0, preHydrate).map((s) => s.id);
 	const recallTruncate = cfg.pipelineV2.guardrails.recallTruncateChars;
-	const ontologyClaimResults = ontologyClaimCandidates.flatMap((candidate) =>
-		scanMemoryContent(ontologyClaimContent(candidate)).contextEligible
-			? [ontologyClaimToRecallResult(candidate, recallTruncate)]
-			: [],
+	const ontologyClaimResults = ontologyClaimCandidates.map((candidate) =>
+		ontologyClaimToRecallResult(candidate, recallTruncate),
 	);
 	const allowSourceFallbacks = temporalCandidateSet.size === 0 && !hasMemoryMetadataFilters(params);
+	let sourceChunkSearchDiagnostics: SourceChunkVectorDiagnostics | undefined;
 
 	if (topIds.length === 0) {
 		const results = suppressPreviouslyRecalledForSelection(ontologyClaimResults).slice(0, limit);
 		const fallbackLimit = selectionDedupeEnabled ? Math.max(limit * 3, limit + 10) : limit;
-		const sourceChunkHits = allowSourceFallbacks
-			? await timings.timeAsync(
-					"source_chunk_vector_fallback",
-					async () =>
-						await buildSourceChunkVectorHits(
-							queryVecF32,
-							new Set(),
-							fallbackLimit,
-							params.agentId ?? "default",
-							params.project,
-						),
-				)
-			: [];
-		if (sourceChunkHits.length > 0 && results.length < limit) {
+		const sourceChunkOutcome =
+			allowSourceFallbacks && results.length < limit
+				? await timings.timeAsync(
+						"source_chunk_vector_fallback",
+						async () =>
+							await buildSourceChunkVectorHits(
+								queryVecF32,
+								new Set(),
+								fallbackLimit,
+								params.agentId ?? "default",
+								cfg.embedding,
+								params.project,
+								execution,
+							),
+					)
+				: undefined;
+		sourceChunkSearchDiagnostics = sourceChunkOutcome?.diagnostics;
+		if (sourceChunkOutcome?.completeness === "recent-window") {
+			vectorCompleteness = "recent-window";
+			searchedWindow = sourceChunkOutcome.searchedWindow;
+		} else if (sourceChunkOutcome?.completeness === "unavailable" && vectorCompleteness === undefined) {
+			vectorCompleteness = "unavailable";
+		}
+		if (sourceChunkOutcome && sourceChunkOutcome.hits.length > 0 && results.length < limit) {
 			const sourceResults = suppressPreviouslyRecalledForSelection(
-				sourceChunkHits.slice(0, fallbackLimit).map((hit): RecallResult => {
+				sourceChunkOutcome.hits.slice(0, fallbackLimit).map((hit): RecallResult => {
 					const content = `[Source chunk: ${hit.sourcePath}]\n${hit.chunkText}`;
 					const truncated = content.length > recallTruncate;
 					return {
@@ -2681,12 +2939,13 @@ export async function hybridRecall(
 				results.push(row);
 			}
 		}
-		const nativeHits = allowSourceFallbacks
-			? await timings.timeAsync(
-					"native_artifact_fallback",
-					async () => await buildNativeArtifactRecallHits(params, expandedQuery, new Set()),
-				)
-			: [];
+		const nativeHits =
+			allowSourceFallbacks && results.length < limit
+				? await timings.timeAsync(
+						"native_artifact_fallback",
+						async () => await buildNativeArtifactRecallHits(params, query, new Set()),
+					)
+				: [];
 		if (nativeHits.length > 0 && results.length < limit) {
 			const nativeResults = suppressPreviouslyRecalledForSelection(
 				nativeHits.slice(0, fallbackLimit).map((hit): RecallResult => {
@@ -2735,13 +2994,11 @@ export async function hybridRecall(
 				noHits: results.length === 0,
 				...(vectorCompleteness === undefined ? {} : { vectorCompleteness }),
 				...(searchedWindow === undefined ? {} : { searchedWindow }),
+				...(sourceChunkOutcome === undefined ? {} : { sourceVectorSearch: sourceChunkOutcome.diagnostics }),
+				...(rerankOutcome === undefined ? {} : { reranker: rerankOutcome }),
 			},
 		});
 	}
-
-	// --- Fetch full memory rows ---
-	// Hydration uses the same auth/scope/project filter as candidate
-	// authorization so no alternate path can widen access.
 	const placeholders = topIds.map(() => "?").join(", ");
 
 	const rows = await timings.timeAsync(
@@ -2751,7 +3008,7 @@ export async function hybridRecall(
 				async (db) =>
 					db
 						.prepare(
-							`SELECT m.id, m.content, m.source_id, m.type, m.tags, m.pinned, m.importance, m.who, m.project, m.created_at, m.visibility, m.scope, m.agent_id
+							`SELECT m.id, m.content, m.source_id, m.type, m.tags, m.pinned, m.importance, m.who, m.project, m.created_at, m.visibility, m.scope
         FROM memories m
         WHERE m.id IN (${placeholders})${currentMemorySql("m")}${filter.sql}`,
 						)
@@ -2768,27 +3025,12 @@ export async function hybridRecall(
 						created_at: string;
 						visibility: string | null;
 						scope: string | null;
-						agent_id: string | null;
 					}>,
 				{ siteToken: "db:recall.final-candidates.hydrate" },
 			),
 	);
 
-	const safeRows = await getDbAccessor().withReadDbAsync(
-		async (db) =>
-			rows.filter((row) =>
-				isMemoryContentContextEligible(db, {
-					agentId: row.agent_id?.trim() || "default",
-					sourceKind: "memory",
-					sourceId: row.id,
-					content: row.content,
-				}),
-			),
-		{ siteToken: "db:recall.final-candidates.safety" },
-	);
-	const rowMap = new Map(safeRows.map((r) => [r.id, r]));
-	// No pre-decrement: always fetch `limit` memories. The summary card is
-	// injected after assembly and the array is capped to `limit` at that point.
+	const rowMap = new Map(rows.map((r) => [r.id, r]));
 	let results: RecallResult[] = timings.time("assemble_results", () =>
 		suppressPreviouslyRecalledForSelection(
 			scored
@@ -2797,7 +3039,7 @@ export async function hybridRecall(
 				.flatMap((s) => {
 					const r = rowMap.get(s.id);
 					if (!r) return [];
-					const content = annotateCurrentness(r.content, currentness.get(r.id));
+					const content = annotateCurrentness(redactCredentials(r.content), currentness.get(r.id));
 					const isTruncated = content.length > recallTruncate;
 					return [
 						{
@@ -2834,7 +3076,7 @@ export async function hybridRecall(
 	if (results.length < limit) {
 		const existingSourceIds = new Set(results.map((row) => row.source_id).filter((id): id is string => !!id));
 		const fill = limit - results.length;
-		const sourceChunkHits = allowSourceFallbacks
+		const sourceChunkOutcome = allowSourceFallbacks
 			? await timings.timeAsync(
 					"source_chunk_vector_supplement",
 					async () =>
@@ -2843,11 +3085,18 @@ export async function hybridRecall(
 							existingSourceIds,
 							selectionDedupeEnabled ? Math.max(fill * 3, fill + 10) : fill,
 							params.agentId ?? "default",
+							cfg.embedding,
 							params.project,
+							execution,
 						),
 				)
-			: [];
-		const candidates = sourceChunkHits.map((hit): RecallResult => {
+			: undefined;
+		if (sourceChunkOutcome) {
+			sourceChunkSearchDiagnostics = sourceChunkOutcome.diagnostics;
+			if (sourceChunkOutcome.completeness !== "complete") vectorCompleteness = sourceChunkOutcome.completeness;
+			searchedWindow = sourceChunkOutcome.searchedWindow ?? searchedWindow;
+		}
+		const candidates = (sourceChunkOutcome?.hits ?? []).map((hit): RecallResult => {
 			const content = `[Source chunk: ${hit.sourcePath}]\n${hit.chunkText}`;
 			const truncated = content.length > recallTruncate;
 			return {
@@ -2881,7 +3130,7 @@ export async function hybridRecall(
 		const existingSourceIds = new Set(results.map((row) => row.source_id).filter((id): id is string => !!id));
 		const nativeHits = allowSourceFallbacks
 			? await timings.timeAsync("native_artifact_supplement", () =>
-					buildNativeArtifactRecallHits(params, expandedQuery, existingSourceIds),
+					buildNativeArtifactRecallHits(params, query, existingSourceIds),
 				)
 			: [];
 		const candidates = nativeHits.map((hit): RecallResult => {
@@ -2918,16 +3167,12 @@ export async function hybridRecall(
 			results.push(row);
 		}
 	}
-
-	// Generate LLM summary from the final recalled set (not pre-filter candidates).
-	// Skip when limit < 2: can't fit a summary card without evicting the only
-	// real memory, which would leave the caller with nothing to verify against.
 	if (summarizeLeft > 0 && results.length > 0 && limit >= 2) {
 		const llmSummaryStart = performance.now();
 		try {
 			const summCandidates = results.slice(0, 12).map((r) => ({ id: r.id, content: r.content, score: r.score }));
 			const s = await summarizeRecallWithLlm(getLlmProvider(), query, summCandidates, summarizeLeft);
-			if (s && scanMemoryContent(s).contextEligible) recallSummary = s;
+			if (s) recallSummary = redactCredentials(s);
 		} catch (e) {
 			logger.warn("memory", "LLM summary failed (non-fatal)", {
 				error: e instanceof Error ? e.message : String(e),
@@ -2964,12 +3209,10 @@ export async function hybridRecall(
 			results.unshift(summary[0]);
 		}
 	}
-
-	// --- Decision-rationale linking: auto-fetch linked rationale memories ---
 	const decisionIds = results.filter((r) => r.type === "decision").map((r) => r.id);
 	const existingIds = new Set(results.map((r) => r.id));
 
-	if (decisionIds.length > 0 && cfg.pipelineV2.graph.enabled) {
+	if (decisionIds.length > 0 && cfg.pipelineV2.graph.enabled && results.length < limit) {
 		const rationaleStart = performance.now();
 		try {
 			const dPlaceholders = decisionIds.map(() => "?").join(", ");
@@ -2986,20 +3229,6 @@ export async function hybridRecall(
 					: await (async () => {
 							const eIds = entityIds.map((row) => row.entity_id);
 							const ePlaceholders = eIds.map(() => "?").join(", ");
-							const safetyTable = await graphOwnerReadAll<{ name: string }>(
-								"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_content_safety'",
-								[],
-								"memory-search.rationale.safety-table",
-								1,
-							);
-							const safetyJoin =
-								safetyTable.length > 0
-									? "LEFT JOIN memory_content_safety mcs ON mcs.agent_id = m.agent_id AND mcs.source_kind = 'memory' AND mcs.source_id = m.id"
-									: "";
-							const safetyFilter =
-								safetyTable.length > 0
-									? "AND (mcs.source_id IS NULL OR (mcs.status = 'clean' AND mcs.context_eligible = 1))"
-									: "";
 							return await graphOwnerReadAll<{
 								id: string;
 								content: string;
@@ -3012,18 +3241,15 @@ export async function hybridRecall(
 								created_at: string;
 								visibility?: string | null;
 								scope?: string | null;
-								agent_id: string | null;
 							}>(
 								`SELECT DISTINCT m.id, m.content, m.type, m.tags, m.pinned,
-						        m.importance, m.who, m.project, m.created_at, m.visibility, m.scope, m.agent_id
+						        m.importance, m.who, m.project, m.created_at, m.visibility, m.scope
 						 FROM memory_entity_mentions mem
 						 JOIN memories m ON m.id = mem.memory_id
-						 ${safetyJoin}
 						 WHERE mem.entity_id IN (${ePlaceholders})
 						   AND m.type = 'rationale'
 						   ${currentMemorySql("m")}
 						   ${filter.sql}
-						   ${safetyFilter}
 						 LIMIT 10`,
 								[...eIds, ...filter.args],
 								"memory-search.rationale.memories",
@@ -3035,11 +3261,12 @@ export async function hybridRecall(
 				if (results.length >= limit) break;
 				if (existingIds.has(r.id)) continue;
 				existingIds.add(r.id);
-				const isTrunc = r.content.length > recallTruncate;
+				const content = redactCredentials(r.content);
+				const isTrunc = content.length > recallTruncate;
 				results.push({
 					id: r.id,
-					content: isTrunc ? `${r.content.slice(0, recallTruncate)} [truncated]` : r.content,
-					content_length: r.content.length,
+					content: isTrunc ? `${content.slice(0, recallTruncate)} [truncated]` : content,
+					content_length: content.length,
 					truncated: isTrunc,
 					score: 0,
 					source: "graph",
@@ -3063,10 +3290,9 @@ export async function hybridRecall(
 			timings.record("rationale_linking", rationaleStart);
 		}
 	}
-
-	// --- Entity context + constructed memories (DP-7) ---
 	let entityContext: RecallResponse["entities"];
 	let focalEids: string[] = [];
+	let contextBlocks: Awaited<ReturnType<typeof constructContextBlocksViaOwner>>["blocks"] = [];
 
 	if (cfg.pipelineV2.graph.enabled && cfg.pipelineV2.traversal?.enabled) {
 		const entityContextStart = performance.now();
@@ -3080,92 +3306,37 @@ export async function hybridRecall(
 				const ctx = await (async () => {
 					if (focal.entityIds.length === 0) return null;
 					let eids = focal.entityIds;
-					if (params.scope !== undefined || params.project) {
-						const ph = eids.map(() => "?").join(", ");
-						const scoped = await graphOwnerReadAll<{ entity_id: string }>(
-							`SELECT DISTINCT mem.entity_id
-							 FROM memory_entity_mentions mem
-							 JOIN memories m ON m.id = mem.memory_id
-							 WHERE mem.entity_id IN (${ph})
-							   ${currentMemorySql("m")}
-							   ${filter.sql}`,
-							[...eids, ...filter.args],
-							"memory-search.entity-context.scope",
-							eids.length,
-						);
-						eids = scoped.map((row) => row.entity_id);
-						if (eids.length === 0) return null;
-					}
-
-					const placeholders = eids.map(() => "?").join(", ");
-					const entities = await graphOwnerReadAll<{ id: string; name: string; entity_type: string }>(
-						`SELECT id, name, entity_type FROM entities WHERE id IN (${placeholders})`,
-						eids,
-						"memory-search.entity-context.entities",
+					const ph = eids.map(() => "?").join(", ");
+					const scoped = await graphOwnerReadAll<{ entity_id: string }>(
+						`SELECT DISTINCT mem.entity_id
+						 FROM memory_entity_mentions mem
+						 JOIN memories m ON m.id = mem.memory_id
+						 WHERE mem.entity_id IN (${ph})
+						   ${currentMemorySql("m")}
+						   ${filter.sql}`,
+						[...eids, ...filter.args],
+						"memory-search.entity-context.scope",
 						eids.length,
 					);
-					const safetyTable = await graphOwnerReadAll<{ name: string }>(
-						"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_content_safety'",
-						[],
-						"memory-search.entity-context.safety-table",
-						1,
+					eids = scoped.map((row) => row.entity_id);
+					if (eids.length === 0) return null;
+
+					const blockLimit =
+						results.length < limit ? Math.min(limit - results.length, Math.max(3, Math.ceil(limit * 0.3))) : 0;
+					const snapshot = await constructContextBlocksViaOwner(
+						owner,
+						agentId,
+						eids,
+						blockLimit,
+						filter,
+						!hasRestrictedMemoryContentFilters(params),
 					);
-					const safetyJoin =
-						safetyTable.length > 0
-							? "LEFT JOIN memory_content_safety safety ON safety.agent_id = ea.agent_id AND safety.source_kind = 'memory' AND safety.source_id = ea.memory_id"
-							: "";
-					const safetySelect =
-						safetyTable.length > 0
-							? ", safety.status AS safety_status, safety.context_eligible AS safety_context_eligible"
-							: "";
-					const structured = [];
-					for (const entity of entities) {
-						const aspects = await graphOwnerReadAll<{ id: string; name: string }>(
-							`SELECT id, name FROM entity_aspects INDEXED BY idx_entity_aspects_entity
-							 WHERE entity_id = ? AND agent_id = ?
-							 ORDER BY weight DESC LIMIT 10`,
-							[entity.id, agentId],
-							"memory-search.entity-context.aspects",
-							10,
-						);
-						const contextAspects = [];
-						for (const aspect of aspects) {
-							const attrs = await graphOwnerReadAll<{
-								content: string;
-								status: string;
-								importance: number;
-								memory_id: string | null;
-								safety_status?: string | null;
-								safety_context_eligible?: number | null;
-							}>(
-								`SELECT ea.content, ea.status, ea.importance, ea.memory_id${safetySelect}
-								 FROM entity_attributes ea ${safetyJoin}
-								 WHERE ea.aspect_id = ? AND ea.agent_id = ? AND ea.status = 'active'
-								 ORDER BY ea.importance DESC LIMIT 5`,
-								[aspect.id, agentId],
-								"memory-search.entity-context.attributes",
-								5,
-							);
-							const attributes = attrs
-								.filter(
-									(attr) =>
-										scanMemoryContent(attr.content).contextEligible &&
-										(!attr.memory_id ||
-											attr.safety_status == null ||
-											(attr.safety_status === "clean" && attr.safety_context_eligible === 1)),
-								)
-								.map((attr) => ({ content: attr.content, status: attr.status, importance: attr.importance }));
-							if (attributes.length > 0) contextAspects.push({ name: aspect.name, attributes });
-						}
-						if (contextAspects.length > 0) {
-							structured.push({ name: entity.name, type: entity.entity_type, aspects: contextAspects });
-						}
-					}
-					return { eids, structured };
+					return { eids, snapshot };
 				})();
 
 				if (ctx) {
-					entityContext = ctx.structured;
+					entityContext = redactCredentialsDeep(ctx.snapshot.entities);
+					contextBlocks = ctx.snapshot.blocks;
 					focalEids = ctx.eids;
 				}
 			}
@@ -3177,34 +3348,27 @@ export async function hybridRecall(
 			timings.record("entity_context", entityContextStart);
 		}
 	}
-
-	// --- Constructed memories: synthesize from graph paths (DP-7) ---
-	// Constructed cards use structural density as their score, which is
-	// query-independent. To prevent large entity cards from outranking
-	// actual memories that answer the query, cap their scores below the
-	// lowest real result score.
-	if (focalEids.length > 0) {
+	if (focalEids.length > 0 && results.length < limit) {
 		const constructedStart = performance.now();
 		try {
-			const agentId = params.agentId ?? "default";
-			const cap = Math.max(3, Math.ceil(limit * 0.3));
-			const blocks = await constructContextBlocksViaOwner(await getGraphOwner(), agentId, focalEids, cap);
+			const cap = Math.min(limit - results.length, Math.max(3, Math.ceil(limit * 0.3)));
+			const blocks = contextBlocks;
 			const now = new Date().toISOString();
 			const minReal = results.length > 0 ? Math.min(...results.map((r) => r.score)) : 0.5;
 			const maxConstructed = Math.max(0.01, minReal - 0.01);
 			let added = 0;
 			for (const block of blocks) {
 				if (added >= cap || results.length >= limit) break;
-				if (!scanMemoryContent(block.content).contextEligible) continue;
 				const syntheticId = `constructed:${block.provenance.entityName}`;
 				if (existingIds.has(syntheticId)) continue;
 				existingIds.add(syntheticId);
 				added++;
 
+				const content = redactCredentials(block.content);
 				results.push({
 					id: syntheticId,
-					content: block.content,
-					content_length: block.content.length,
+					content,
+					content_length: content.length,
 					truncated: block.truncated,
 					score: Math.round(Math.min(block.score, maxConstructed) * 100) / 100,
 					source: "constructed",
@@ -3240,7 +3404,9 @@ export async function hybridRecall(
 			noHits: results.length === 0,
 			...(vectorCompleteness === undefined ? {} : { vectorCompleteness }),
 			...(searchedWindow === undefined ? {} : { searchedWindow }),
+			...(sourceChunkSearchDiagnostics === undefined ? {} : { sourceVectorSearch: sourceChunkSearchDiagnostics }),
 			...(temporal.meta ? { temporal: temporal.meta } : {}),
+			...(rerankOutcome === undefined ? {} : { reranker: rerankOutcome }),
 		},
 		entities: entityContext && entityContext.length > 0 ? entityContext : undefined,
 	});

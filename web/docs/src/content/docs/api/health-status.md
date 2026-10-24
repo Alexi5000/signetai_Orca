@@ -116,6 +116,41 @@ legacy synchronous read attempts rejected at the hard connection cap. The
 `dbRuntime.queue` snapshot reports current read/write depth, queue age, and
 active leases; `eventLoopLag` is the bounded independent event-loop sample.
 
+The `dbOwner` block is read from the registered DB-owner maintenance authority. The
+legacy accessor is not a second health source. `/health` samples the owner after
+its bounded owner probe completes (including a failed probe), then projects that
+same snapshot into `databaseIntegrity.ownerState` and
+`databaseIntegrity.ownerGeneration`.
+
+`databaseIntegrity.ftsVerification` is `pending`, `complete`, or
+`unverifiable`. The incremental check skips FTS5 virtual tables because their
+native integrity check cannot be split into bounded work. Skipped objects do not
+make an otherwise healthy database unhealthy; their count is available in
+`databaseIntegrity.incrementalProgress.skippedObjects`.
+
+A table with more than 100,000 rows is too large to `quick_check` within one
+bounded owner job. The incremental check instead reads its records in rowid
+chunks, saving its position between slices so the sweep keeps moving. A read
+error marks the table failed. This scan does not verify the table's b-tree
+structure or indexes, so a completed sweep that used it reports their count in
+`databaseIntegrity.incrementalProgress.scannedObjects` and says so in
+`databaseIntegrity.quickCheck.messages`. If a table's size probe or whole-table
+check does not finish, for example because it hits the owner deadline, the next
+slice reads that table in chunks instead of retrying the same work. A table over
+the limit that cannot be addressed by rowid (a `WITHOUT ROWID` table, or one
+that declares columns named `rowid`, `_rowid_`, and `oid`) is counted in
+`skippedObjects`.
+
+`dbOwner.generation` identifies the owner lifecycle generation and changes when
+the owner is replaced or restarted. If no maintenance authority is registered,
+`dbOwner` is `null` and the integrity owner fields are also `null`; they do not
+retain values from a retired owner. Shutdown clears the registry before awaiting
+the old maintenance resource and waits for active registry leases, so a replacement
+must be registered explicitly rather than overwriting or using a closing owner. While
+maintenance is closing, health does not fall back to the raw accessor: `/health`
+reports a degraded database view and `/health/ready` remains not ready until a new
+owner is registered.
+
 The process-local `eventLoop` signal separates a responsive daemon from one
 whose event loop is falling behind. Its health semantics are:
 
@@ -185,7 +220,8 @@ with a human-readable `reasons` list. Gates:
 
 - `workspace` — the selected workspace is `ready`; `missing` and `incomplete`
   states include recovery reasons and return 503.
-- `db` — a readonly database connection answers `SELECT 1`.
+- `db` — the registered DB-owner maintenance authority answers a bounded readonly
+  `SELECT 1` probe. An unavailable or closing owner returns 503.
 - `migrations` — no pending database migrations.
 - `embedding` — the configured embedding provider is reachable. Passes with
   `note: "disabled"` when the provider is intentionally `"none"`.
@@ -342,9 +378,13 @@ silent fallback or hard-blocked extraction after boot.
   },
   "pipeline": {
     "queue": {
-      "memory": { "pending": 0, "leased": 0, "completed": 0, "failed": 0, "dead": 0, "oldestAgeSec": 0, "oldestDeadAgeSec": 0, "lastError": null, "completeness": "exact" },
-      "summary": { "pending": 0, "leased": 0, "completed": 0, "failed": 0, "dead": 0, "oldestAgeSec": 0, "oldestDeadAgeSec": 0, "lastError": null, "completeness": "exact" }
+      "memory": { "pending": 0, "leased": 0, "completed": 0, "failed": 0, "dead": 0, "oldestAgeSec": 0, "oldestDeadAgeSec": 0, "lastError": null, "completeness": "unknown" },
+      "summary": { "pending": 0, "leased": 0, "completed": 0, "failed": 0, "dead": 0, "oldestAgeSec": 0, "oldestDeadAgeSec": 0, "lastError": null, "completeness": "unknown" }
     }
+  },
+  "dreaming": {
+    "enabled": true,
+    "workerRunning": false
   },
   "providerResolution": {
     "extraction": {
@@ -366,8 +406,8 @@ silent fallback or hard-blocked extraction after boot.
     }
   },
   "logging": {
-    "logDir": "/home/user/.agents/.daemon/logs",
-    "logFile": "/home/user/.agents/.daemon/logs/signet-2026-04-29.log"
+    "logDir": "/home/user/.agents/runtime/logs",
+    "logFile": "/home/user/.agents/runtime/logs/signet-2026-04-29.log"
   },
   "activeSessions": 1,
   "bypassedSessions": 1,
@@ -435,16 +475,70 @@ extraction provider is unavailable or routed to a fallback target.
 When extraction is blocked, `providerResolution.extraction.blockedBy` contains
 the first routing candidate's policy and runtime gate reasons in evaluation
 order. The array is empty for non-blocked states.
-`pipeline.queue` exposes per-queue counts (memory / summary).
+`pipeline.queue` is a nonblocking snapshot; its zero-valued counts have
+`completeness: "unknown"` and must not be read as verified zeros. Use
+`GET /api/diagnostics/queue` for bounded queue counts. `dreaming.enabled`
+reports configuration and `dreaming.workerRunning` reports the live worker
+state; they are separate from the most recent scheduler decision in
+`pipeline.dreaming`. `dreaming.blockedBy` names what keeps automatic Dreaming
+from running: `"disabled"` (`memory.pipelineV2.enabled` is `false`),
+`"paused"`, `"frozen"`, or `"no_provider"` (no inference route resolves for
+Dreaming). It is `null` when nothing blocks it.
 `pipeline.dreaming` records the latest periodic Dreaming scheduler decision.
 It is `null` before the worker starts. A `deferred` result with
 `reason: "queue_pressure"` means the scheduler itself yielded that sweep to
 queue health. It does not infer a queue deferral from another readiness gate.
+A `blocked` result with `reason: "inference_unavailable"` means no inference
+route resolved; the worker rechecks every 30 seconds and returns to `idle` once
+a provider is connected.
 The retired worker's load/overload telemetry is no longer reported.
 `transcripts.capture` exposes compact durable transcript-capture queue counts;
 use `GET /api/diagnostics/transcripts` for detailed artifact/audit diagnostics.
 Use `GET /api/inference/status` for the shared inference control plane status.
 
+### GET /api/status/workspace
+
+Returns workspace statistics for the daemon's resolved agent. Callers cannot
+select a different agent or workspace. `memoryCount` excludes soft-deleted
+memories and is scoped to the daemon agent on current schemas; legacy
+python/cli-v1 schemas predate agent scoping and soft deletes, so the count is
+unscoped there while `needsMigration` still reports the upgrade path.
+`capturedSessionCount` counts distinct captured session keys and is
+`null` when the transcript table is unavailable. The ontology fields use the
+same agent-scoped knowledge statistics as `GET /api/knowledge/stats`;
+`coveragePercent` and `unassignedMemoryCount` describe memory IDs represented by
+active graph mentions; they do not count every stored workspace memory. Returns
+`schema` and `needsMigration` from the database owner, so schema diagnostics do
+not open the workspace database from the CLI process. `needsMigration` is true
+for recognized legacy schemas and false for the current or unknown schema.
+Returns `503` when the owner cannot provide a complete summary. Standard daemon
+authentication applies.
+
+**Response**
+
+```json
+{
+  "agentId": "default",
+  "memoryCount": 190,
+  "capturedSessionCount": 17,
+  "schema": "core",
+  "needsMigration": false,
+  "ontology": {
+    "entityCount": 14,
+    "aspectCount": 22,
+    "attributeCount": 31,
+    "claimCount": 8,
+    "constraintCount": 5,
+    "dependencyCount": 12,
+    "unassignedMemoryCount": 7,
+    "coveragePercent": 82.5,
+    "feedbackUpdatedAspectCount": 3,
+    "averageAspectWeight": 0.641,
+    "maxWeightAspectCount": 2,
+    "minWeightAspectCount": 1
+  }
+}
+```
 
 ### GET /api/diagnostics/workloads
 

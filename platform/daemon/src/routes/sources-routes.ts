@@ -1,8 +1,8 @@
 import { execFileHidden as execFile } from "@signet/core";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import {
 	LEGACY_OBSIDIAN_CHUNK_SOURCE_TYPE,
@@ -10,17 +10,25 @@ import {
 	type SignetSourceEntry,
 	addDiscordSource,
 	addGitHubSource,
+	addNotionSource,
 	addObsidianSource,
 	addWebSource,
+	DEFAULT_DISCORD_DESKTOP_CACHE_PATH,
 	loadSourcesConfig,
 	markSourceIndexed,
+	normalizePublicWebUrl,
+	notionSourceId,
+	parseDiscordSettings,
+	parseGitHubSettings,
 	removeSourceIfGeneration,
 	resolveDefaultBasePath,
+	resolveWorkspaceLayout,
 } from "@signet/core";
 import type { Context, Hono } from "hono";
 import { resolveDaemonAgentId } from "../agent-id";
 import { getPeerAddress } from "../auth/middleware";
 import { dbOwnerQuery, dbOwnerSourceEvidenceEligibility } from "../db-owner-runtime";
+import type { DbOwnerParameter } from "../db-owner-protocol";
 import { fetchEmbedding } from "../embedding-fetch";
 import { type ImportExtractionOutcome, readImportedSourceOutcome } from "../imported-source-outcome";
 import { logger } from "../logger";
@@ -43,13 +51,16 @@ import {
 	consumeCanceledSourceIndexJob,
 	failSourceIndexJob,
 	getSourceIndexJob,
+	getSourceIndexRuns,
 	invalidateSourceIndexJob,
 	isCurrentSourceIndexJob,
 	isSourceIndexInFlight,
 	markSourceIndexInFlight,
 	markSourceIndexJobRunning,
 	pauseSourceIndexJob,
+	trackSourceIndexRun,
 	updateSourceIndexJobProgress,
+	waitForSourceIndexRuns,
 } from "../source-index-progress";
 import {
 	recordSourceConnected,
@@ -64,6 +75,13 @@ import {
 	trackSourceLifecycleWrite,
 } from "../source-lifecycle-telemetry";
 import { getSourceProvider } from "../source-providers";
+import {
+	beginSourceDeletion,
+	beginSourceMutation,
+	isSourceDeletionInFlight,
+	SOURCE_DELETION_IN_PROGRESS_ERROR,
+	SOURCE_OPERATION_IN_PROGRESS_ERROR,
+} from "../source-deletion-lock";
 import { exportSourceSnapshot, importSourceSnapshot } from "../source-snapshots";
 import { purgeSourceOwnedRows } from "../source-purge";
 
@@ -151,14 +169,12 @@ export interface RegisterSourcesRoutesDeps {
 	readonly pickerPlatform?: NodeJS.Platform;
 	readonly platform?: NodeJS.Platform;
 	readonly recordIndexOperation?: typeof recordSourceIndexOperation;
+	readonly importSourceSnapshot?: typeof importSourceSnapshot;
 }
 
-const sourceIndexRuns = new Set<{ readonly sourceId: string; readonly jobId: string; readonly run: Promise<void> }>();
 const sourceIndexTimers = new Set<ReturnType<typeof setTimeout>>();
 const routeSourceJobs = new Map<string, { readonly job: SourceIndexJob; readonly input: SourceIndexJobInput }>();
 let sourceIndexStopping = false;
-
-/** Stop route-owned source work before the daemon closes telemetry and SQLite. */
 export async function stopSourceIndexJobs(): Promise<void> {
 	sourceIndexStopping = true;
 	for (const timer of sourceIndexTimers) clearTimeout(timer);
@@ -178,8 +194,7 @@ export async function stopSourceIndexJobs(): Promise<void> {
 		});
 		invalidateSourceIndexJob(sourceId);
 	}
-	await Promise.allSettled([...sourceIndexRuns].map(({ run }) => run));
-	sourceIndexRuns.clear();
+	await waitForSourceIndexRuns("route");
 	routeSourceJobs.clear();
 }
 
@@ -188,6 +203,7 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 	const startBridge = deps.startBridge ?? startNativeMemoryBridge;
 	const purgeNativeSource = deps.purgeNativeSource ?? purgeNativeMemorySourceArtifacts;
 	const recordIndexOperation = deps.recordIndexOperation ?? recordSourceIndexOperation;
+	const importSnapshot = deps.importSourceSnapshot ?? importSourceSnapshot;
 	const pickerExecFile = deps.pickerExecFile ?? execFileAsync;
 	const pickerPlatform = deps.pickerPlatform ?? process.platform;
 	app.get("/api/sources", async (c) => {
@@ -257,22 +273,28 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 		const excludeGlobs = Array.isArray(body.excludeGlobs)
 			? body.excludeGlobs.filter((entry) => typeof entry === "string")
 			: undefined;
-		const result = addObsidianSource({ root, name: body.name, excludeGlobs }, agentsDir);
-		if (result.ok === false) {
-			recordSourceConnectionFailure("obsidian", result.error);
-			return c.json({ error: result.error }, 400);
+		const releaseSourceMutation = beginSourceMutationLease(c, sourceIdForObsidian(root));
+		if (typeof releaseSourceMutation !== "function") return releaseSourceMutation;
+		try {
+			const result = addObsidianSource({ root, name: body.name, excludeGlobs }, agentsDir);
+			if (result.ok === false) {
+				recordSourceConnectionFailure("obsidian", result.error);
+				return c.json({ error: result.error }, 400);
+			}
+			await recordSourceConnected(result.source, resolveDaemonAgentId());
+
+			const job = enqueueSourceIndexJob({
+				source: result.source,
+				agentsDir,
+				startBridge,
+				purgeNativeSource,
+				recordIndexOperation,
+			});
+
+			return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
+		} finally {
+			releaseSourceMutation();
 		}
-		await recordSourceConnected(result.source, resolveDaemonAgentId());
-
-		const job = enqueueSourceIndexJob({
-			source: result.source,
-			agentsDir,
-			startBridge,
-			purgeNativeSource,
-			recordIndexOperation,
-		});
-
-		return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
 	});
 
 	app.post("/api/sources/discord", async (c) => {
@@ -294,45 +316,51 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 			: Array.isArray(body.channels)
 				? body.channels.filter((entry): entry is string => typeof entry === "string")
 				: undefined;
-		const result = addDiscordSource(
-			{
-				guildIds,
-				tokenRef: typeof body.tokenRef === "string" ? body.tokenRef : "",
-				name: body.name,
-				desktopCachePath: typeof body.desktopCachePath === "string" ? body.desktopCachePath : undefined,
-				desktopCacheFullScan: body.desktopCacheFullScan,
-				channelFilter,
-				maxMessagesPerChannel: body.maxMessagesPerChannel,
-				includeThreads: body.includeThreads,
-				includeArchivedThreads: body.includeArchivedThreads,
-				includePrivateArchivedThreads: body.includePrivateArchivedThreads,
-				includeMembers: body.includeMembers,
-				includeAttachments: body.includeAttachments,
-				includeAttachmentText: body.includeAttachmentText,
-				maxAttachmentTextBytes: body.maxAttachmentTextBytes,
-				includeEmbeds: body.includeEmbeds,
-				includePolls: body.includePolls,
-				includeThreadMembers: body.includeThreadMembers,
-				since: body.since,
-				syncMode: body.syncMode,
-			},
-			agentsDir,
-		);
-		if (result.ok === false) {
-			recordSourceConnectionFailure("discord", result.error);
-			return c.json({ error: result.error }, 400);
+		const releaseSourceMutation = beginSourceMutationLease(c, sourceIdForDiscord(body, guildIds));
+		if (typeof releaseSourceMutation !== "function") return releaseSourceMutation;
+		try {
+			const result = addDiscordSource(
+				{
+					guildIds,
+					tokenRef: typeof body.tokenRef === "string" ? body.tokenRef : "",
+					name: body.name,
+					desktopCachePath: typeof body.desktopCachePath === "string" ? body.desktopCachePath : undefined,
+					desktopCacheFullScan: body.desktopCacheFullScan,
+					channelFilter,
+					maxMessagesPerChannel: body.maxMessagesPerChannel,
+					includeThreads: body.includeThreads,
+					includeArchivedThreads: body.includeArchivedThreads,
+					includePrivateArchivedThreads: body.includePrivateArchivedThreads,
+					includeMembers: body.includeMembers,
+					includeAttachments: body.includeAttachments,
+					includeAttachmentText: body.includeAttachmentText,
+					maxAttachmentTextBytes: body.maxAttachmentTextBytes,
+					includeEmbeds: body.includeEmbeds,
+					includePolls: body.includePolls,
+					includeThreadMembers: body.includeThreadMembers,
+					since: body.since,
+					syncMode: body.syncMode,
+				},
+				agentsDir,
+			);
+			if (result.ok === false) {
+				recordSourceConnectionFailure("discord", result.error);
+				return c.json({ error: result.error }, 400);
+			}
+			await recordSourceConnected(result.source, resolveDaemonAgentId());
+
+			const job = enqueueSourceIndexJob({
+				source: result.source,
+				agentsDir,
+				startBridge,
+				purgeNativeSource,
+				recordIndexOperation,
+			});
+
+			return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
+		} finally {
+			releaseSourceMutation();
 		}
-		await recordSourceConnected(result.source, resolveDaemonAgentId());
-
-		const job = enqueueSourceIndexJob({
-			source: result.source,
-			agentsDir,
-			startBridge,
-			purgeNativeSource,
-			recordIndexOperation,
-		});
-
-		return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
 	});
 
 	app.get("/api/sources/:sourceId/snapshot", (c) => {
@@ -366,6 +394,8 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 		if (isSourceImportBlocked(source.id)) {
 			return c.json({ error: "Source snapshot import cannot run while source indexing is queued or running" }, 409);
 		}
+		const releaseSourceMutation = beginSourceMutation(source.id);
+		if (releaseSourceMutation === undefined) return c.json({ error: SOURCE_OPERATION_IN_PROGRESS_ERROR }, 409);
 		markSourceIndexInFlight(source.id);
 		try {
 			let body: unknown;
@@ -386,7 +416,7 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 				});
 				return c.json({ error: "Invalid JSON body" }, 400);
 			}
-			const result = await importSourceSnapshot({
+			const result = await importSnapshot({
 				source,
 				agentId: resolveDaemonAgentId(),
 				snapshot: body,
@@ -422,6 +452,7 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 			return c.json(result);
 		} finally {
 			clearSourceIndexInFlight(source.id);
+			releaseSourceMutation();
 		}
 	});
 
@@ -439,39 +470,80 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 			: typeof body.repo === "string"
 				? [body.repo]
 				: [];
-		const result = addGitHubSource(
-			{
-				repos,
-				tokenRef: typeof body.tokenRef === "string" ? body.tokenRef : undefined,
-				name: body.name,
-				resourceTypes: body.resourceTypes,
-				state: body.state,
-				includeComments: body.includeComments,
-				labels: Array.isArray(body.labels)
-					? body.labels.filter((entry): entry is string => typeof entry === "string")
-					: undefined,
-				docPaths: Array.isArray(body.docPaths)
-					? body.docPaths.filter((entry): entry is string => typeof entry === "string")
-					: undefined,
-				maxItemsPerRepo: body.maxItemsPerRepo,
-			},
-			agentsDir,
-		);
-		if (result.ok === false) {
-			recordSourceConnectionFailure("github", result.error);
-			return c.json({ error: result.error }, 400);
+		const releaseSourceMutation = beginSourceMutationLease(c, sourceIdForGitHub(repos));
+		if (typeof releaseSourceMutation !== "function") return releaseSourceMutation;
+		try {
+			const result = addGitHubSource(
+				{
+					repos,
+					tokenRef: typeof body.tokenRef === "string" ? body.tokenRef : undefined,
+					name: body.name,
+					resourceTypes: body.resourceTypes,
+					state: body.state,
+					includeComments: body.includeComments,
+					labels: Array.isArray(body.labels)
+						? body.labels.filter((entry): entry is string => typeof entry === "string")
+						: undefined,
+					docPaths: Array.isArray(body.docPaths)
+						? body.docPaths.filter((entry): entry is string => typeof entry === "string")
+						: undefined,
+					maxItemsPerRepo: body.maxItemsPerRepo,
+				},
+				agentsDir,
+			);
+			if (result.ok === false) {
+				recordSourceConnectionFailure("github", result.error);
+				return c.json({ error: result.error }, 400);
+			}
+			await recordSourceConnected(result.source, resolveDaemonAgentId());
+
+			const job = enqueueSourceIndexJob({
+				source: result.source,
+				agentsDir,
+				startBridge,
+				purgeNativeSource,
+				recordIndexOperation,
+			});
+
+			return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
+		} finally {
+			releaseSourceMutation();
 		}
-		await recordSourceConnected(result.source, resolveDaemonAgentId());
+	});
 
-		const job = enqueueSourceIndexJob({
-			source: result.source,
-			agentsDir,
-			startBridge,
-			purgeNativeSource,
-			recordIndexOperation,
-		});
-
-		return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
+	app.post("/api/sources/notion", async (c) => {
+		let parsed: unknown;
+		try {
+			parsed = await c.req.json();
+		} catch {
+			recordSourceConnectionFailure("notion", "invalid configuration");
+			return c.json({ error: "Invalid JSON body" }, 400);
+		}
+		const body = parseAddNotionSourceBody(parsed);
+		if ("error" in body) {
+			recordSourceConnectionFailure("notion", "invalid configuration");
+			return c.json({ error: body.error }, 400);
+		}
+		const releaseSourceMutation = beginSourceMutationLease(c, notionSourceId(body.tokenRef));
+		if (typeof releaseSourceMutation !== "function") return releaseSourceMutation;
+		try {
+			const result = addNotionSource(body, agentsDir);
+			if (result.ok === false) {
+				recordSourceConnectionFailure("notion", result.error);
+				return c.json({ error: result.error }, 400);
+			}
+			await recordSourceConnected(result.source, resolveDaemonAgentId());
+			const job = enqueueSourceIndexJob({
+				source: result.source,
+				agentsDir,
+				startBridge,
+				purgeNativeSource,
+				recordIndexOperation,
+			});
+			return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
+		} finally {
+			releaseSourceMutation();
+		}
 	});
 
 	app.post("/api/sources/web", async (c) => {
@@ -483,26 +555,32 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 			recordSourceConnectionFailure("web", "invalid configuration");
 			return c.json({ error: "Invalid JSON body" }, 400);
 		}
-		const result = addWebSource(
-			{
-				url: typeof body.url === "string" ? body.url : "",
-				name: typeof body.name === "string" ? body.name : undefined,
-			},
-			agentsDir,
-		);
-		if (result.ok === false) {
-			recordSourceConnectionFailure("web", result.error);
-			return c.json({ error: result.error }, 400);
+		const releaseSourceMutation = beginSourceMutationLease(c, sourceIdForWeb(body.url));
+		if (typeof releaseSourceMutation !== "function") return releaseSourceMutation;
+		try {
+			const result = addWebSource(
+				{
+					url: typeof body.url === "string" ? body.url : "",
+					name: typeof body.name === "string" ? body.name : undefined,
+				},
+				agentsDir,
+			);
+			if (result.ok === false) {
+				recordSourceConnectionFailure("web", result.error);
+				return c.json({ error: result.error }, 400);
+			}
+			await recordSourceConnected(result.source, resolveDaemonAgentId());
+			const job = enqueueSourceIndexJob({
+				source: result.source,
+				agentsDir,
+				startBridge,
+				purgeNativeSource,
+				recordIndexOperation,
+			});
+			return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
+		} finally {
+			releaseSourceMutation();
 		}
-		await recordSourceConnected(result.source, resolveDaemonAgentId());
-		const job = enqueueSourceIndexJob({
-			source: result.source,
-			agentsDir,
-			startBridge,
-			purgeNativeSource,
-			recordIndexOperation,
-		});
-		return c.json({ source: result.source, created: result.created, indexed: 0, queued: true, job }, 202);
 	});
 
 	app.delete("/api/sources/:sourceId", async (c) => {
@@ -512,21 +590,166 @@ export function registerSourcesRoutes(app: Hono, deps: RegisterSourcesRoutesDeps
 		const sourceAgentId = resolveDaemonAgentId();
 		if (source.kind === "import" && source.providerSettings?.agentId !== sourceAgentId)
 			return c.json({ error: "Source not found" }, 404);
-		// Keep the configured source until lifecycle state and provider artifacts
-		// are gone. The config is the durable retry handle when an owner or purge
-		// operation fails partway through deletion.
-		cancelSourceIndexJob(source.id);
-		recordSourceDeletionTombstone(source, sourceAgentId, agentsDir);
-		await removeSourceLifecycleState(source, sourceAgentId);
-		const provider = getSourceProvider(source.kind);
-		const purged =
-			(await purgeSourceOwnedRows({ sourceId: source.id, agentId: sourceAgentId })) +
-			(provider ? await purgeSource(provider, source, sourceAgentId, purgeNativeSource) : 0);
-		const result = removeSourceIfGeneration(sourceId, source.generation, agentsDir);
-		if (result.ok === false) return c.json({ error: result.error }, 500);
-		if (!isSourceIndexInFlight(source.id)) clearSourceDeletionTombstone(source, sourceAgentId, agentsDir);
-		return c.json({ source: result.source ?? source, purged });
+		const releaseSourceDeletion = beginSourceDeletion(source.id);
+		if (releaseSourceDeletion === undefined) {
+			const error = isSourceDeletionInFlight(source.id)
+				? SOURCE_DELETION_IN_PROGRESS_ERROR
+				: SOURCE_OPERATION_IN_PROGRESS_ERROR;
+			return c.json({ error }, 409);
+		}
+		let deferRelease = false;
+		try {
+			cancelSourceIndexJob(source.id);
+			recordSourceDeletionTombstone(source, sourceAgentId, agentsDir);
+			const provider = getSourceProvider(source.kind);
+			let purged = 0;
+			try {
+				await removeSourceLifecycleState(source, sourceAgentId);
+				purged += await purgeSourceOwnedRows({ sourceId: source.id, agentId: sourceAgentId });
+				if (provider) purged += await purgeSource(provider, source, sourceAgentId, purgeNativeSource);
+			} catch (error) {
+				deferRelease = true;
+				return sourceDeletionPending(c, source, purged, error);
+			}
+			const result = removeSourceIfGeneration(sourceId, source.generation, agentsDir);
+			if (result.ok === false) {
+				deferRelease = true;
+				return sourceDeletionPending(c, source, purged, new Error(result.error));
+			}
+			const cleanupPending = isSourceIndexInFlight(source.id);
+			if (!cleanupPending) {
+				try {
+					clearSourceDeletionTombstone(source, sourceAgentId, agentsDir);
+				} catch (error) {
+					logger.warn("system", `Source deletion completed for ${source.id}; cleanup marker remains for retry`, {
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return c.json({ source: result.source ?? source, purged, cleanupPending: true });
+				}
+			}
+			if (cleanupPending) {
+				deferRelease = true;
+				return c.json({ source: result.source ?? source, purged, cleanupPending: true });
+			}
+			return c.json({ source: result.source ?? source, purged });
+		} finally {
+			if (deferRelease) releaseSourceDeletionAfterIndexRuns(source.id, releaseSourceDeletion);
+			else releaseSourceDeletion();
+		}
 	});
+}
+
+function sourceDeletionPending(c: Context, source: SignetSourceEntry, purged: number, error: unknown): Response {
+	logger.warn("system", `Source deletion deferred for ${source.id}; retry remains available`, {
+		error: error instanceof Error ? error.message : String(error),
+	});
+	return c.json({ source, purged, pending: true }, 202);
+}
+
+function beginSourceMutationLease(c: Context, sourceId: string | undefined): (() => void) | Response {
+	if (sourceId === undefined) return () => {};
+	const release = beginSourceMutation(sourceId);
+	if (release === undefined) return c.json({ error: SOURCE_OPERATION_IN_PROGRESS_ERROR }, 409);
+	return release;
+}
+
+function sourceIdForObsidian(root: string): string | undefined {
+	if (typeof root !== "string") return undefined;
+	const trimmed = root.trim();
+	const normalized = trimmed ? resolve(trimmed) : root;
+	return `obsidian:${createHash("sha256").update(normalized).digest("hex").slice(0, 16)}`;
+}
+
+function sourceIdForWeb(url: string | undefined): string | undefined {
+	if (url === undefined) return undefined;
+	const normalized = normalizePublicWebUrl(url);
+	return normalized === null ? undefined : `web:${createHash("sha256").update(normalized).digest("hex").slice(0, 16)}`;
+}
+
+function sourceIdForDiscord(body: AddDiscordSourceBody, guildIds: readonly string[]): string {
+	const settings = parseDiscordSettings({
+		guildIds,
+		desktopCachePath: body.desktopCachePath,
+		syncMode: body.syncMode,
+	});
+	const root =
+		settings.syncMode === "desktop-cache"
+			? (settings.desktopCachePath ?? DEFAULT_DISCORD_DESKTOP_CACHE_PATH)
+			: `discord://guilds/${settings.guildIds.slice().sort().join(",")}`;
+	return settings.syncMode === "desktop-cache"
+		? `discord-cache:${createHash("sha256").update(root).digest("hex").slice(0, 16)}`
+		: `discord:${createHash("sha256").update(settings.guildIds.slice().sort().join(",")).digest("hex").slice(0, 16)}`;
+}
+
+function parseAddNotionSourceBody(
+	value: unknown,
+): { readonly tokenRef: string; readonly name?: string; readonly maxPages?: number } | { readonly error: string } {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return { error: "Request body must be an object" };
+	const body = value as Record<string, unknown>;
+	if (typeof body.tokenRef !== "string") return { error: "Notion tokenRef is required" };
+	if (body.name !== undefined && typeof body.name !== "string") return { error: "Notion name must be a string" };
+	if (body.maxPages !== undefined && typeof body.maxPages !== "number")
+		return { error: "Notion maxPages must be a number" };
+	return {
+		tokenRef: body.tokenRef,
+		...(typeof body.name === "string" ? { name: body.name } : {}),
+		...(typeof body.maxPages === "number" ? { maxPages: body.maxPages } : {}),
+	};
+}
+
+function sourceIdForGitHub(repos: readonly string[]): string {
+	const settings = parseGitHubSettings({ repos });
+	return `github:${createHash("sha256").update(settings.repos.slice().sort().join(",")).digest("hex").slice(0, 16)}`;
+}
+
+function releaseSourceDeletionAfterIndexRuns(sourceId: string, release: () => void): void {
+	const runs = getSourceIndexRuns(sourceId).map((activeRun) => activeRun.run);
+	if (runs.length === 0) {
+		release();
+		return;
+	}
+	void Promise.allSettled(runs).then(release);
+}
+
+export async function finalizeCancelledSourceIndexJob(input: {
+	readonly source: SignetSourceEntry;
+	readonly jobId: string;
+	readonly agentsDir: string;
+	readonly agentId: string;
+	readonly purgeNativeSource?: typeof purgeNativeMemorySourceArtifacts;
+}): Promise<void> {
+	if (!consumeCanceledSourceIndexJob(input.jobId) || sourceIndexStopping) return;
+	const tombstone = loadSourceDeletionTombstones(input.agentsDir).find(
+		(entry) =>
+			entry.source.id === input.source.id &&
+			entry.source.generation === input.source.generation &&
+			entry.agentId === input.agentId,
+	);
+	if (!tombstone) return;
+	const configuredSource = loadSourcesConfig(input.agentsDir).sources.find(
+		(configured) => configured.id === input.source.id,
+	);
+	if (configuredSource !== undefined && configuredSource.generation !== input.source.generation) return;
+	const provider = getSourceProvider(input.source.kind);
+	try {
+		await removeSourceLifecycleState(input.source, input.agentId);
+		await purgeSourceOwnedRows({ sourceId: input.source.id, agentId: input.agentId });
+		if (provider) {
+			await purgeSource(
+				provider,
+				input.source,
+				input.agentId,
+				input.purgeNativeSource ?? purgeNativeMemorySourceArtifacts,
+			);
+		}
+		const removed = removeSourceIfGeneration(input.source.id, input.source.generation, input.agentsDir);
+		if (!removed.ok) throw new Error(removed.error);
+		clearSourceDeletionTombstone(input.source, input.agentId, input.agentsDir);
+	} catch (error) {
+		logger.warn("system", `Source deletion finalization failed for source ${input.source.id}; deferring to next boot`, {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
 }
 
 function findConfiguredSource(
@@ -748,12 +971,17 @@ async function runSourceIndexJob(input: SourceIndexJobInput, job: SourceIndexJob
 		});
 	} finally {
 		await bridge?.close().catch(() => undefined);
-		if (consumeCanceledSourceIndexJob(job.id) && !sourceIndexStopping) {
-			const provider = getSourceProvider(input.source.kind);
-			if (provider) await purgeSource(provider, input.source, resolveDaemonAgentId(), input.purgeNativeSource);
-			clearSourceDeletionTombstone(input.source, resolveDaemonAgentId(), input.agentsDir);
+		try {
+			await finalizeCancelledSourceIndexJob({
+				source: input.source,
+				jobId: job.id,
+				agentsDir: input.agentsDir,
+				agentId,
+				purgeNativeSource: input.purgeNativeSource,
+			});
+		} finally {
+			clearSourceIndexInFlight(input.source.id);
 		}
-		clearSourceIndexInFlight(input.source.id);
 	}
 }
 
@@ -763,61 +991,62 @@ function scheduleSourceIndexJob(input: SourceIndexJobInput, job: SourceIndexJob,
 		sourceIndexTimers.delete(timer);
 		if (!isCurrentSourceIndexJob(input.source.id, job.id)) return;
 		const run = runSourceIndexJob(input, job);
-		const activeRun = { sourceId: input.source.id, jobId: job.id, run };
-		sourceIndexRuns.add(activeRun);
-		void run.finally(() => {
-			sourceIndexRuns.delete(activeRun);
-		});
+		trackSourceIndexRun({ sourceId: input.source.id, jobId: job.id, kind: "route", run });
 	}, delayMs);
 	sourceIndexTimers.add(timer);
 	timer.unref?.();
 }
-
-/**
- * Purge artifacts of sources deleted while the daemon was down and drop their
- * tombstones. Runs in the post-ready deferred lane AFTER the DB accessor is
- * initialized (#1143): route registration executes before DB init, so it must
- * not trigger this — the old placement crashed the daemon with "DbAccessor not
- * initialised" whenever a tombstone existed at boot.
- *
- * A failed lifecycle cleanup or purge is logged and its tombstone is kept for
- * the next boot: tombstone processing must never brick startup.
- */
 export async function cleanupSourceDeletionTombstones(
 	agentsDir = resolveDefaultBasePath(),
 	purgeNativeSource: typeof purgeNativeMemorySourceArtifacts = purgeNativeMemorySourceArtifacts,
 ): Promise<void> {
 	const tombstones = loadSourceDeletionTombstones(agentsDir);
 	if (tombstones.length === 0) return;
-	const configuredSources = loadSourcesConfig(agentsDir).sources;
 	const remaining: SourceDeletionTombstone[] = [];
-	for (const tombstone of tombstones) {
-		const configured = configuredSources.find((source: SignetSourceEntry) => source.id === tombstone.source.id);
-		if (configured !== undefined && configured.generation !== tombstone.source.generation) {
-			// Artifact purge is keyed by source id rather than generation. Retain
-			// every tombstone while that id is configured: this avoids deleting a
-			// deliberately re-added source, while generation-specific route
-			// filtering leaves a newer source generation visible.
-			remaining.push(tombstone);
-			continue;
-		}
-		const provider = getSourceProvider(tombstone.source.kind);
-		try {
-			await removeSourceLifecycleState(tombstone.source, tombstone.agentId);
-			await purgeSourceOwnedRows({ sourceId: tombstone.source.id, agentId: tombstone.agentId });
-			if (provider) await purgeSource(provider, tombstone.source, tombstone.agentId, purgeNativeSource);
-			const removed = removeSourceIfGeneration(tombstone.source.id, tombstone.source.generation, agentsDir);
-			if (!removed.ok) throw new Error(removed.error);
-		} catch (err) {
-			remaining.push(tombstone);
-			logger.warn(
-				"system",
-				`Source-deletion tombstone cleanup failed for source ${tombstone.source.id}; deferring to next boot`,
-				{ error: err instanceof Error ? err.message : String(err) },
+	const processedTombstoneIds = new Set<string>();
+	const releaseSourceDeletions: Array<() => void> = [];
+	try {
+		for (const tombstone of tombstones) {
+			const releaseSourceDeletion = beginSourceDeletion(tombstone.source.id);
+			if (releaseSourceDeletion === undefined) {
+				remaining.push(tombstone);
+				continue;
+			}
+			releaseSourceDeletions.push(releaseSourceDeletion);
+			const configured = loadSourcesConfig(agentsDir).sources.find(
+				(source: SignetSourceEntry) => source.id === tombstone.source.id,
 			);
+			if (configured !== undefined && configured.generation !== tombstone.source.generation) {
+				remaining.push(tombstone);
+				continue;
+			}
+			const provider = getSourceProvider(tombstone.source.kind);
+			try {
+				await removeSourceLifecycleState(tombstone.source, tombstone.agentId);
+				await purgeSourceOwnedRows({ sourceId: tombstone.source.id, agentId: tombstone.agentId });
+				if (provider) await purgeSource(provider, tombstone.source, tombstone.agentId, purgeNativeSource);
+				const removed = removeSourceIfGeneration(tombstone.source.id, tombstone.source.generation, agentsDir);
+				if (!removed.ok) throw new Error(removed.error);
+				processedTombstoneIds.add(tombstone.id);
+			} catch (err) {
+				remaining.push(tombstone);
+				logger.warn(
+					"system",
+					`Source-deletion tombstone cleanup failed for source ${tombstone.source.id}; deferring to next boot`,
+					{ error: err instanceof Error ? err.message : String(err) },
+				);
+			}
 		}
+		const latest = loadSourceDeletionTombstones(agentsDir);
+		const merged = new Map<string, SourceDeletionTombstone>();
+		for (const tombstone of remaining) merged.set(tombstone.id, tombstone);
+		for (const tombstone of latest) {
+			if (!processedTombstoneIds.has(tombstone.id)) merged.set(tombstone.id, tombstone);
+		}
+		saveSourceDeletionTombstones([...merged.values()], agentsDir);
+	} finally {
+		for (const releaseSourceDeletion of releaseSourceDeletions.reverse()) releaseSourceDeletion();
 	}
-	saveSourceDeletionTombstones(remaining, agentsDir);
 }
 
 function purgeSource(
@@ -851,9 +1080,6 @@ function recordSourceDeletionTombstone(source: SignetSourceEntry, agentId: strin
 }
 
 function clearSourceDeletionTombstone(source: SignetSourceEntry, agentId: string, agentsDir: string): void {
-	// The canceled-index cleanup path can run after a failed config write. Keep
-	// the marker for the same source generation, but allow a deliberate
-	// reconnect to replace that generation and become live again.
 	const configured = loadSourcesConfig(agentsDir).sources.find((entry) => entry.id === source.id);
 	if (configured?.generation === source.generation) return;
 	const tombstones = loadSourceDeletionTombstones(agentsDir);
@@ -885,7 +1111,7 @@ function saveSourceDeletionTombstones(tombstones: readonly SourceDeletionTombsto
 }
 
 function sourceDeletionTombstonesPath(agentsDir: string): string {
-	return `${agentsDir.replace(/\/$/, "")}/.daemon/source-deletion-tombstones.json`;
+	return join(resolveWorkspaceLayout(agentsDir).runtime, "source-deletion-tombstones.json");
 }
 
 function isSourceDeletionTombstone(value: unknown): value is SourceDeletionTombstone {
@@ -906,12 +1132,11 @@ interface SourceStats {
 	readonly artifacts: number;
 	readonly chunks: number;
 	readonly indexed: number;
-	/** Whether canonical visible source evidence still has an eligible undelivered fragment. */
 	readonly hasEligibleUnconsumedEvidence: boolean;
 }
 
 interface SourceHealth {
-	readonly status: "healthy" | "degraded" | "unhealthy" | "empty";
+	readonly status: "healthy" | "degraded" | "unhealthy" | "empty" | "unknown";
 	readonly generatedAt: string;
 	readonly error?: string;
 	readonly latestArtifactAt: string | null;
@@ -1042,7 +1267,7 @@ async function sourceHealth(source: SignetSourceEntry, agentId: string, stats: S
 		};
 	} catch (err) {
 		return {
-			status: "unhealthy",
+			status: "unknown",
 			error: `Source health diagnostics failed: ${err instanceof Error ? err.message : String(err)}`,
 			generatedAt,
 			latestArtifactAt: null,
@@ -1064,63 +1289,92 @@ async function sourceHealth(source: SignetSourceEntry, agentId: string, stats: S
 		};
 	}
 }
+const SOURCE_HEALTH_PAGE_ROWS = 500;
+
+async function pagedSourceHealthRows<Row extends { readonly rowid: number }>(
+	sql: string,
+	params: readonly DbOwnerParameter[],
+	operation: string,
+	visit: (rows: readonly Row[]) => void,
+): Promise<void> {
+	let cursor = 0;
+	for (;;) {
+		const rows = await dbOwnerQuery<Row[]>(
+			{ sql, params: [...params, cursor, SOURCE_HEALTH_PAGE_ROWS], result: "all" },
+			{ operation, lane: "read", deadlineMs: 5_000 },
+		);
+		visit(rows);
+		const last = rows.at(-1);
+		if (!last || rows.length < SOURCE_HEALTH_PAGE_ROWS) return;
+		cursor = last.rowid;
+	}
+}
 
 async function sourceOrphanChunks(source: SignetSourceEntry, agentId: string): Promise<number> {
 	const chunkPrefix = `${source.id}:`;
-	const [livePaths, chunks] = await Promise.all([
-		liveSourceArtifactPaths(source, agentId),
-		dbOwnerQuery<SourceChunkHealthRow[]>(
-			{
-				sql: `SELECT source_id, chunk_text FROM embeddings
-				 WHERE agent_id = ? AND source_type IN (?, ?) AND source_id >= ? AND source_id < ?`,
-				params: [
-					agentId,
-					SOURCE_CHUNK_SOURCE_TYPE,
-					LEGACY_OBSIDIAN_CHUNK_SOURCE_TYPE,
-					chunkPrefix,
-					`${chunkPrefix}\uffff`,
-				],
-				result: "all",
-			},
-			{ operation: "sources.health_orphan_chunks", lane: "read", deadlineMs: 5_000 },
-		),
-	]);
-	return chunks.filter((chunk) => !sourceChunkMatchesLiveArtifact(source, chunk, livePaths)).length;
+	const livePaths = await liveSourceArtifactPaths(source, agentId);
+	let orphans = 0;
+	await pagedSourceHealthRows<SourceChunkHealthRow>(
+		`SELECT rowid, source_id,
+		        CASE WHEN instr(tail, char(10)) > 0 THEN substr(tail, 1, instr(tail, char(10)) - 1) ELSE tail END AS chunk_text
+		 FROM (
+		   SELECT rowid, source_id,
+		          CASE WHEN header_at > 0 THEN substr(framed, header_at + 1, 1024) END AS tail
+		   FROM (
+		     SELECT rowid, source_id, char(10) || chunk_text AS framed,
+		            instr(char(10) || lower(chunk_text), char(10) || 'source_path:') AS header_at
+		     FROM embeddings
+		     WHERE agent_id = ? AND source_type IN (?, ?) AND source_id >= ? AND source_id < ? AND rowid > ?
+		     ORDER BY rowid LIMIT ?
+		   )
+		 )`,
+		[agentId, SOURCE_CHUNK_SOURCE_TYPE, LEGACY_OBSIDIAN_CHUNK_SOURCE_TYPE, chunkPrefix, `${chunkPrefix}\uffff`],
+		"sources.health_orphan_chunks",
+		(rows) => {
+			for (const chunk of rows) if (!sourceChunkMatchesLiveArtifact(source, chunk, livePaths)) orphans++;
+		},
+	);
+	return orphans;
 }
 
 async function liveSourceArtifactPaths(source: SignetSourceEntry, agentId: string): Promise<ReadonlySet<string>> {
+	const paths = new Set<string>();
+	const collect = (rows: readonly SourcePathHealthRow[]): void => {
+		for (const row of rows) paths.add(normalizeSourcePath(row.source_path));
+	};
 	if (source.kind === "obsidian") {
 		const rootPrefix = `${source.root.replace(/\\/g, "/").replace(/\/$/, "")}/`;
-		const rows = await dbOwnerQuery<SourcePathHealthRow[]>(
-			{
-				sql: `SELECT source_path FROM memory_artifacts
-				 WHERE agent_id = ? AND COALESCE(is_deleted, 0) = 0
-				   AND (source_id = ? OR (harness = 'obsidian' AND source_id IS NULL AND source_path >= ? AND source_path < ?))`,
-				params: [agentId, source.id, rootPrefix, `${rootPrefix}\uffff`],
-				result: "all",
-			},
-			{ operation: "sources.health_live_paths", lane: "read", deadlineMs: 5_000 },
+		await pagedSourceHealthRows<SourcePathHealthRow>(
+			`SELECT rowid, source_path FROM memory_artifacts
+			 WHERE agent_id = ? AND COALESCE(is_deleted, 0) = 0
+			   AND (source_id = ? OR (harness = 'obsidian' AND source_id IS NULL AND source_path >= ? AND source_path < ?))
+			   AND rowid > ?
+			 ORDER BY rowid LIMIT ?`,
+			[agentId, source.id, rootPrefix, `${rootPrefix}\uffff`],
+			"sources.health_live_paths",
+			collect,
 		);
-		return new Set(rows.map((row) => normalizeSourcePath(row.source_path)));
+		return paths;
 	}
-	const rows = await dbOwnerQuery<SourcePathHealthRow[]>(
-		{
-			sql: `SELECT source_path FROM memory_artifacts
-			 WHERE agent_id = ? AND source_id = ? AND COALESCE(is_deleted, 0) = 0`,
-			params: [agentId, source.id],
-			result: "all",
-		},
-		{ operation: "sources.health_live_paths", lane: "read", deadlineMs: 5_000 },
+	await pagedSourceHealthRows<SourcePathHealthRow>(
+		`SELECT rowid, source_path FROM memory_artifacts
+		 WHERE agent_id = ? AND source_id = ? AND COALESCE(is_deleted, 0) = 0 AND rowid > ?
+		 ORDER BY rowid LIMIT ?`,
+		[agentId, source.id],
+		"sources.health_live_paths",
+		collect,
 	);
-	return new Set(rows.map((row) => normalizeSourcePath(row.source_path)));
+	return paths;
 }
 
 interface SourceChunkHealthRow {
+	readonly rowid: number;
 	readonly source_id: string;
 	readonly chunk_text: string | null;
 }
 
 interface SourcePathHealthRow {
+	readonly rowid: number;
 	readonly source_path: string;
 }
 

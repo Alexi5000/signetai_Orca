@@ -3,6 +3,7 @@ import type { DbAccessor, ReadDb } from "./db-accessor";
 import { tableExists } from "./db-helpers";
 import { findEpisodicSourceAgentIds, readEpisodicSource, sourceIdCandidates } from "./episodic-sources";
 import { listEntityAttributesByPath } from "./knowledge-graph";
+import { redactCredentials } from "@signet/core";
 
 const SOURCE_KINDS = ["memory", "artifact", "transcript", "summary"] as const;
 const MAX_VERSION_LIMIT = 50;
@@ -380,10 +381,6 @@ function publicReference(value: unknown): unknown | null {
 	if (!kind || !sourceId) return null;
 	if (typeof value === "string") return `${kind}:${sourceId}`;
 	if (!isRecord(value)) return null;
-
-	// Evidence metadata is untrusted input. Return only the canonical source
-	// identity and human-readable span fields; in particular, never echo
-	// session IDs/tokens or connector-specific metadata from the stored object.
 	const result: Record<string, string> = { source_ref: `${kind}:${sourceId}` };
 	const sourcePath = parsed.sourcePath;
 	const quote = parsed.quote;
@@ -399,9 +396,6 @@ function publicEvidence(values: readonly unknown[]): readonly unknown[] {
 }
 
 function visibleSessionKeys(sessionKey: string | null): readonly string[] {
-	// Source-native session tokens remain internal authorization material. Only
-	// echo the boundary the caller explicitly supplied; never return discovered
-	// session IDs/tokens from artifact metadata.
 	return sessionKey === null ? [] : [sessionKey];
 }
 
@@ -522,10 +516,6 @@ function sourceSessionKeys(
 }
 
 function sourceAgentIds(db: ReadDb, kind: TraceSourceKind, id: string, path: string | null): readonly string[] {
-	// This is an ownership probe, not a content read: it deliberately checks
-	// all agent rows so an inaccessible source is forbidden rather than
-	// misreported as missing. The returned rows contain agent IDs only; every
-	// source body is still read through the requested agent scope below.
 	const owners = new Set(findEpisodicSourceAgentIds(db, `${kind}:${path ?? id}`));
 	const candidates = sourceIdCandidates(id);
 	const placeholders = candidates.map(() => "?").join(", ");
@@ -657,7 +647,7 @@ function readSource(
 		kind: params.kind,
 		id: source.id,
 		path: source.sourcePath,
-		content: state === "available" ? source.content : null,
+		content: state === "available" ? redactCredentials(source.content) : null,
 		project: source.project,
 		visibility: "scoped",
 		scope: null,
@@ -698,8 +688,6 @@ function readMemorySource(
 		  }
 		| undefined;
 	if (!row) {
-		// Return only existence, never cross-agent content, so fabricated and
-		// cross-agent source IDs have distinct fail-closed outcomes.
 		const crossAgent = db.prepare("SELECT 1 FROM memories WHERE id = ? LIMIT 1").get(params.id);
 		if (crossAgent) throw new OntologyClaimTraceError("Claim premise crosses the authorized agent scope", 403);
 		throw new OntologyClaimTraceError(`Claim premise 'memory:${params.id}' was not found`, 409);
@@ -1062,10 +1050,6 @@ export async function explainOntologyClaim(
 	// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
 	return accessor.withReadDb((db: import("./db-accessor").ReadDb) => {
 		if (project !== null) {
-			// Graph rows are agent-scoped but do not carry a project column. A
-			// project-scoped caller may only receive a claim whose linked semantic
-			// memory proves the same project; otherwise fail closed before any
-			// claim content, history, or assertion is returned.
 			for (const attribute of result.items) requireProjectScopedAttribute(db, attribute, project);
 		}
 		const versions = result.items.slice(0, versionLimit).map((attribute) => traceVersion(db, attribute));
@@ -1187,7 +1171,7 @@ export async function explainOntologyClaim(
 			},
 			latencyMs: Math.round((performance.now() - started) * 100) / 100,
 		};
-	}, "ontology-claim-trace.ts:1063");
+	}, "ontology-claim-trace.ts:1051");
 }
 
 export type { TraceAssertion, TraceEvidence, TracePremise, TraceVersion, ReverseTraceItem };

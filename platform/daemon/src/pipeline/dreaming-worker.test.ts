@@ -1,14 +1,37 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	readlinkSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { DreamingConfig } from "@signet/core";
 import { runMigrations } from "../../../core/src/migrations";
-import type { DbAccessor } from "../db-accessor";
-import type { DbOwnerClient } from "../db-owner-client";
-import type { DbOwnerMaintenance } from "../db-owner-maintenance";
+import { configureLlmConcurrency, getLlmConcurrencyLimit } from "./provider";
+import { closeDbAccessor, getDbAccessor, initDbAccessor, type DbAccessor, type WriteDb } from "../db-accessor";
+import {
+	createDbOwnerClient,
+	DbOwnerDeadlineError,
+	DbOwnerDiedError,
+	type DbOwnerClient,
+	type DbOwnerJobHandle,
+	type DbOwnerSubmitOptions,
+} from "../db-owner-client";
+import {
+	closeRegisteredDbOwnerMaintenance,
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+	type DbOwnerMaintenance,
+} from "../db-owner-maintenance";
 import type { DbOwnerRequest } from "../db-owner-protocol";
+import { recallThroughDbOwner } from "../db-owner-recall";
 import { reportEventLoopLag, resetPressureState } from "../system-pressure";
 import {
 	DREAMING_AGENT_PROMPT,
@@ -20,8 +43,10 @@ import {
 } from "./dreaming";
 import {
 	AlreadyRunningError,
+	type DreamingWorkerOptions,
 	createAgentScopeSnapshot,
 	getDreamingWorkerAgentIds,
+	partitionDreamingScopes,
 	selectDreamingCheckMode,
 	shouldDeferDreamingSweep,
 	startDreamingWorker,
@@ -83,6 +108,305 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<voi
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	throw new Error(`Condition not met within ${timeoutMs}ms`);
+}
+
+interface ScopeDelayOwner {
+	readonly client: DbOwnerClient;
+	arm(durationMs: number): void;
+	limitPassCreate(deadlineMs: number): void;
+	passCreateJobId(): string | null;
+	delayPassCreateReconcile(deadlineMs: number, blockerDurationMs: number): void;
+	passCreateResult(): "pending" | "resolved" | "rejected" | null;
+	passCreateResults(): readonly ("pending" | "resolved" | "rejected")[];
+	passCreateIds(): readonly string[];
+	passCreateReconcileJobId(): string | null;
+	blocker(): DbOwnerJobHandle<{ readonly sleptMs: number }> | null;
+}
+
+function createScopeDelayOwner(owner: DbOwnerClient): ScopeDelayOwner {
+	let armed = false;
+	let durationMs = 0;
+	let passCreateDeadlineMs: number | null = null;
+	let reconcileDelay: { readonly deadlineMs: number; readonly blockerDurationMs: number } | null = null;
+	let reconcileBlockerQueued = false;
+	let currentPassCreateJobId: string | null = null;
+	let currentPassCreateResult: "pending" | "resolved" | "rejected" | null = null;
+	let passCreateResults: Array<"pending" | "resolved" | "rejected"> = [];
+	let passCreateIds: string[] = [];
+	let currentReconcileJobId: string | null = null;
+	let blocker: DbOwnerJobHandle<{ readonly sleptMs: number }> | null = null;
+	const client: DbOwnerClient = {
+		start: () => owner.start(),
+		initialize: (agentsDir?: string) => owner.initialize(agentsDir),
+		submit: <Result>(request: DbOwnerRequest, options: DbOwnerSubmitOptions): DbOwnerJobHandle<Result> => {
+			if (armed && options.operation === "pipeline/dreaming-worker.agent-scopes") {
+				armed = false;
+				blocker = owner.submit<{ readonly sleptMs: number }>(
+					{ kind: "sleep", durationMs },
+					{
+						operation: "maintenance.test.dreaming-scope-blocker",
+						lane: "maintenance",
+						workloadClass: "maintenance",
+						deadlineMs: durationMs + 15_000,
+					},
+				);
+			}
+			const submitOptions =
+				options.operation === "dreaming.pass.create" && passCreateDeadlineMs !== null
+					? { ...options, deadlineMs: passCreateDeadlineMs }
+					: options.operation === "dreaming.pass.create.reconcile" && reconcileDelay !== null
+						? { ...options, deadlineMs: reconcileDelay.deadlineMs }
+						: options;
+			const handle = owner.submit<Result>(request, submitOptions);
+			if (options.operation === "dreaming.pass.create") {
+				currentPassCreateJobId = handle.job.id;
+				currentPassCreateResult = "pending";
+				const resultIndex = passCreateResults.push("pending") - 1;
+				if (request.kind === "query") {
+					const passId = request.statement.params?.[0];
+					if (typeof passId === "string") passCreateIds.push(passId);
+				}
+				void handle.result.then(
+					() => {
+						currentPassCreateResult = "resolved";
+						passCreateResults[resultIndex] = "resolved";
+					},
+					() => {
+						currentPassCreateResult = "rejected";
+						passCreateResults[resultIndex] = "rejected";
+					},
+				);
+				if (reconcileDelay !== null && !reconcileBlockerQueued) {
+					const delay = reconcileDelay;
+					reconcileBlockerQueued = true;
+					blocker = owner.submit<{ readonly sleptMs: number }>(
+						{ kind: "sleep", durationMs: delay.blockerDurationMs },
+						{
+							operation: "maintenance.test.dreaming-pass-reconcile-blocker",
+							lane: "maintenance",
+							workloadClass: "maintenance",
+							deadlineMs: delay.blockerDurationMs + 5_000,
+						},
+					);
+				}
+			}
+			if (options.operation === "dreaming.pass.create.reconcile") {
+				currentReconcileJobId = handle.job.id;
+				reconcileDelay = null;
+			}
+			return handle;
+		},
+		setWriteBlocked: (blocked: boolean) => owner.setWriteBlocked(blocked),
+		awaitResult: <Result>(handle: DbOwnerJobHandle<Result>, timeoutMs?: number) => owner.awaitResult(handle, timeoutMs),
+		cancel: (jobId: string) => owner.cancel(jobId),
+		health: () => owner.health(),
+		close: () => owner.close(),
+	};
+	return {
+		client,
+		arm(nextDurationMs: number) {
+			durationMs = nextDurationMs;
+			blocker = null;
+			armed = true;
+		},
+		limitPassCreate(deadlineMs) {
+			passCreateDeadlineMs = deadlineMs;
+			currentPassCreateJobId = null;
+		},
+		delayPassCreateReconcile(deadlineMs, blockerDurationMs) {
+			reconcileDelay = { deadlineMs, blockerDurationMs };
+			reconcileBlockerQueued = false;
+			currentPassCreateResult = null;
+			passCreateResults = [];
+			passCreateIds = [];
+			currentReconcileJobId = null;
+			blocker = null;
+		},
+		passCreateResult: () => currentPassCreateResult,
+		passCreateResults: () => [...passCreateResults],
+		passCreateIds: () => [...passCreateIds],
+		passCreateReconcileJobId: () => currentReconcileJobId,
+		passCreateJobId: () => currentPassCreateJobId,
+		blocker: () => blocker,
+	};
+}
+
+type TriggerOutcome =
+	| { readonly kind: "resolved"; readonly passId: string }
+	| { readonly kind: "rejected"; readonly error: unknown };
+
+function observeTrigger(trigger: Promise<string>): Promise<TriggerOutcome> {
+	return trigger.then(
+		(passId) => ({ kind: "resolved", passId }),
+		(error: unknown) => ({ kind: "rejected", error }),
+	);
+}
+
+function processHasPathDescriptor(processId: number, path: string): boolean {
+	if (process.platform !== "linux") return false;
+	const descriptorDirectory = `/proc/${processId}/fd`;
+	if (!existsSync(descriptorDirectory)) return false;
+	return readdirSync(descriptorDirectory).some((descriptor) => {
+		try {
+			return readlinkSync(join(descriptorDirectory, descriptor)) === path;
+		} catch {
+			return false;
+		}
+	});
+}
+
+interface RealOwnerTriggerFixture {
+	readonly agentsDir: string;
+	readonly dbPath: string;
+	readonly accessor: DbAccessor;
+	readonly owner: DbOwnerClient;
+	readonly scopeDelay: ScopeDelayOwner;
+	readonly maintenance: DbOwnerMaintenance;
+	readonly worker: ReturnType<typeof startDreamingWorker>;
+	readonly ownerCommitMarker: string;
+	readonly ownerCommitResultGate: string;
+
+	readonly previousSignetPath: string | undefined;
+	readonly previousCommitMarker: string | undefined;
+	readonly previousCommitPause: string | undefined;
+	readonly previousCommitResultPause: string | undefined;
+	readonly previousCommitResultGate: string | undefined;
+}
+
+async function createRealOwnerTriggerFixture(
+	options: {
+		readonly commitPauseMs?: number;
+		readonly commitResultPauseMs?: number;
+		readonly seed?: (db: WriteDb) => void;
+		readonly executorFactory?: DreamingWorkerOptions["executorFactory"];
+	} = {},
+): Promise<RealOwnerTriggerFixture> {
+	const agentsDir = mkdtempSync(join(tmpdir(), "dreaming-owner-trigger-"));
+	const dbPath = join(agentsDir, "memory", "memories.db");
+	const ownerCommitMarker = join(agentsDir, "owner-commit-started");
+	const ownerCommitResultGate = join(agentsDir, "owner-commit-result-gate");
+
+	const previousSignetPath = process.env.SIGNET_PATH;
+	const previousCommitMarker = process.env.SIGNET_DB_OWNER_TEST_COMMIT_STARTED;
+	const previousCommitPause = process.env.SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS;
+	const previousCommitResultPause = process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS;
+	const previousCommitResultGate = process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_GATE;
+
+	let owner: DbOwnerClient | null = null;
+	let worker: ReturnType<typeof startDreamingWorker> | null = null;
+	let registered = false;
+	try {
+		await closeDbAccessor();
+		process.env.SIGNET_PATH = agentsDir;
+		mkdirSync(join(agentsDir, "memory"), { recursive: true });
+		initDbAccessor(dbPath, { agentsDir });
+		const accessor = getDbAccessor();
+		const now = new Date().toISOString();
+		await accessor.withWriteTxAsync((db) => {
+			db.prepare(
+				`INSERT INTO memories (id, content, type, agent_id, created_at, updated_at, updated_by)
+				 VALUES ('owner-recall-fixture', 'isolated recall control row', 'fact', 'default', ?, ?, 'fixture')`,
+			).run(now, now);
+			options.seed?.(db);
+		});
+		accessor.close();
+
+		process.env.SIGNET_DB_OWNER_TEST_COMMIT_STARTED = ownerCommitMarker;
+		if (options.commitPauseMs !== undefined) {
+			process.env.SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS = String(options.commitPauseMs);
+		} else Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS");
+		if (options.commitResultPauseMs !== undefined) {
+			process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS = String(options.commitResultPauseMs);
+		} else Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS");
+		process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_GATE = ownerCommitResultGate;
+
+		owner = createDbOwnerClient({ dbPath, workerPath: resolve(import.meta.dir, "../db-owner-worker.ts") });
+		const scopeDelay = createScopeDelayOwner(owner);
+		const maintenance = createDbOwnerMaintenance({ dbPath, owner: scopeDelay.client });
+		await owner.start();
+		if (options.commitPauseMs === undefined && options.commitResultPauseMs === undefined)
+			await owner.initialize(agentsDir);
+		registerDbOwnerMaintenance(maintenance);
+		registered = true;
+		worker = startDreamingWorker(accessor, defaultCfg(), agentsDir, "default", {
+			checkIntervalMs: 60_000,
+			ownerMaintenance: maintenance,
+			...(options.executorFactory ? { executorFactory: options.executorFactory } : {}),
+		});
+		return {
+			agentsDir,
+			dbPath,
+			accessor,
+			owner,
+			scopeDelay,
+			maintenance,
+			worker,
+			ownerCommitMarker,
+			ownerCommitResultGate,
+
+			previousSignetPath,
+			previousCommitMarker,
+			previousCommitPause,
+			previousCommitResultPause,
+			previousCommitResultGate,
+		};
+	} catch (error) {
+		worker?.stop();
+		await owner?.close();
+		if (registered) await closeRegisteredDbOwnerMaintenance();
+		await closeDbAccessor();
+		if (previousSignetPath === undefined) Reflect.deleteProperty(process.env, "SIGNET_PATH");
+		else process.env.SIGNET_PATH = previousSignetPath;
+		if (previousCommitMarker === undefined) Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_STARTED");
+		else process.env.SIGNET_DB_OWNER_TEST_COMMIT_STARTED = previousCommitMarker;
+		if (previousCommitPause === undefined) Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS");
+		else process.env.SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS = previousCommitPause;
+		if (previousCommitResultPause === undefined)
+			Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS");
+		else process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS = previousCommitResultPause;
+		if (previousCommitResultGate === undefined)
+			Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_RESULT_GATE");
+		else process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_GATE = previousCommitResultGate;
+
+		rmSync(agentsDir, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+async function closeRealOwnerTriggerFixture(fixture: RealOwnerTriggerFixture): Promise<void> {
+	fixture.worker.stop();
+	try {
+		await fixture.owner.close();
+	} finally {
+		try {
+			await fixture.worker.activePass?.catch(() => {});
+		} finally {
+			try {
+				await closeRegisteredDbOwnerMaintenance();
+			} finally {
+				try {
+					await closeDbAccessor();
+				} finally {
+					if (fixture.previousSignetPath === undefined) Reflect.deleteProperty(process.env, "SIGNET_PATH");
+					else process.env.SIGNET_PATH = fixture.previousSignetPath;
+					if (fixture.previousCommitMarker === undefined)
+						Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_STARTED");
+					else process.env.SIGNET_DB_OWNER_TEST_COMMIT_STARTED = fixture.previousCommitMarker;
+					if (fixture.previousCommitPause === undefined)
+						Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS");
+					else process.env.SIGNET_DB_OWNER_TEST_COMMIT_PAUSE_MS = fixture.previousCommitPause;
+					if (fixture.previousCommitResultPause === undefined)
+						Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS");
+					else process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_PAUSE_MS = fixture.previousCommitResultPause;
+					if (fixture.previousCommitResultGate === undefined)
+						Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_TEST_COMMIT_RESULT_GATE");
+					else process.env.SIGNET_DB_OWNER_TEST_COMMIT_RESULT_GATE = fixture.previousCommitResultGate;
+
+					rmSync(fixture.agentsDir, { recursive: true, force: true });
+				}
+			}
+		}
+	}
 }
 
 describe("dreaming worker agent scope", () => {
@@ -176,6 +500,39 @@ describe("dreaming worker agent scope", () => {
 		}
 	});
 
+	it("waits for owner work to settle after an agent-scope deadline", async () => {
+		const metricsGate = { release: (): void => {} };
+		const metrics = new Promise<void>((resolve) => {
+			metricsGate.release = resolve;
+		});
+		const owner = {
+			submit() {
+				return {
+					job: {} as never,
+					result: Promise.reject(new DbOwnerDeadlineError("scope-query")),
+					metrics,
+					cancel: (): void => {},
+				};
+			},
+		} as unknown as DbOwnerClient;
+		const pending = getDreamingWorkerAgentIds(accessor, "default", { owner } as DbOwnerMaintenance);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(settled).toBe(false);
+
+		metricsGate.release();
+		await expect(pending).rejects.toBeInstanceOf(DbOwnerDeadlineError);
+		expect(settled).toBe(true);
+	});
+
 	it("serves the agent-scope union from a snapshot refreshed on a cadence", async () => {
 		let resolves = 0;
 		let now = 0;
@@ -188,11 +545,9 @@ describe("dreaming worker agent scope", () => {
 			() => now,
 		);
 		expect(await scopes()).toEqual(["default", "new-scope"]);
-		// Within the refresh window the union query does not run again.
 		now = 999;
 		expect(await scopes()).toEqual(["default", "new-scope"]);
 		expect(resolves).toBe(1);
-		// Past the window the next read re-resolves the union.
 		now = 1_000;
 		expect(await scopes()).toEqual(["default", "new-scope"]);
 		expect(resolves).toBe(2);
@@ -333,8 +688,92 @@ describe("dreaming worker agent scope", () => {
 		}
 	});
 
-	it("writes manual async trigger passes to the requested agent", async () => {
-		const worker = startDreamingWorker(accessor, defaultCfg(), agentsDir, "default");
+	it("does not run scheduled checks when automatic Dreaming is disabled", async () => {
+		let queueHealthChecks = 0;
+		const ownerMaintenance = {
+			queueIsHealthy: async () => {
+				queueHealthChecks += 1;
+				return true;
+			},
+		} as unknown as DbOwnerMaintenance;
+		const worker = startDreamingWorker(accessor, defaultCfg({ enabled: false }), agentsDir, "default", {
+			checkIntervalMs: 10,
+			ownerMaintenance,
+		});
+		try {
+			await new Promise<void>((resolve) => setTimeout(resolve, 50));
+			expect(queueHealthChecks).toBe(0);
+		} finally {
+			worker.stop();
+		}
+	});
+
+	it("follows the live automatic Dreaming setting instead of its startup snapshot", async () => {
+		let queueHealthChecks = 0;
+		let enabled = false;
+		const ownerMaintenance = {
+			queueIsHealthy: async () => {
+				queueHealthChecks += 1;
+				return false;
+			},
+		} as unknown as DbOwnerMaintenance;
+		const worker = startDreamingWorker(accessor, defaultCfg({ enabled: true }), agentsDir, "default", {
+			checkIntervalMs: 10,
+			enabled: () => enabled,
+			ownerMaintenance,
+		});
+		try {
+			await new Promise<void>((resolve) => setTimeout(resolve, 50));
+			expect(queueHealthChecks).toBe(0);
+			enabled = true;
+			await waitFor(() => queueHealthChecks > 0, 2_000);
+		} finally {
+			worker.stop();
+		}
+	});
+
+	it("waits for an inference provider and resumes once one is available", async () => {
+		let queueHealthChecks = 0;
+		let available = false;
+		const checkedAgents: string[] = [];
+		const ownerMaintenance = {
+			queueIsHealthy: async () => {
+				queueHealthChecks += 1;
+				return false;
+			},
+		} as unknown as DbOwnerMaintenance;
+		const worker = startDreamingWorker(accessor, defaultCfg({ enabled: true }), agentsDir, "default", {
+			checkIntervalMs: 10,
+			inferenceAvailable: async (agentId) => {
+				checkedAgents.push(agentId);
+				return available || agentId === "scoped";
+			},
+			ownerMaintenance,
+		});
+		try {
+			await waitFor(() => worker.scheduler.reason === "inference_unavailable", 2_000);
+			expect(worker.scheduler).toEqual({
+				status: "blocked",
+				reason: "inference_unavailable",
+				checkedAt: expect.any(String),
+			});
+			await new Promise<void>((resolve) => setTimeout(resolve, 50));
+			expect(queueHealthChecks).toBe(0);
+			expect(await worker.inferenceReady()).toBe(false);
+			expect(await worker.inferenceReady("scoped")).toBe(true);
+			expect(checkedAgents).toContain("scoped");
+			expect(worker.scheduler.reason).toBe("inference_unavailable");
+			available = true;
+			await waitFor(() => queueHealthChecks > 0, 2_000);
+			expect(worker.scheduler.reason).not.toBe("inference_unavailable");
+			expect(await worker.inferenceReady()).toBe(true);
+		} finally {
+			worker.stop();
+		}
+	});
+
+	it("writes manual async trigger passes when automatic Dreaming is disabled", async () => {
+		const worker = startDreamingWorker(accessor, defaultCfg({ enabled: false }), agentsDir, "default");
 		try {
 			const passId = await worker.triggerAsync("incremental", "noam");
 			await worker.activePass;
@@ -350,6 +789,62 @@ describe("dreaming worker agent scope", () => {
 					count: number;
 				},
 			).toEqual({ count: 0 });
+		} finally {
+			worker.stop();
+		}
+	});
+
+	it("releases a failed async preflight and admits the next trigger", async () => {
+		db.prepare(
+			`INSERT INTO session_transcripts
+			 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
+			 VALUES ('async-preflight', 'default', 'Fixture evidence for a completed pass.', 'pi',
+			         datetime('now'), datetime('now'), datetime('now'))`,
+		).run();
+		let rejectNextRead = false;
+		const triggerAccessor = {
+			...accessor,
+			withReadDbAsync: <Result>(fn: (db: Database) => Result): Promise<Result> => {
+				if (rejectNextRead) {
+					rejectNextRead = false;
+					return Promise.reject(new DbOwnerDeadlineError("fixture-agent-scopes"));
+				}
+				return Promise.resolve(fn(db));
+			},
+		} as unknown as DbAccessor;
+		const worker = startDreamingWorker(triggerAccessor, defaultCfg({ tokenThreshold: 1 }), agentsDir, "default", {
+			checkIntervalMs: 60_000,
+			executorFactory: () => ({
+				async run() {
+					return { summary: "Controlled executor fixture completed." };
+				},
+			}),
+		});
+		try {
+			const controlId = await worker.triggerAsync("incremental");
+			const control = worker.activePass;
+			if (control !== null) await control;
+			expect(db.prepare("SELECT status FROM dreaming_passes WHERE id = ?").get(controlId)).toMatchObject({
+				status: "completed",
+			});
+
+			rejectNextRead = true;
+			const failedTrigger = worker.triggerAsync("incremental");
+			expect(worker.activePass).not.toBeNull();
+			await expect(failedTrigger).rejects.toBeInstanceOf(DbOwnerDeadlineError);
+			await waitFor(() => !worker.running, 2_000);
+			expect(worker.activePass).toBeNull();
+			expect(db.prepare("SELECT COUNT(*) AS count FROM dreaming_passes WHERE status = 'running'").get()).toEqual({
+				count: 0,
+			});
+
+			const recoveryId = await worker.triggerAsync("incremental");
+			const recovery = worker.activePass;
+			if (recovery !== null) await recovery;
+			await waitFor(() => !worker.running, 2_000);
+			expect(db.prepare("SELECT status FROM dreaming_passes WHERE id = ?").get(recoveryId)).toMatchObject({
+				status: "completed",
+			});
 		} finally {
 			worker.stop();
 		}
@@ -423,13 +918,6 @@ describe("dreaming worker agent scope", () => {
 	});
 
 	it("keeps the check loop alive when a scheduled pass fails (#1198)", async () => {
-		// Regression for #1198: the periodic check loop awaited runPass
-		// without catching, so a provider 429 (or any executor rejection)
-		// escaped through the timer callback as an unhandled rejection. The
-		// daemon's unhandledRejection exit path (#1148) then shut down the
-		// whole process, and the sweep never re-armed. The check loop must
-		// record the failure (recordDreamingFailure + failDreamingPass), log
-		// it, and keep scheduling future checks.
 		db.prepare(
 			`INSERT INTO session_transcripts
 		 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
@@ -442,9 +930,6 @@ describe("dreaming worker agent scope", () => {
 				throw new Error("429 rate_limit_error: Token usage limit reached");
 			},
 		});
-
-		// The bug's observable signature is an unhandled rejection escaping
-		// the check loop; capture any that surface during the test window.
 		const unhandled: unknown[] = [];
 		const onUnhandledRejection = (reason: unknown) => {
 			unhandled.push(reason);
@@ -456,11 +941,6 @@ describe("dreaming worker agent scope", () => {
 			checkIntervalMs: 20,
 		});
 		try {
-			// Failures accumulate on the run agent ("default") while the
-			// per-scope backoff reads each scope's own state, so "alpha"'s
-			// fresh backlog re-triggers on the next tick. Two recorded
-			// failures prove the loop survived the first one and kept
-			// checking instead of dying with it.
 			await waitFor(() => {
 				const state = db
 					.prepare("SELECT consecutive_failures AS n FROM dreaming_state WHERE agent_id = 'default'")
@@ -486,12 +966,236 @@ describe("dreaming worker agent scope", () => {
 		}
 	});
 
+	it("balances agent groups by backlog and leaves scopes with nothing to do out", () => {
+		expect(
+			partitionDreamingScopes(
+				[
+					{ scope: "alpha", tokens: 3_000 },
+					{ scope: "beta", tokens: 2_000 },
+					{ scope: "gamma", tokens: 1_500 },
+					{ scope: "default", tokens: 0 },
+				],
+				2,
+			),
+		).toEqual([["alpha"], ["beta", "gamma"]]);
+		expect(
+			partitionDreamingScopes(
+				[
+					{ scope: "alpha", tokens: 10 },
+					{ scope: "default", tokens: 0 },
+					{ scope: "idle", tokens: 0 },
+				],
+				4,
+			),
+		).toEqual([["alpha"]]);
+		expect(partitionDreamingScopes([{ scope: "default", tokens: 0 }], 3)).toEqual([]);
+	});
+
+	it("spreads scopes with only pending attention across free slots", () => {
+		expect(
+			partitionDreamingScopes(
+				[
+					{ scope: "alpha", tokens: 10 },
+					{ scope: "flagged-a", tokens: 0, attention: true },
+					{ scope: "flagged-b", tokens: 0, attention: true },
+					{ scope: "idle", tokens: 0 },
+				],
+				3,
+			),
+		).toEqual([["alpha"], ["flagged-a"], ["flagged-b"]]);
+		expect(
+			partitionDreamingScopes(
+				[
+					{ scope: "alpha", tokens: 10 },
+					{ scope: "flagged-a", tokens: 0, attention: true },
+				],
+				1,
+			),
+		).toEqual([["alpha"]]);
+	});
+
+	it("never piles attention-only scopes into one pass and serves the oldest attention first", () => {
+		const flagged = [
+			{ scope: "newer", tokens: 0, attention: true, oldestAttentionAt: "2026-10-05 12:00:00" },
+			{ scope: "older", tokens: 0, attention: true, oldestAttentionAt: "2026-10-05 09:00:00" },
+			{ scope: "oldest", tokens: 0, attention: true, oldestAttentionAt: "2026-10-04 23:00:00" },
+		];
+		expect(partitionDreamingScopes(flagged, 1)).toEqual([["oldest"]]);
+		expect(partitionDreamingScopes(flagged, 2)).toEqual([["oldest"], ["older"]]);
+		expect(partitionDreamingScopes([{ scope: "busy", tokens: 500 }, ...flagged], 2)).toEqual([["busy"], ["oldest"]]);
+	});
+
+	it("runs disjoint agent groups concurrently after the first pass reaches a tool", async () => {
+		const seed = db.prepare(
+			`INSERT INTO session_transcripts
+			 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
+			 VALUES (?, ?, ?, 'pi', datetime('now'), datetime('now'), datetime('now'))`,
+		);
+		seed.run("alpha-session", "alpha", "Alpha evidence. ".repeat(400));
+		seed.run("beta-session", "beta", "Beta evidence. ".repeat(250));
+		seed.run("gamma-session", "gamma", "Gamma evidence. ".repeat(200));
+		const allowedOf = (tools: ReadonlyArray<{ parameters: unknown }>): string[] => {
+			const agentId = (tools[0]?.parameters as { properties?: { agentId?: { const?: string; enum?: string[] } } })
+				.properties?.agentId;
+			return agentId?.enum ?? (agentId?.const ? [agentId.const] : []);
+		};
+		const groups: string[][] = [];
+		const crossGroupErrors: string[] = [];
+		let running = 0;
+		let peak = 0;
+		let releaseBarrier: () => void = () => undefined;
+		const barrier = new Promise<void>((resolve) => {
+			releaseBarrier = resolve;
+		});
+		const worker = startDreamingWorker(accessor, defaultCfg({ maxConcurrentPasses: 2 }), agentsDir, "default", {
+			checkIntervalMs: 60_000,
+			executorFactory: () => ({
+				async run(input) {
+					running++;
+					peak = Math.max(peak, running);
+					const allowed = allowedOf(input.tools);
+					groups.push(allowed);
+					const search = input.tools.find((tool) => tool.name === "search_evidence");
+					if (!search) throw new Error("Missing search_evidence");
+					await search.execute("own", { agentId: allowed[0] }, undefined, undefined, {} as never);
+					const outsider = ["alpha", "beta", "gamma"].find((agent) => !allowed.includes(agent));
+					if (outsider !== undefined) {
+						await search
+							.execute("cross", { agentId: outsider }, undefined, undefined, {} as never)
+							.catch((error: unknown) => crossGroupErrors.push(error instanceof Error ? error.message : String(error)));
+					}
+					await Promise.race([barrier, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+					running--;
+					return { summary: `Processed ${allowed.join(", ")}` };
+				},
+			}),
+		});
+		try {
+			await worker.triggerAsync("incremental");
+			await waitFor(() => groups.length === 2 && running === 2, 2_000);
+			await expect(worker.triggerAsync("incremental")).rejects.toBeInstanceOf(AlreadyRunningError);
+			releaseBarrier();
+			await waitFor(() => !worker.running, 5_000);
+			expect(peak).toBe(2);
+			const covered = groups.flat();
+			expect(new Set(covered).size).toBe(covered.length);
+			expect([...covered].sort()).toEqual(expect.arrayContaining(["alpha", "beta", "gamma"]));
+			expect(crossGroupErrors).toHaveLength(2);
+			expect(crossGroupErrors.every((message) => message.includes("one of this pass's agents"))).toBe(true);
+			expect(db.prepare("SELECT status, COUNT(*) AS n FROM dreaming_passes GROUP BY status").all()).toEqual([
+				{ status: "completed", n: 2 },
+			]);
+		} finally {
+			worker.stop();
+		}
+	});
+
+	it("admits no more concurrent passes than the shared LLM limit", async () => {
+		const seed = db.prepare(
+			`INSERT INTO session_transcripts
+			 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
+			 VALUES (?, ?, ?, 'pi', datetime('now'), datetime('now'), datetime('now'))`,
+		);
+		seed.run("alpha-session", "alpha", "Alpha evidence. ".repeat(400));
+		seed.run("beta-session", "beta", "Beta evidence. ".repeat(250));
+		const previousLimit = getLlmConcurrencyLimit();
+		configureLlmConcurrency(1);
+		let runs = 0;
+		const worker = startDreamingWorker(accessor, defaultCfg({ maxConcurrentPasses: 4 }), agentsDir, "default", {
+			checkIntervalMs: 60_000,
+			executorFactory: () => ({
+				async run(input) {
+					runs++;
+					const search = input.tools.find((tool) => tool.name === "search_evidence");
+					await search?.execute("own", {}, undefined, undefined, {} as never);
+					return { summary: "Processed every agent" };
+				},
+			}),
+		});
+		try {
+			await worker.triggerAsync("incremental");
+			await waitFor(() => !worker.running, 2_000);
+			expect(runs).toBe(1);
+		} finally {
+			worker.stop();
+			configureLlmConcurrency(previousLimit);
+		}
+	});
+
+	it("does not fan out when the first pass fails before reaching a tool", async () => {
+		const seed = db.prepare(
+			`INSERT INTO session_transcripts
+			 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
+			 VALUES (?, ?, ?, 'pi', datetime('now'), datetime('now'), datetime('now'))`,
+		);
+		seed.run("alpha-session", "alpha", "Alpha evidence. ".repeat(400));
+		seed.run("beta-session", "beta", "Beta evidence. ".repeat(250));
+		let runs = 0;
+		const worker = startDreamingWorker(accessor, defaultCfg({ maxConcurrentPasses: 2 }), agentsDir, "default", {
+			checkIntervalMs: 60_000,
+			executorFactory: () => ({
+				async run() {
+					runs++;
+					throw new Error("provider unavailable");
+				},
+			}),
+		});
+		try {
+			await worker.triggerAsync("incremental");
+			await waitFor(() => !worker.running, 2_000);
+			expect(runs).toBe(1);
+			expect(db.prepare("SELECT status, COUNT(*) AS n FROM dreaming_passes GROUP BY status").all()).toEqual([
+				{ status: "failed", n: 1 },
+			]);
+		} finally {
+			worker.stop();
+		}
+	});
+
+	it("keeps an unrecordable pass failure from becoming an unhandled rejection (#2023)", async () => {
+		db.prepare(
+			`INSERT INTO session_transcripts
+			 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
+			 VALUES ('unrecordable-failure', 'default', 'Evidence for a pass that will be interrupted.', 'pi',
+			         datetime('now'), datetime('now'), datetime('now'))`,
+		).run();
+		db.exec(
+			`CREATE TRIGGER reject_failure_insert BEFORE INSERT ON dreaming_state
+			 WHEN NEW.consecutive_failures > 0
+			 BEGIN SELECT RAISE(ABORT, 'owner draining'); END;
+			 CREATE TRIGGER reject_failure_update BEFORE UPDATE OF consecutive_failures ON dreaming_state
+			 WHEN NEW.consecutive_failures > OLD.consecutive_failures
+			 BEGIN SELECT RAISE(ABORT, 'owner draining'); END;`,
+		);
+		const unhandled: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandledRejection);
+		const worker = startDreamingWorker(accessor, defaultCfg({ enabled: false }), agentsDir, "default", {
+			executorFactory: () => ({
+				async run() {
+					throw new Error("pass interrupted");
+				},
+			}),
+		});
+		try {
+			await worker.triggerAsync("incremental");
+			const active = worker.activePass;
+			if (active !== null) await active.catch(() => undefined);
+			await waitFor(() => !worker.running, 2_000);
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(unhandled).toEqual([]);
+			expect(db.prepare("SELECT COUNT(*) AS n FROM dreaming_state WHERE consecutive_failures > 0").get()).toEqual({
+				n: 0,
+			});
+		} finally {
+			worker.stop();
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
 	it("alternates hygiene and content runbooks across sweep checks (#1098)", async () => {
-		// Regression for #1098: with the hygiene queue perpetually full, the
-		// sweep scheduled the combined runbook every cycle and content
-		// ingestion never got budget. When both hygiene and content work are
-		// pending, the sweep must alternate so content gets a guaranteed
-		// turn.
 		const now = new Date().toISOString();
 		db.prepare(
 			`INSERT INTO entities
@@ -534,9 +1238,6 @@ describe("dreaming worker agent scope", () => {
 	});
 
 	it("seeds deterministic hygiene attention for legacy graph rows", async () => {
-		// Hygiene attention is enqueued during regular check() ticks, not at
-		// worker startup (startup scans block the event loop before the HTTP
-		// server binds). Exercise the enqueue contract directly.
 		db.prepare(
 			`INSERT INTO entities
 			 (id, name, canonical_name, entity_type, agent_id, mentions, created_at, updated_at)
@@ -550,16 +1251,10 @@ describe("dreaming worker agent scope", () => {
 	});
 
 	it("runs one universe pass over every agent scope and keeps semantic rows agent-isolated (#946)", async () => {
-		// Behavioral regression: one Dreaming pass covers the whole install.
-		// The pass addresses each agent scope via the per-call agentId on its
-		// tools; every write is attributed to the agent named on the call, and
-		// no cross-agent evidence leaks into another scope's derived graph.
 		const ALPHA = "alpha";
 		const BETA = "beta";
 		const alphaEvidence = "Alpha is building the Apex platform.";
 		const betaEvidence = "Beta is building the Zenith platform.";
-
-		// Seed distinct episodic evidence for each agent.
 		db.prepare(
 			`INSERT INTO session_transcripts
 			 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
@@ -570,10 +1265,6 @@ describe("dreaming worker agent scope", () => {
 			 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
 			 VALUES ('summary-beta', ?, ?, 'pi', datetime('now'), datetime('now'), datetime('now'))`,
 		).run(BETA, betaEvidence);
-
-		// Deterministic provider: one universe pass consolidates BOTH scopes
-		// in a single invocation, each apply batch carrying the agentId whose
-		// graph it maintains and citing that scope's own evidence.
 		const seenPrompts: string[] = [];
 		const executorFactory = (agentId: string) => ({
 			async run(input: {
@@ -633,23 +1324,16 @@ describe("dreaming worker agent scope", () => {
 			{ executorFactory },
 		);
 		try {
-			// One trigger = one pass covering every discovered scope.
 			await worker.trigger("incremental", "default");
-
-			// A single pass row on the primary agent.
 			const passes = db
 				.prepare("SELECT agent_id, status, mode FROM dreaming_passes ORDER BY created_at")
 				.all() as Array<{ agent_id: string; status: string; mode: string }>;
 			expect(passes).toEqual([{ agent_id: "default", status: "completed", mode: "incremental" }]);
-
-			// One invocation, and the prompt names every scope in the install.
 			expect(seenPrompts).toHaveLength(1);
 			expect(seenPrompts[0]).toContain(DREAMING_AGENT_PROMPT);
 			expect(seenPrompts[0]).toContain("<agent_scopes>");
 			expect(seenPrompts[0]).toContain(ALPHA);
 			expect(seenPrompts[0]).toContain(BETA);
-
-			// Semantic rows are agent-isolated: each agent only owns its entity.
 			const alphaEntities = (
 				db
 					.prepare("SELECT canonical_name FROM entities WHERE agent_id = ? ORDER BY canonical_name")
@@ -666,8 +1350,6 @@ describe("dreaming worker agent scope", () => {
 			).map((r) => r.canonical_name);
 			expect(alphaEntities).toEqual(["apex"]);
 			expect(betaEntities).toEqual(["zenith"]);
-
-			// No entity was written to the wrong agent.
 			expect(
 				(
 					db
@@ -688,4 +1370,519 @@ describe("dreaming worker agent scope", () => {
 			worker.stop();
 		}
 	});
+});
+
+describe("dreaming worker async trigger with a real DB owner", () => {
+	let fixture: RealOwnerTriggerFixture | null = null;
+
+	beforeEach(async () => {
+		fixture = await createRealOwnerTriggerFixture();
+	}, 30_000);
+
+	afterEach(async () => {
+		if (fixture === null) return;
+		await closeRealOwnerTriggerFixture(fixture);
+		fixture = null;
+	}, 30_000);
+
+	it("holds a timed-out scope trigger until owner work settles, then permits a completed pass", async () => {
+		const current = fixture;
+		if (current === null) throw new Error("real owner trigger fixture was not initialized");
+		const { dbPath, maintenance, owner, scopeDelay, worker } = current;
+		const ownerPid = owner.health().pid;
+		if (ownerPid === null) throw new Error("DB owner did not publish its pid");
+		if (process.platform === "linux") {
+			expect(processHasPathDescriptor(process.pid, dbPath)).toBe(false);
+			expect(processHasPathDescriptor(ownerPid, dbPath)).toBe(true);
+		}
+
+		const controlId = await worker.triggerAsync("incremental");
+		const controlAttempt = worker.activePass;
+		if (controlAttempt !== null) await controlAttempt;
+		const controlRows = await recallThroughDbOwner<{ readonly status: string }>(
+			maintenance.owner,
+			"SELECT status FROM dreaming_passes WHERE id = ?",
+			[controlId],
+		);
+		expect(controlRows).toEqual([{ status: "completed" }]);
+
+		scopeDelay.arm(6_500);
+		let triggerSettled = false;
+		const triggerOutcome = observeTrigger(worker.triggerAsync("incremental")).then((outcome) => {
+			triggerSettled = true;
+			return outcome;
+		});
+		const activeAttempt = worker.activePass;
+		await waitFor(() => {
+			const blocker = scopeDelay.blocker();
+			return blocker !== null && owner.health().activeJobId === blocker.job.id;
+		}, 2_000);
+		const blocker = scopeDelay.blocker();
+		if (blocker === null) throw new Error("scope lookup blocker was not submitted");
+		const healthWhileBlocked = owner.health();
+		const recallWhileBlocked = recallThroughDbOwner<{ readonly id: string }>(
+			maintenance.owner,
+			"SELECT id FROM memories WHERE id = ?",
+			["owner-recall-fixture"],
+			{ deadlineMs: 20_000 },
+		);
+		const readinessWhileBlocked = maintenance.healthReady({ deadlineMs: 20_000 });
+		await new Promise<void>((resolve) => setTimeout(resolve, 5_200));
+		const protectedWhileOutstanding =
+			!triggerSettled &&
+			worker.running &&
+			worker.activePass === activeAttempt &&
+			owner.health().activeJobId === blocker.job.id;
+
+		await blocker.result;
+		const [recallRows, readiness, failedTrigger] = await Promise.all([
+			recallWhileBlocked,
+			readinessWhileBlocked,
+			triggerOutcome,
+		]);
+		const runningRows = await recallThroughDbOwner<{ readonly id: string }>(
+			maintenance.owner,
+			"SELECT id FROM dreaming_passes WHERE status = 'running'",
+		);
+		const releasedAfterSettle = !worker.running && worker.activePass === null;
+		const recoveryOutcome = await observeTrigger(worker.triggerAsync("incremental"));
+		if (recoveryOutcome.kind === "resolved") {
+			const recoveryAttempt = worker.activePass;
+			if (recoveryAttempt !== null) await recoveryAttempt;
+		}
+		const recoveryRows =
+			recoveryOutcome.kind === "resolved"
+				? await recallThroughDbOwner<{ readonly status: string }>(
+						maintenance.owner,
+						"SELECT status FROM dreaming_passes WHERE id = ?",
+						[recoveryOutcome.passId],
+					)
+				: [];
+
+		expect(healthWhileBlocked.state).toBe("ready");
+		expect(healthWhileBlocked.activeJobId).toBe(blocker.job.id);
+		expect(recallRows).toEqual([{ id: "owner-recall-fixture" }]);
+		expect(readiness.migrationsOk).toBe(true);
+		expect(protectedWhileOutstanding).toBe(true);
+		expect(failedTrigger.kind).toBe("rejected");
+		if (failedTrigger.kind === "rejected") {
+			expect(failedTrigger.error).toBeInstanceOf(DbOwnerDeadlineError);
+		}
+		expect(releasedAfterSettle).toBe(true);
+		expect(runningRows).toEqual([]);
+		expect(recoveryOutcome.kind).toBe("resolved");
+		expect(recoveryRows).toEqual([{ status: "completed" }]);
+	}, 30_000);
+
+	it("finalizes a pass that surfaced more transcripts than the owner admits at once", async () => {
+		const initial = fixture;
+		if (initial === null) throw new Error("real owner trigger fixture was not initialized");
+		await closeRealOwnerTriggerFixture(initial);
+		const surfaced: string[] = [];
+		fixture = await createRealOwnerTriggerFixture({
+			seed: (db) => {
+				const insert = db.prepare(
+					`INSERT INTO session_transcripts
+					 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
+					 VALUES (?, 'default', ?, 'pi', datetime('now'), datetime('now'), datetime('now'))`,
+				);
+				for (let index = 0; index < 80; index++)
+					insert.run(`bulk-session-${index}`, `Bulk session ${index} settled its deployment owner.`);
+			},
+			executorFactory: () => ({
+				async run(input) {
+					const search = input.tools.find((tool) => tool.name === "search_evidence");
+					if (!search) throw new Error("Missing search_evidence");
+					for (let page = 0; page < 10; page++) {
+						const result = await search.execute(
+							"page",
+							{ agentId: "default", limit: 50 },
+							undefined,
+							undefined,
+							{} as never,
+						);
+						const payload = JSON.parse((result.content[0] as { text: string }).text) as {
+							items: Array<{ id: string }>;
+							hasMore: boolean;
+						};
+						surfaced.push(...payload.items.map((item) => item.id));
+						if (!payload.hasMore) break;
+					}
+					return { summary: "Reviewed the bulk sessions" };
+				},
+			}),
+		});
+		const { maintenance, worker } = fixture;
+		const passId = await worker.triggerAsync("incremental");
+		await worker.activePass;
+		expect(new Set(surfaced).size).toBe(80);
+		expect(
+			await recallThroughDbOwner<{ readonly status: string; readonly error: string | null }>(
+				maintenance.owner,
+				"SELECT status, error FROM dreaming_passes WHERE id = ?",
+				[passId],
+			),
+		).toEqual([{ status: "completed", error: null }]);
+	}, 30_000);
+
+	it("holds the trigger fence through a timed-out pass-create commit", async () => {
+		const initial = fixture;
+		if (initial === null) throw new Error("real owner trigger fixture was not initialized");
+		await closeRealOwnerTriggerFixture(initial);
+		fixture = await createRealOwnerTriggerFixture({ commitPauseMs: 1_000 });
+		const current = fixture;
+		const { maintenance, owner, ownerCommitMarker, scopeDelay, worker } = current;
+		scopeDelay.limitPassCreate(100);
+		let firstSettled = false;
+		let secondTrigger: Promise<TriggerOutcome> | null = null;
+		let firstOutcome: TriggerOutcome | null = null;
+		let secondOutcomeBeforeRelease: TriggerOutcome | null = null;
+		let protectedBeforeRelease = false;
+		let commitGateObserved = false;
+		let triggerSettledBeforeRelease = false;
+		let workerRunningBeforeRelease = false;
+		let activePassMatchesBeforeRelease = false;
+		let ownerAliveBeforeRelease = false;
+		let commitWorkSettled = false;
+		let passRows: readonly {
+			readonly id: string;
+			readonly status: string;
+		}[] = [];
+		const firstTrigger = observeTrigger(worker.triggerAsync("incremental")).then((outcome) => {
+			firstSettled = true;
+			return outcome;
+		});
+		const firstAttempt = worker.activePass;
+		try {
+			await waitFor(() => {
+				const jobId = scopeDelay.passCreateJobId();
+				return (
+					jobId !== null &&
+					existsSync(ownerCommitMarker) &&
+					readFileSync(ownerCommitMarker, "utf8").includes("waiting") &&
+					owner.health().activeJobId === jobId
+				);
+			}, 5_000);
+			commitGateObserved = readFileSync(ownerCommitMarker, "utf8").includes("waiting");
+			await new Promise<void>((resolve) => setTimeout(resolve, 250));
+			triggerSettledBeforeRelease = firstSettled;
+			workerRunningBeforeRelease = worker.running;
+			activePassMatchesBeforeRelease = worker.activePass === firstAttempt;
+			ownerAliveBeforeRelease = owner.health().state === "ready";
+			protectedBeforeRelease =
+				!triggerSettledBeforeRelease &&
+				workerRunningBeforeRelease &&
+				activePassMatchesBeforeRelease &&
+				ownerAliveBeforeRelease &&
+				commitGateObserved;
+			secondTrigger = observeTrigger(worker.triggerAsync("incremental"));
+			secondOutcomeBeforeRelease = await Promise.race([
+				secondTrigger,
+				new Promise<null>((resolve) => setTimeout(() => resolve(null), 50)),
+			]);
+		} finally {
+			firstOutcome = await firstTrigger;
+			if (secondTrigger !== null) await secondTrigger;
+			await waitFor(() => readFileSync(ownerCommitMarker, "utf8").includes("completed"), 5_000);
+			commitWorkSettled = true;
+			await worker.activePass?.catch(() => {});
+			passRows = await recallThroughDbOwner<{
+				readonly id: string;
+				readonly status: string;
+			}>(maintenance.owner, "SELECT id, status FROM dreaming_passes ORDER BY created_at, id");
+		}
+		const createdRows = passRows;
+		expect({
+			commitWorkSettled,
+			protectedBeforeRelease,
+			commitGateObserved,
+			triggerSettledBeforeRelease,
+			workerRunningBeforeRelease,
+			activePassMatchesBeforeRelease,
+			ownerAliveBeforeRelease,
+			secondOutcomeBeforeRelease: secondOutcomeBeforeRelease?.kind,
+			secondOutcomeError:
+				secondOutcomeBeforeRelease?.kind === "rejected"
+					? secondOutcomeBeforeRelease.error instanceof Error
+						? secondOutcomeBeforeRelease.error.name
+						: String(secondOutcomeBeforeRelease.error)
+					: null,
+			firstOutcome: firstOutcome?.kind,
+			newPassCount: createdRows.length,
+			runningPassCount: createdRows.filter((row) => row.status === "running").length,
+			createdPassStatus: createdRows[0]?.status,
+			passId: createdRows[0]?.id,
+		}).toMatchObject({
+			commitWorkSettled: true,
+			protectedBeforeRelease: true,
+			commitGateObserved: true,
+			triggerSettledBeforeRelease: false,
+			workerRunningBeforeRelease: true,
+			activePassMatchesBeforeRelease: true,
+			ownerAliveBeforeRelease: true,
+			secondOutcomeBeforeRelease: "rejected",
+			secondOutcomeError: "AlreadyRunningError",
+			firstOutcome: "resolved",
+			newPassCount: 1,
+			runningPassCount: 0,
+			createdPassStatus: "completed",
+			passId: expect.any(String),
+		});
+	}, 30_000);
+
+	it("returns an acknowledged pass without a reconciliation read", async () => {
+		const current = fixture;
+		if (current === null) throw new Error("real owner trigger fixture was not initialized");
+		const { maintenance, owner, scopeDelay, worker } = current;
+		scopeDelay.delayPassCreateReconcile(100, 500);
+		const firstOutcomePromise = observeTrigger(worker.triggerAsync("incremental"));
+		await waitFor(() => {
+			const blocker = scopeDelay.blocker();
+			return (
+				scopeDelay.passCreateResult() === "resolved" &&
+				blocker !== null &&
+				owner.health().activeJobId === blocker.job.id
+			);
+		}, 5_000);
+		const firstOutcome = await firstOutcomePromise;
+		const firstPassCreateResults = scopeDelay.passCreateResults();
+		const firstPassCreateIds = scopeDelay.passCreateIds();
+		const firstReconcileSubmitted = scopeDelay.passCreateReconcileJobId() !== null;
+		await worker.activePass?.catch(() => {});
+		const firstRows = await recallThroughDbOwner<{ readonly id: string; readonly status: string }>(
+			maintenance.owner,
+			"SELECT id, status FROM dreaming_passes ORDER BY created_at, id",
+		);
+
+		const secondOutcome = await observeTrigger(worker.triggerAsync("incremental"));
+		await worker.activePass?.catch(() => {});
+		const allRows = await recallThroughDbOwner<{ readonly id: string; readonly status: string }>(
+			maintenance.owner,
+			"SELECT id, status FROM dreaming_passes ORDER BY created_at, id",
+		);
+
+		expect({
+			passCreateResults: firstPassCreateResults,
+			passCreateIds: firstPassCreateIds,
+			reconcileSubmitted: firstReconcileSubmitted,
+			firstOutcome: firstOutcome.kind,
+			firstPassStatuses: firstRows.map((row) => row.status),
+			secondOutcome: secondOutcome.kind,
+			passCount: allRows.length,
+			runningPassCount: allRows.filter((row) => row.status === "running").length,
+			passIdsAreDistinct: allRows.length === 2 && allRows[0]?.id !== allRows[1]?.id,
+		}).toMatchObject({
+			passCreateResults: ["resolved"],
+			passCreateIds: [expect.any(String)],
+			reconcileSubmitted: false,
+			firstOutcome: "resolved",
+			firstPassStatuses: [expect.not.stringContaining("running")],
+			secondOutcome: "resolved",
+			passCount: 2,
+			runningPassCount: 0,
+			passIdsAreDistinct: true,
+		});
+	}, 30_000);
+
+	it("keeps a late-committed pass owned when its reconciliation read times out", async () => {
+		const initial = fixture;
+		if (initial === null) throw new Error("real owner trigger fixture was not initialized");
+		await closeRealOwnerTriggerFixture(initial);
+		fixture = await createRealOwnerTriggerFixture({ commitPauseMs: 1_000 });
+		const current = fixture;
+		const { maintenance, owner, ownerCommitMarker, scopeDelay, worker } = current;
+		scopeDelay.limitPassCreate(100);
+		scopeDelay.delayPassCreateReconcile(100, 500);
+		const firstOutcomePromise = observeTrigger(worker.triggerAsync("incremental"));
+		await waitFor(() => {
+			const blocker = scopeDelay.blocker();
+			return (
+				blocker !== null &&
+				scopeDelay.passCreateReconcileJobId() !== null &&
+				owner.health().activeJobId === blocker.job.id &&
+				existsSync(ownerCommitMarker) &&
+				readFileSync(ownerCommitMarker, "utf8").includes("completed")
+			);
+		}, 10_000);
+		const firstOutcome = await firstOutcomePromise;
+		const firstPassCreateResults = scopeDelay.passCreateResults();
+		const firstPassCreateIds = scopeDelay.passCreateIds();
+		const firstReconcileSubmitted = scopeDelay.passCreateReconcileJobId() !== null;
+		await worker.activePass?.catch(() => {});
+		const firstRows = await recallThroughDbOwner<{ readonly id: string; readonly status: string }>(
+			maintenance.owner,
+			"SELECT id, status FROM dreaming_passes ORDER BY created_at, id",
+		);
+
+		const secondOutcome = await observeTrigger(worker.triggerAsync("incremental"));
+		await worker.activePass?.catch(() => {});
+		const allRows = await recallThroughDbOwner<{ readonly id: string; readonly status: string }>(
+			maintenance.owner,
+			"SELECT id, status FROM dreaming_passes ORDER BY created_at, id",
+		);
+
+		expect({
+			passCreateResults: firstPassCreateResults,
+			passCreateIds: firstPassCreateIds,
+			passCreateIdsAreSame:
+				firstPassCreateIds.length === 2 && firstPassCreateIds.every((id) => id === firstPassCreateIds[0]),
+			reconcileSubmitted: firstReconcileSubmitted,
+			commitCompleted: existsSync(ownerCommitMarker) && readFileSync(ownerCommitMarker, "utf8").includes("completed"),
+			firstOutcome: firstOutcome.kind,
+			firstPassStatuses: firstRows.map((row) => row.status),
+			secondOutcome: secondOutcome.kind,
+			passCount: allRows.length,
+			runningPassCount: allRows.filter((row) => row.status === "running").length,
+			passIdsAreDistinct: allRows.length === 2 && allRows[0]?.id !== allRows[1]?.id,
+		}).toMatchObject({
+			passCreateResults: ["rejected", "resolved"],
+			passCreateIds: [expect.any(String), expect.any(String)],
+			passCreateIdsAreSame: true,
+			commitCompleted: true,
+			firstOutcome: "resolved",
+			firstPassStatuses: [expect.not.stringContaining("running")],
+			secondOutcome: "resolved",
+			passCount: 2,
+			runningPassCount: 0,
+			passIdsAreDistinct: true,
+		});
+	}, 30_000);
+
+	it("reconciles a committed pass by pass ID after the owner exits before the trigger sees its result", async () => {
+		if (process.platform === "win32") return;
+		const initial = fixture;
+		if (initial === null) throw new Error("real owner trigger fixture was not initialized");
+		await closeRealOwnerTriggerFixture(initial);
+		fixture = await createRealOwnerTriggerFixture({ commitResultPauseMs: 30_000 });
+		const current = fixture;
+		const { maintenance, owner, ownerCommitMarker, ownerCommitResultGate, scopeDelay, worker } = current;
+		writeFileSync(ownerCommitResultGate, "pause-next-committed-result\n");
+		const triggerOutcomePromise = observeTrigger(worker.triggerAsync("incremental"));
+		const activeAttempt = worker.activePass;
+		await waitFor(
+			() => existsSync(ownerCommitMarker) && readFileSync(ownerCommitMarker, "utf8").includes("result-wait"),
+			10_000,
+		);
+		const ownerPid = owner.health().pid;
+		if (ownerPid === null) throw new Error("DB owner did not publish its pid");
+		const passCreateJobId = scopeDelay.passCreateJobId();
+		const protectedWhileResultHeld =
+			worker.running &&
+			worker.activePass === activeAttempt &&
+			passCreateJobId !== null &&
+			owner.health().activeJobId === passCreateJobId;
+		const duplicateTrigger = await observeTrigger(worker.triggerAsync("incremental"));
+		const generationBeforeRetirement = owner.health().generation;
+		process.kill(ownerPid, "SIGKILL");
+		await waitFor(
+			() => owner.health().state === "ready" && owner.health().generation > generationBeforeRetirement,
+			10_000,
+		);
+		const triggerOutcome = await triggerOutcomePromise;
+		await activeAttempt?.catch(() => {});
+		const ownerRecovered = owner.health().state === "ready" && owner.health().pid !== ownerPid;
+		const passRows = await recallThroughDbOwner<{
+			readonly id: string;
+			readonly status: string;
+		}>(maintenance.owner, "SELECT id, status FROM dreaming_passes ORDER BY created_at, id");
+		const nextTriggerOutcome = await observeTrigger(worker.triggerAsync("incremental"));
+		await worker.activePass?.catch(() => {});
+		const settledPassRows = await recallThroughDbOwner<{
+			readonly id: string;
+			readonly status: string;
+		}>(maintenance.owner, "SELECT id, status FROM dreaming_passes ORDER BY created_at, id");
+
+		expect(protectedWhileResultHeld).toBe(true);
+		expect(duplicateTrigger.kind).toBe("rejected");
+		if (duplicateTrigger.kind === "rejected") expect(duplicateTrigger.error).toBeInstanceOf(AlreadyRunningError);
+		expect(triggerOutcome.kind).toBe("resolved");
+		expect(ownerRecovered).toBe(true);
+		expect(owner.health().generation).toBeGreaterThan(generationBeforeRetirement);
+		expect(passRows).toHaveLength(1);
+		expect(passRows[0]).toMatchObject({ status: "completed" });
+		if (triggerOutcome.kind === "resolved") expect(passRows[0]?.id).toBe(triggerOutcome.passId);
+		expect(nextTriggerOutcome.kind).toBe("resolved");
+		expect(settledPassRows).toHaveLength(2);
+		expect(settledPassRows.every((row) => row.status === "completed")).toBe(true);
+		if (triggerOutcome.kind === "resolved" && nextTriggerOutcome.kind === "resolved") {
+			expect(triggerOutcome.passId).not.toBe(nextTriggerOutcome.passId);
+		}
+	}, 30_000);
+
+	it("releases the deadline fence after owner retirement and completes the next pass after restart", async () => {
+		if (process.platform === "win32") return;
+		const current = fixture;
+		if (current === null) throw new Error("real owner trigger fixture was not initialized");
+		const { maintenance, owner, scopeDelay, worker } = current;
+		const controlId = await worker.triggerAsync("incremental");
+		const controlAttempt = worker.activePass;
+		if (controlAttempt !== null) await controlAttempt;
+		const controlRows = await recallThroughDbOwner<{ readonly status: string }>(
+			maintenance.owner,
+			"SELECT status FROM dreaming_passes WHERE id = ?",
+			[controlId],
+		);
+		expect(controlRows).toEqual([{ status: "completed" }]);
+
+		const generationBeforeRetirement = owner.health().generation;
+		scopeDelay.arm(60_000);
+		let triggerSettled = false;
+		const triggerOutcome = observeTrigger(worker.triggerAsync("incremental")).then((outcome) => {
+			triggerSettled = true;
+			return outcome;
+		});
+		const activeAttempt = worker.activePass;
+		await waitFor(() => {
+			const blocker = scopeDelay.blocker();
+			return blocker !== null && owner.health().activeJobId === blocker.job.id;
+		}, 2_000);
+		const blocker = scopeDelay.blocker();
+		if (blocker === null) throw new Error("scope lookup blocker was not submitted");
+		const blockerOutcome = blocker.result.then(
+			(value) => ({ kind: "resolved" as const, value }),
+			(error: unknown) => ({ kind: "rejected" as const, error }),
+		);
+		const ownerPid = owner.health().pid;
+		if (ownerPid === null) throw new Error("DB owner did not publish its pid");
+		await new Promise<void>((resolve) => setTimeout(resolve, 5_200));
+		const protectedBeforeRetirement =
+			!triggerSettled &&
+			worker.running &&
+			worker.activePass === activeAttempt &&
+			owner.health().activeJobId === blocker.job.id;
+
+		process.kill(ownerPid, "SIGKILL");
+		await waitFor(() => owner.health().state === "dead", 5_000);
+		const retiredBlocker = await blockerOutcome;
+		const failedTrigger = await triggerOutcome;
+		const releasedAfterRetirement = !worker.running && worker.activePass === null;
+		const recoveryOutcome = await observeTrigger(worker.triggerAsync("incremental"));
+		if (recoveryOutcome.kind === "resolved") {
+			const recoveryAttempt = worker.activePass;
+			if (recoveryAttempt !== null) await recoveryAttempt;
+		}
+		if (owner.health().state === "dead") await owner.start();
+		const passRows = await recallThroughDbOwner<{
+			readonly id: string;
+			readonly status: string;
+		}>(maintenance.owner, "SELECT id, status FROM dreaming_passes ORDER BY created_at, id");
+		const runningRows = passRows.filter((row) => row.status === "running");
+		const recoveredRows =
+			recoveryOutcome.kind === "resolved" ? passRows.filter((row) => row.id === recoveryOutcome.passId) : [];
+
+		expect(protectedBeforeRetirement).toBe(true);
+		expect(retiredBlocker.kind).toBe("rejected");
+		if (retiredBlocker.kind === "rejected") {
+			expect(retiredBlocker.error).toBeInstanceOf(DbOwnerDiedError);
+		}
+		expect(failedTrigger.kind).toBe("rejected");
+		if (failedTrigger.kind === "rejected") {
+			expect(failedTrigger.error).toBeInstanceOf(DbOwnerDeadlineError);
+		}
+		expect(releasedAfterRetirement).toBe(true);
+		expect(owner.health().generation).toBeGreaterThan(generationBeforeRetirement);
+		expect(runningRows).toEqual([]);
+		expect(recoveryOutcome.kind).toBe("resolved");
+		expect(recoveredRows).toEqual([{ id: expect.any(String), status: "completed" }]);
+	}, 30_000);
 });

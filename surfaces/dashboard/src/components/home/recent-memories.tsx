@@ -1,10 +1,13 @@
-import { ChevronRight, Search, FileText, MessageCircle } from "@/components/mingcute-icons";
+import { LoadingRows } from "@/components/ui/skeleton";
+import { SectionHeading } from "@/components/dashboard/heading";
+import { SearchField } from "@/components/ui/field";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Dialog, DialogTrigger, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { api, type Memory } from "@/lib/api";
 import { useAsync } from "@/lib/use-async";
 import { cn } from "@/lib/utils";
 import { useMemo, useState } from "react";
+import { useScrollEnd } from "@/lib/use-scroll-end";
 
 const TYPE_TINTS: Record<string, string> = {
 	decision: "home-type-decision",
@@ -25,7 +28,7 @@ export function HomeRecentMemories() {
 				return { memories: null, query: trimmedQuery };
 			}
 		},
-		{ deps: [trimmedQuery], intervalMs: 30_000 },
+		{ key: `recent-memories:${trimmedQuery}`, deps: [trimmedQuery], intervalMs: 30_000 },
 	);
 	const memories = memoriesQuery.data?.memories ?? [];
 	const sourceOptions = useMemo(
@@ -40,6 +43,7 @@ export function HomeRecentMemories() {
 	);
 	const visibleMemories =
 		sourceFilter === "all" ? memories : memories.filter((memory) => (memory.source_type ?? "agent") === sourceFilter);
+	const scroll = useScrollEnd<HTMLDivElement>();
 	const searching = memoriesQuery.loading || memoriesQuery.data?.query !== trimmedQuery;
 	const failed = !searching && memoriesQuery.data?.memories === null;
 	const meta = searching
@@ -51,30 +55,26 @@ export function HomeRecentMemories() {
 			: `${visibleMemories.length} ${trimmedQuery ? (visibleMemories.length === 1 ? "match" : "matches") : "latest"}`;
 
 	return (
-		<section className="home-recent group flex min-h-0 flex-col" aria-labelledby="recent-memories-title">
-			<div className="flex shrink-0 items-center justify-between gap-3">
-				<div className="flex items-baseline gap-2.5">
-					<h2 id="recent-memories-title" className="m-0 text-[15px] font-semibold tracking-tight text-foreground">
-						Recently saved
-					</h2>
-					<span role="status" className="font-mono text-[10.5px] text-muted-foreground">
+		<section className="home-recent group flex flex-col" aria-labelledby="recent-memories-title">
+			<SectionHeading
+				id="recent-memories-title"
+				title="Recently saved"
+				className="shrink-0"
+				meta={
+					<span role="status" className="text-meta tabular-nums text-muted-foreground">
 						{meta}
 					</span>
-				</div>
-			</div>
+				}
+			/>
 
 			<div className="mt-3 flex shrink-0 items-center gap-2">
-				<label className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[var(--radius)] border border-border bg-[color-mix(in_oklch,var(--foreground)_3%,transparent)] px-2.5 transition-colors focus-within:border-[color-mix(in_oklch,var(--foreground)_28%,transparent)]">
-					<Search className="size-3.5 shrink-0 text-muted-foreground" />
-					<span className="sr-only">Search saved memories</span>
-					<input
-						aria-label="Search saved memories"
-						value={query}
-						onChange={(event) => setQuery(event.target.value)}
-						placeholder="Search saved memories…"
-						className="h-full min-w-0 flex-1 border-0 bg-transparent p-0 text-[12px] text-foreground outline-none placeholder:text-muted-foreground"
-					/>
-				</label>
+				<SearchField
+					className="min-w-0 flex-1"
+					aria-label="Search saved memories"
+					value={query}
+					onChange={(event) => setQuery(event.target.value)}
+					placeholder="Search saved memories…"
+				/>
 				<Select value={sourceFilter} onValueChange={setSourceFilter}>
 					<SelectTrigger className="home-source-filter" aria-label="Filter memories by source">
 						<SelectValue />
@@ -90,21 +90,19 @@ export function HomeRecentMemories() {
 				</Select>
 			</div>
 
-			<div className="relative mt-2 min-h-0 flex-1">
-				<div aria-busy={searching} className="h-full overflow-y-auto scrollbar-none">
+			<div className="mt-2">
+				<div aria-busy={searching}>
 					{memoriesQuery.loading && memoriesQuery.data === null ? (
-						<div className="grid min-h-[84px] place-items-center font-mono text-[10.5px] text-muted-foreground">
-							Loading memories…
-						</div>
+						<LoadingRows label="Loading memories…" rows={4} />
 					) : failed ? (
-						<div className="flex min-h-[84px] items-center justify-center gap-2 text-[11px] text-muted-foreground">
+						<div className="flex min-h-[84px] items-center justify-center gap-2 text-meta text-muted-foreground">
 							<span>{trimmedQuery ? "Unable to search saved memories." : "Unable to load saved memories."}</span>
 							<button type="button" className="home-text-action" onClick={() => void memoriesQuery.refresh()}>
 								Retry
 							</button>
 						</div>
 					) : visibleMemories.length === 0 ? (
-						<div className="grid min-h-[84px] place-items-center text-center text-[11px] text-muted-foreground">
+						<div className="grid min-h-[84px] place-items-center text-center text-meta text-muted-foreground">
 							{searching
 								? "Searching…"
 								: trimmedQuery
@@ -114,7 +112,12 @@ export function HomeRecentMemories() {
 										: "No saved memories yet."}
 						</div>
 					) : (
-						<div className="flex flex-col">
+						<div
+							ref={scroll.ref}
+							onScroll={scroll.onScroll}
+							data-at-end={scroll.atEnd}
+							className="home-recent-list flex flex-col"
+						>
 							{visibleMemories.map((memory) => (
 								<RecentMemoryRow key={memory.id} memory={memory} />
 							))}
@@ -133,26 +136,27 @@ function RecentMemoryRow({ memory }: { memory: Memory }) {
 		<Dialog>
 			<DialogTrigger asChild>
 				<button type="button" className="home-memory-row home-memory-summary group/memory w-full text-left">
-					<span className="home-memory-icon">
-						{kind === "manual" ? <MessageCircle aria-hidden="true" /> : <FileText aria-hidden="true" />}
-					</span>
 					<div className="min-w-0 flex-1">
-						<p className="m-0 line-clamp-1 text-[12.5px] font-medium leading-[1.35] text-foreground">{title}</p>
-						<div className="mt-0.5 flex min-w-0 items-center gap-1.5 font-mono text-[9.5px] text-muted-foreground">
-							<span className="truncate">via {memory.who || sourceLabel(kind)}</span>
+						<p className="m-0 line-clamp-1 text-body leading-[1.35] text-foreground">{title}</p>
+						<div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-meta tabular-nums text-muted-foreground">
+							<span className="shrink-0">{timeAgo(memory.created_at)}</span>
 							<span aria-hidden="true">·</span>
 							<span className={cn("shrink-0", TYPE_TINTS[memory.type] ?? "text-muted-foreground")}>
 								{memory.type || sourceLabel(kind)}
 							</span>
+							{memory.who && memory.who !== "dreaming" && (
+								<>
+									<span aria-hidden="true">·</span>
+									<span className="truncate">via {memory.who}</span>
+								</>
+							)}
 						</div>
 					</div>
-					<span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{timeAgo(memory.created_at)}</span>
-					<ChevronRight className="size-3.5 shrink-0 text-muted-foreground/75 transition-transform group-hover/memory:translate-x-0.5" />
 				</button>
 			</DialogTrigger>
 			<DialogContent className="home-memory-reader">
-				<DialogTitle className="text-sm font-medium">Saved memory</DialogTitle>
-				<DialogDescription className="font-mono text-[11px]">
+				<DialogTitle className="text-body font-medium">Saved memory</DialogTitle>
+				<DialogDescription className="text-meta tabular-nums">
 					<span className="block">
 						via {memory.who || sourceLabel(kind)} · {sourceLabel(kind)} · {memory.type || "memory"}
 					</span>
@@ -160,7 +164,7 @@ function RecentMemoryRow({ memory }: { memory: Memory }) {
 						Saved {new Date(memory.created_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "long" })}
 					</time>
 				</DialogDescription>
-				<div className="min-h-0 overflow-y-auto whitespace-pre-wrap break-words text-[14px] leading-relaxed">
+				<div className="min-h-0 overflow-y-auto whitespace-pre-wrap break-words text-title leading-relaxed">
 					{memory.content}
 				</div>
 			</DialogContent>

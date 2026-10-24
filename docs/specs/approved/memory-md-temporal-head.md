@@ -63,9 +63,36 @@ The rendered document has two layers:
 
 The daemon's bounded `memory_head` owner operation is the publication and
 freshness boundary for `memory_head_commit`, the sole Dreaming head publication tool. A content pass snapshots
-its agent's existing head revision when it starts. Publication requires that
-snapshot and the submitted revision/hash to still match. Reading a newer head
-cannot make an older pass eligible to publish.
+its agent's existing head revision when it starts, and publication requires the
+head to still be at that fence. The daemon owns the fence; callers do not submit
+a base revision or hash. Reading a newer head cannot make an older pass eligible
+to publish.
+
+Invalidations caused by the running pass's own writes (its ontology operations
+and its finalization's transcript nodes) advance its fence in the same owner
+transaction, because the pass already knows about them; publication still
+revalidates every cited quote against current, non-superseded evidence. An
+invalidation from anywhere else leaves the fence behind, and the commit fails
+with `STALE_HEAD`. Only the daemon's binding to its own running pass moves the
+fence; a pass ID supplied by an external tool caller labels provenance and
+never absorbs writes into a pass. Finalization writes the pass's transcript
+nodes before it commits the head, so a successful publication is current when it
+lands, and a head entry that cites a summary node that the same finalization
+replaces with its transcript fails with `INVALID_PROVENANCE`.
+
+During a content pass, the pass's own `memory_head_read` also returns
+`committedEntries`: the last published entries whose support still resolves to
+current scoped evidence, with that support, even when the head is stale. The
+pass carries them forward instead of rebuilding the head from nothing. Support
+whose evidence was deleted, superseded, or purged is dropped, and an entry is
+returned only while at least one support survives. Every other reader still
+receives no text from a stale head.
+
+An empty entry set clears a head only when no committed entry still has valid
+support and every stored entry's provenance is readable; otherwise it fails with
+`INVALID_HEAD`. A cleared head is current and
+empty, and its projection replaces an existing generated `MEMORY.md` so removed
+text does not linger on disk.
 
 Corrections, supersession, deletion, source removal, and access revocation
 advance the affected head's revision and mark it stale in the same database
@@ -100,7 +127,9 @@ The database remains authoritative if a process dies between file replacement
 and transaction completion. Delivery never trusts that file as committed state.
 
 Migration 150 marks pre-existing heads unverified without deleting their text,
-files, or audit history. Existing in-flight passes without a captured revision
+files, or audit history. Those heads have no structured entries to carry
+forward, so the next successful commit, including an empty one, replaces their
+unversioned text. Existing in-flight passes without a captured revision
 cannot publish. Deploy readers, writers, and the migration together; do not run
 older publishers against the migrated workspace. For rollback, stop the daemon
 and restore the pre-migration workspace/database backup together with the older
@@ -109,7 +138,8 @@ separate dependency index, revision service, or automatic regeneration queue is
 introduced.
 
 `memory_head_commit` takes the complete ordered set of retained entries, each
-with an entry ID, text, and exact source/quote support. The owner renders the
+with an entry ID, text, and exact source/quote support. The daemon binds the
+commit to the running content pass; callers never supply a pass ID, base revision, or hash. The owner renders the
 body and records entry provenance and removals. Deferrals and reasons for no
 change belong in the existing pass log, not a second publication format.
 

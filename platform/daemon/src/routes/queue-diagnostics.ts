@@ -77,7 +77,7 @@ function parseRepairBody(body: unknown): {
 	if (actionRaw !== "requeue" && actionRaw !== "cancel" && actionRaw !== "prune") {
 		return null;
 	}
-	const dryRun = r.dryRun !== false; // default to dry-run for safety
+	const dryRun = r.dryRun !== false;
 	const ids: string[] = Array.isArray(r.ids)
 		? r.ids.filter((v): v is string => typeof v === "string" && v.length > 0)
 		: [];
@@ -174,10 +174,6 @@ export function registerQueueDiagnosticsRoutes(
 		try {
 			result = await dispatchRepairWith(ctx, resolveAccessor(), limiter, parsed.action, options);
 		} catch (err) {
-			// Repair actions throw synchronously from inside withWriteTx (e.g. a
-			// missing migrations table, a closed DbAccessor, or a SQLite error).
-			// Mirror the GET sibling and the Rust parity handler by returning the
-			// documented structured RepairResult instead of an unstructured 500.
 			result = {
 				action: parsed.action,
 				success: false,
