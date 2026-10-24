@@ -1962,7 +1962,7 @@
     },
     {
       "path": "memory-search.ts",
-      "line": 3000,
+      "line": 3007,
       "api": "withReadDbAsync",
       "source": "await getDbAccessor().withReadDbAsync(",
       "category": "hot-path",

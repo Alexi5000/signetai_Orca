@@ -1889,6 +1889,44 @@ describe("hybridRecall", () => {
 		expect(result.results[1]?.source).toBe("temporal_window");
 	});
 
+	it("still fills same-window memories when their vectors cannot be read", async () => {
+		await markActiveEmbeddingProfileKnown();
+		const savedAt = "2026-05-24T18:00:00.000Z";
+		getDbAccessor().withWriteTx((db) => {
+			for (const [id, at] of [
+				["mem-window-fill-a", "2026-05-13T09:00:00.000Z"],
+				["mem-window-fill-b", "2026-05-13T10:00:00.000Z"],
+			]) {
+				db.prepare(
+					`INSERT INTO memories (
+						id, content, type, agent_id, visibility, created_at, updated_at, updated_by, is_deleted
+					) VALUES (?, ?, 'fact', 'agent-a', 'global', ?, ?, 'test', 0)`,
+				).run(id, `Same-day temporal candidate ${id}.`, savedAt, savedAt);
+				db.prepare(
+					`INSERT INTO temporal_edges (
+						id, agent_id, subject_type, subject_id, facet, start_at, end_at,
+						confidence, created_at, updated_at
+					) VALUES (?, 'agent-a', 'memory', ?, 'occurred', ?, ?, 1.0, ?, ?)`,
+				).run(`edge-${id}`, id, at, at, savedAt, savedAt);
+			}
+			db.exec("ALTER TABLE embeddings RENAME COLUMN dimensions TO declared_dimensions");
+		});
+
+		const result = await hybridRecall(
+			{
+				query: "2026/05/13 unrelated wording",
+				keywordQuery: "unrelated wording",
+				limit: 2,
+				agentId: "agent-a",
+				readPolicy: "isolated",
+			},
+			testCfg(),
+			async () => unitVector(),
+		);
+
+		expect(result.results.map((row) => row.source)).toEqual(["temporal_window", "temporal_window"]);
+	});
+
 	it("honors explicit timeline mode even when query text is present", async () => {
 		getDbAccessor().withWriteTx((db) => {
 			db.prepare(

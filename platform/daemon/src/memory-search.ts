@@ -2843,12 +2843,19 @@ export async function hybridRecall(
 				const similarity = new Map<string, number>();
 				if (comparableQueryVector) {
 					const queryVector = comparableQueryVector;
-					const embRows = await readOwnerVectorsBySource(
-						missing,
-						cfg.embedding.dimensions,
-						async (sql, sqlParams, pageRows) =>
-							await graphOwnerReadAll<OwnerVectorRow>(sql, sqlParams, "memory-search.temporal-window-fill", pageRows),
-					);
+					let embRows: Array<{ source_id: string; vector: Float32Array }> = [];
+					try {
+						embRows = await readOwnerVectorsBySource(
+							missing,
+							cfg.embedding.dimensions,
+							async (sql, sqlParams, pageRows) =>
+								await graphOwnerReadAll<OwnerVectorRow>(sql, sqlParams, "memory-search.temporal-window-fill", pageRows),
+						);
+					} catch (e) {
+						logger.warn("memory", "Temporal window vector ordering failed (non-fatal)", {
+							error: e instanceof Error ? e.message : String(e),
+						});
+					}
 					for (const row of embRows) {
 						similarity.set(row.source_id, cosineSimilarity(queryVector, row.vector));
 					}
