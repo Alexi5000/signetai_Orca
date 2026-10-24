@@ -112,8 +112,6 @@ export function registerMiscRoutes(app: Hono): void {
 
 			for (const fileName of configFiles) {
 				const filePath = join(AGENTS_DIR, fileName);
-				// Open once (non-blocking so a FIFO cannot stall the request) and
-				// fstat the descriptor so the reported size matches what is read.
 				const fd = openSync(filePath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
 				try {
 					const fileStat = fstatSync(fd);

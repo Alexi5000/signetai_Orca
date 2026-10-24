@@ -404,7 +404,6 @@ export async function runExistingSetupWizard(
 		const agentsPath = join(basePath, "AGENTS.md");
 		if (identityMode === "managed") {
 			const agentsTemplate = join(templatesDir, "AGENTS.md.template");
-			// O_EXCL create-if-missing: an existing AGENTS.md is never overwritten.
 			if (existsSync(agentsTemplate)) {
 				const content = readFileSync(agentsTemplate, "utf-8").replace(/\{\{AGENT_NAME\}\}/g, agentName);
 				writeFileExclusiveSync(agentsPath, content);

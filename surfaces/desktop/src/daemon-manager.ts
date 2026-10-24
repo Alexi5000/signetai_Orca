@@ -270,9 +270,6 @@ export class DaemonManager {
 		}
 
 		this.#closeFds();
-
-		// openSync returns a real fd synchronously — no race with spawn's fd validation.
-		// See issue #606: createWriteStream causes "TypeError: stream must have an underlying descriptor"
 		const logs = openDaemonLogs(this.#workspacePath);
 		this.#stdoutFd = logs.stdout;
 		this.#stderrFd = logs.stderr;

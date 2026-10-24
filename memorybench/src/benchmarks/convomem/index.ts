@@ -133,8 +133,6 @@ export class ConvoMemBenchmark implements Benchmark {
     if (allItems.length === 0) {
       throw new Error("ConvoMem download produced no benchmark items")
     }
-
-    // Save all items to a single file only after every required slice succeeds.
     writeFileScopedAtomicSync(
       dirname(dataFile),
       basename(dataFile),

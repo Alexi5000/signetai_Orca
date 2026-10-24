@@ -2,17 +2,6 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import type { ChildProcess } from "node:child_process";
 import EventEmitter from "node:events";
 import { join, resolve } from "node:path";
-
-// ---------------------------------------------------------------------------
-// Module mocks — declared before any dynamic import of the module under test.
-// bun:test hoists mock.module calls so substitutes are in place when the
-// module graph is first evaluated. Dynamic imports (await import) below pick
-// up the mocked versions automatically.
-// ---------------------------------------------------------------------------
-
-// Stub electron: DaemonManager#spawnBundled calls app.getPath("userData"),
-// which would crash without an Electron runtime. We provide a real path so
-// that mkdirSync/openSync stubs receive a predictable argument.
 mock.module("electron", () => ({
 	default: {
 		app: { getPath: (_name: string) => "/tmp/signet-test-userdata", isPackaged: false },
@@ -27,11 +16,6 @@ const testRuntimePaths = {
 
 const daemonLogs = await import("./daemon-logs.js");
 let openLogsMock: ReturnType<typeof spyOn>;
-
-// ---------------------------------------------------------------------------
-// Import the module under test AFTER mock.module declarations so the mocked
-// dependencies are in scope when DaemonManager is evaluated.
-// ---------------------------------------------------------------------------
 const { DaemonManager } = await import("./daemon-manager.js");
 
 function makeDaemonManager(workspacePath: string): InstanceType<typeof DaemonManager> {

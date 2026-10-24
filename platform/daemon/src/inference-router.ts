@@ -553,8 +553,6 @@ export class InferenceRouter {
 		let signature = "no-config";
 		for (const candidate of inferenceConfigPaths(this.agentsDir)) {
 			try {
-				// Open once and fstat the descriptor so the signature describes
-				// exactly the bytes that were parsed.
 				const file = await readFileWithStat(candidate, "utf-8");
 				if (file === null) continue;
 				path = candidate;

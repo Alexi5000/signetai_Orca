@@ -362,7 +362,7 @@ describe("DbAccessor", () => {
 					state.latched = getEventLoopLiveness(5_000);
 					db.prepare("SELECT 1").get();
 				},
-				{ siteToken: "db-accessor.test.ts:339" },
+				{ siteToken: "db-accessor.test.ts:357" },
 			);
 		} finally {
 			Date.now = realNow;
@@ -391,7 +391,7 @@ describe("DbAccessor", () => {
 				recordEventLoopHeartbeat(5_000, 2_000);
 				state.latched = getEventLoopLiveness(5_000);
 				db.prepare("SELECT 1").get();
-			}, "db-accessor.test.ts:370");
+			}, "db-accessor.test.ts:388");
 		} finally {
 			Date.now = realNow;
 		}
@@ -421,7 +421,7 @@ describe("DbAccessor", () => {
 					state.latched = getEventLoopLiveness(5_000);
 					db.prepare("SELECT 1").get();
 				},
-				{ siteToken: "db-accessor.test.ts:398" },
+				{ siteToken: "db-accessor.test.ts:416" },
 			);
 		} finally {
 			Date.now = realNow;

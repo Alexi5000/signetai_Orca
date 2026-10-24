@@ -1,11 +1,3 @@
-/**
- * Portable agent export and import.
- *
- * Creates a ZIP archive containing the full agent identity, memories,
- * entities, relations, and optionally embeddings. Supports round-trip
- * import with conflict resolution.
- */
-
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 
@@ -168,16 +160,12 @@ function collectSkillFiles(dir: string, prefix: string, out: Array<{ path: strin
 			if (entry.isDirectory()) {
 				collectSkillFiles(fullPath, relPath, out);
 			} else {
-				// Open once and size-check the descriptor, so the file we measure is
-				// the file we read.
 				const fd = openSync(fullPath, "r");
 				try {
-					if (fstatSync(fd).size > 1_000_000) continue; // skip files > 1MB
+					if (fstatSync(fd).size > 1_000_000) continue;
 					try {
 						out.push({ path: relPath, content: readFileSync(fd, "utf-8") });
-					} catch {
-						// Skip binary files
-					}
+					} catch {}
 				} finally {
 					closeSync(fd);
 				}

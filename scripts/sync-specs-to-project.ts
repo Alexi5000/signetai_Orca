@@ -4,8 +4,6 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
-// --- config ---
-
 const PROJECT_ID = "PVT_kwDOD4vxcc4BTHDc";
 const PROJECT_NUMBER = 1;
 const ORG = "Signet-AI";

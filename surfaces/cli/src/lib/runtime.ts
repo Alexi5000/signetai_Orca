@@ -2182,9 +2182,7 @@ export async function startDaemon(
 		proc.on("error", (err) => {
 			try {
 				appendPrivateDaemonLog(agentsDir, `[spawn error] ${err.message}\n`);
-			} catch {
-				// Best effort.
-			}
+			} catch {}
 		});
 		proc.on("exit", (code, signal) => {
 			procExited = true;

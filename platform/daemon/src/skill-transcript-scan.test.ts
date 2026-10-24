@@ -6,10 +6,6 @@ import { runMigrations } from "../../core/src/migrations";
 import { closeDbAccessor, initDbAccessor } from "./db-accessor";
 import { MAX_TRANSCRIPT_SCAN_BYTES, recordSkillsFromTranscript } from "./skill-transcript-scan";
 import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
-
-// Each JSONL line: { sessionId, timestamp, cwd, message: { content: [...] } }
-// Two resolved Skill uses (toolu_AAA=web-search, toolu_BBB=tavily-cli),
-// one unresolved use (toolu_CCC=web-search, no matching tool_result).
 const FIXTURE_JSONL = [
 	JSON.stringify({
 		sessionId: "sess-scan-1",

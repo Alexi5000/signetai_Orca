@@ -92,30 +92,16 @@ export function resolveEmbeddedDashboardAsset(requestPath: string): EmbeddedDash
 }
 
 const privateCacheFallbacks = new Map<string, string>();
-
-/**
- * Whether `dir` is a real directory owned by this user that no other user
- * could have written into. Owner-only read/execute bits are tightened.
- */
 function isTrustedPrivateDir(dir: string): boolean {
 	const st = lstatSync(dir);
 	if (st.isSymbolicLink() || !st.isDirectory()) return false;
 	if (process.platform === "win32") return true;
 	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
 	if (uid !== undefined && st.uid !== uid) return false;
-	// Group/other-writable: another user may have planted content.
 	if ((st.mode & 0o022) !== 0) return false;
 	if ((st.mode & 0o077) !== 0) chmodSync(dir, 0o700);
 	return true;
 }
-
-/**
- * Resolve the content-addressed cache directory `tmpdir()/<name>`, reused
- * across runs. The shared temp root is world-writable, so the directory must
- * be created owner-only (0o700) and verified to be ours before any cached
- * code is trusted; otherwise a fresh private mkdtemp directory is used for
- * the rest of this process.
- */
 function ensurePrivateCacheDir(name: string): string {
 	const fallback = privateCacheFallbacks.get(name);
 	if (fallback !== undefined) return fallback;
@@ -281,7 +267,6 @@ export function materializeEmbeddedWasmAssets(): string | null {
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	for (const asset of assets) {
 		const path = join(dir, asset.name.replace(/[/\\]/g, "_"));
-		// Create-if-missing without a check-then-write window.
 		writeFileExclusiveSync(path, Buffer.from(asset.contentBase64, "base64"));
 	}
 	return dir;
@@ -301,7 +286,6 @@ export function materializeEmbeddedAssetTree(kind: "connectors" | "graphiq" | "s
 		if (parts.length === 0 || parts.includes("..")) continue;
 		const path = join(root, ...parts);
 		mkdirSync(dirname(path), { recursive: true });
-		// Create-if-missing (O_EXCL); the asset mode is applied to the descriptor.
 		writeFileExclusiveSync(path, Buffer.from(asset.contentBase64, "base64"), { mode: asset.mode });
 	}
 	if (kind === "connectors") {

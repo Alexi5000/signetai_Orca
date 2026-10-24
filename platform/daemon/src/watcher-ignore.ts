@@ -1,8 +1,6 @@
 import { closeSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, join, normalize, relative, resolve } from "node:path";
 import { resolveWorkspaceSourceRepoPath, resolveWorkspaceLayout, writeFileExclusiveSync } from "@signet/core";
-
-// Canonical artifact filename patterns (keep in sync with daemon.ts)
 const ARTIFACT_FILENAME_RE = /--(?:summary|transcript|compaction|manifest)\.md$/;
 const MEMORY_BACKUP_FILENAME_RE = /^MEMORY\.(?:backup|bak|pre)-.+\.md$/;
 const SIGNET_IGNORE_FILENAME = ".sigignore";
@@ -136,11 +134,8 @@ function isIgnoredBySigignore(patterns: readonly SigignorePattern[], relativePat
 
 function ensureDefaultSigignore(sigignorePath: string): void {
 	try {
-		// Create-if-missing (O_EXCL): never clobbers a concurrently created file.
 		writeFileExclusiveSync(sigignorePath, DEFAULT_SIGNIGNORE_CONTENT);
-	} catch {
-		// Best-effort; watcher still works without a .sigignore file.
-	}
+	} catch {}
 }
 
 function createSigignoreMatcher(agentsDir: string): (normalizedPath: string) => boolean {
@@ -151,8 +146,6 @@ function createSigignoreMatcher(agentsDir: string): (normalizedPath: string) => 
 	function loadPatterns(): readonly SigignorePattern[] {
 		let fd: number | undefined;
 		try {
-			// Stamp and read through one descriptor so the cached patterns
-			// always correspond to the stamped file.
 			fd = openSync(sigignorePath, "r");
 			const stat = fstatSync(fd);
 			const stamp = `${stat.mtimeMs}:${stat.size}`;

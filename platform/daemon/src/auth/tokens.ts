@@ -1,10 +1,3 @@
-/**
- * Token creation and verification using HMAC-SHA256.
- * No external dependencies — uses Web Crypto API only.
- *
- * Token format: {base64url(payload)}.{base64url(hmac)}
- */
-
 import { mkdirSync } from "node:fs";
 import { readFileIfExistsSync, writeFileAtomicSync, writeFileExclusiveSync } from "@signet/core";
 import { dirname } from "node:path";
@@ -43,7 +36,6 @@ export function loadOrCreateSecret(secretPath: string): Buffer {
 	mkdirSync(dirname(secretPath), { recursive: true });
 	const secret = generateSecret();
 	if (writeFileExclusiveSync(secretPath, secret, { mode: 0o600 })) return secret;
-	// Another process created the secret concurrently; adopt it.
 	return loadOrCreateSecret(secretPath);
 }
 

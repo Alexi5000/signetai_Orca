@@ -52,7 +52,6 @@ const assets: NativeAsset[] = readdirSync(nativeDir)
 		if (!platform) return [];
 		const path = join(nativeDir, name);
 		if (!statSync(path).isFile()) return [];
-		// Hash and size come from one descriptor so they describe the same file.
 		const file = readFileWithStatSync(path);
 		if (!file?.stat.isFile()) return [];
 		return [

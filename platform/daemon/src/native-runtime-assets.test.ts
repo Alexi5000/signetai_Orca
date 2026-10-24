@@ -94,8 +94,6 @@ describe("native-runtime-assets", () => {
 		expect(new Set(concurrentPaths).size).toBe(1);
 		expect(concurrentPaths.every((path) => path && existsSync(path))).toBe(true);
 		expect(concurrentPaths[0] ? readFileSync(concurrentPaths[0], "utf8") : "").toBe("fake-native-binding");
-
-		// Inspect the directory the runtime actually materialized into.
 		const addonDir = dirname(concurrentPaths[0] ?? "");
 		const addonEntries = readdirSync(addonDir).filter((entry) => entry.startsWith("napi-rs-keyring-"));
 		expect(addonEntries).toHaveLength(1);
@@ -120,7 +118,6 @@ describe("native-runtime-assets", () => {
 		const dir = dirname(pathA ?? "");
 		const corrupt = join(dir, "fenced-addon-deadbeefdeadbeef.node");
 		const stray = join(dir, "fenced-addon-stray.tmp");
-		// Planted fixtures are owner-only, like the runtime's own files.
 		writeFileSync(corrupt, "torn", { mode: 0o600 });
 		writeFileSync(stray, "temp", { mode: 0o600 });
 		materializeEmbeddedNativeAddon("fenced-addon");

@@ -1,11 +1,3 @@
-/**
- * Anonymous, opt-in telemetry collector for the Signet daemon.
- *
- * Records events to an in-memory buffer, periodically flushing to
- * SQLite (always) and a self-hosted PostHog instance (when configured).
- * No memory content, user identity, or file paths are ever included.
- */
-
 import { createHash, randomUUID } from "node:crypto";
 import { appendFile, mkdir, open, readdir, rename, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -110,8 +102,6 @@ async function appendToTelemetryLog(
 			dropped++;
 			continue;
 		}
-		// Size the log through the same append descriptor that receives the
-		// line (owner-only when created), instead of stat-then-append by path.
 		let handle: Awaited<ReturnType<typeof open>> | undefined;
 		try {
 			handle = await open(logPath, "a", 0o600);

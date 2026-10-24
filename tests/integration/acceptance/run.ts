@@ -175,11 +175,6 @@ function markPhase(phase: string): void {
 }
 
 const emergencyArtifactName = `phase-d-acceptance-${args.scale}-failure.json`;
-
-/**
- * Directory for the emergency failure artifact. Without --out this is a fresh
- * private (mkdtemp, 0o700) directory rather than a predictable shared /tmp path.
- */
 function emergencyArtifactDir(): string {
 	if (args.out) {
 		const dir = resolve(args.out);

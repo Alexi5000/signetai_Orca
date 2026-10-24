@@ -63,8 +63,6 @@ export function registerImportRoutes(app: Hono, deps: ImportRouteDeps): void {
 		const uploadedBytes = uploadedEntries.reduce((total, file) => total + file.size, 0);
 		let pathBytes = 0;
 		for (const path of pathEntries) {
-			// Open once and fstat the descriptor: the size limits are enforced on
-			// the same file that is read, not on a path that can be swapped.
 			let handle: Awaited<ReturnType<typeof open>> | undefined;
 			try {
 				handle = await open(path, "r");

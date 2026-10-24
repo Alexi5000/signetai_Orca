@@ -1,12 +1,3 @@
-/**
- * Startup integrity checks for SQLite's derived database surfaces.
- *
- * `PRAGMA quick_check` deliberately does not validate every index/table
- * relationship. The telemetry table is append-only and its indexes are
- * disposable, so it gets a targeted full check and a transactional REINDEX
- * when SQLite reports an index mismatch.
- */
-
 import { spawnHidden as spawn, type ChildProcess, createPrivateTempDirAsync } from "@signet/core";
 import { existsSync } from "node:fs";
 import { rm, writeFile } from "node:fs/promises";

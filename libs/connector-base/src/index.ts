@@ -22,9 +22,6 @@ import {
 	stripSignetBlock,
 	symlinkSkills,
 } from "@signet/core";
-
-// Secure filesystem helpers, re-exported for connectors that depend only on
-// connector-base.
 export { readFileIfExistsSync, writeFileAtomicSync, writeFileExclusiveSync } from "@signet/core";
 
 export interface InstallResult {
@@ -75,9 +72,6 @@ export abstract class BaseConnector {
 		}
 		const tmp = join(basePath, `.${randomBytes(6).toString("hex")}.tmp`);
 		try {
-			// Create the temp file exclusively (O_EXCL, owner-only while it is being
-			// written), then give it the process default mode before the rename so
-			// the resulting AGENTS.md permissions are unchanged.
 			const fd = openFileExclusiveSync(tmp);
 			try {
 				writeSync(fd, cleaned, null, "utf-8");

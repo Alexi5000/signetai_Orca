@@ -17,8 +17,6 @@ export function recordSkillsFromTranscript(args: {
 	let content: string;
 	let fd: number | undefined;
 	try {
-		// Open once (non-blocking for FIFOs) and fstat the descriptor so the
-		// size/type checks apply to the file that is actually read.
 		fd = openSync(args.transcriptPath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
 		const stat = fstatSync(fd);
 		if (!stat.isFile()) {

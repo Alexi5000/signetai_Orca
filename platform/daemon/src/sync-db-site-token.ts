@@ -52,8 +52,10 @@ function normalizeSourcePath(path: string): string | null {
 		return `/UNC/${remainder}`;
 	}
 	if (path.includes("\\")) return null;
-	const remainder = path.startsWith("/") ? path.slice(1) : path;
-	return isSafePathRemainder(remainder) ? path : null;
+	const normalized = path.replace(/\/{2,}/g, "/");
+	const remainder = normalized.startsWith("/") ? normalized.slice(1) : normalized;
+	if (/\s/.test(remainder)) return null;
+	return isSafePathRemainder(remainder) ? normalized : null;
 }
 
 export function normalizeSyncDbSiteToken(token: string): SyncDbCallSiteToken | null {

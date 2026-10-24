@@ -288,7 +288,6 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 			const destPath = join(context.basePath, doc.name);
 			if (existsSync(templatePath)) {
 				const content = readFileSync(templatePath, "utf-8").replace(/\{\{AGENT_NAME\}\}/g, plan.agentName);
-				// O_EXCL: never overwrite an identity file that already exists.
 				writeFileExclusiveSync(destPath, content);
 			}
 		}

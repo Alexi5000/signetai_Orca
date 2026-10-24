@@ -15,8 +15,6 @@ import {
 	withSkillReconciliationLock,
 } from "./skill-reconciler";
 import { createTestTempDir } from "../test-temp-dir";
-
-/** Poll `cond` until it returns true or `timeoutMs` elapses. */
 async function waitFor(cond: () => boolean, timeoutMs = 3_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!cond()) {
@@ -745,9 +743,6 @@ describe("single-flight trigger overlap (#1354)", () => {
 	});
 
 	it("keys the single-flight lock by workspace so agent scoping is preserved", async () => {
-		// Two different agentsDirs with the same skill name must not serialize
-		// against each other: a lock held for one agent's workspace cannot
-		// block another agent's reconcile of the same-named skill.
 		const dirA = createTestTempDir("signet-lock-a-");
 		const dirB = createTestTempDir("signet-lock-b-");
 		try {

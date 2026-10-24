@@ -88,7 +88,6 @@ function rewriteTextFiles(dir: string): void {
 			rewriteTextFiles(path);
 			continue;
 		}
-		// Inspect and read through one descriptor so the checks apply to the bytes we rewrite.
 		const fd = openSync(path, "r");
 		let raw: string | null = null;
 		let isDirectory = false;

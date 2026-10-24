@@ -68,7 +68,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Build the platform package with its OS protocol registration
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           cd surfaces/desktop
           bun run build:desktop -- ${{ matrix.electron_builder_args }}

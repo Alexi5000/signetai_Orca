@@ -750,7 +750,6 @@ function writeWindowsHookWrapper(
 	const invocation = signetArgs.map(windowsBatchArg).join(" ");
 	lines.push(`${windowsBatchEntrypoint(signetArgs[0] ?? "")}${invocation} %*`);
 	lines.push("exit /b %ERRORLEVEL%", "");
-	// The wrapper embeds the daemon API key, so keep it owner-only.
 	writeFileAtomicSync(wrapperPath, `${lines.join("\r\n")}`, { mode: 0o600 });
 	return wrapperPath;
 }

@@ -906,11 +906,6 @@ type LauncherState =
 	| { readonly kind: "missing" }
 	| { readonly kind: "symlink"; readonly target: string }
 	| { readonly kind: "file"; readonly content: string };
-
-/**
- * Classify an existing launcher through a single no-follow open, so the
- * symlink/content decision applies to exactly the object that was inspected.
- */
 function inspectLauncher(path: string): LauncherState {
 	let fd: number;
 	try {
@@ -956,7 +951,6 @@ function writeManagedLauncher(path: string, target: string, workspace: string): 
 		}
 		rmSync(path, { force: true });
 	}
-	// O_EXCL: never follow or overwrite anything that appeared after the inspection above.
 	if (!writeFileExclusiveSync(path, launcherContent(target, workspace), { mode: 0o755 })) {
 		throw new Error(`Launcher at ${path} changed while it was being replaced; re-run the install.`);
 	}

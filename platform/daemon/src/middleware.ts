@@ -14,8 +14,6 @@ export function registerGlobalMiddleware(app: Hono): void {
 		}
 		return next();
 	});
-
-	// MW-1: CORS
 	app.use(
 		"*",
 		cors({

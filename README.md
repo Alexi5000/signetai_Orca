@@ -32,6 +32,8 @@ Built by [Alex Cinovoj](https://alexcinovoj.com), Founder & CTO of [TechTide AI]
 
 Upstream core by Signet AI: [Signet-AI/signetai](https://github.com/Signet-AI/signetai). Product docs at [signetai.sh](https://signetai.sh).
 
+[English](README.md) · [Deutsch](README.de.md) · [한국어](README.ko.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
+
 ## Why this fork exists
 
 **What it does.** Orca is TechTide's delivery fork of Signet: a local-first memory daemon that ingests transcripts and imports, builds derived memory through a background process called dreaming, and serves recall to Claude Code, OpenCode, OpenClaw, Codex, Kimi, Hermes, Pi, and Gemini CLI through hooks, plugins, and MCP. The fork keeps the upstream core and adds Orca positioning, delivery docs and assets, a README lint gate, and a run of security hardening fixes.
@@ -100,18 +102,18 @@ signet dashboard                     # open memory + retrieval inspector
 
 Signet runs underneath the tools you already use. Run `signet setup` to configure plugins and connectors. Currently, Signet supports:
 
-|Harness|Integration path|
-|---|---|
-|[Claude Code](https://docs.anthropic.com/en/docs/claude-code)|Hooks + MCP|
-|[OpenCode](https://github.com/sst/opencode)|Plugin|
-|[OpenClaw](https://github.com/openclaw/openclaw)|Plugin|
-|[Codex](https://github.com/openai/codex)|Native plugin + hooks/MCP fallback|
-|[Kimi Code](https://github.com/MoonshotAI/kimi-cli)|Hooks + MCP / ACPX|
-|[Hermes Agent](https://github.com/NousResearch/hermes-agent)|Memory provider plugin|
-|[Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)|Extension|
-|Oh My Pi|Extension|
-|[Gemini CLI](https://github.com/google-gemini/gemini-cli)|MCP + GEMINI.md sync|
-|[ForgeCode](https://forgecode.dev/)|Hooks + MCP|
+| Harness                                                                    | Integration path                   |
+| -------------------------------------------------------------------------- | ---------------------------------- |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code)              | Hooks + MCP                        |
+| [OpenCode](https://github.com/sst/opencode)                                | Plugin                             |
+| [OpenClaw](https://github.com/openclaw/openclaw)                           | Plugin                             |
+| [Codex](https://github.com/openai/codex)                                   | Native plugin + hooks/MCP fallback |
+| [Kimi Code](https://github.com/MoonshotAI/kimi-cli)                        | Hooks + MCP / ACPX                 |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent)               | Memory provider plugin             |
+| [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) | Extension                          |
+| Oh My Pi                                                                   | Extension                          |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli)                  | MCP + GEMINI.md sync               |
+| [ForgeCode](https://forgecode.dev/)                                        | Hooks + MCP                        |
 
 > Don't see your favorite harness? File an [issue](https://github.com/Signet-AI/signetai/issues) and request that it be added!
 
@@ -131,25 +133,25 @@ Read more: [Sources](https://docs.signetai.sh/sources/) · [Data portability](ht
 
 ### Supported sources and formats
 
-|Source|Notes|
-|---|---|
-|Obsidian|Real-time file watcher. Connect multiple vaults read-only; supports the LLM-Wiki format.|
-|GitHub|Real-time ingest of issues, pull requests, and discussions.|
-|Notion|Syncs the pages and database entries shared with a Notion integration; re-syncs fetch only what changed.|
-|Discord|Real-time crawler that contributes to memory and links into the existing knowledge graph.|
-|Webpages|One-time import of a public URL, extracted to readable Markdown with page metadata.|
-|Slack, email, Telegram, WhatsApp|_Coming soon_|
+| Source                           | Notes                                                                                                    |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Obsidian                         | Real-time file watcher. Connect multiple vaults read-only; supports the LLM-Wiki format.                 |
+| GitHub                           | Real-time ingest of issues, pull requests, and discussions.                                              |
+| Notion                           | Syncs the pages and database entries shared with a Notion integration; re-syncs fetch only what changed. |
+| Discord                          | Real-time crawler that contributes to memory and links into the existing knowledge graph.                |
+| Webpages                         | One-time import of a public URL, extracted to readable Markdown with page metadata.                      |
+| Slack, email, Telegram, WhatsApp | _Coming soon_                                                                                            |
 
-|Format|Extensions|
-|---|---|
-|Word|`.doc`, `.docx`, `.docm`|
-|PowerPoint|`.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm`|
-|Excel|`.xls`, `.xlsx`, `.xlsm`, `.xlsb`|
-|OpenDocument|`.odt`, `.ods`, `.odp`|
-|Rich Text Format|`.rtf`|
-|EPUB|`.epub`|
-|CSV|`.csv`|
-|PDF|`.pdf`|
+| Format           | Extensions                                                 |
+| ---------------- | ---------------------------------------------------------- |
+| Word             | `.doc`, `.docx`, `.docm`                                   |
+| PowerPoint       | `.ppt`, `.pps`, `.pot`, `.pptx`, `.pptm`, `.ppsx`, `.ppsm` |
+| Excel            | `.xls`, `.xlsx`, `.xlsm`, `.xlsb`                          |
+| OpenDocument     | `.odt`, `.ods`, `.odp`                                     |
+| Rich Text Format | `.rtf`                                                     |
+| EPUB             | `.epub`                                                    |
+| CSV              | `.csv`                                                     |
+| PDF              | `.pdf`                                                     |
 
 ## How Orca fits together
 
@@ -162,34 +164,34 @@ Read more: [Sources](https://docs.signetai.sh/sources/) · [Data portability](ht
 
 ## Documentation
 
-| Goal | Start here |
-| --- | --- |
-| Install in 5 minutes | [Quickstart](https://docs.signetai.sh/quickstart/) |
-| Run the CLI | [CLI Reference](https://docs.signetai.sh/cli/) |
-| Configure identity and workspace | [Configuration](https://docs.signetai.sh/configuration/) |
-| Connect a harness | [Harnesses](https://docs.signetai.sh/harnesses/) |
-| Guard secrets | [Secrets](https://docs.signetai.sh/secrets/) |
-| See memory model | [Knowledge Architecture](https://docs.signetai.sh/knowledge-architecture/) |
-| Check recall quality | [Benchmarks](https://docs.signetai.sh/benchmarking/) |
-| Read the delivery story | [docs/ORCA-HERO-STORY.md](docs/ORCA-HERO-STORY.md) |
+| Goal                             | Start here                                                                 |
+| -------------------------------- | -------------------------------------------------------------------------- |
+| Install in 5 minutes             | [Quickstart](https://docs.signetai.sh/quickstart/)                         |
+| Run the CLI                      | [CLI Reference](https://docs.signetai.sh/cli/)                             |
+| Configure identity and workspace | [Configuration](https://docs.signetai.sh/configuration/)                   |
+| Connect a harness                | [Harnesses](https://docs.signetai.sh/harnesses/)                           |
+| Guard secrets                    | [Secrets](https://docs.signetai.sh/secrets/)                               |
+| See memory model                 | [Knowledge Architecture](https://docs.signetai.sh/knowledge-architecture/) |
+| Check recall quality             | [Benchmarks](https://docs.signetai.sh/benchmarking/)                       |
+| Read the delivery story          | [docs/ORCA-HERO-STORY.md](docs/ORCA-HERO-STORY.md)                         |
 
 ## Harnesses
 
 A "harness" is the app or environment your agent runs in. Signet connects through each harness's own hooks, plugins, or extensions to supply memory in the background and capture new context as you work, so if you switch agents you don't have to start over.
 
-|Harness|Integration|
-|---|---|
-|[Claude Code](https://docs.anthropic.com/en/docs/claude-code)|Hooks + MCP|
-|[Codex](https://github.com/openai/codex) and ChatGPT desktop|Native plugin, hooks/MCP fallback|
-|[OpenCode](https://github.com/sst/opencode)|Plugin|
-|[OpenClaw](https://github.com/openclaw/openclaw)|Plugin|
-|[Hermes Agent](https://github.com/NousResearch/hermes-agent)|Memory provider plugin|
-|[Kimi Code](https://github.com/MoonshotAI/kimi-cli)|Hooks + MCP, ACPX inference|
-|[Pi](https://github.com/mariozechner/pi-coding-agent)|Extension|
-|Oh My Pi|Extension|
-|[Gemini CLI](https://github.com/google-gemini/gemini-cli)|MCP + GEMINI.md sync|
-|[ForgeCode](https://forgecode.dev/)|Hooks + MCP|
-|[Muse Code](https://dev.meta.ai/docs/muse-code)|Hooks + MCP|
+| Harness                                                                    | Integration                       |
+| -------------------------------------------------------------------------- | --------------------------------- |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code)              | Hooks + MCP                       |
+| [Codex](https://github.com/openai/codex) and ChatGPT desktop               | Native plugin, hooks/MCP fallback |
+| [OpenCode](https://github.com/sst/opencode)                                | Plugin                            |
+| [OpenClaw](https://github.com/openclaw/openclaw)                           | Plugin                            |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent)               | Memory provider plugin            |
+| [Kimi Code](https://github.com/MoonshotAI/kimi-cli)                        | Hooks + MCP, ACPX inference       |
+| [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) | Extension                         |
+| Oh My Pi                                                                   | Extension                         |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli)                  | MCP + GEMINI.md sync              |
+| [ForgeCode](https://forgecode.dev/)                                        | Hooks + MCP                       |
+| [Muse Code](https://dev.meta.ai/docs/muse-code)                            | Hooks + MCP                       |
 
 Agents can also message each other through Signet. Messages survive restarts and arrive at the start of the recipient's next session or prompt.
 

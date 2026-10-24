@@ -51,8 +51,6 @@ import {
 } from "./native-memory-source-worker";
 
 const NO_FOLLOW_READ_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
-
-/** Keep one owner-side source descriptor bounded without using the 5s default. */
 export const NATIVE_MEMORY_OWNER_DEADLINE_MS = 60_000;
 const EMBEDDING_PROVIDER_PROBE_TEXT = "Signet embedding provider health check.";
 
@@ -962,11 +960,6 @@ export async function indexNativeMemoryFile(
 	let mtimeMs = options.mtimeMs ?? 0;
 	if (options.content === undefined) {
 		try {
-			// Async reads and stats run in the threadpool: a transiently locked
-			// file (EDEADLK from Obsidian or a sync service) or a stalled
-			// filesystem must not block the daemon event loop for seconds
-			// (#1135, #1142). Open once (no-follow, non-blocking for FIFOs) and
-			// fstat the descriptor so the checked file is the one that is read.
 			const handle = await open(filePath, NO_FOLLOW_READ_FLAGS);
 			try {
 				const fileStat = await handle.stat();

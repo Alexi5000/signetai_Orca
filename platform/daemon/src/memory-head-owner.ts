@@ -85,8 +85,6 @@ function isGenerated(db: WriteDb, content: string): boolean {
 		return false;
 	return generatedMarker.test(content.trim());
 }
-
-/** Read `path` through one descriptor, refusing files larger than `budget`. Returns null when absent. */
 function readBoundedProjection(path: string, budget: number): string | null {
 	let fd: number;
 	try {
@@ -103,8 +101,6 @@ function readBoundedProjection(path: string, budget: number): string | null {
 		closeSync(fd);
 	}
 }
-
-/** Called only inside the owner's transaction. Files are projections, never read as the head. */
 function publish(db: WriteDb, root: string, agentId: string, head: Head): void {
 	if (head.is_current !== 1) return;
 	const target = agentId === "default" ? join(root, "MEMORY.md") : join(root, "agents", agentId, "MEMORY.md");
@@ -118,7 +114,6 @@ function publish(db: WriteDb, root: string, agentId: string, head: Head): void {
 	const projection = `<!-- signet-generated-memory agent=${agentId} revision=${head.revision}; inspect only, use Signet for current context -->\n\n${redactCredentials(head.content)}\n`;
 	if ((head.content || existing) && existing !== projection) {
 		mkdirSync(dirname(target), { recursive: true });
-		// Exclusive 0o600 sibling temp + rename; the temp is removed on failure.
 		writeFileAtomicSync(target, projection, { fsync: false });
 	}
 

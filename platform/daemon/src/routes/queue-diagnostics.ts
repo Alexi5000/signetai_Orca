@@ -1,16 +1,4 @@
 import { getDbOwnerMaintenance } from "../db-owner-maintenance";
-/**
- * Issue #901 — surface queue diagnostics and provide a safe repair
- * endpoint. Mounted next to the existing `/api/diagnostics/*` and
- * `/api/repair/*` routes.
- *
- *  - `GET /api/diagnostics/queue` reads `getDiagnostics(...)` plus the
- *    oldest-dead summaries.
- *  - `POST /api/diagnostics/queue/repair` dispatches to
- *    `requeueDeadJobs` / `cancelObsoleteJobs` / `pruneTerminalJobs`
- *    with the caller's filters. Always dry-runs unless the request
- *    body sets `dryRun: false`.
- */
 
 import type { Hono } from "hono";
 import { requirePermission } from "../auth";

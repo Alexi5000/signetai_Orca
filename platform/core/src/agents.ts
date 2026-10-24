@@ -1,10 +1,3 @@
-/**
- * Multi-agent support utilities for Signet.
- *
- * Handles agent discovery, scaffolding, identity file resolution,
- * and per-agent skill filtering.
- */
-
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { writeFileExclusiveSync } from "./secure-fs";
@@ -54,12 +47,6 @@ export function discoverAgents(agentsDir: string): AgentDefinition[] {
 		.filter((d) => d.isDirectory())
 		.map((d) => ({ name: d.name }));
 }
-
-/**
- * Creates {agentsDir}/agents/{name}/ and writes stub identity files
- * (SOUL.md, IDENTITY.md) if they don't already exist. Files are created
- * exclusively, so an existing file is never overwritten.
- */
 export function scaffoldAgent(name: string, agentsDir: string): void {
 	const dir = join(agentsDir, "agents", name);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

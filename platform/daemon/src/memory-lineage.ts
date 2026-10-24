@@ -1114,8 +1114,6 @@ async function doReindex(agentId?: string): Promise<void> {
 		if (breakerOpen) break;
 		let statKey: string;
 		let mtime: number;
-		// Stat and read through one descriptor so the cache key always
-		// describes the bytes that were indexed.
 		let handle: Awaited<ReturnType<typeof open>>;
 		try {
 			handle = await open(path, "r");

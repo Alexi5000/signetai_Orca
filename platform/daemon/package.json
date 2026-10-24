@@ -43,7 +43,7 @@
 		"@firecrawl/anydoc": "0.1.7",
 		"@hono/node-server": "^2.1.0",
 		"@huggingface/transformers": "^4.2.0",
-		"@modelcontextprotocol/sdk": "^1.30.0",
+		"@modelcontextprotocol/sdk": "^1.32.2",
 		"@signet/core": "workspace:*",
 		"@signet/connector-base": "workspace:*",
 		"@signet/lifecycle-proof": "workspace:*",

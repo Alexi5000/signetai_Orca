@@ -18,8 +18,6 @@ import { createPromptContext } from "@signet/core";
 import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
 
 const TEST_DIR = createTestTempDir("signet-hooks-test-");
-
-/** Clear the private test root without removing it, so its mkdtemp name and 0o700 mode persist. */
 function emptyTestDir(): void {
 	if (!existsSync(TEST_DIR)) return;
 	for (const entry of readdirSync(TEST_DIR)) rmSync(join(TEST_DIR, entry), { recursive: true, force: true });

@@ -311,7 +311,6 @@ jobs:
       skip: ${{ steps.changes.outputs.skip }}
       bump_level: ${{ steps.bump_version.outputs.bump_level }}
 
-
   build-native:
     needs: release
     if: needs.release.result == 'success' && needs.release.outputs.skip != 'true' && needs.release.outputs.version != '' && inputs.signing_preflight_only != true

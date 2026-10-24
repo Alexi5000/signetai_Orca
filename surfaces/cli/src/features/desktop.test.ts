@@ -29,8 +29,6 @@ import {
 	installWindowsDesktopApp,
 	resolveDesktopSourceCheckout,
 } from "./desktop.js";
-
-/** Read a launcher through one no-follow descriptor; throws (ELOOP) if it is a symlink. */
 function readRegularFileNoFollow(path: string): string {
 	const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
 	try {

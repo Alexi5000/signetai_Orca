@@ -1,29 +1,3 @@
-/**
- * Signet Connector for Kimi CLI / Kimi Code
- *
- * Integrates Signet's memory system with Kimi's lifecycle hooks.
- *
- * Kimi facts (from the official Kimi Code docs):
- * - Current config home: ~/.kimi/ (env override KIMI_SHARE_DIR).
- * - Legacy Kimi Code 0.x uses ~/.kimi-code/ (env override KIMI_CODE_HOME).
- * - Hooks: [[hooks]] array-of-tables in the selected config.toml.
- *   Allowed fields: event (required), matcher (optional regex),
- *   command (required), timeout (optional). Extra fields break config load.
- * - Hook payload arrives as JSON on STDIN (snake_case fields).
- * - For UserPromptSubmit, hook STDOUT text is appended to the model context;
- *   SessionStart STDOUT is also appended. SessionEnd is observation-only.
- * - MCP servers: JSON file mcp.json in the selected Kimi home, with shape
- *   {"mcpServers": {"signet": {"command": ..., "args": [...]}}} for stdio.
- *
- * Usage:
- * ```typescript
- * import { KimiConnector } from '@signet/connector-kimi';
- *
- * const connector = new KimiConnector();
- * await connector.install('~/.agents');
- * ```
- */
-
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";

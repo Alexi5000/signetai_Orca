@@ -331,7 +331,6 @@ function configurePragmas(db: SqliteDatabase, path: string): void {
 	db.exec("PRAGMA auto_vacuum = INCREMENTAL");
 	const journal = resolveSqliteJournalConfig({ directory: dirname(path) });
 	db.exec(`PRAGMA journal_mode = ${journal.journalMode}`);
-	// Compatibility calls on the HTTP thread must fail promptly; only the owner may wait for SQLite locks.
 	db.exec("PRAGMA busy_timeout = 0");
 	db.exec(`PRAGMA synchronous = ${journal.networkFilesystem ? "FULL" : "NORMAL"}`);
 	db.exec("PRAGMA temp_store = MEMORY");
@@ -1183,8 +1182,6 @@ async function readMigrationBackupCursor(
 
 async function writeMigrationBackupCursor(cursor: MigrationBackupCursor): Promise<void> {
 	const cursorPath = `${cursor.destination}.cursor.json`;
-	// Exclusive 0o600 sibling temp + rename: the cursor is never observed torn
-	// and a pre-planted temp path cannot redirect the write.
 	await writeFileAtomic(cursorPath, `${JSON.stringify(cursor)}\n`, { fsync: false });
 }
 

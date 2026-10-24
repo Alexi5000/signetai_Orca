@@ -1,10 +1,3 @@
-/**
- * Singleton update system — extracted from daemon.ts for observability.
- *
- * Pattern: init once in main(), get from anywhere (like llm.ts,
- * db-accessor.ts).
- */
-
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";

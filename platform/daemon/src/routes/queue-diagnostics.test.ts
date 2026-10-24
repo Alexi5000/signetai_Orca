@@ -8,12 +8,6 @@ import {
 	type DbOwnerMaintenance,
 } from "../db-owner-maintenance";
 const owners: Array<{ owner: DbOwnerMaintenance; directory: string }> = [];
-/**
- * Issue #901 — regression tests for /api/diagnostics/queue + repair.
- *
- * Uses a file-backed SQLite DB and real database owner with migrations so the queue
- * breakdowns read against production-shaped tables.
- */
 
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -219,11 +213,6 @@ describe("POST /api/diagnostics/queue/repair", () => {
 
 describe("repair action integration via the new dispatch path", () => {
 	it("returns a structured result when a repair action throws (no unstructured 500)", async () => {
-		// Simulate a degraded runtime: the write transaction throws (e.g. a
-		// missing migrations table, a closed DbAccessor, or a transient SQLite
-		// error). The handler must return the documented RepairResult instead
-		// of propagating an unhandled exception. Mirrors the GET sibling and
-		// the Rust parity handler.
 		const directory = mkdtempSync(join(tmpdir(), "queue-owner-test-"));
 		const dbPath = join(directory, "memory.db");
 		const db = new Database(dbPath);

@@ -216,8 +216,6 @@ function parseRecords(text: string): CanonicalTranscriptRecord[] {
 }
 
 function readTailRecords(path: string): CanonicalTranscriptRecord[] {
-	// Open first, then size the descriptor: the tail offsets always match the
-	// file being read even if the path is replaced concurrently.
 	let fd: number;
 	try {
 		fd = openSync(path, "r");
@@ -238,18 +236,10 @@ function readTailRecords(path: string): CanonicalTranscriptRecord[] {
 		closeSync(fd);
 	}
 }
-
-/**
- * Create the rewrite temp file exclusively with mode 0o600. Callers hold the
- * transcript lock, so a leftover temp from a crashed rewrite is stale and is
- * removed first; a pre-planted file or symlink is never opened.
- */
 function openRewriteTemp(tmpPath: string): number {
 	rmSync(tmpPath, { force: true });
 	return openFileExclusiveSync(tmpPath);
 }
-
-/** Mode the rewritten file should keep (the replaced file's mode). */
 function replacedFileMode(path: string): number {
 	return statSync(path).mode & 0o7777;
 }
@@ -257,7 +247,6 @@ function replacedFileMode(path: string): number {
 function writeRecords(path: string, records: readonly CanonicalTranscriptRecord[]): void {
 	mkdirSync(dirname(path), { recursive: true });
 	const body = records.map((record) => JSON.stringify(record)).join("\n");
-	// Exclusive 0o600 sibling temp + rename (removed on failure).
 	writeFileAtomicSync(path, body.length > 0 ? `${body}\n` : "", { fsync: false });
 }
 
@@ -330,8 +319,6 @@ async function acquireTranscriptFileLock(path: string): Promise<{ readonly lockP
 		const token = randomUUID();
 		try {
 			mkdirSync(lockPath);
-			// The lock directory was created exclusively above; its owner record
-			// is created exclusively too so it can never be pre-planted.
 			writeFileExclusiveSync(
 				join(lockPath, "owner.json"),
 				JSON.stringify({ pid: process.pid, token, created_at: new Date().toISOString() }),

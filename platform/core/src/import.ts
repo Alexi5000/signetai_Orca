@@ -99,8 +99,6 @@ export function chunkMarkdownHierarchically(
 	let currentHeader = "";
 	let currentContent: string[] = [];
 	let chunkIndex = 0;
-
-	// Keep the title disjoint from leading whitespace; retain legacy whitespace-only headings.
 	const headerPattern = /^#{1,3}\s+(?:\S.*|[^\S\r\n\u2028\u2029])$/;
 
 	const flushSection = () => {
