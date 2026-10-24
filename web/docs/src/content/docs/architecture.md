@@ -32,6 +32,7 @@ Some boundaries intentionally remain separate from the ordinary helper runtime:
 - The database owner is one killable process because it owns synchronous SQLite access and must be restartable without wedging the daemon.
 - Native embedding keeps its own worker and model lifecycle because the model and WASM runtime are memory-heavy. Its idle TTL evicts the worker after inactivity; it is not part of the general helper pool.
 - Database integrity checks and repairs, and transcript recovery when enabled, retain killable process boundaries for deadline, crash, and restart containment.
+- Transcript recovery children discover and parse files but do not open SQLite. Their bounded, sequential store requests return through the supervising daemon to its existing database owner. The daemon fixes the agent and workspace scope; shutdown cancels and drains outstanding store work before closing the owner. A child exit without a completion receipt is a failed scan.
 - External provider commands remain external subprocesses. They are not internal helper fan-out.
 
 The compiled runtime materializes worker entrypoints as assets and starts them with `Worker`; it must not be invoked once per internal helper job. The daemon regression test `src/worker-process-boundary.test.ts` audits compiled-runtime launch sites and prints the remaining intentional process owners.

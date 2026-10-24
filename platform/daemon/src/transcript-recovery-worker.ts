@@ -6,8 +6,9 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DbAccessor, WriteDb } from "./db-accessor";
 import { logger } from "./logger";
+import { getDbOwnerForAccessor } from "./db-owner-runtime";
 import { deriveSessionEndFallbackId } from "./session-end-recovery";
-import { enqueueTranscriptCaptureJob } from "./transcript-capture-worker";
+import { enqueueTranscriptCaptureJob, type TranscriptCaptureJobInput } from "./transcript-capture-worker";
 
 export const TRANSCRIPT_RECOVERY_INTERVAL_MS = 5 * 60_000;
 export const TRANSCRIPT_RECOVERY_SETTLE_MS = 60_000;
@@ -31,6 +32,25 @@ interface TranscriptMetadata {
 	readonly project: string | null;
 	readonly capturedAt: string;
 }
+
+export interface TranscriptRecoveryStore {
+	frontiers(): Promise<Map<string, string | null>>;
+	fingerprints(candidates: readonly RecoveryCandidate[]): Promise<Map<string, string>>;
+	save(candidate: RecoveryCandidate, cursor: string | null): Promise<void>;
+	clear(roots: TranscriptRecoveryRoots): Promise<void>;
+	mark(candidate: RecoveryCandidate, fingerprint: string, sessionId: string, scannedAt: string): Promise<void>;
+	receipt(path: string): Promise<{ source_size_bytes: number | null; source_mtime_ms: number | null } | undefined>;
+	enqueue(input: TranscriptCaptureJobInput): Promise<string | null>;
+}
+
+export type TranscriptRecoveryStoreRequest = {
+	[K in keyof TranscriptRecoveryStore]: {
+		readonly type: "store-request";
+		readonly id: number;
+		readonly method: K;
+		readonly args: Parameters<TranscriptRecoveryStore[K]>;
+	};
+}[keyof TranscriptRecoveryStore];
 
 export interface TranscriptRecoveryRoots {
 	readonly claudeCode: string;
@@ -62,7 +82,20 @@ export function parseTranscriptRecoveryResult(output: string): TranscriptRecover
 	for (const line of output.split("\n")) {
 		try {
 			const event = JSON.parse(line) as { type?: string; result?: TranscriptRecoveryScanResult };
-			if (event.type === "result" && event.result !== undefined) return event.result;
+			if (event.type === "result" && event.result !== null && typeof event.result === "object") {
+				const counts = [
+					"discovered",
+					"examined",
+					"enqueued",
+					"deduplicated",
+					"skippedRecent",
+					"skippedOversized",
+					"skippedUnchanged",
+					"skippedInvalid",
+				] as const;
+				if (counts.every((key) => Number.isSafeInteger(event.result?.[key]) && (event.result?.[key] ?? -1) >= 0))
+					return event.result;
+			}
 		} catch {}
 	}
 	return null;
@@ -348,12 +381,81 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Transcript recovery aborted");
 }
 
-export async function runTranscriptRecoveryScan(
+function createRecoveryStore(
 	dbAccessor: DbAccessor,
+	basePath: string,
+	agentId: string,
+	signal?: AbortSignal,
+): TranscriptRecoveryStore {
+	return {
+		frontiers: () => loadFrontiers(dbAccessor, agentId, signal),
+		fingerprints: (candidates) => loadRecoveryFingerprints(dbAccessor, agentId, candidates, signal),
+		save: (candidate, cursor) => saveFrontier(dbAccessor, agentId, candidate, cursor, signal),
+		clear: (roots) => clearFrontiers(dbAccessor, agentId, roots, signal),
+		mark: (candidate, fingerprint, sessionId, scannedAt) =>
+			dbAccessor.withWriteTxAsync((db) => markScanned(db, agentId, candidate, fingerprint, sessionId, scannedAt), {
+				siteToken: "db:transcript-recovery.scan.mark-invalid",
+				operation: "transcript-recovery.mark-scanned",
+				signal,
+			}),
+		receipt: (path) =>
+			dbAccessor.withReadDbAsync(
+				(db) =>
+					db
+						.prepare(
+							"SELECT source_size_bytes, source_mtime_ms FROM transcript_capture_jobs WHERE agent_id = ? AND transcript_path = ? ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
+						)
+						.get(agentId, path) as { source_size_bytes: number | null; source_mtime_ms: number | null } | undefined,
+				{
+					siteToken: "db:transcript-recovery.scan.capture-receipt",
+					operation: "transcript-recovery.lookup-capture-receipt",
+					signal,
+				},
+			),
+		enqueue: (input) => enqueueTranscriptCaptureJob(dbAccessor, { ...input, agentId, basePath }, signal),
+	};
+}
+
+async function dispatchRecoveryStore(
+	store: TranscriptRecoveryStore,
+	request: TranscriptRecoveryStoreRequest,
+): Promise<unknown> {
+	switch (request.method) {
+		case "frontiers":
+			return Array.from(await store.frontiers());
+		case "fingerprints":
+			return Array.from(await store.fingerprints(...request.args));
+		case "save":
+			return store.save(...request.args);
+		case "clear":
+			return store.clear(...request.args);
+		case "mark":
+			return store.mark(...request.args);
+		case "receipt":
+			return store.receipt(...request.args);
+		case "enqueue":
+			return store.enqueue(...request.args);
+		default:
+			throw new Error("Unsupported transcript recovery store operation");
+	}
+}
+
+export async function executeTranscriptRecoveryStore(
+	dbAccessor: DbAccessor,
+	basePath: string,
+	agentId: string,
+	request: TranscriptRecoveryStoreRequest,
+): Promise<unknown> {
+	return dispatchRecoveryStore(createRecoveryStore(dbAccessor, basePath, agentId), request);
+}
+
+export async function runTranscriptRecoveryScan(
+	database: DbAccessor | TranscriptRecoveryStore,
 	basePath: string,
 	agentId: string,
 	options: TranscriptRecoveryScanOptions = {},
 ): Promise<TranscriptRecoveryScanResult> {
+	const store = "frontiers" in database ? database : createRecoveryStore(database, basePath, agentId, options.signal);
 	const roots = { ...defaultRoots(), ...options.roots };
 	const nowMs = options.nowMs ?? Date.now();
 	const settleMs = options.settleMs ?? TRANSCRIPT_RECOVERY_SETTLE_MS;
@@ -381,8 +483,13 @@ export async function runTranscriptRecoveryScan(
 		new Map(discoveredCandidates.map((candidate) => [`${candidate.harness}\0${candidate.path}`, candidate])).values(),
 	);
 	candidates.sort((a, b) => a.path.localeCompare(b.path));
-	const frontiers = await loadFrontiers(dbAccessor, agentId, options.signal);
-	const recoveryFingerprints = await loadRecoveryFingerprints(dbAccessor, agentId, candidates, options.signal);
+	const frontiers = await store.frontiers();
+	const recoveryFingerprints = new Map<string, string>();
+	for (let offset = 0; offset < candidates.length; offset += 100) {
+		for (const [path, fingerprint] of await store.fingerprints(candidates.slice(offset, offset + 100))) {
+			recoveryFingerprints.set(path, fingerprint);
+		}
+	}
 	const resumableCandidates = candidates.filter((candidate) => {
 		const cursor = frontiers.get(frontierKey(candidate));
 		if (cursor === undefined || cursor === null || candidate.path > cursor) return true;
@@ -401,12 +508,12 @@ export async function runTranscriptRecoveryScan(
 		throwIfAborted(options.signal);
 		if (nowMs - candidate.mtimeMs < settleMs) {
 			skippedRecent++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
 		if (candidate.size > maxBytes) {
 			skippedOversized++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
 		if (examined >= maxFiles) break;
@@ -422,7 +529,7 @@ export async function runTranscriptRecoveryScan(
 				error: error instanceof Error ? error.message : String(error),
 			});
 			skippedInvalid++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
 		const sourceFingerprint = sourceMetadataFingerprint(candidate);
@@ -433,65 +540,33 @@ export async function runTranscriptRecoveryScan(
 				.update(sourceFingerprint)
 				.digest("hex")
 				.slice(0, 24)}`;
-			await dbAccessor.withWriteTxAsync(
-				(db) => markScanned(db, agentId, candidate, sourceFingerprint, skippedSessionId, new Date(nowMs).toISOString()),
-				{
-					siteToken: "db:transcript-recovery.scan.mark-invalid",
-					operation: "transcript-recovery.mark-scanned",
-					signal: options.signal,
-				},
-			);
+			await store.mark(candidate, sourceFingerprint, skippedSessionId, new Date(nowMs).toISOString());
 			skippedInvalid++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
 
 		const sessionId = deriveSessionEndFallbackId(metadata.sessionKey, candidate.path, "");
-		const existingCapture = await dbAccessor.withReadDbAsync(
-			(db) =>
-				db
-					.prepare(
-						"SELECT source_size_bytes, source_mtime_ms FROM transcript_capture_jobs WHERE agent_id = ? AND transcript_path = ? ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
-					)
-					.get(agentId, candidate.path) as
-					| { source_size_bytes: number | null; source_mtime_ms: number | null }
-					| undefined,
-			{
-				siteToken: "db:transcript-recovery.scan.capture-receipt",
-				operation: "transcript-recovery.lookup-capture-receipt",
-				signal: options.signal,
-			},
-		);
-		const jobId = await enqueueTranscriptCaptureJob(
-			dbAccessor,
-			{
-				agentId,
-				harness: candidate.harness,
-				sessionKey: metadata.sessionKey,
-				sessionId,
-				project: metadata.project,
-				transcript: "",
-				transcriptPath: candidate.path,
-				basePath,
-				capturedAt: metadata.capturedAt,
-				endedAt: metadata.capturedAt,
-			},
-			options.signal,
-		);
+		const existingCapture = await store.receipt(candidate.path);
+		const jobId = await store.enqueue({
+			agentId,
+			harness: candidate.harness,
+			sessionKey: metadata.sessionKey,
+			sessionId,
+			project: metadata.project,
+			transcript: "",
+			transcriptPath: candidate.path,
+			basePath,
+			capturedAt: metadata.capturedAt,
+			endedAt: metadata.capturedAt,
+		});
 		if (!jobId) {
 			skippedInvalid++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
-		await dbAccessor.withWriteTxAsync(
-			(db) => markScanned(db, agentId, candidate, sourceFingerprint, sessionId, new Date(nowMs).toISOString()),
-			{
-				siteToken: "db:transcript-recovery.scan.mark-enqueued",
-				operation: "transcript-recovery.mark-scanned",
-				signal: options.signal,
-			},
-		);
-		await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+		await store.mark(candidate, sourceFingerprint, sessionId, new Date(nowMs).toISOString());
+		await store.save(candidate, candidate.path);
 		if (
 			existingCapture &&
 			existingCapture.source_size_bytes === candidate.size &&
@@ -501,7 +576,7 @@ export async function runTranscriptRecoveryScan(
 		} else enqueued++;
 	}
 	if (!options.signal?.aborted && discoveryComplete && resumableCandidates.length === 0) {
-		await clearFrontiers(dbAccessor, agentId, roots, options.signal);
+		await store.clear(roots);
 	}
 
 	return {
@@ -584,8 +659,11 @@ export function startTranscriptRecoveryWorker(
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		activeChild = child;
+
 		return await new Promise<TranscriptRecoveryScanResult>((resolve, reject) => {
 			let output = "";
+			let lineBuffer = "";
+			let pendingStore: Promise<void> | null = null;
 			let errorOutput = "";
 			let settled = false;
 			const settle = (callback: () => void): void => {
@@ -595,31 +673,80 @@ export function startTranscriptRecoveryWorker(
 			};
 			child.stdout?.setEncoding("utf8");
 			child.stdout?.on("data", (chunk: string) => {
-				output += chunk;
-				activeTargetPid = parseTranscriptRecoveryChildPid(output) ?? activeTargetPid;
+				lineBuffer += chunk;
+				if (lineBuffer.length > 1_048_576) {
+					signalActiveProcesses("SIGKILL");
+					settle(() => reject(new Error("Transcript recovery output exceeds limit")));
+					return;
+				}
+				let newline: number;
+				while ((newline = lineBuffer.indexOf("\n")) >= 0) {
+					const line = lineBuffer.slice(0, newline);
+					lineBuffer = lineBuffer.slice(newline + 1);
+					let event: { type?: string };
+					try {
+						event = JSON.parse(line) as { type?: string };
+					} catch {
+						continue;
+					}
+					if (event.type !== "store-request") {
+						output = `${output}${line}\n`.slice(-65_536);
+						activeTargetPid = parseTranscriptRecoveryChildPid(output) ?? activeTargetPid;
+						continue;
+					}
+					if (pendingStore || cancellation.signal.aborted) {
+						signalActiveProcesses("SIGKILL");
+						settle(() => reject(new Error("Concurrent or cancelled recovery store request")));
+						return;
+					}
+					const request = event as TranscriptRecoveryStoreRequest;
+					pendingStore = (async () => {
+						let response: string;
+						try {
+							const owner = await getDbOwnerForAccessor(dbAccessor);
+							throwIfAborted(cancellation.signal);
+							const handle = owner.submit(
+								{ kind: "transcript_recovery_store", basePath, agentId, request },
+								{
+									operation: `transcript-recovery.${request.method}`,
+									lane: "write",
+									deadlineMs: 30_000,
+								},
+							);
+							const cancel = () => handle.cancel();
+							cancellation.signal.addEventListener("abort", cancel, { once: true });
+							let result: unknown;
+							try {
+								result = await handle.result;
+							} finally {
+								cancellation.signal.removeEventListener("abort", cancel);
+							}
+							response = JSON.stringify({ id: request.id, result });
+							if (response.length > 1_048_576) throw new Error("Transcript recovery response exceeds limit");
+						} catch (error) {
+							response = JSON.stringify({
+								id: request.id,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+						pendingStore = null;
+						if (!child.stdin?.destroyed) child.stdin?.write(`${response}\n`);
+					})();
+				}
 			});
+			child.stdin?.on("error", () => {});
 			child.stderr?.setEncoding("utf8");
 			child.stderr?.on("data", (chunk: string) => {
 				errorOutput = `${errorOutput}${chunk}`.slice(-2_000);
 			});
 			child.on("error", (error) => settle(() => reject(error)));
-			child.on("close", (code, signal) => {
+			child.on("close", async (code, signal) => {
+				await pendingStore;
 				const result = parseTranscriptRecoveryResult(output);
 				if (code === 0 && signal === null) {
-					settle(() =>
-						resolve(
-							result ?? {
-								discovered: 0,
-								examined: 0,
-								enqueued: 0,
-								deduplicated: 0,
-								skippedRecent: 0,
-								skippedOversized: 0,
-								skippedUnchanged: 0,
-								skippedInvalid: 0,
-							},
-						),
-					);
+					if (result === null)
+						settle(() => reject(new Error("Transcript recovery child omitted its completion receipt")));
+					else settle(() => resolve(result));
 					return;
 				}
 				const detail = signal === null ? `exit code ${code ?? "unknown"}` : `signal ${signal}`;

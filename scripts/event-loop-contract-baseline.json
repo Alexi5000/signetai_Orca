@@ -926,7 +926,7 @@
     },
     {
       "path": "db-owner-worker.ts",
-      "line": 1215,
+      "line": 1241,
       "api": "writeFileSync",
       "source": "if (activeFile) writeFileSync(activeFile, `${Date.now()}\\n`);",
       "category": "hot-path"
@@ -5244,14 +5244,14 @@
     },
     {
       "path": "transcript-recovery-child.ts",
-      "line": 26,
+      "line": 79,
       "api": "existsSync",
       "source": "while (holdFile !== undefined && existsSync(holdFile)) await new Promise((resolve) => setTimeout(resolve, 5));",
       "category": "hot-path"
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 259,
+      "line": 292,
       "api": "withReadDbAsync",
       "source": "return dbAccessor.withReadDbAsync(",
       "category": "hot-path",
@@ -5259,7 +5259,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 281,
+      "line": 314,
       "api": "withReadDbAsync",
       "source": "return dbAccessor.withReadDbAsync(",
       "category": "hot-path",
@@ -5267,7 +5267,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 311,
+      "line": 344,
       "api": "withWriteTxAsync",
       "source": "await dbAccessor.withWriteTxAsync(",
       "category": "hot-path",
@@ -5275,7 +5275,7 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 331,
+      "line": 364,
       "api": "withWriteTxAsync",
       "source": "await dbAccessor.withWriteTxAsync(",
       "category": "hot-path",
@@ -5283,27 +5283,19 @@
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 436,
+      "line": 396,
       "api": "withWriteTxAsync",
-      "source": "await dbAccessor.withWriteTxAsync(",
+      "source": "dbAccessor.withWriteTxAsync((db) => markScanned(db, agentId, candidate, fingerprint, sessionId, scannedAt), {",
       "category": "hot-path",
       "siteToken": "db:transcript-recovery.scan.mark-invalid"
     },
     {
       "path": "transcript-recovery-worker.ts",
-      "line": 450,
+      "line": 402,
       "api": "withReadDbAsync",
-      "source": "const existingCapture = await dbAccessor.withReadDbAsync(",
+      "source": "dbAccessor.withReadDbAsync(",
       "category": "hot-path",
       "siteToken": "db:transcript-recovery.scan.capture-receipt"
-    },
-    {
-      "path": "transcript-recovery-worker.ts",
-      "line": 486,
-      "api": "withWriteTxAsync",
-      "source": "await dbAccessor.withWriteTxAsync(",
-      "category": "hot-path",
-      "siteToken": "db:transcript-recovery.scan.mark-enqueued"
     },
     {
       "path": "update-system.ts",

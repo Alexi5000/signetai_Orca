@@ -273,6 +273,12 @@ export type DbOwnerRequest =
 			readonly openclawHealth?: Parameters<typeof import("./diagnostics").getDiagnostics>[3];
 			readonly options?: Parameters<typeof import("./diagnostics").getDiagnostics>[4];
 	  }
+	| {
+			readonly kind: "transcript_recovery_store";
+			readonly basePath: string;
+			readonly agentId: string;
+			readonly request: import("./transcript-recovery-worker").TranscriptRecoveryStoreRequest;
+	  }
 	| { readonly kind: "queue_diagnostics" }
 	| {
 			readonly kind: "embedding_tracker_candidates";

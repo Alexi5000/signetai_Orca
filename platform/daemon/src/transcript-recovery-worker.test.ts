@@ -6,6 +6,8 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	readdirSync,
+	readlinkSync,
 	realpathSync,
 	rmSync,
 	statSync,
@@ -17,6 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
+import { getDbOwnerForAccessor } from "./db-owner-runtime";
 import { DbOwnerDiedError } from "./db-owner-client";
 import { deriveSessionEndFallbackId } from "./session-end-recovery";
 import { logger } from "./logger";
@@ -50,6 +53,11 @@ async function scan(nowMs = Date.now()) {
 }
 
 describe("transcript recovery worker", () => {
+	it("rejects incomplete or invalid completion receipts", () => {
+		for (const result of [null, {}, { enqueued: 1 }, { discovered: -1 }, "done"]) {
+			expect(parseTranscriptRecoveryResult(JSON.stringify({ type: "result", result }))).toBeNull();
+		}
+	});
 	it("parses a buffered child result after the child has closed", () => {
 		const result = {
 			discovered: 1,
@@ -802,7 +810,7 @@ describe("transcript recovery worker", () => {
 		};
 		writeFileSync(
 			childPath,
-			`require("node:fs").appendFileSync(${JSON.stringify(counterPath)}, "x"); process.stdout.write(${JSON.stringify(`${JSON.stringify({ type: "result", result })}\\n`)}); process.exit(0);`,
+			`require("node:fs").appendFileSync(${JSON.stringify(counterPath)}, "x"); process.stdout.write(${JSON.stringify(`${JSON.stringify({ type: "result", result })}\n`)}); process.exit(0);`,
 		);
 		const handle = startTranscriptRecoveryWorker(getDbAccessor(), dir, "agent-a", {
 			roots: { claudeCode: claudeRoot, codex: codexRoot },
@@ -813,7 +821,7 @@ describe("transcript recovery worker", () => {
 		await handle.stop();
 		expect(readFileSync(counterPath, "utf8")).toBe("x");
 	});
-	it("treats a clean exit without a protocol payload as a terminal success", async () => {
+	it("reports a missing completion receipt instead of claiming a successful scan", async () => {
 		const childPath = join(dir, "empty-success-child.js");
 		writeFileSync(childPath, "process.exit(0);");
 		const warnings: string[] = [];
@@ -827,8 +835,9 @@ describe("transcript recovery worker", () => {
 			childPath,
 		});
 		try {
-			await Bun.sleep(100);
-			expect(warnings).toEqual([]);
+			const deadline = Date.now() + 5_000;
+			while (warnings.length === 0 && Date.now() < deadline) await Bun.sleep(10);
+			expect(warnings).toContain("transcripts:Transcript recovery scan failed");
 		} finally {
 			await handle.stop();
 			logger.warn = originalWarn;
@@ -924,6 +933,55 @@ describe("transcript recovery worker", () => {
 		await resumed.stop();
 		expect(capturedPaths()).toEqual([firstPath, secondPath]);
 	}, 15_000);
+
+	it.skipIf(process.platform !== "linux")(
+		"routes child database requests through the owner without opening SQLite in the child",
+		async () => {
+			const accessor = getDbAccessor();
+			let requested = false;
+			let release!: () => void;
+			const barrier = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const owner = await getDbOwnerForAccessor(accessor);
+			const originalSubmit = owner.submit;
+			owner.submit = ((request, options) => {
+				const submitted = originalSubmit.call(owner, request, options);
+				if (request.kind !== "transcript_recovery_store") return submitted;
+				requested = true;
+				return {
+					...submitted,
+					result: submitted.result.then(async (result) => {
+						await barrier;
+						return result;
+					}),
+				};
+			}) as typeof owner.submit;
+			const handle = startTranscriptRecoveryWorker(accessor, dir, "agent-a", {
+				roots: { claudeCode: claudeRoot, codex: codexRoot },
+			});
+			try {
+				const deadline = Date.now() + 5_000;
+				while (!requested && Date.now() < deadline) await Bun.sleep(10);
+				expect(requested).toBe(true);
+				expect(handle.childPid).not.toBeNull();
+				const fdRoot = `/proc/${handle.childPid}/fd`;
+				const targets = readdirSync(fdRoot).flatMap((fd) => {
+					try {
+						return [readlinkSync(join(fdRoot, fd))];
+					} catch {
+						return [];
+					}
+				});
+				expect(targets.filter((target) => target.startsWith(join(dir, "memory")))).toEqual([]);
+			} finally {
+				release();
+				owner.submit = originalSubmit;
+				await handle.stop();
+			}
+		},
+		10_000,
+	);
 
 	it("completes a scan through the real recovery child process", async () => {
 		writeSettled(

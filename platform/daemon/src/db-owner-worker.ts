@@ -1115,6 +1115,23 @@ export function runDbOwnerWorker(): void {
 					: ({ base_url: job.request.configuredBaseUrl } as never),
 			);
 		}
+		if (job.request.kind === "transcript_recovery_store") {
+			if (!recallAccessorReady) {
+				const { initDbAccessorAsync } = await import("./db-accessor");
+				await initDbAccessorAsync(ownerDbPath);
+				recallAccessorReady = true;
+			}
+			const { getDbAccessor } = await import("./db-accessor");
+			const { executeTranscriptRecoveryStore } = await import("./transcript-recovery-worker");
+			const result = await executeTranscriptRecoveryStore(
+				getDbAccessor(),
+				job.request.basePath,
+				job.request.agentId,
+				job.request.request,
+			);
+			if (["save", "clear", "mark", "enqueue"].includes(job.request.request.method)) context.committed = true;
+			return result;
+		}
 		if (job.request.kind === "queue_diagnostics") {
 			const { getQueueDiagnosticsSnapshot } = await import("./diagnostics-queue");
 			return getQueueDiagnosticsSnapshot(db as never, { fresh: true });

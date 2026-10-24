@@ -216,6 +216,7 @@ async function executeInlineOwnerRequest(accessor: DbAccessor, request: DbOwnerR
 		case "embedding_migration_progress":
 		case "health_ready":
 		case "diagnostics":
+		case "transcript_recovery_store":
 		case "queue_diagnostics":
 		case "embedding_tracker_candidates":
 		case "vector_backfill":
