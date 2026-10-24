@@ -71,6 +71,7 @@ async function duplicateDarwinDescriptor(fd: number, flags: number): Promise<Fil
 }
 
 async function openContainedChild(parent: FileHandle, name: string, flags: number, mode?: number): Promise<FileHandle> {
+	if (process.platform === "darwin") return duplicateDarwinDescriptor(openAt(parent.fd, name, flags, mode), flags);
 	const target = descriptorPath(parent.fd, name);
 	const expected = await lstat(target).catch((error: NodeJS.ErrnoException) => {
 		if (error.code === "ENOENT" && flags & fsConstants.O_CREAT) return null;
@@ -80,10 +81,7 @@ async function openContainedChild(parent: FileHandle, name: string, flags: numbe
 	if (expected?.isDirectory() && ((expected.mode & 0o444) === 0 || (expected.mode & 0o111) === 0))
 		throw Object.assign(new Error("managed directory permission denied"), { code: "EACCES" });
 	const openFlags = expected === null ? flags | fsConstants.O_EXCL : flags;
-	const handle =
-		process.platform !== "darwin"
-			? await open(target, openFlags, mode)
-			: await duplicateDarwinDescriptor(openAt(parent.fd, name, openFlags, mode), openFlags);
+	const handle = await open(target, openFlags, mode);
 	try {
 		const actual = await handle.stat();
 		if (expected && (actual.dev !== expected.dev || actual.ino !== expected.ino))
