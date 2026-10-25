@@ -1,4 +1,4 @@
-export type ModelProvider = "openai" | "anthropic" | "google" | "zai"
+export type ModelProvider = "openai" | "anthropic" | "google" | "zai" | "local"
 
 export interface ModelPricing {
   inputPerMillion: number
@@ -15,6 +15,7 @@ export interface ModelConfig {
   maxTokensParam: "maxTokens" | "max_completion_tokens" | "maxOutputTokens"
   defaultMaxTokens: number
   thinking?: "enabled" | "disabled"
+  reasoningEffort?: string
   pricing?: ModelPricing
 }
 
@@ -258,8 +259,32 @@ export const MODEL_CONFIGS: Record<string, ModelConfig> = {
 
 export const DEFAULT_ANSWERING_MODEL = "gpt-4o"
 
-export function getModelConfig(alias: string): ModelConfig {
+const LOCAL_PREFIX = "local:"
+const DEFAULT_LOCAL_MAX_TOKENS = 16_000
+
+function readLocalMaxTokens(env: NodeJS.ProcessEnv): number {
+  const parsed = Number.parseInt(env.MEMORYBENCH_LOCAL_MAX_TOKENS ?? "", 10)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_LOCAL_MAX_TOKENS
+}
+
+export function getModelConfig(alias: string, env: NodeJS.ProcessEnv = process.env): ModelConfig {
   const lowerAlias = alias.toLowerCase()
+
+  if (lowerAlias.startsWith(LOCAL_PREFIX)) {
+    const id = alias.slice(LOCAL_PREFIX.length)
+    if (!id) throw new Error(`Local model alias ${alias} is missing a model id`)
+    const reasoningEffort = env.MEMORYBENCH_LOCAL_REASONING_EFFORT?.trim()
+    return {
+      id,
+      provider: "local",
+      displayName: reasoningEffort ? `${id} (local, reasoning ${reasoningEffort})` : `${id} (local)`,
+      supportsTemperature: false,
+      defaultTemperature: 1,
+      maxTokensParam: "maxTokens",
+      defaultMaxTokens: readLocalMaxTokens(env),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    }
+  }
 
   if (MODEL_CONFIGS[lowerAlias]) {
     return MODEL_CONFIGS[lowerAlias]
