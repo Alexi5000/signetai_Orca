@@ -7,7 +7,9 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-10-25
-- Bug fixes: keep rehearsal boost finite for unparseable access times; measure hint coverage against the sanitized FTS query; count traversal cosine as direct evidence at final rank; measure hint coverage with a unicode tokenizer; cap hint-only rows by evidence, not source label; bound hint and rehearsal contributions to recall scores; publish head over unrecorded revisions.
+- Bug fixes: return primary candidates in fused rank order; score the best fused recall hit 1; reserve candidate slots for the best vector hits; rank keyword and vector hits by position in hybrid recall; keep rehearsal boost finite for unparseable access times; measure hint coverage against the sanitized FTS query; count traversal cosine as direct evidence at final rank; measure hint coverage with a unicode tokenizer; cap hint-only rows by evidence, not source label; bound hint and rehearsal contributions to recall scores; publish head over unrecorded revisions.
+- Refactoring: retire search.alpha.
+- Docs: state what the hint-only cap guarantees.
 
 ### 2026-10-24
 - Bug fixes: keep temporal window fill when vector reads fail; decode owner hex in linear time and bound vector pages; page transcript evidence by bytes; keep paged recall reads in scope and bounded; decode and page traversal vectors; page transcript evidence reads; retry stapler validation on lost Apple connection; dedupe escaped PATH profile entries; escape shell metachars in PATH line; print PATH commands after piped install.
@@ -32,6 +34,26 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Docs: address review on docs template; add screenshots for docs template PR; add page template and rewrite core pages; refresh for 1.0 and post-1.0 direction; note native updater cap in 1.0 post.
 
 ## Release Ledger
+
+## [0.237.21] - 2026-10-25
+
+Release summary: 4 bug fixes, 1 refactor, and 1 docs update.
+Tag range: `v0.237.20..v0.237.21`.
+
+### Bug Fixes
+
+- **daemon**: return primary candidates in fused rank order
+- **daemon**: score the best fused recall hit 1
+- **daemon**: reserve candidate slots for the best vector hits
+- **daemon**: rank keyword and vector hits by position in hybrid recall
+
+### Refactoring
+
+- retire search.alpha
+
+### Docs
+
+- **memory**: state what the hint-only cap guarantees
 
 ## [0.237.20] - 2026-10-25
 
