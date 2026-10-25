@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import type { TokenClaims } from "../auth/types";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "../db-accessor";
+import { DbOwnerAdmissionError } from "../db-owner-client";
 import { getDbOwnerForAccessor } from "../db-owner-runtime";
 import { setDreamingWorker } from "../pipeline";
 import { dreamingLiveEvents, publishDreamingAgentEvent } from "../pipeline/dreaming-live-events";
@@ -195,6 +196,32 @@ describe("Dreaming live routes", () => {
 		} finally {
 			if (previousOwnerMode === undefined) Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_WORKER");
 			else process.env.SIGNET_DB_OWNER_WORKER = previousOwnerMode;
+		}
+	});
+
+	it("returns a retryable 503 when a trigger hits DB owner admission pressure", async () => {
+		const worker = {
+			running: true,
+			inferenceReady: async () => true,
+			triggerAsync: async () => {
+				throw new DbOwnerAdmissionError(
+					"DB_OWNER_QUEUE_FULL",
+					"DB owner maintenance admission queue is full at 64 admitted jobs",
+				);
+			},
+		} as unknown as DreamingWorkerHandle;
+		setDreamingWorker(worker);
+		try {
+			const response = await createPipelineApp().request("/api/dream/trigger", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ mode: "incremental" }),
+			});
+			expect(response.status).toBe(503);
+			expect(response.headers.get("Retry-After")).toBe("1");
+			expect(await response.json()).toMatchObject({ retryable: true });
+		} finally {
+			setDreamingWorker(null);
 		}
 	});
 

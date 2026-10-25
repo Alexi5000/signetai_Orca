@@ -93,6 +93,7 @@ import {
 	telemetryRef,
 } from "./state.js";
 import { STATUS_CACHE_TTL, cachedEmbeddingStatus, resolveScopedAgentId, statusCacheTime } from "./utils.js";
+import { WRITE_PRESSURE_RETRY_AFTER_SECONDS, isRetryableWritePressure } from "../write-pressure";
 
 interface PipelineQueueBlock {
 	readonly memory: QueueCounts;
@@ -576,7 +577,7 @@ export function registerPipelineRoutes(app: Hono): void {
 		const ownerRows = await withRegisteredDbOwnerMaintenance((maintenance) =>
 			ownerQueryAll<{ status: string; count: number }>(
 				maintenance.owner,
-				"routes/pipeline-routes.ts:579",
+				"routes/pipeline-routes.ts:580",
 				"SELECT status, COUNT(*) as count FROM memory_jobs GROUP BY status",
 			),
 		);
@@ -896,7 +897,7 @@ export function registerPipelineRoutes(app: Hono): void {
 				async (maintenance) =>
 					(await ownerQueryOne<{ present: number }>(
 						maintenance.owner,
-						"routes/pipeline-routes.ts:899",
+						"routes/pipeline-routes.ts:900",
 						"SELECT 1 AS present FROM dreaming_evidence_exclusions WHERE agent_id = ? AND source_kind = 'summary' AND source_id = ? AND resolved_at IS NULL",
 						[agentId, sourceId],
 					)) != null,
@@ -1066,6 +1067,10 @@ export function registerPipelineRoutes(app: Hono): void {
 		} catch (e) {
 			if (e instanceof AlreadyRunningError) return c.json({ error: e.message }, 409);
 			const msg = e instanceof Error ? e.message : String(e);
+			if (isRetryableWritePressure(e)) {
+				c.header("Retry-After", String(WRITE_PRESSURE_RETRY_AFTER_SECONDS));
+				return c.json({ error: msg, retryable: true }, 503);
+			}
 			return c.json({ error: msg }, 500);
 		}
 		return c.json({ accepted: true, passId, status: "running", mode, agentId }, 202);
