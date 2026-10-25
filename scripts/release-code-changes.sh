@@ -9,7 +9,14 @@ fi
 base="$1"
 head="$2"
 if [ "${base}" = "--since-release" ]; then
-  base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${head}")
+  git rev-parse --verify "${head}^{commit}" >/dev/null
+  release_tags=$(git tag --merged "${head}" --list 'v[0-9]*')
+  if [ -z "${release_tags}" ]; then
+    base=$(git hash-object -w -t tree --stdin </dev/null)
+    echo "No reachable release tag; checking the initial release tree" >&2
+  else
+    base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${head}")
+  fi
   echo "Comparing ${base}..${head}" >&2
 fi
 
