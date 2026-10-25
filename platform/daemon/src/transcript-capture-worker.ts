@@ -100,11 +100,6 @@ export interface TranscriptCaptureJobReceipt {
 	readonly status: TranscriptCaptureJobStatus;
 	readonly error: string | null;
 }
-
-/**
- * The pending inline-transcript backlog is full. The worker drains it continuously, so
- * the caller should retry shortly instead of the capture being dropped.
- */
 export class TranscriptCaptureBacklogFullError extends Error {
 	readonly code = "TRANSCRIPT_CAPTURE_BACKLOG_FULL" as const;
 	readonly retryable = true as const;

@@ -1,12 +1,3 @@
-/**
- * Ask a local OpenAI-compatible server how large its context window is, instead of
- * guessing. Catalog and OAuth providers already carry the selected model's window in
- * the pi-ai catalog; local servers (vLLM, llama.cpp, Ollama) only know it at runtime.
- *
- *   vLLM       GET  {base}/models   -> data[].max_model_len
- *   llama.cpp  GET  {base}/models   -> data[].meta.n_ctx (or n_ctx_train), else GET {root}/props
- *   Ollama     POST {root}/api/show -> model_info["<arch>.context_length"]
- */
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 const DISCOVERY_TIMEOUT_MS = 3_000;

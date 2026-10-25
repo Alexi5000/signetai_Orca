@@ -18,8 +18,6 @@ import { SIGNET_PROMPTS, SIGNET_SUPERMEMORY_PARITY_PROMPTS } from "./prompts"
 const DEFAULT_AGENT_ID = "memorybench"
 const DEFAULT_PROJECT = "memorybench"
 const DEFAULT_TIMEOUT_MS = 60_000
-// The daemon answers 503 + Retry-After while its capture backlog drains; at full
-// LongMemEval scale that backlog takes over an hour, so retry for as long as it says to.
 const DEFAULT_PRESSURE_RETRY_SECS = 3 * 60 * 60
 const DREAM_STATUS_CONCURRENCY = 4
 const STRICT_SEARCH_LIMIT = 10
@@ -955,9 +953,6 @@ export class SignetProvider implements Provider {
 }
 
 const MAX_DROPPED_CONNECTION_RETRIES = 4
-
-// A pooled keep-alive socket the daemon already closed fails before the request is read,
-// so resending is safe. Bun and Node word it differently.
 export function isDroppedConnection(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const code = (error as { code?: unknown }).code

@@ -108,14 +108,6 @@ export const ROUTING_THINKING_BUDGET_FIELDS = [
 	"thinking_budget_tokens",
 ] as const;
 export type RoutingThinkingBudgetField = (typeof ROUTING_THINKING_BUDGET_FIELDS)[number];
-
-/**
- * Thinking control for local OpenAI-compatible servers (vLLM, SGLang, llama.cpp).
- * `format` says how the server toggles thinking, `budgetTokens` caps reasoning tokens
- * per model turn through `budgetField` (vLLM: thinking_token_budget, SGLang/DashScope:
- * thinking_budget, llama.cpp: thinking_budget_tokens), and `chatTemplateKwargs` is sent
- * verbatim for the chat-template format.
- */
 export interface RoutingLocalThinkingConfig {
 	readonly format: RoutingLocalThinkingFormat;
 	readonly budgetTokens?: number;
