@@ -2087,9 +2087,9 @@ export async function hybridRecall(
 				const rawScores = rows.map((r) => Math.abs(r.raw_score));
 				const maxRaw = rawScores.length > 0 ? Math.max(...rawScores) : 1;
 				const normalizer = maxRaw > 0 ? maxRaw : 1;
-				const hintQuery = params.keywordQuery ?? query;
 				for (const row of rows) {
-					const hint = (Math.abs(row.raw_score) / normalizer) * hintQueryCoverage(hintQuery, row.hint);
+					const hint = (Math.abs(row.raw_score) / normalizer) * hintQueryCoverage(keywordQuery, row.hint);
+					if (hint <= 0) continue;
 					hintMap.set(row.id, Math.max(hintMap.get(row.id) ?? 0, hint));
 				}
 			});

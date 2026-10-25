@@ -3080,6 +3080,44 @@ describe("hybridRecall", () => {
 		expect(boosted?.score).toBe(HINT_ONLY_SCORE_CAP);
 	});
 
+	it("scores hint coverage against the sanitized FTS query", async () => {
+		const now = new Date().toISOString();
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare(
+				`INSERT INTO memories (
+					id, content, type, agent_id, created_at, updated_at, updated_by
+				) VALUES (?, ?, 'fact', 'default', ?, ?, 'test')`,
+			).run("mem-joined-hint", "favorite food is swordfish at the corner restaurant", now, now);
+
+			db.prepare(
+				`INSERT INTO memory_hints (id, memory_id, agent_id, hint, created_at)
+				 VALUES (?, ?, 'default', ?, ?)`,
+			).run("hint-joined", "mem-joined-hint", "foobar", now);
+		});
+
+		const cfg = loadMemoryConfig(dir);
+		cfg.search.rehearsal_enabled = false;
+		cfg.search.min_score = 0;
+		cfg.pipelineV2.graph.enabled = false;
+		cfg.pipelineV2.traversal.enabled = false;
+		cfg.pipelineV2.reranker.enabled = false;
+		cfg.pipelineV2.hints.enabled = true;
+		const result = await hybridRecall(
+			{
+				query: "foo(bar)",
+				keywordQuery: "foo(bar)",
+				limit: 5,
+				agentId: "default",
+				readPolicy: "isolated",
+			},
+			cfg,
+			async () => null,
+		);
+
+		const row = result.results.find((candidate) => candidate.id === "mem-joined-hint");
+		expect(row?.score ?? 0).toBeGreaterThan(0);
+	});
+
 	it("uses structured path candidates when lexical recall misses a music platform", async () => {
 		const now = new Date().toISOString();
 		getDbAccessor().withWriteTx((db) => {
