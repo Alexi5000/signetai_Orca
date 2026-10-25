@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import type { TokenClaims } from "../auth/types";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "../db-accessor";
-import { DbOwnerAdmissionError } from "../db-owner-client";
+import { DbOwnerAdmissionError, DbOwnerDeadlineError } from "../db-owner-client";
 import { getDbOwnerForAccessor } from "../db-owner-runtime";
 import { setDreamingWorker } from "../pipeline";
 import { dreamingLiveEvents, publishDreamingAgentEvent } from "../pipeline/dreaming-live-events";
@@ -199,29 +199,34 @@ describe("Dreaming live routes", () => {
 		}
 	});
 
-	it("returns a retryable 503 when a trigger hits DB owner admission pressure", async () => {
-		const worker = {
-			running: true,
-			inferenceReady: async () => true,
-			triggerAsync: async () => {
-				throw new DbOwnerAdmissionError(
-					"DB_OWNER_QUEUE_FULL",
-					"DB owner maintenance admission queue is full at 64 admitted jobs",
-				);
-			},
-		} as unknown as DreamingWorkerHandle;
-		setDreamingWorker(worker);
-		try {
-			const response = await createPipelineApp().request("/api/dream/trigger", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ mode: "incremental" }),
-			});
-			expect(response.status).toBe(503);
-			expect(response.headers.get("Retry-After")).toBe("1");
-			expect(await response.json()).toMatchObject({ retryable: true });
-		} finally {
-			setDreamingWorker(null);
+	it("returns a retryable 503 when a trigger hits DB owner admission pressure or a deadline", async () => {
+		for (const failure of [
+			new DbOwnerAdmissionError(
+				"DB_OWNER_QUEUE_FULL",
+				"DB owner maintenance admission queue is full at 64 admitted jobs",
+			),
+			new DbOwnerDeadlineError("db-owner-1-2"),
+		]) {
+			const worker = {
+				running: true,
+				inferenceReady: async () => true,
+				triggerAsync: async () => {
+					throw failure;
+				},
+			} as unknown as DreamingWorkerHandle;
+			setDreamingWorker(worker);
+			try {
+				const response = await createPipelineApp().request("/api/dream/trigger", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ mode: "incremental" }),
+				});
+				expect(response.status).toBe(503);
+				expect(response.headers.get("Retry-After")).toBe("1");
+				expect(await response.json()).toMatchObject({ retryable: true });
+			} finally {
+				setDreamingWorker(null);
+			}
 		}
 	});
 

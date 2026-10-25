@@ -1067,7 +1067,7 @@ export function registerPipelineRoutes(app: Hono): void {
 		} catch (e) {
 			if (e instanceof AlreadyRunningError) return c.json({ error: e.message }, 409);
 			const msg = e instanceof Error ? e.message : String(e);
-			if (isRetryableWritePressure(e)) {
+			if (isRetryableWritePressure(e) || (e instanceof Error && e.name === "DbOwnerDeadlineError")) {
 				c.header("Retry-After", String(WRITE_PRESSURE_RETRY_AFTER_SECONDS));
 				return c.json({ error: msg, retryable: true }, 503);
 			}
