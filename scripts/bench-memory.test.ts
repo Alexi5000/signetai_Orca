@@ -10,6 +10,7 @@ import {
 	benchDreamingCodemode,
 	benchDreamingConcurrency,
 	benchDreamingMaxOutputTokens,
+	benchDreamingThinking,
 	buildSetupArgs,
 	isLocalEndpoint,
 	loadEnvFile,
@@ -18,6 +19,7 @@ import {
 	setBenchDreamingCodemode,
 	setBenchDreamingConcurrency,
 	setBenchDreamingMaxOutputTokens,
+	setBenchDreamingThinking,
 } from "./bench-memory";
 
 const workspaces: string[] = [];
@@ -162,6 +164,22 @@ describe("MemoryBench launcher", () => {
 		expect(() => benchDreamingMaxOutputTokens({ SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS: "10" })).toThrow(
 			"from 1000 to 1000000",
 		);
+	});
+
+	test("writes local thinking control onto the background target only when asked", async () => {
+		const dir = await workspace();
+		await writeFile(join(dir, "agent.yaml"), setupAgentYaml);
+		setBenchDreamingThinking(dir, benchDreamingThinking({}));
+		expect(parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).inference.targets.background.thinking).toBe(
+			undefined,
+		);
+		const thinking = { format: "chat-template", budgetTokens: 2000 };
+		setBenchDreamingThinking(dir, benchDreamingThinking({ SIGNET_BENCH_DREAMING_THINKING: JSON.stringify(thinking) }));
+		const config = parseYaml(await readFile(join(dir, "agent.yaml"), "utf8"));
+		expect(config.inference.targets.background.thinking).toEqual(thinking);
+		expect(config.inference.targets.background.executor).toBe("openai-compatible");
+		expect(() => benchDreamingThinking({ SIGNET_BENCH_DREAMING_THINKING: "nope" })).toThrow("JSON object");
+		expect(() => benchDreamingThinking({ SIGNET_BENCH_DREAMING_THINKING: "{}" })).toThrow("needs a format");
 	});
 
 	test("turns Dreaming codemode on only when the bench asks for it", async () => {

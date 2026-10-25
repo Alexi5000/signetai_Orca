@@ -341,6 +341,36 @@ export function setBenchDreamingMaxOutputTokens(agentsDir: string, maxOutputToke
 	writeFileSync(path, stringifyYaml(config));
 }
 
+export function benchDreamingThinking(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> | undefined {
+	const raw = env.SIGNET_BENCH_DREAMING_THINKING?.trim();
+	if (raw === undefined || raw === "") return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new Error("SIGNET_BENCH_DREAMING_THINKING must be a JSON object");
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("SIGNET_BENCH_DREAMING_THINKING must be a JSON object");
+	}
+	if (typeof (parsed as { format?: unknown }).format !== "string") {
+		throw new Error("SIGNET_BENCH_DREAMING_THINKING needs a format");
+	}
+	return parsed as Record<string, unknown>;
+}
+
+export function setBenchDreamingThinking(agentsDir: string, thinking: Record<string, unknown> | undefined): void {
+	if (thinking === undefined) return;
+	const path = join(agentsDir, "agent.yaml");
+	const config = parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const inference = config.inference as Record<string, unknown> | undefined;
+	const targets = inference?.targets as Record<string, Record<string, unknown>> | undefined;
+	const target = inference?.defaultPolicy === "background" ? targets?.background : undefined;
+	if (!target) throw new Error("Signet setup did not write the expected background inference target");
+	target.thinking = thinking;
+	writeFileSync(path, stringifyYaml(config));
+}
+
 export function pinnedBunMismatch(
 	packageManager: unknown,
 	version: string = Bun.version,
@@ -526,6 +556,7 @@ async function main(): Promise<void> {
 		setBenchDreamingConcurrency(agentsDir, benchDreamingConcurrency());
 		setBenchDreamingCodemode(agentsDir, benchDreamingCodemode());
 		setBenchDreamingMaxOutputTokens(agentsDir, benchDreamingMaxOutputTokens());
+		setBenchDreamingThinking(agentsDir, benchDreamingThinking());
 		mkdirSync(join(agentsDir, ".daemon", "logs"), { recursive: true });
 		daemon = spawn(process.execPath, ["platform/daemon/src/daemon.ts"], {
 			cwd: repoRoot,

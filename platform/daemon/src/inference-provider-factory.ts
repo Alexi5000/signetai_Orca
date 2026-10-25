@@ -47,7 +47,7 @@ function resolveProviderReasoning(
 ): ThinkingLevel | undefined {
 	if (target.openrouter?.reasoning?.enabled) return "medium";
 	if (model.reasoning === "high") return "high";
-	if (model.reasoning !== "low") return undefined;
+	if (model.reasoning !== "low") return target.thinking ? "medium" : undefined;
 	return piModel && !getSupportedThinkingLevels(piModel).includes("low") ? undefined : "low";
 }
 
@@ -103,6 +103,7 @@ export async function createRoutingProvider(opts: CreateRoutingProviderOptions):
 			apiKey: credential?.apiKey,
 			reasoning: resolveProviderReasoning(target, model, piModel),
 			contextWindow: model.contextWindow,
+			...(target.thinking ? { thinking: target.thinking } : {}),
 			name: `${target.executor}:${model.model}`,
 			defaultTimeoutMs: 60_000,
 		}),

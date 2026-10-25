@@ -599,6 +599,9 @@ export {
 	configuredRoutingTargetRefs,
 	resolveAcpxModelSelection,
 	resolveRoutingDecision,
+	parseLocalThinkingConfig,
+	ROUTING_LOCAL_THINKING_FORMATS,
+	ROUTING_THINKING_BUDGET_FIELDS,
 } from "./routing";
 export type {
 	AcpxModelSelection,
@@ -619,6 +622,9 @@ export type {
 	RoutingAccountConfig,
 	RoutingModelConfig,
 	RoutingTargetConfig,
+	RoutingLocalThinkingConfig,
+	RoutingLocalThinkingFormat,
+	RoutingThinkingBudgetField,
 	RoutingPolicyConfig,
 	RoutingTaskClassConfig,
 	AgentRoutingConfig,
