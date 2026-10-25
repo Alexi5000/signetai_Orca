@@ -580,6 +580,66 @@ describe("backfill OOM regression (#587)", () => {
 		expect(content).not.toContain('"content":"X"');
 	});
 
+	test("writeCanonicalTranscriptSnapshot appends a new session in place instead of rewriting the file", async () => {
+		const root = makeRoot("snapshot-append-new-session");
+		const jsonlPath = canonicalTranscriptPath(root, "memorybench");
+		for (let s = 0; s < 50; s++) {
+			await writeCanonicalTranscriptSnapshot({
+				basePath: root,
+				agentId: `agent-${s % 5}`,
+				harness: "memorybench",
+				sessionKey: `session-${s}`,
+				sourceFormat: "normalized",
+				transcript: `User: prompt ${s}\nAssistant: reply ${s}`,
+			});
+		}
+		const before = readFileSync(jsonlPath, "utf8");
+		const inodeBefore = statSync(jsonlPath).ino;
+
+		const written = await writeCanonicalTranscriptSnapshot({
+			basePath: root,
+			agentId: "agent-0",
+			harness: "memorybench",
+			sessionKey: "session-new",
+			sourceFormat: "normalized",
+			transcript: "User: new prompt\nAssistant: new reply",
+		});
+
+		expect(written).toBe(true);
+		expect(statSync(jsonlPath).ino).toBe(inodeBefore);
+		const after = readFileSync(jsonlPath, "utf8");
+		expect(after.startsWith(before)).toBe(true);
+		const added = after
+			.slice(before.length)
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line) as { session_key: string; seq: number; role: string; content: string });
+		expect(added.map((r) => [r.session_key, r.seq, r.role, r.content])).toEqual([
+			["session-new", 1, "user", "new prompt"],
+			["session-new", 2, "assistant", "new reply"],
+		]);
+
+		const replaced = await writeCanonicalTranscriptSnapshot({
+			basePath: root,
+			agentId: "agent-0",
+			harness: "memorybench",
+			sessionKey: "session-new",
+			sourceFormat: "normalized",
+			transcript: "User: new prompt\nAssistant: new reply\nUser: follow-up",
+		});
+		expect(replaced).toBe(true);
+		const records = readFileSync(jsonlPath, "utf8")
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line) as { session_key: string; content: string });
+		expect(records.filter((r) => r.session_key === "session-new").map((r) => r.content)).toEqual([
+			"new prompt",
+			"new reply",
+			"follow-up",
+		]);
+		expect(records).toHaveLength(103);
+	});
+
 	test("writeCanonicalTranscriptSnapshot handles large files without excessive memory (OOM guard)", async () => {
 		const root = makeRoot("snapshot-oom-guard");
 		const jsonlPath = canonicalTranscriptPath(root, "opencode");

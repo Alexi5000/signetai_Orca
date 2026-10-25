@@ -553,6 +553,19 @@ export function writeCanonicalTranscriptSnapshot(
 		}
 
 		const tmpPath = `${path}.snapshot-tmp`;
+		const entries = await loadSessionSeqIndex(path);
+		if (lastSessionSeq(entries, input) === 0) {
+			rmSync(tmpPath, { force: true });
+			appendIndexedRecords(path, entries, next);
+			const appended = openSync(path, "r");
+			try {
+				fsyncSync(appended);
+			} finally {
+				closeSync(appended);
+			}
+			return true;
+		}
+
 		let fd: number | null = null;
 		try {
 			fd = openSync(tmpPath, "w");
