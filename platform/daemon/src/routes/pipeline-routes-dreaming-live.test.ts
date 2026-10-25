@@ -6,7 +6,9 @@ import { Hono } from "hono";
 import type { TokenClaims } from "../auth/types";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "../db-accessor";
 import { getDbOwnerForAccessor } from "../db-owner-runtime";
+import { setDreamingWorker } from "../pipeline";
 import { dreamingLiveEvents, publishDreamingAgentEvent } from "../pipeline/dreaming-live-events";
+import type { DreamingWorkerHandle } from "../pipeline/dreaming-worker";
 import { getSseDiagnosticsSnapshot } from "../sse-stream.js";
 import {
 	invalidateDreamingEpisodicTokenBacklog,
@@ -194,6 +196,39 @@ describe("Dreaming live routes", () => {
 			if (previousOwnerMode === undefined) Reflect.deleteProperty(process.env, "SIGNET_DB_OWNER_WORKER");
 			else process.env.SIGNET_DB_OWNER_WORKER = previousOwnerMode;
 		}
+	});
+
+	it("reports running passes that cover the scoped agent without leaking other scopes", async () => {
+		const worker = {
+			running: true,
+			activeAgentId: "agent-a",
+			activePasses: [
+				{ passId: "p-own", agentId: "agent-a", mode: "incremental", scopes: ["agent-a", "agent-x"] },
+				{ passId: "p-member", agentId: "agent-z", mode: "incremental", scopes: ["agent-y", "agent-a"] },
+				{ passId: null, agentId: "agent-b", mode: "incremental", scopes: ["agent-b"] },
+			],
+		} as unknown as DreamingWorkerHandle;
+		setDreamingWorker(worker);
+		try {
+			const response = await createPipelineApp().request("/api/dream/status");
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as { worker: { activePasses: unknown[] } };
+			expect(body.worker.activePasses).toEqual([
+				{ passId: "p-own", agentId: "agent-a", mode: "incremental", scopeCount: 2 },
+				{ passId: "p-member", agentId: "agent-z", mode: "incremental", scopeCount: 2 },
+			]);
+			expect(JSON.stringify(body.worker)).not.toContain("agent-y");
+		} finally {
+			setDreamingWorker(null);
+		}
+	});
+
+	it("reports no active passes when no worker is running", async () => {
+		setDreamingWorker(null);
+		const body = (await (await createPipelineApp().request("/api/dream/status")).json()) as {
+			worker: { activePasses: unknown[] };
+		};
+		expect(body.worker.activePasses).toEqual([]);
 	});
 
 	it("returns null when no fresh exact backlog measurement exists", async () => {

@@ -710,12 +710,16 @@ export function registerPipelineRoutes(app: Hono): void {
 		const reviewedEvidence = await getDreamingReviewedEvidence(accessor, agentId);
 		const attention = getDreamingAttention(accessor, agentId);
 		const worker = getDreamingWorker();
+		const activePasses = (worker?.activePasses ?? [])
+			.filter((pass) => pass.agentId === agentId || pass.scopes.includes(agentId))
+			.map((pass) => ({ passId: pass.passId, agentId: pass.agentId, mode: pass.mode, scopeCount: pass.scopes.length }));
 
 		return c.json({
 			worker: {
 				running: worker !== null,
 				active: worker?.activeAgentId === agentId,
 				activeAgentId: worker?.activeAgentId ?? null,
+				activePasses,
 			},
 			scheduler: worker?.scheduler ?? null,
 			state,
