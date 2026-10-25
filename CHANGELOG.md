@@ -7,7 +7,7 @@ All notable changes to Signet are documented here.
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
 ### 2026-10-25
-- Bug fixes: publish head over unrecorded revisions.
+- Bug fixes: keep rehearsal boost finite for unparseable access times; measure hint coverage against the sanitized FTS query; count traversal cosine as direct evidence at final rank; measure hint coverage with a unicode tokenizer; cap hint-only rows by evidence, not source label; bound hint and rehearsal contributions to recall scores; publish head over unrecorded revisions.
 
 ### 2026-10-24
 - Bug fixes: keep temporal window fill when vector reads fail; decode owner hex in linear time and bound vector pages; page transcript evidence by bytes; keep paged recall reads in scope and bounded; decode and page traversal vectors; page transcript evidence reads; retry stapler validation on lost Apple connection; dedupe escaped PATH profile entries; escape shell metachars in PATH line; print PATH commands after piped install.
@@ -32,6 +32,20 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Docs: address review on docs template; add screenshots for docs template PR; add page template and rewrite core pages; refresh for 1.0 and post-1.0 direction; note native updater cap in 1.0 post.
 
 ## Release Ledger
+
+## [0.237.20] - 2026-10-25
+
+Release summary: 6 bug fixes.
+Tag range: `v0.237.19..v0.237.20`.
+
+### Bug Fixes
+
+- **daemon**: keep rehearsal boost finite for unparseable access times
+- **daemon**: measure hint coverage against the sanitized FTS query
+- **daemon**: count traversal cosine as direct evidence at final rank
+- **daemon**: measure hint coverage with a unicode tokenizer
+- **daemon**: cap hint-only rows by evidence, not source label
+- **daemon**: bound hint and rehearsal contributions to recall scores
 
 ## [0.237.19] - 2026-10-25
 
