@@ -9,6 +9,7 @@ import {
 	benchUsesSubscription,
 	benchDreamingCodemode,
 	benchDreamingConcurrency,
+	benchDreamingMaxOutputTokens,
 	buildSetupArgs,
 	isLocalEndpoint,
 	loadEnvFile,
@@ -16,6 +17,7 @@ import {
 	resolveBenchModel,
 	setBenchDreamingCodemode,
 	setBenchDreamingConcurrency,
+	setBenchDreamingMaxOutputTokens,
 } from "./bench-memory";
 
 const workspaces: string[] = [];
@@ -143,6 +145,23 @@ describe("MemoryBench launcher", () => {
 		expect(benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "128" })).toBe(128);
 		expect(() => benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "0" })).toThrow("from 1 to 256");
 		expect(() => benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "257" })).toThrow("from 1 to 256");
+	});
+
+	test("raises the Dreaming per-turn output budget only when the bench asks for it", async () => {
+		const dir = await workspace();
+		await writeFile(join(dir, "agent.yaml"), setupAgentYaml);
+		setBenchDreamingMaxOutputTokens(dir, benchDreamingMaxOutputTokens({}));
+		expect(parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).memory.dreaming).toEqual({ enabled: true });
+		setBenchDreamingMaxOutputTokens(
+			dir,
+			benchDreamingMaxOutputTokens({ SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS: "16384" }),
+		);
+		const config = parseYaml(await readFile(join(dir, "agent.yaml"), "utf8"));
+		expect(config.memory.dreaming).toEqual({ enabled: true, maxOutputTokens: 16384 });
+		expect(config.inference.targets.background.executor).toBe("openai-compatible");
+		expect(() => benchDreamingMaxOutputTokens({ SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS: "10" })).toThrow(
+			"from 1000 to 1000000",
+		);
 	});
 
 	test("turns Dreaming codemode on only when the bench asks for it", async () => {

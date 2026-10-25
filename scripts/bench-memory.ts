@@ -320,6 +320,27 @@ export function setBenchDreamingCodemode(agentsDir: string, enabled: boolean | u
 	writeFileSync(path, stringifyYaml(config));
 }
 
+export function benchDreamingMaxOutputTokens(env: NodeJS.ProcessEnv = process.env): number | undefined {
+	const raw = env.SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS?.trim();
+	if (raw === undefined || raw === "") return undefined;
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 1_000 || parsed > 1_000_000) {
+		throw new Error("SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS must be an integer from 1000 to 1000000");
+	}
+	return parsed;
+}
+
+export function setBenchDreamingMaxOutputTokens(agentsDir: string, maxOutputTokens: number | undefined): void {
+	if (maxOutputTokens === undefined) return;
+	const path = join(agentsDir, "agent.yaml");
+	const config = parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const memory = (config.memory ?? {}) as Record<string, unknown>;
+	const dreaming = (memory.dreaming ?? {}) as Record<string, unknown>;
+	if (dreaming.maxOutputTokens === maxOutputTokens) return;
+	config.memory = { ...memory, dreaming: { ...dreaming, maxOutputTokens } };
+	writeFileSync(path, stringifyYaml(config));
+}
+
 export function pinnedBunMismatch(
 	packageManager: unknown,
 	version: string = Bun.version,
@@ -504,6 +525,7 @@ async function main(): Promise<void> {
 
 		setBenchDreamingConcurrency(agentsDir, benchDreamingConcurrency());
 		setBenchDreamingCodemode(agentsDir, benchDreamingCodemode());
+		setBenchDreamingMaxOutputTokens(agentsDir, benchDreamingMaxOutputTokens());
 		mkdirSync(join(agentsDir, ".daemon", "logs"), { recursive: true });
 		daemon = spawn(process.execPath, ["platform/daemon/src/daemon.ts"], {
 			cwd: repoRoot,
