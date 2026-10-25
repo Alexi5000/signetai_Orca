@@ -11,6 +11,7 @@ import {
   containerTagFor,
   mergeIngestUsage,
   resolveResumeBenchmarkConfig,
+  storedTargetQuestionIds,
 } from "./index"
 import { runIngestPhase } from "./phases/ingest"
 import { runIndexingPhase } from "./phases/indexing"
@@ -120,6 +121,28 @@ describe("shared haystack ingestion", () => {
 })
 
 describe("resume guards", () => {
+  it("records every question for an unrestricted run so a resume keeps all of them", async () => {
+    const root = mkdtempSync(join(tmpdir(), "memorybench-targets-"))
+    roots.push(root)
+    const manager = new CheckpointManager(root)
+    const questions = benchmark().getQuestions()
+    const checkpoint = manager.create("full-run", "recording", "fixture", "judge", "answer", {})
+    checkpoint.targetQuestionIds = storedTargetQuestionIds(undefined, questions)
+    for (const q of questions)
+      manager.initQuestion(checkpoint, q.questionId, `tag-${q.questionId}`, {
+        question: q.question,
+        groundTruth: q.groundTruth,
+        questionType: q.questionType,
+      })
+    manager.save(checkpoint)
+    await manager.flush("full-run")
+
+    const resumed = new CheckpointManager(root).load("full-run")
+
+    expect(resumed?.targetQuestionIds).toEqual(["q1", "q2", "q3"])
+    expect(storedTargetQuestionIds(["q2"], questions)).toEqual(["q2"])
+  })
+
   it("keeps the stored benchmark config and rejects a conflicting one", () => {
     const stored = { dataPath: "./d", retrievalTopK: 5, evaluationProfile: "custom-judge" }
     expect(resolveResumeBenchmarkConfig(stored, undefined)).toBe(stored)

@@ -117,6 +117,13 @@ export function assertSameIdentity(
   }
 }
 
+export function storedTargetQuestionIds(
+  targetQuestionIds: readonly string[] | undefined,
+  allQuestions: readonly { readonly questionId: string }[]
+): string[] {
+  return targetQuestionIds ? [...targetQuestionIds] : allQuestions.map((q) => q.questionId)
+}
+
 export function containerTagFor(
   benchmark: Pick<Benchmark, "getIngestionGroupId">,
   questionId: string,
@@ -394,7 +401,7 @@ export class Orchestrator {
         logger.info(`No sampling/limit specified, using all ${allQuestions.length} questions`)
       }
 
-      checkpoint.targetQuestionIds = targetQuestionIds
+      checkpoint.targetQuestionIds = storedTargetQuestionIds(targetQuestionIds, allQuestions)
       checkpoint.limit = effectiveLimit
 
       const questionsToInit = targetQuestionIds
