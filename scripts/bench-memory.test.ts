@@ -10,6 +10,7 @@ import {
 	benchDreamingCodemode,
 	benchDreamingConcurrency,
 	buildSetupArgs,
+	isLocalEndpoint,
 	loadEnvFile,
 	pinnedBunMismatch,
 	resolveBenchModel,
@@ -44,6 +45,14 @@ inference:
 `;
 
 describe("MemoryBench launcher", () => {
+	test("treats loopback inference endpoints as local so they need no API key", () => {
+		expect(isLocalEndpoint("http://127.0.0.1:8000/v1")).toBe(true);
+		expect(isLocalEndpoint("http://localhost:8000/v1")).toBe(true);
+		expect(isLocalEndpoint("http://[::1]:8000/v1")).toBe(true);
+		expect(isLocalEndpoint("https://open.bigmodel.cn/api/coding/paas/v4")).toBe(false);
+		expect(isLocalEndpoint("not a url")).toBe(false);
+	});
+
 	test("sets the workspace up through real Signet setup without letting setup start a daemon", () => {
 		const args = buildSetupArgs("/tmp/bench/agents", 47123, resolveBenchModel({}));
 

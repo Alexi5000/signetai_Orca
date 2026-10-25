@@ -234,6 +234,16 @@ export function buildSetupArgs(agentsDir: string, port: number, model: BenchMode
 	];
 }
 
+export function isLocalEndpoint(value: string): boolean {
+	let hostname: string;
+	try {
+		hostname = new URL(value).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+}
+
 const SUBSCRIPTION_PROVIDER_FAMILIES: ReadonlySet<string> = new Set(["openai-codex"]);
 
 export function benchUsesSubscription(providerFamily: string): boolean {
