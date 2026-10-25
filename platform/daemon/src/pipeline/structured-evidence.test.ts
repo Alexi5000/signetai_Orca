@@ -1,10 +1,27 @@
 import { describe, expect, it } from "bun:test";
 import {
 	HINT_ONLY_SCORE_CAP,
+	hasDirectEvidence,
 	hintQueryCoverage,
 	shapeByFacetCoverage,
 	shapeStructuredEvidence,
 } from "./structured-evidence";
+
+describe("hasDirectEvidence", () => {
+	it("counts traversal cosine as direct evidence even without a vector-search hit", () => {
+		expect(hasDirectEvidence({ semantic: 0.42 })).toBe(true);
+	});
+
+	it("counts lexical and structured evidence", () => {
+		expect(hasDirectEvidence({ lexical: 0.1 })).toBe(true);
+		expect(hasDirectEvidence({ structured: 0.3 })).toBe(true);
+	});
+
+	it("treats rows with only hint or traversal evidence as indirect", () => {
+		expect(hasDirectEvidence({})).toBe(false);
+		expect(hasDirectEvidence({ lexical: 0, semantic: 0, structured: 0 })).toBe(false);
+	});
+});
 
 describe("hintQueryCoverage", () => {
 	it("scores a query that restates the hint close to 1", () => {

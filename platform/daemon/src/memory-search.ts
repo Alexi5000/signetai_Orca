@@ -56,6 +56,7 @@ import { FTS_STOP } from "./pipeline/stop-words";
 import {
 	type EvidenceCandidateInput,
 	HINT_ONLY_SCORE_CAP,
+	hasDirectEvidence,
 	hintQueryCoverage,
 	shapeByFacetCoverage,
 	shapeStructuredEvidence,
@@ -2824,12 +2825,12 @@ export async function hybridRecall(
 			});
 		}
 		for (const row of scored) {
-			const hasDirectEvidence =
-				(bm25Map.get(row.id) ?? 0) > 0 ||
-				(temporalTopicEvidenceMap.get(row.id) ?? 0) > 0 ||
-				(vectorMap.get(row.id) ?? 0) > 0 ||
-				(structuredEvidenceMap.get(row.id) ?? 0) > 0;
-			if ((hintMap.get(row.id) ?? 0) > 0 && !hasDirectEvidence) {
+			const direct = hasDirectEvidence({
+				lexical: Math.max(bm25Map.get(row.id) ?? 0, temporalTopicEvidenceMap.get(row.id) ?? 0),
+				semantic: semanticEvidenceMap.get(row.id),
+				structured: structuredEvidenceMap.get(row.id),
+			});
+			if ((hintMap.get(row.id) ?? 0) > 0 && !direct) {
 				row.score = Math.min(row.score, HINT_ONLY_SCORE_CAP);
 			}
 		}
