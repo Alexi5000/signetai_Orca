@@ -277,7 +277,9 @@ export function getModelConfig(alias: string, env: NodeJS.ProcessEnv = process.e
     return {
       id,
       provider: "local",
-      displayName: reasoningEffort ? `${id} (local, reasoning ${reasoningEffort})` : `${id} (local)`,
+      displayName: reasoningEffort
+        ? `${id} (local, reasoning ${reasoningEffort})`
+        : `${id} (local)`,
       supportsTemperature: false,
       defaultTemperature: 1,
       maxTokensParam: "maxTokens",
