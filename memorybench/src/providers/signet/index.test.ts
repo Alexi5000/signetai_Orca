@@ -741,8 +741,10 @@ describe("Signet benchmark profiles", () => {
       requestOnce: (path: string, init: RequestInit) => Promise<unknown>
       request: (path: string, init: RequestInit) => Promise<unknown>
     }
-    provider.requestOnce = async () => {
+    const inits: RequestInit[] = []
+    provider.requestOnce = async (_path, init) => {
       attempts += 1
+      inits.push(init)
       if (attempts < 3) throw new Error("The socket connection was closed unexpectedly.")
       return { results: [] }
     }
@@ -750,8 +752,16 @@ describe("Signet benchmark profiles", () => {
       results: [],
     })
     expect(attempts).toBe(3)
+    expect(inits.map((init) => init.keepalive)).toEqual([undefined, false, false])
     expect(isDroppedConnection(new Error("boom"))).toBe(false)
-  })
+
+    provider.requestOnce = async () => {
+      throw new Error("The socket connection was closed unexpectedly.")
+    }
+    await expect(provider.request("/api/hooks/session-end", { method: "POST" })).rejects.toThrow(
+      "POST /api/hooks/session-end: connection dropped 9 times"
+    )
+  }, 30_000)
 
   it("retries Signet write pressure (503 + Retry-After) instead of failing the ingest", async () => {
     let attempts = 0

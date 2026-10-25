@@ -900,13 +900,25 @@ export class SignetProvider implements Provider {
 
   protected async request<T>(path: string, init: RequestInit): Promise<T> {
     const pressureDeadline = Date.now() + this.pressureRetryMs
+    let droppedConnections = 0
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this.requestOnce<T>(path, init)
+        return await this.requestOnce<T>(
+          path,
+          droppedConnections > 0 ? { ...init, keepalive: false } : init
+        )
       } catch (error) {
-        if (isDroppedConnection(error) && attempt < MAX_DROPPED_CONNECTION_RETRIES) {
-          await new Promise((resolve) => setTimeout(resolve, 250 * attempt))
-          continue
+        if (isDroppedConnection(error)) {
+          droppedConnections++
+          if (droppedConnections <= MAX_DROPPED_CONNECTION_RETRIES) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, Math.min(250 * droppedConnections, 2_000))
+            )
+            continue
+          }
+          throw new Error(
+            `${init.method ?? "GET"} ${path}: connection dropped ${droppedConnections} times: ${(error as Error).message}`
+          )
         }
         if (!(error instanceof RetryableSignetError) || Date.now() >= pressureDeadline) throw error
         await new Promise((resolve) =>
@@ -952,7 +964,7 @@ export class SignetProvider implements Provider {
   }
 }
 
-const MAX_DROPPED_CONNECTION_RETRIES = 4
+const MAX_DROPPED_CONNECTION_RETRIES = 8
 export function isDroppedConnection(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   const code = (error as { code?: unknown }).code
