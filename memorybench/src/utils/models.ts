@@ -16,6 +16,7 @@ export interface ModelConfig {
   defaultMaxTokens: number
   thinking?: "enabled" | "disabled"
   reasoningEffort?: string
+  thinkingBudgetTokens?: number
   pricing?: ModelPricing
 }
 
@@ -274,6 +275,8 @@ export function getModelConfig(alias: string, env: NodeJS.ProcessEnv = process.e
     const id = alias.slice(LOCAL_PREFIX.length)
     if (!id) throw new Error(`Local model alias ${alias} is missing a model id`)
     const reasoningEffort = env.MEMORYBENCH_LOCAL_REASONING_EFFORT?.trim()
+    const budget = Number.parseInt(env.MEMORYBENCH_LOCAL_THINKING_BUDGET ?? "", 10)
+    const thinkingBudgetTokens = Number.isInteger(budget) && budget > 0 ? budget : undefined
     return {
       id,
       provider: "local",
@@ -285,6 +288,7 @@ export function getModelConfig(alias: string, env: NodeJS.ProcessEnv = process.e
       maxTokensParam: "maxTokens",
       defaultMaxTokens: readLocalMaxTokens(env),
       ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(thinkingBudgetTokens ? { thinkingBudgetTokens } : {}),
     }
   }
 

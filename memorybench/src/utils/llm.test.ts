@@ -192,6 +192,25 @@ describe("local OpenAI-compatible transport", () => {
     }
   })
 
+  it("caps local reasoning with the vLLM thinking budget when configured", async () => {
+    const server = serve(() => chatCompletion("Paris"))
+    config.localBaseUrl = server.url
+    try {
+      await generateWithModel(
+        getModelConfig("local:qwen3.8-27b", {
+          MEMORYBENCH_LOCAL_REASONING_EFFORT: "low",
+          MEMORYBENCH_LOCAL_THINKING_BUDGET: "2000",
+        }),
+        "Capital of France?"
+      )
+      const body = server.requests[0]!.body
+      expect(body.thinking_token_budget).toBe(2000)
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: true, reasoning_effort: "low" })
+    } finally {
+      server.stop()
+    }
+  })
+
   it("turns thinking off when the reasoning effort is off", async () => {
     const server = serve(() => chatCompletion("Paris"))
     config.localBaseUrl = server.url

@@ -118,15 +118,19 @@ export function providerOptionsFor(
 ): Record<string, Record<string, JSONValue>> | undefined {
   if (modelConfig.provider === "local") {
     const effort = modelConfig.reasoningEffort
-    if (!effort) return undefined
+    const budget = modelConfig.thinkingBudgetTokens
     const off = effort === "off" || effort === "none"
-    return {
-      local: {
-        chat_template_kwargs: off
-          ? { enable_thinking: false }
-          : { enable_thinking: true, reasoning_effort: effort },
-      },
+    const options: Record<string, JSONValue> = {
+      ...(effort
+        ? {
+            chat_template_kwargs: off
+              ? { enable_thinking: false }
+              : { enable_thinking: true, reasoning_effort: effort },
+          }
+        : {}),
+      ...(budget && !off ? { thinking_token_budget: budget } : {}),
     }
+    return Object.keys(options).length > 0 ? { local: options } : undefined
   }
   return modelConfig.thinking
     ? { [modelConfig.provider]: { thinking: { type: modelConfig.thinking } } }
