@@ -1619,21 +1619,21 @@
     },
     {
       "path": "memory-head-owner.ts",
-      "line": 99,
+      "line": 98,
       "api": "readFileSync",
       "source": "return readFileSync(fd, \"utf8\");",
       "category": "hot-path"
     },
     {
       "path": "memory-head-owner.ts",
-      "line": 116,
+      "line": 115,
       "api": "mkdirSync",
       "source": "mkdirSync(dirname(target), { recursive: true });",
       "category": "hot-path"
     },
     {
       "path": "memory-head-owner.ts",
-      "line": 117,
+      "line": 116,
       "api": "writeFileAtomicSync",
       "source": "writeFileAtomicSync(target, projection, { fsync: false });",
       "category": "hot-path"
