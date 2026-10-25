@@ -157,6 +157,7 @@ import {
 	normalizeSessionTranscript as normalizeSessionTranscriptBase,
 } from "./transcript-normalization";
 import { getUpdateSummary } from "./update-system";
+import { isRetryableWritePressure } from "./write-pressure";
 
 function getAgentsDir(): string {
 	return resolveDefaultBasePath();
@@ -1992,6 +1993,7 @@ export async function handleSessionEnd(req: SessionEndRequest): Promise<SessionE
 				endedAt,
 			});
 		} catch (error) {
+			if (isRetryableWritePressure(error)) throw error;
 			logger.warn("hooks", "Transcript capture enqueue failed", {
 				error: error instanceof Error ? error.message : String(error),
 				sessionKey,

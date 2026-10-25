@@ -47,6 +47,17 @@ describe("agent route memory policy contracts", () => {
 		).toBe(201);
 	});
 
+	it("POST of an existing agent is a 409 conflict, not a 500, even when racing", async () => {
+		const created = await Promise.all(
+			Array.from({ length: 6 }, () => request("POST", "/api/agents", { name: "raced", read_policy: "isolated" })),
+		);
+		const statuses = created.map((response) => response.status).sort();
+		expect(statuses).toEqual([201, 409, 409, 409, 409, 409]);
+		expect(await created.find((response) => response.status === 409)?.json()).toEqual({
+			error: "Agent raced already exists",
+		});
+	});
+
 	it("GET returns a structured error for a legacy invalid persisted policy", async () => {
 		const { getDbAccessor, runWriteTxAsync } = await import("./db-accessor");
 		await runWriteTxAsync(getDbAccessor(), (db) => {
