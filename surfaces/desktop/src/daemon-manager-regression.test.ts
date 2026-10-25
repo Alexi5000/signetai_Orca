@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import EventEmitter from "node:events";
+import { closeSync, fstatSync, mkdtempSync, openSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 mock.module("electron", () => ({
 	default: {
@@ -48,15 +50,45 @@ function healthyFetchResponse(): Response {
 
 describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 	let originalFetch: typeof globalThis.fetch;
+	let logDirectory: string;
+	let logFds: { stdout: number; stderr: number };
+	let unrelatedFd: number;
+	let ownedFds: Array<{ fd: number; ino: number; dev: number }>;
 
 	beforeEach(() => {
 		originalFetch = globalThis.fetch;
-		openLogsMock = spyOn(daemonLogs, "openDaemonLogs").mockReturnValue({ stdout: 17, stderr: 18 });
+		logDirectory = mkdtempSync(join(tmpdir(), "signet-desktop-fds-"));
+		logFds = {
+			stdout: openSync(join(logDirectory, "stdout.log"), "w"),
+			stderr: openSync(join(logDirectory, "stderr.log"), "w"),
+		};
+		unrelatedFd = openSync(join(logDirectory, "unrelated.log"), "w");
+		ownedFds = [logFds.stdout, logFds.stderr, unrelatedFd].map((fd) => {
+			const { ino, dev } = fstatSync(fd);
+			return { fd, ino, dev };
+		});
+		openLogsMock = spyOn(daemonLogs, "openDaemonLogs").mockReturnValue(logFds);
 	});
 
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
 		mock.restore();
+		const closeOwnedDescriptors = () => {
+			for (const { fd, ino, dev } of ownedFds) {
+				try {
+					const current = fstatSync(fd);
+					if (current.ino === ino && current.dev === dev) closeSync(fd);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error;
+				}
+			}
+			rmSync(logDirectory, { recursive: true, force: true });
+		};
+		try {
+			expect(fstatSync(unrelatedFd).isFile()).toBe(true);
+		} finally {
+			closeOwnedDescriptors();
+		}
 	});
 	test("spawnBundled passes synchronous fd, not lazy WriteStream (regression for #606 fd race)", async () => {
 		let fetchCallCount = 0;
@@ -66,8 +98,6 @@ describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 			return healthyFetchResponse();
 		};
 		const fs = await import("node:fs");
-		const STDOUT_FD = 17;
-		const STDERR_FD = 18;
 		openLogsMock.mockClear();
 		spyOn(fs, "existsSync").mockReturnValue(true);
 		spyOn(fs, "mkdirSync").mockReturnValue(undefined);
@@ -84,8 +114,8 @@ describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 		expect(stdioArg[0]).toBe("ignore");
 		expect(typeof stdioArg[1]).toBe("number");
 		expect(typeof stdioArg[2]).toBe("number");
-		expect(stdioArg[1]).toBe(STDOUT_FD);
-		expect(stdioArg[2]).toBe(STDERR_FD);
+		expect(stdioArg[1]).toBe(logFds.stdout);
+		expect(stdioArg[2]).toBe(logFds.stderr);
 
 		expect(openLogsMock).toHaveBeenCalledTimes(1);
 		expect(openLogsMock.mock.calls[0]).toEqual([resolve("/tmp/signet-workspace")]);
@@ -113,7 +143,6 @@ describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 		};
 
 		const fs = await import("node:fs");
-		spyOn(fs, "openSync").mockImplementation((_path: fs.PathLike | number, _flags: fs.OpenMode): number => 99);
 		spyOn(fs, "existsSync").mockImplementation(existsExceptLayoutFile);
 		spyOn(fs, "mkdirSync").mockReturnValue(undefined);
 
@@ -133,7 +162,6 @@ describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 		};
 
 		const fs = await import("node:fs");
-		spyOn(fs, "openSync").mockImplementation((_path: fs.PathLike | number, _flags: fs.OpenMode): number => 99);
 		spyOn(fs, "existsSync").mockImplementation(existsExceptLayoutFile);
 		spyOn(fs, "mkdirSync").mockReturnValue(undefined);
 
@@ -156,5 +184,8 @@ describe("DaemonManager dual-mode regressions (#606 / PR #615)", () => {
 		expect(status.mode).toBe("none");
 		expect(status.startupErrorCode).toBe("bundled-runtime-enoent");
 		expect(status.startupError).toContain("Reinstall the desktop app or install Bun");
+		expect(() => fstatSync(logFds.stdout)).toThrow();
+		expect(() => fstatSync(logFds.stderr)).toThrow();
+		expect(fstatSync(unrelatedFd).isFile()).toBe(true);
 	});
 });
