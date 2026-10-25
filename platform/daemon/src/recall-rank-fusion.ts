@@ -36,7 +36,8 @@ export function selectPrimaryCandidates<T extends { readonly id: string }>(
 		const neededFlat = Math.max(0, flatTarget - flatCount);
 		if (!isFlat && neededFlat >= budget - selected.length) continue;
 		selected.push(row);
+		kept.add(row.id);
 		if (isFlat) flatCount++;
 	}
-	return selected;
+	return fused.filter((row) => kept.has(row.id));
 }

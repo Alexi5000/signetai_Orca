@@ -82,14 +82,14 @@ describe("selectPrimaryCandidates", () => {
 		const fused = rows("t1", "t2", "t3", "t4", "v1");
 		const flat = new Set(["v1"]);
 
-		expect(ids(selectPrimaryCandidates(fused, 3, flat, 0, new Set(["v1"])))).toEqual(["v1", "t1", "t2"]);
+		expect(ids(selectPrimaryCandidates(fused, 3, flat, 0, new Set(["v1"])))).toEqual(["t1", "t2", "v1"]);
 	});
 
 	it("counts reserved flat rows toward the flat minimum", () => {
 		const fused = rows("t1", "t2", "t3", "v1", "f1");
 		const flat = new Set(["v1", "f1"]);
 
-		expect(ids(selectPrimaryCandidates(fused, 3, flat, 1, new Set(["v1"])))).toEqual(["v1", "t1", "t2"]);
+		expect(ids(selectPrimaryCandidates(fused, 3, flat, 1, new Set(["v1"])))).toEqual(["t1", "t2", "v1"]);
 	});
 
 	it("never returns more rows than the budget", () => {
