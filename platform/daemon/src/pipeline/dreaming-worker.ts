@@ -90,6 +90,7 @@ export function partitionDreamingScopes(
 		readonly oldestAttentionAt?: string | null;
 	}>,
 	slots: number,
+	maxTokensPerPass = Number.POSITIVE_INFINITY,
 ): string[][] {
 	const withBacklog = backlogs
 		.filter((item) => item.tokens > 0)
@@ -107,6 +108,7 @@ export function partitionDreamingScopes(
 	}));
 	for (const item of withBacklog) {
 		const target = groups.reduce((smallest, group) => (group.tokens < smallest.tokens ? group : smallest));
+		if (target.scopes.length > 0 && target.tokens + item.tokens > maxTokensPerPass) continue;
 		target.scopes.push(item.scope);
 		target.tokens += item.tokens;
 	}
@@ -176,6 +178,7 @@ export interface DreamingWorkerOptions {
 
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const INFERENCE_RECHECK_MS = 30 * 1000;
+const PASS_SETTLED_CHECK_DELAY_MS = 1_000;
 const AGENT_SCOPE_SNAPSHOT_REFRESH_MS = 30 * 60 * 1000;
 export async function shouldDeferDreamingSweep(
 	accessor: DbAccessor,
@@ -336,6 +339,7 @@ export function startDreamingWorker(
 	caps?: GraphHygieneCaps,
 ): DreamingWorkerHandle {
 	let timer: ReturnType<typeof setTimeout> | null = null;
+	let checkRequested = false;
 	let stopped = false;
 	let admission: Promise<void> | null = null;
 	let activeWork: Promise<void> | null = null;
@@ -547,13 +551,20 @@ export function startDreamingWorker(
 			() => resolveToolCall(true),
 			() => resolveToolCall(false),
 		);
+		let madeProgress = false;
 		void result
-			.catch(() => undefined)
+			.then(
+				(outcome) => {
+					madeProgress = outcome.applied > 0;
+				},
+				() => undefined,
+			)
 			.then(async () => compactHistoryAfterPass(runAgentId, await passId, scopes, live))
 			.catch(() => undefined)
 			.finally(() => {
 				runningPasses.delete(entry);
 				release();
+				if (madeProgress) checkSoon();
 			});
 		return { passId, result, firstToolCall };
 	}
@@ -594,7 +605,9 @@ export function startDreamingWorker(
 		const slots = maxPasses() - usedSlots();
 		if (scopes.length === 0 || slots <= 0) throw new AlreadyRunningError();
 		const measured =
-			scopes.length === 1 ? [[...scopes]] : partitionDreamingScopes(await measureScopeWork(scopes), slots);
+			scopes.length === 1
+				? [[...scopes]]
+				: partitionDreamingScopes(await measureScopeWork(scopes), slots, cfg.tokenThreshold);
 		const groups = measured.length > 0 ? measured : [[...scopes]];
 		const [firstGroup, ...rest] = groups;
 		const first = startPass(runAgentId, "incremental", firstGroup ?? [...scopes], false);
@@ -735,6 +748,8 @@ export function startDreamingWorker(
 
 	function schedule(): void {
 		if (stopped) return;
+		const delay = checkRequested ? PASS_SETTLED_CHECK_DELAY_MS : nextCheckDelay();
+		checkRequested = false;
 		timer = setTimeout(async () => {
 			timer = null;
 			try {
@@ -748,7 +763,14 @@ export function startDreamingWorker(
 				);
 			}
 			schedule();
-		}, nextCheckDelay());
+		}, delay);
+	}
+	function checkSoon(): void {
+		checkRequested = true;
+		if (stopped || timer === null) return;
+		clearTimeout(timer);
+		timer = null;
+		schedule();
 	}
 	function nextCheckDelay(): number {
 		const interval = options.checkIntervalMs ?? CHECK_INTERVAL_MS;

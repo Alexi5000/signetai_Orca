@@ -794,6 +794,85 @@ describe("dreaming worker agent scope", () => {
 		}
 	});
 
+	it("checks for more work right after a pass that applied changes, but not after a failed or empty one", async () => {
+		db.prepare(
+			`INSERT INTO session_transcripts
+			 (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
+			 VALUES ('settled-check', 'default', 'Orrin owns the settlement ledger.', 'pi',
+			         datetime('now'), datetime('now'), datetime('now'))`,
+		).run();
+		const originalSetTimeout = globalThis.setTimeout;
+		const delays: number[] = [];
+		globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+			if (timeout !== undefined) delays.push(timeout);
+			return originalSetTimeout(handler, timeout, ...args);
+		}) as typeof setTimeout;
+		let fail = false;
+		let file = false;
+		const worker = startDreamingWorker(accessor, defaultCfg({ tokenThreshold: 1 }), agentsDir, "default", {
+			checkIntervalMs: 60_000,
+			executorFactory: () => ({
+				async run(input: {
+					tools: ReadonlyArray<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }>;
+				}) {
+					if (fail) throw new Error("fixture executor failure");
+					if (file) {
+						const apply = input.tools.find((tool) => tool.name === "apply_ontology_ops");
+						if (!apply) throw new Error("Missing apply_ontology_ops");
+						await apply.execute("call", {
+							agentId: "default",
+							operations: [
+								{
+									operation: "create_entity",
+									payload: { name: "Orrin", type: "person" },
+									reason: "The evidence names the ledger owner.",
+									confidence: 0.9,
+									evidence: [
+										{
+											source_ref: "transcript:settled-check",
+											source_kind: "transcript",
+											source_id: "settled-check",
+											quote: "Orrin owns the settlement ledger.",
+										},
+									],
+								},
+							],
+						});
+					}
+					return { summary: "Controlled executor fixture completed." };
+				},
+			}),
+		});
+		try {
+			delays.length = 0;
+			await worker.triggerAsync("incremental");
+			const empty = worker.activePass;
+			if (empty !== null) await empty;
+			await waitFor(() => !worker.running, 2_000);
+			expect(delays).not.toContain(1_000);
+
+			file = true;
+			delays.length = 0;
+			await worker.triggerAsync("incremental");
+			const productive = worker.activePass;
+			if (productive !== null) await productive;
+			await waitFor(() => !worker.running, 2_000);
+			expect(delays).toContain(1_000);
+			file = false;
+
+			fail = true;
+			delays.length = 0;
+			await worker.triggerAsync("incremental").catch(() => undefined);
+			const failed = worker.activePass;
+			if (failed !== null) await failed.catch(() => undefined);
+			await waitFor(() => !worker.running, 2_000);
+			expect(delays).not.toContain(1_000);
+		} finally {
+			worker.stop();
+			globalThis.setTimeout = originalSetTimeout;
+		}
+	});
+
 	it("releases a failed async preflight and admits the next trigger", async () => {
 		db.prepare(
 			`INSERT INTO session_transcripts
@@ -989,6 +1068,23 @@ describe("dreaming worker agent scope", () => {
 			),
 		).toEqual([["alpha"]]);
 		expect(partitionDreamingScopes([{ scope: "default", tokens: 0 }], 3)).toEqual([]);
+	});
+
+	it("caps each pass at the per-pass token budget and leaves the rest for later passes", () => {
+		const haystacks = Array.from({ length: 100 }, (_, i) => ({
+			scope: `haystack-${String(i).padStart(3, "0")}`,
+			tokens: 115_000,
+		}));
+		const groups = partitionDreamingScopes(haystacks, 20, 100_000);
+		expect(groups).toHaveLength(20);
+		expect(groups.every((group) => group.length === 1)).toBe(true);
+
+		const small = Array.from({ length: 10 }, (_, i) => ({ scope: `small-${i}`, tokens: 30_000 }));
+		const packed = partitionDreamingScopes(small, 2, 100_000);
+		expect(packed.map((group) => group.length)).toEqual([3, 3]);
+		expect(packed.flat()).toHaveLength(6);
+
+		expect(partitionDreamingScopes([{ scope: "huge", tokens: 900_000 }], 4, 100_000)).toEqual([["huge"]]);
 	});
 
 	it("spreads scopes with only pending attention across free slots", () => {
