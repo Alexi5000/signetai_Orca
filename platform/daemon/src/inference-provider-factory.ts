@@ -12,6 +12,7 @@ import {
 	type RoutingConfig,
 	routingTelemetryAttribution,
 } from "@signet/core";
+import { discoverLocalContextWindow } from "./local-context-window";
 import { type PiExecutorKind, createPiModelProvider } from "./pipeline/pi-provider";
 import type { AcpxHooksMode, StreamCapableLlmProvider } from "./pipeline/provider";
 import { createAcpxProvider } from "./pipeline/provider";
@@ -33,6 +34,7 @@ export interface ResolvedInferenceCredential {
 const FOLDED_EXECUTORS = new Set(["claude-code", "codex", "opencode", "kimi", "command"]);
 
 const CUSTOM_PI_EXECUTORS = new Set(["anthropic", "openrouter", "ollama", "llama-cpp", "openai-compatible"]);
+const LOCAL_SERVER_EXECUTORS = new Set(["ollama", "llama-cpp", "openai-compatible"]);
 
 function catalogModel(providerFamily: string, modelId: string): Model<Api> | undefined {
 	if (!(getBuiltinProviders() as readonly string[]).includes(providerFamily)) return undefined;
@@ -91,6 +93,11 @@ export async function createRoutingProvider(opts: CreateRoutingProviderOptions):
 	if (!piModel && !CUSTOM_PI_EXECUTORS.has(target.executor)) {
 		throw new Error(`Unknown pi-ai model "${model.model}" for provider "${providerFamily}"`);
 	}
+	const contextWindow =
+		model.contextWindow ??
+		(!piModel && LOCAL_SERVER_EXECUTORS.has(target.executor)
+			? await discoverLocalContextWindow(target.executor, target.endpoint, model.model, credential?.apiKey)
+			: undefined);
 
 	return {
 		...createPiModelProvider({
@@ -102,7 +109,7 @@ export async function createRoutingProvider(opts: CreateRoutingProviderOptions):
 			baseUrl: target.endpoint,
 			apiKey: credential?.apiKey,
 			reasoning: resolveProviderReasoning(target, model, piModel),
-			contextWindow: model.contextWindow,
+			contextWindow,
 			...(target.thinking ? { thinking: target.thinking } : {}),
 			name: `${target.executor}:${model.model}`,
 			defaultTimeoutMs: 60_000,
