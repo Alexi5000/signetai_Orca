@@ -117,9 +117,16 @@ export function providerOptionsFor(
   modelConfig: ModelConfig
 ): Record<string, Record<string, JSONValue>> | undefined {
   if (modelConfig.provider === "local") {
-    return modelConfig.reasoningEffort
-      ? { local: { chat_template_kwargs: { reasoning_effort: modelConfig.reasoningEffort } } }
-      : undefined
+    const effort = modelConfig.reasoningEffort
+    if (!effort) return undefined
+    const off = effort === "off" || effort === "none"
+    return {
+      local: {
+        chat_template_kwargs: off
+          ? { enable_thinking: false }
+          : { enable_thinking: true, reasoning_effort: effort },
+      },
+    }
   }
   return modelConfig.thinking
     ? { [modelConfig.provider]: { thinking: { type: modelConfig.thinking } } }

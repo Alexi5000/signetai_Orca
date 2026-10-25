@@ -179,11 +179,28 @@ describe("local OpenAI-compatible transport", () => {
       const request = server.requests[0]!
       expect(request.path).toBe("/api/coding/paas/v4/chat/completions")
       expect(request.body.model).toBe("qwen3.8-27b")
-      expect(request.body.chat_template_kwargs).toEqual({ reasoning_effort: "low" })
+      expect(request.body.chat_template_kwargs).toEqual({
+        enable_thinking: true,
+        reasoning_effort: "low",
+      })
       expect(request.body.max_tokens).toBe(2048)
       expect(request.body.temperature).toBeUndefined()
       expect(request.body.thinking).toBeUndefined()
       expect(result.usage.inputTokens).toBe(120)
+    } finally {
+      server.stop()
+    }
+  })
+
+  it("turns thinking off when the reasoning effort is off", async () => {
+    const server = serve(() => chatCompletion("Paris"))
+    config.localBaseUrl = server.url
+    try {
+      await generateWithModel(
+        getModelConfig("local:qwen3.8-27b", { MEMORYBENCH_LOCAL_REASONING_EFFORT: "off" }),
+        "Capital of France?"
+      )
+      expect(server.requests[0]!.body.chat_template_kwargs).toEqual({ enable_thinking: false })
     } finally {
       server.stop()
     }
