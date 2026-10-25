@@ -15,7 +15,6 @@ on:
       - "tests/integration/acceptance/**"
       - ".github/workflows/phase-d-acceptance.yml"
   schedule:
-    # Full variant nightly, 07:15 UTC — catches drift the 90s PR smoke can't see.
     - cron: "15 7 * * *"
   workflow_dispatch:
     inputs:
@@ -37,6 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Build @signet/core and @signet/daemon

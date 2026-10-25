@@ -16,7 +16,6 @@ describe("writeFileIfChanged", () => {
 			const firstMtimeMs = statSync(path).mtimeMs;
 
 			expect(writeFileIfChanged(path, "alpha")).toBe(false);
-			// Read content and metadata through one descriptor (no stat-then-read race).
 			const second = readFileWithStatSync(path, "utf8");
 
 			expect(second?.stat.mtimeMs).toBe(firstMtimeMs);
@@ -52,7 +51,6 @@ describe("writeFileIfChangedAsync", () => {
 			const firstMtimeMs = statSync(path).mtimeMs;
 
 			expect(await writeFileIfChangedAsync(path, "alpha")).toBe(false);
-			// Read content and metadata through one descriptor (no stat-then-read race).
 			const second = readFileWithStatSync(path, "utf8");
 
 			expect(second?.stat.mtimeMs).toBe(firstMtimeMs);

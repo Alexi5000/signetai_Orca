@@ -19,9 +19,9 @@ calls from the other path return `409`.
 
 ### POST /api/hooks/session-start
 
-Called at the beginning of a session. Returns context and relevant memories
-for injection into the harness system prompt. Requires `remember` permission
-(via hook routing).
+Called at the beginning of a session. Returns bounded Session Continuity previews,
+identity, and context for injection into the harness system prompt. Requires
+`remember` permission (via hook routing).
 
 **Request body**
 
@@ -40,7 +40,9 @@ for injection into the harness system prompt. Requires `remember` permission
 
 `harness` is required. `agentId` is the Signet persistence scope. First-seen
 named agent IDs are registered in the `agents` table with `read_policy` set to
-`shared` as the initial policy; existing agent policy rows are preserved.
+`isolated`, the same default as `POST /api/agents`; existing agent policy rows
+are preserved. Granting `shared` or `group` access is an explicit operator
+action (`signet agent set` or `PATCH /api/agents/:name`).
 Harness native sub-agent identifiers, such as Claude Code's `agent_id`, must be
 sent as `harnessAgentId`; they are lineage hints and are not used for Signet data
 scoping. `parentSessionKey` may be provided when the harness exposes explicit
@@ -60,6 +62,15 @@ mid-conversation invalidates prompt caching.
 **Response** — ordinary starts return the implementation-defined context object
 from `handleSessionStart`; claim-only recovery returns only
 `{ "sessionKnown": true }`.
+
+For ordinary starts, `memories` contains the records that survived final
+Session Continuity rendering. Each item includes its full `id`, bounded
+`content`, `type`, `importance`, `created_at`, tags/project, source metadata,
+and a `truncated` flag. The model-facing `dynamicContext` labels these records
+as historical reference material, not instructions. A truncated record retains
+its full ID and can be retrieved with the `memory_get` MCP tool or
+`GET /api/memory/:id`; records omitted by the configured limits are not reported
+as delivered.
 
 ### POST /api/hooks/user-prompt-submit
 
@@ -152,7 +163,7 @@ may retain raw auditable traces separately in daemon logs.
 
 When transcript text is available, the daemon queues a capture receipt and
 then writes the canonical conversation transcript as JSONL at
-`$SIGNET_WORKSPACE/memory/{harness}/transcripts/transcript.jsonl` and records
+`$SIGNET_WORKSPACE/transcripts/{harness}/transcript.jsonl` and records
 lineage through the session manifest. Existing markdown transcript artifacts
 remain readable for backward compatibility and are backfilled into the JSONL
 history.

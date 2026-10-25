@@ -17,11 +17,6 @@ import {
 } from "./hook";
 
 const prevLog = console.log;
-
-// process.exit mock: the postAction hook (hook.ts lines 136-138) calls
-// process.exit(0) after every hook subcommand. This mock prevents the real
-// process.exit from terminating the test runner during integration tests
-// that exercise program.parseAsync, while letting new tests verify exit codes.
 const hookExitCodes: number[] = [];
 const originalExit = process.exit;
 
@@ -69,14 +64,16 @@ describe("resolvePromptSubmitTimeout", () => {
 		const prev = process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT;
 		process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT = "9000";
 		expect(resolvePromptSubmitTimeout()).toBe(9000);
-		process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT = prev;
+		if (prev === undefined) delete process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT;
+		else process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT = prev;
 	});
 
 	test("falls back to the default when env is invalid or too small", () => {
 		const prev = process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT;
 		process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT = "200";
 		expect(resolvePromptSubmitTimeout()).toBe(5000);
-		process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT = prev;
+		if (prev === undefined) delete process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT;
+		else process.env.SIGNET_PROMPT_SUBMIT_TIMEOUT = prev;
 	});
 });
 
@@ -85,14 +82,16 @@ describe("resolveSessionStartTimeout", () => {
 		const prev = process.env.SIGNET_SESSION_START_TIMEOUT;
 		process.env.SIGNET_SESSION_START_TIMEOUT = "18000";
 		expect(resolveSessionStartTimeout()).toBe(18000);
-		process.env.SIGNET_SESSION_START_TIMEOUT = prev;
+		if (prev === undefined) delete process.env.SIGNET_SESSION_START_TIMEOUT;
+		else process.env.SIGNET_SESSION_START_TIMEOUT = prev;
 	});
 
 	test("falls back to the default when env is invalid or too small", () => {
 		const prev = process.env.SIGNET_SESSION_START_TIMEOUT;
 		process.env.SIGNET_SESSION_START_TIMEOUT = "200";
 		expect(resolveSessionStartTimeout()).toBe(15000);
-		process.env.SIGNET_SESSION_START_TIMEOUT = prev;
+		if (prev === undefined) delete process.env.SIGNET_SESSION_START_TIMEOUT;
+		else process.env.SIGNET_SESSION_START_TIMEOUT = prev;
 	});
 });
 
@@ -171,6 +170,20 @@ describe("buildSessionEndBody", () => {
 			reason: "shutdown",
 			runtimePath: "legacy",
 		});
+	});
+
+	test("forwards the turn's final assistant reply from Stop payloads", () => {
+		const body = buildSessionEndBody(
+			{
+				session_id: "muse-sess",
+				hook_event_name: "Stop",
+				last_assistant_message: "Ultramarine noted.",
+				transcript_path: null,
+			},
+			"muse-code",
+		);
+		expect(body.lastAssistantMessage).toBe("Ultramarine noted.");
+		expect(body.transcriptPath).toBe("");
 	});
 
 	test("preserves a distinct legacy sessionId alongside canonical sessionKey", () => {
@@ -787,15 +800,13 @@ describe("postAction exit behavior", () => {
 		});
 
 		await program.parseAsync(["node", "test", "hook", "session-end", "-H", "test-harness"]);
-
-		// preAction calls exit(0), then action runs and postAction also calls exit(0).
-		// With the mock all calls fire — but they're all code 0.
 		expect(hookExitCodes.length).toBeGreaterThanOrEqual(1);
 		for (const code of hookExitCodes) {
 			expect(code).toBe(0);
 		}
 
-		process.env.SIGNET_NO_HOOKS = prev;
+		if (prev === undefined) delete process.env.SIGNET_NO_HOOKS;
+		else process.env.SIGNET_NO_HOOKS = prev;
 	});
 
 	test("error path calls process.exit(1) before postAction fires", async () => {
@@ -810,10 +821,6 @@ describe("postAction exit behavior", () => {
 		});
 
 		await program.parseAsync(["node", "test", "hook", "session-start", "-H", "test-harness"]);
-
-		// Handler calls exit(1) for data.error, then postAction fires exit(0).
-		// With the mock both land — the first call proves the handler's exit
-		// code is preserved and not preempted by postAction.
 		expect(hookExitCodes.length).toBeGreaterThanOrEqual(1);
 		expect(hookExitCodes[0]).toBe(1);
 	});

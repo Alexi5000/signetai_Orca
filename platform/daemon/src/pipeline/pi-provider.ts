@@ -1,14 +1,5 @@
-/**
- * Pi-backed inference provider (#947).
- *
- * Single LlmProvider implementation backed by @earendil-works/pi-ai. Replaces
- * the per-provider HTTP/subprocess factories that previously lived in
- * provider.ts. Every routing executor except `acpx` (which stays a Signet-native
- * harness backend) resolves to a pi-ai `Model<TApi>` constructed here.
- *
- * Verified against live local servers (LM Studio, Ollama) and pi's own
- * llama.cpp extension pattern: see docs/research/2026-07-21-pi-inference-spike.md.
- */
+import { createWorkerAgentSession, leaseWorkerAgentSession } from "./pi-agent-client";
+import type { PiAgentRetryPolicy, PiAgentTool, PiAgentWorkerInput } from "./pi-agent-protocol";
 import {
 	type Api,
 	type Context,
@@ -19,16 +10,7 @@ import {
 	type ThinkingLevel,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import {
-	DefaultResourceLoader,
-	ModelRuntime,
-	SessionManager,
-	type AgentSessionEvent,
-	type SessionStats,
-	SettingsManager,
-	type ToolDefinition,
-	createAgentSession,
-} from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, type AgentSessionEvent, type SessionStats } from "@earendil-works/pi-coding-agent";
 import type {
 	AccountingProvenance,
 	LlmCacheRequestAccounting,
@@ -43,8 +25,6 @@ import {
 	type StreamCapableLlmProvider,
 	acquireLlmConcurrencyPermit,
 } from "./provider";
-
-/** Executors that route through pi-ai. `acpx` is handled separately. */
 export type PiExecutorKind = "anthropic" | "openrouter" | "ollama" | "llama-cpp" | "openai-compatible" | (string & {});
 
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
@@ -52,8 +32,6 @@ const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1";
 const DEFAULT_LLAMA_CPP_BASE_URL = "http://127.0.0.1:8080/v1";
 const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://127.0.0.1:1234/v1";
-
-/** Keyless local/gateway servers get a dummy key so pi-ai's resolver short-circuits. */
 const KEYLESS_API_KEY = "signet-keyless";
 
 const LOCAL_COMPAT: OpenAICompletionsCompat = {
@@ -69,30 +47,16 @@ export interface PiModelProviderConfig {
 	readonly executor: PiExecutorKind;
 	readonly providerFamily?: string;
 	readonly model: string;
-	/** Model metadata supplied by pi-ai for native providers. */
 	readonly piModel?: Model<Api>;
-	/** Native pi-ai providers do not share a portable unauthenticated health endpoint. */
 	readonly skipAvailabilityProbe?: boolean;
 	readonly baseUrl?: string;
-	/** Resolved credential (API key). Omit for keyless local servers. */
 	readonly apiKey?: string;
-	/**
-	 * Per-call thinking level forwarded to pi-ai as `options.reasoning`.
-	 * Pi-ai has TWO reasoning fields: `Model.reasoning` (a boolean CAPABILITY
-	 * flag) and `options.reasoning` (a ThinkingLevel that actually turns
-	 * thinking on for the call). Setting the capability flag alone has no
-	 * observable effect — the per-call level must be forwarded too.
-	 * `RoutingReasoningDepth` ("low"|"medium"|"high") is a subset of
-	 * ThinkingLevel ("minimal"|"low"|"medium"|"high"|"xhigh").
-	 */
 	readonly reasoning?: ThinkingLevel;
 	readonly contextWindow?: number;
 	readonly maxTokens?: number;
 	readonly defaultTimeoutMs?: number;
 	readonly name?: string;
 }
-
-/** A deadline created by this provider, distinct from an upstream timeout response. */
 export class PiProviderDeadlineError extends Error {
 	readonly timeoutMs: number;
 
@@ -102,33 +66,21 @@ export class PiProviderDeadlineError extends Error {
 		this.timeoutMs = timeoutMs;
 	}
 }
-
-/**
- * A deliberately isolated Pi AgentSession for daemon-owned agentic work.
- *
- * The daemon supplies every tool, including the single audited write seam.
- * No project context, extensions, skills, or persisted Pi session is exposed
- * to this background process.
- */
 export interface PiAgentSession {
 	prompt(text: string): Promise<void>;
+	setTools?(tools: readonly PiAgentTool[]): void;
+	cancelTurn?(): Promise<void>;
+	updateModel?(input: Pick<PiAgentWorkerInput, "model" | "apiKey">): Promise<void>;
 	abort(): Promise<void>;
-	dispose(): void;
-	/** Forward the underlying Pi event stream without making it durable. */
+	dispose(): void | Promise<void>;
 	subscribe?(listener: (event: AgentSessionEvent) => void): () => void;
-	/** Session context used by the opt-in Dreaming live viewer. */
 	getSystemPrompt?(): string;
 	getSessionId?(): string;
 	getModelName?(): string | undefined;
 	getActiveToolNames(): readonly string[];
+	getExecutionThreadId?(): number;
 	getFailureMessage(): string | undefined;
-	/**
-	 * Provider-reported token usage for the whole session, aggregated by
-	 * pi-coding-agent across every assistant turn and tool call. Undefined
-	 * for providers that never reported usage.
-	 */
 	getStats(): SessionStats | undefined;
-	/** Provider usage for each assistant response in the session, when available. */
 	getRequestUsages(): readonly Usage[] | undefined;
 }
 
@@ -136,8 +88,15 @@ export interface PiAgentSessionProvider {
 	readonly isPiAgentSessionProvider: true;
 	readonly agentSessionTimeoutMs: number;
 	createAgentSession(
-		tools: readonly ToolDefinition[],
-		options?: { readonly maxTokens?: number; readonly signal?: AbortSignal },
+		tools: readonly PiAgentTool[],
+		options?: {
+			readonly maxTokens?: number;
+			readonly signal?: AbortSignal;
+			readonly systemPrompt?: string;
+			readonly persistentSessionKey?: string;
+			readonly continuationPrompt?: string;
+			readonly retry?: PiAgentRetryPolicy;
+		},
 	): Promise<PiAgentSession>;
 }
 
@@ -235,9 +194,6 @@ function openCodeHeaders(
 	model: Model<Api>,
 	sessionId: string | undefined,
 ): ProviderHeaders | undefined {
-	// ModelRuntime's direct API does not run pi-coding-agent's SDK provider
-	// attribution transform. Keep only the OpenCode defaults here; session
-	// lifetime is owned by the router and configured model headers win.
 	if (!sessionId || !isOpenCodeModel(config, model)) return undefined;
 	const headers: Record<string, string> = {
 		...(hasHeader(model, "x-opencode-session") ? {} : { "x-opencode-session": sessionId }),
@@ -261,17 +217,21 @@ function accountingProvenanceForConfig(config: PiModelProviderConfig, piModel: M
 
 function withVersionPath(baseUrl: string): string {
 	const trimmed = baseUrl.trim().replace(/\/+$/, "");
-	// Routing targets conventionally store an OpenAI *base* URL, while users
-	// commonly paste the concrete chat-completions endpoint. Pi appends the
-	// operation path itself, so normalize that concrete form instead of issuing
-	// `/chat/completions/chat/completions`.
 	if (trimmed.endsWith("/v1/chat/completions")) return trimmed.slice(0, -"/chat/completions".length);
 	if (trimmed.endsWith("/v1/responses")) return trimmed.slice(0, -"/responses".length);
 	if (trimmed.endsWith("/v1")) return trimmed;
 	return `${trimmed}/v1`;
 }
 
-/** Map a routing executor + config to a pi-ai Model. */
+function availabilityProbeHeaders(api: Api, apiKey: string | undefined): Record<string, string> {
+	if (!apiKey) return {};
+	if (api !== "anthropic-messages") return { authorization: `Bearer ${apiKey}` };
+	const auth: Record<string, string> = apiKey.includes("sk-ant-oat")
+		? { authorization: `Bearer ${apiKey}` }
+		: { "x-api-key": apiKey };
+	return { ...auth, "anthropic-version": "2023-06-01" };
+}
+
 export function resolvePiModel(config: PiModelProviderConfig): ResolvedModel {
 	const timeoutMs = config.defaultTimeoutMs ?? 60_000;
 	void timeoutMs;
@@ -346,10 +306,7 @@ export function resolvePiModel(config: PiModelProviderConfig): ResolvedModel {
 						? DEFAULT_LLAMA_CPP_BASE_URL
 						: DEFAULT_OPENAI_COMPATIBLE_BASE_URL;
 			const rawBase = config.baseUrl ?? defaultBase;
-			// ollama/llama-cpp always get /v1; openai-compatible respects a provided path.
 			const baseUrl = config.executor === "openai-compatible" ? withVersionPath(rawBase) : withVersionPath(rawBase);
-			// Keyless only when the server is local AND no explicit key was provided.
-			// A local gateway/proxy that requires a bearer token keeps its real key.
 			const keyless = !config.apiKey && isLocalBaseUrl(rawBase);
 			const piModel: Model<"openai-completions"> = {
 				id: config.model,
@@ -424,6 +381,14 @@ function effectiveAccountingProvenance(
 	return hasUsage || accountingProvenance === "local_zero_cost" ? accountingProvenance : "unavailable";
 }
 
+function peakContextTokens(usages: readonly Usage[] | undefined): number | null {
+	if (usages === undefined || usages.length === 0) return null;
+	const peak = Math.max(
+		...usages.map((usage) => (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0)),
+	);
+	return peak > 0 ? peak : null;
+}
+
 export function mapUsage(usage: Usage, accountingProvenance: AccountingProvenance): LlmUsage {
 	const effectiveProvenance = effectiveAccountingProvenance(usageHasAccounting(usage), accountingProvenance);
 	return {
@@ -436,16 +401,9 @@ export function mapUsage(usage: Usage, accountingProvenance: AccountingProvenanc
 		totalDurationMs: null,
 		accountingProvenance: effectiveProvenance,
 		cacheRequests: summarizeCacheRequests([usage]),
+		peakContextTokens: peakContextTokens([usage]),
 	};
 }
-
-/**
- * Map a pi-coding-agent SessionStats aggregate to the shared LlmUsage shape.
- * The stats object aggregates usage across every assistant turn and tool
- * result in the session; a session that reported nothing
- * yields an all-null usage so callers can distinguish "no usage reported"
- * from a real zero-token pass.
- */
 export function mapSessionStatsToUsage(
 	stats: SessionStats | undefined,
 	totalDurationMs: number,
@@ -463,6 +421,7 @@ export function mapSessionStatsToUsage(
 			totalDurationMs,
 			accountingProvenance,
 			cacheRequests: requestUsages === undefined ? null : summarizeCacheRequests(requestUsages),
+			peakContextTokens: peakContextTokens(requestUsages),
 		};
 	}
 	const effectiveProvenance = effectiveAccountingProvenance(
@@ -486,6 +445,7 @@ export function mapSessionStatsToUsage(
 		totalDurationMs,
 		accountingProvenance: effectiveProvenance,
 		cacheRequests: requestUsages === undefined ? null : summarizeCacheRequests(requestUsages),
+		peakContextTokens: peakContextTokens(requestUsages),
 	};
 }
 
@@ -503,6 +463,13 @@ function extractText(content: unknown): string {
 
 interface PiError extends Error {
 	stopReason?: string;
+	status?: number;
+}
+
+function leadingHttpStatus(detail: string): number | undefined {
+	const match = /^(\d{3})\b/.exec(detail.trim());
+	const status = match ? Number(match[1]) : Number.NaN;
+	return status >= 400 && status <= 599 ? status : undefined;
 }
 
 function toError(label: string, message: { stopReason: string; errorMessage?: string }): PiError {
@@ -510,10 +477,10 @@ function toError(label: string, message: { stopReason: string; errorMessage?: st
 	const detail = message.errorMessage ?? reason;
 	const err = new Error(`Pi provider ${label} failed (${reason}): ${detail}`) as PiError;
 	err.stopReason = reason;
+	const status = leadingHttpStatus(detail);
+	if (status !== undefined) err.status = status;
 	return err;
 }
-
-/** Create an AbortController that fires on caller signal OR timeout. */
 function callerAbort(
 	opts: LlmProviderCallOptions | undefined,
 	defaultTimeoutMs: number,
@@ -590,10 +557,6 @@ export function createPiModelProvider(
 		temperature?: number;
 		reasoning?: ThinkingLevel;
 	} {
-		// Per-call reasoning override semantics:
-		//   opts.reasoning === false  -> suppress thinking entirely (latency-sensitive ops)
-		//   opts.reasoning is a level -> override the configured level for this call
-		//   opts.reasoning undefined   -> use the provider's configured level
 		const effectiveReasoning: ThinkingLevel | undefined =
 			opts?.reasoning === false ? undefined : (opts?.reasoning ?? reasoning);
 		const headers = openCodeHeaders(config, piModel, opts?.sessionId);
@@ -655,9 +618,6 @@ export function createPiModelProvider(
 		},
 		async available() {
 			if (config.skipAvailabilityProbe) return true;
-			// Reachability check: ping the OpenAI-compatible /models endpoint (or
-			// Anthropic /v1/models) so the router can skip unreachable targets before
-			// attempting a real call. Mirrors the legacy providers' availability probe.
 			const probeUrl =
 				piModel.api === "anthropic-messages"
 					? `${piModel.baseUrl.replace(/\/+$/, "")}/v1/models`
@@ -665,12 +625,9 @@ export function createPiModelProvider(
 			try {
 				const res = await fetch(probeUrl, {
 					method: "GET",
-					headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+					headers: availabilityProbeHeaders(piModel.api, apiKey),
 					signal: AbortSignal.timeout(8_000),
 				});
-				// OpenAI-compatible gateways commonly omit /models even though their
-				// chat-completions API is healthy. A 404 proves this host is reachable;
-				// let the routed call report any real completion-path failure.
 				return res.ok || res.status === 401 || res.status === 404;
 			} catch {
 				return false;
@@ -756,62 +713,38 @@ export function createPiModelProvider(
 		isPiAgentSessionProvider: true,
 		agentSessionTimeoutMs: defaultTimeoutMs,
 		async createAgentSession(
-			tools: readonly ToolDefinition[],
-			options: { readonly maxTokens?: number; readonly signal?: AbortSignal } = {},
+			tools: readonly PiAgentTool[],
+			options: {
+				readonly maxTokens?: number;
+				readonly signal?: AbortSignal;
+				readonly systemPrompt?: string;
+				readonly persistentSessionKey?: string;
+				readonly continuationPrompt?: string;
+				readonly retry?: PiAgentRetryPolicy;
+			} = {},
 		) {
-			// Isolated from the user's Pi credentials and models.json. The same
-			// daemon-owned runtime services ordinary calls and this AgentSession.
-			const isolatedRuntime = await awaitWithAbort(modelRuntime, options.signal);
-			const settingsManager = SettingsManager.inMemory();
-			const resourceLoader = new DefaultResourceLoader({
-				cwd: process.cwd(),
-				agentDir: process.cwd(),
-				settingsManager,
-				noExtensions: true,
-				noSkills: true,
-				noPromptTemplates: true,
-				noThemes: true,
-				noContextFiles: true,
-				systemPrompt: "You are a bounded Signet maintenance agent. You may use only the supplied daemon tools.",
-			});
-			await awaitWithAbort(resourceLoader.reload(), options.signal);
-			const { session } = await awaitWithAbort(
-				createAgentSession({
+			const create = options.persistentSessionKey
+				? leaseWorkerAgentSession.bind(null, options.persistentSessionKey, options.continuationPrompt)
+				: createWorkerAgentSession;
+			return create(
+				{
 					model: options.maxTokens ? { ...piModel, maxTokens: options.maxTokens } : piModel,
-					modelRuntime: isolatedRuntime,
-					sessionManager: SessionManager.inMemory(),
-					settingsManager,
-					resourceLoader,
-					tools: tools.map((tool) => tool.name),
-					customTools: [...tools],
-				}),
-				options.signal,
-				(result) => result.session.dispose(),
-			);
-			return {
-				prompt: (text) => session.prompt(text),
-				abort: () => session.abort(),
-				dispose: () => session.dispose(),
-				subscribe: (listener) => session.subscribe(listener),
-				getSystemPrompt: () => session.systemPrompt,
-				getSessionId: () => session.sessionId,
-				getModelName: () => session.model?.id,
-				getActiveToolNames: () => session.getActiveToolNames(),
-				getStats: () => session.getSessionStats(),
-				getRequestUsages: () =>
-					session.messages.flatMap((message) => (message.role === "assistant" ? [message.usage] : [])),
-				getFailureMessage: () => {
-					for (const message of [...session.messages].reverse()) {
-						if (
-							message.role === "assistant" &&
-							(message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "length")
-						) {
-							return message.errorMessage ?? `Pi agent ${message.stopReason}`;
-						}
-					}
-					return undefined;
+					apiKey: apiKey ?? KEYLESS_API_KEY,
+					systemPrompt:
+						options.systemPrompt ??
+						"You are a bounded Signet maintenance agent. You may use only the supplied daemon tools.",
+					tools: tools.map(({ name, label, description, parameters, exposure }) => ({
+						name,
+						label,
+						description,
+						parameters,
+						...(exposure ? { exposure } : {}),
+					})),
+					...(options.retry ? { retry: options.retry } : {}),
 				},
-			};
+				tools,
+				options.signal,
+			);
 		},
 	};
 }

@@ -15,29 +15,6 @@ for first-party harnesses and CLI tooling. The OpenAI-compatible gateway is for
 harnesses that can point at a model endpoint but cannot yet send the richer
 Signet routing metadata.
 
-### POST /api/os/chat
-
-Runs the dashboard's interactive OS Chat flow through the `interactive`
-workload, with a legacy provider fallback when routed inference is unavailable.
-The request body accepts `message` and optional `agentId`, `taskClass`, and
-`privacy` routing hints.
-
-OS Chat has a 30-second end-to-end deadline. The deadline and its abort signal
-cover routed inference, the legacy provider fallback, and internal MCP tool
-calls, so a stalled provider cannot keep the HTTP request or its inference
-admission permit open indefinitely.
-
-On deadline expiry, the route aborts the active work and returns HTTP `504`:
-
-```json
-{
-  "error": "OS Chat inference timed out after 30000ms",
-  "code": "TIMEOUT",
-  "timeoutMs": 30000,
-  "toolCalls": []
-}
-```
-
 ### GET /api/inference/status
 
 Requires `diagnostics` permission in authenticated modes.
@@ -372,3 +349,70 @@ Boundary guards:
 When `stream: true`, the gateway returns OpenAI-style SSE chunks and includes
 `x-signet-request-id` in the response headers so operators can cancel the
 stream through `DELETE /api/inference/requests/:id`.
+
+### GET /api/assistant/models
+
+Requires `recall` permission and a resolved agent scope; accepts optional `agentId`.
+Returns `{ models: [{ targetRef, model, name, provider, account }] }` from the Pi AI
+registry for text-capable models associated with configured targets whose Signet
+account credentials resolve successfully. Credentials and secret references are
+never returned. ACPX targets are excluded from this Pi model picker.
+
+### POST /api/assistant/chat
+
+Requires `recall` permission and a resolved agent scope. Send UUIDs `requestId` (one per turn) and `conversationId` (stable across turns),
+optional `agentId`, `selectedEntityId`, and `modelSelection: { targetRef, model }`, and `messages` containing `user` or
+`assistant` roles with string `content`. The final message must be from the user.
+History is bounded to 32 messages, 16,000 characters per message, and 64,000
+characters total; the request body is bounded to 96 KiB.
+
+Omit `modelSelection` to use the existing interactive/backend assignment. An explicit
+selection must match the credential-backed catalog at execution time. It applies
+only to this request, preserves the configured provider/account and route eligibility,
+and does not update durable model assignments. Unknown or disconnected selections
+fail explicitly; they do not fall back to another model.
+
+The response is an SSE stream of JSON `data` events: `delta`, `tool`, `citation`,
+`retrieval` (`nodeIds` and `evidenceRefs`, at most 100 identifiers each), `focus`, `saved`, `dream`, `done`, or `error`. `done` ends a successful turn;
+`error` ends a failed turn. Disconnecting cancels the current turn and awaits its
+cleanup while retaining the idle session. Output is bounded to 1 MiB and agent execution to 90 seconds.
+
+The daemon uses the shared Pi agent worker boundary also used by Dreaming.
+The Pi worker pool holds the shared LLM limit (`worker.maxLlmConcurrency`) plus three retained chat sessions.
+Additional sessions fail explicitly when capacity is reached. Conversations are scoped
+to the authenticated subject, resolved agent, and conversation UUID. One turn may run
+per conversation. The daemon retains each chat's native Pi session and tool history
+for 15 minutes of inactivity after its last settled turn. Continuations append only
+the new user message; request history seeds a session when it is first created or
+has expired. Switching models updates the existing Pi session. A session has no
+total tool-call budget; at most eight of its tool calls run at once, and further
+calls wait for a slot. Shutdown disposes all workers. Dreaming sessions remain bounded
+to their pass lifecycle.
+The worker owns model execution and the agent loop; tools execute through
+existing daemon capabilities and the asynchronous database owner protocol.
+No shell, coding, ambient extension, or direct semantic mutation tools are
+provided to chat.
+
+Chat reads memory through scoped daemon capabilities: the ontology readers,
+`search_evidence` over the full history of episodic memories, artifacts, and
+transcripts, and `recall_memories`, which calls `POST /api/memory/recall` with the
+resolved agent and recall surface `dashboard`. Recall covers memories curated by
+Dreaming as well as captured ones. Credentials in its output are
+redacted before reaching the model, and malformed rows are dropped.
+A recalled memory that resolves as episodic evidence through `search_evidence`
+carries a `memory:<id>` sourceRef and emits `citation` and `retrieval` events.
+Dreaming-curated memories, ontology claims, and source rows carry only a
+`recallId` and must be backed by evidence tools before they are cited.
+
+The system prompt requires evidence citations as `[[kind:exact-sourceRef-id]]`
+wikilinks copied verbatim from retrieval results. The dashboard renders only
+references backed by retrieved citation events as clickable source pills; entity
+IDs and invented references do not become evidence links.
+
+`remember_user_message` can save only the exact current user message through
+`/api/memory/remember`, with a request-based idempotency key. `request_dreaming`
+saves that message first and invokes `/api/dream/trigger` using its evidence
+reference. The original caller's permissions apply to both operations. `saved`
+means evidence was recorded; `dream` means a pass was accepted, not completed.
+Neither action is rolled back when inference is cancelled. Chat history itself
+is not persisted by this endpoint.

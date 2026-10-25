@@ -78,14 +78,10 @@ export class PiConnector extends BaseConnector {
 		const filesWritten: string[] = [];
 		const agentDir = resolvePiAgentDir();
 		const targetPath = managedExtensionFilePath(agentDir, PI_MANAGED_FILENAME);
-
-		// Read once and reuse the same content for the ownership check and the
-		// change check, instead of checking the path and writing it later.
 		let previous: string | null;
 		try {
 			previous = readFileIfExistsSync(targetPath, "utf8");
 		} catch {
-			// Present but unreadable (e.g. a directory): treat as unmanaged.
 			previous = "";
 		}
 		if (previous !== null && !previous.includes(PI_MANAGED_MARKER)) {

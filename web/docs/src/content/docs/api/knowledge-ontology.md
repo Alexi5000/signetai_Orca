@@ -41,7 +41,15 @@ Resolve one entity by name.
 Return a compact entity outline for agent browsing. The tree includes aspects,
 groups, claim slots, counts, and active previews so agents can decide where to
 drill next without loading the full constellation graph. Query parameters:
-`entity`, `depth`, `max_aspects`, `max_groups`, `max_claims`.
+`entity`, `depth`, `max_aspects`, `max_groups`, `max_claims`, and
+`max_total_claims` (default `1000`, maximum `10000`). `max_claims` caps previews
+per group. `max_total_claims` caps claim summaries across the whole tree; previews
+are allocated across groups by claim rank so one large group cannot consume the
+entire budget. Groups with omitted claims return `claimsHasMore: true`.
+
+This budget limits only claims embedded in the tree. It does not change search
+results or claim-list pages. Use `GET /api/knowledge/navigation/claims` to read
+remaining claims for a group.
 
 Depth controls how far the outline expands: `1` returns aspects, `2` returns
 aspects and groups, and `3` returns aspects, groups, and claim slots.
@@ -69,10 +77,15 @@ List groups under an entity aspect. Attributes without `group_key` appear under
 
 ### GET /api/knowledge/navigation/claims
 
-List claim slots under an entity/aspect/group path.
+List claim slots under an entity/aspect/group path. Query parameters: `entity`,
+`aspect`, `group`, `limit`, and `offset`. The default page size is `50`, the
+maximum is `200`, and negative offsets are treated as `0`; larger offsets are
+clamped to JavaScript's maximum safe integer. The response
+includes `limit`, `offset`, and `hasMore`; when `hasMore` is `true`, request the
+next page with `offset` increased by the number of returned items.
 
 ```text
-/api/knowledge/navigation/claims?entity=Nicholai&aspect=food&group=restaurants
+/api/knowledge/navigation/claims?entity=Nicholai&aspect=food&group=restaurants&limit=50&offset=0
 ```
 
 ### GET /api/knowledge/navigation/attributes
@@ -90,11 +103,12 @@ CLI equivalents:
 
 ```bash
 signet knowledge tree Nicholai
+signet knowledge tree Nicholai --max-total-claims 1000
 signet knowledge entities --query Nicholai
 signet knowledge entity Nicholai
 signet knowledge aspects Nicholai
 signet knowledge groups Nicholai food
-signet knowledge claims Nicholai food restaurants
+signet knowledge claims Nicholai food restaurants --limit 50 --offset 0
 signet knowledge attributes Nicholai food restaurants favorite_restaurant
 signet knowledge attributes Nicholai food restaurants favorite_restaurant --status all
 signet knowledge hygiene
@@ -108,7 +122,30 @@ Query parameters: `agent_id`, `limit`, `max_aspects_per_entity`,
 omitted, the daemon uses the configured daemon agent ID (`SIGNET_AGENT_ID`, or
 `default`). The read includes the requested agent plus agents whose
 `read_policy` is `shared`, and clamps limits so dashboard navigation cannot
-load the entire knowledge graph into one read response.
+load the entire knowledge graph into one read response. `agentId` is accepted
+as an alias for `agent_id`.
+
+`agent_id=all` returns every agent's graph in one view and requires `admin`
+permission outside local mode. The entity limit then applies across all agents,
+and `metadata` still describes the configured daemon agent. Every entity carries
+its owning `agentId`. The dashboard graph opens on all agents, colors each
+agent's entities, rings their aspects, claims, and evidence in the same color
+when more than one agent is shown, and offers a picker to show one agent.
+
+The dashboard entity limit is capped at 300, matching the server limit. The
+3D view also renders no more than 5,000 nodes at once and labels the view when
+that display cap is reached; this is a client rendering limit, not a claim that
+the returned graph is complete.
+
+The route probes the Dreaming episodic backlog using the configured token
+threshold and tokenizes at most 50 entries (with one additional source row as
+a lookahead). The probe considers only sources still waiting for Dreaming, so
+already delivered or reviewed sources do not use up its 50 slots. In `metadata.dreaming`,
+`episodicTokensPending` is an exact number only when
+`episodicBacklogProbe.kind` is `exact`; it is `null` for a threshold result or
+an incomplete scan. The probe exposes its status, not a partial token count.
+The dashboard labels incomplete backlog counts rather than displaying them as
+exact.
 
 Defaults: `limit=150`, `max_aspects_per_entity=6`,
 `max_attributes_per_aspect=4`, and `dependency_limit=500`.
@@ -451,13 +488,25 @@ episodic evidence. Requires `admin` permission.
 |------------|--------|----------|----------------------------------------------|
 | `agentId`  | string | no       | Agent ID (default: daemon configured agent)  |
 | `agent_id` | string | no       | Alias for `agentId`                          |
+| `measure`  | string | no       | `1` probes the episodic backlog now          |
+
+`episodicTokensPending` normally reports the last measurement, which is `null`
+when none is fresh. With `measure=1` the route runs the bounded backlog probe:
+an exact count when at most 50 sources are waiting, `null` when more are.
 
 **Response**
 
 ```json
 {
   "enabled": true,
-  "worker": { "running": true, "active": false, "activeAgentId": null },
+  "worker": {
+    "running": true,
+    "active": false,
+    "activeAgentId": null,
+    "activePasses": [
+      { "passId": "pass-uuid", "agentId": "default", "mode": "incremental", "scopes": ["default", "noam"] }
+    ]
+  },
   "episodicTokensPending": 42000,
   "state": {
     "tokensSinceLastPass": 42000,
@@ -469,7 +518,9 @@ episodic evidence. Requires `admin` permission.
     "tokenThreshold": 100000,
     "backfillOnFirstRun": true,
     "maxInputTokens": 128000,
-    "maxOutputTokens": 16000,
+    "maxOutputTokens": null,
+    "maxConcurrentPasses": 2,
+    "codemode": false,
     "timeout": 300000
   },
   "passes": [
@@ -591,16 +642,26 @@ GET /api/dream/passes/pass-uuid/events?after=42
 Accept: text/event-stream
 ```
 
-Set `verbose=1` (or `verbose=true`) when the operator has opted into raw
-debugging data. The default stream omits `raw` fields; the CLI reconnects on
-the same SSE transport when **Ctrl+V** toggles this mode.
+The `snapshot` event includes the current pass metadata, replay window, and
+persisted token/cache/cost and mutation counters. Counters may be `null` until
+the pass writes its final measurements.
 
-The first event is a `snapshot` whose data contains the current pass metadata
-and replay window. Subsequent events carry a monotonic `id` and include
-assistant deltas, reasoning deltas, Pi lifecycle transitions, tool start/
-progress/end events, detailed `tool_trace` events, session metadata, and a
-terminal `pass_completed` or `pass_failed` event. Tool traces and Pi events remain ephemeral; the durable
-`dreaming_passes` and `dreaming_tool_calls` rows are the audit source.
+Subsequent events carry a monotonic `id` and include visible assistant text,
+Pi lifecycle transitions, tool start/progress/end events, detailed `tool_trace`
+events, session metadata, and a terminal `pass_completed` or `pass_failed`
+event. Tool arguments, progress payloads, results, traces, session prompt data, full
+message frames, and provider-emitted reasoning deltas are available in the
+stream by default. The legacy `verbose` query value is accepted but does not
+change the event payload. In `signet dream attach`, reasoning deltas appear in
+the activity timeline as `Model reasoning`; **Ctrl+V** toggles the local raw
+event-data view without reconnecting. A provider may omit reasoning events or
+provide only partial summaries; the stream reports what it emits and does not
+promise a complete or faithful chain-of-thought transcript.
+
+This admin-only diagnostic stream does not redact event content. Event payloads
+remain size-bounded; a truncated payload is marked as such. Tool traces and Pi
+events remain ephemeral; the durable `dreaming_passes` and
+`dreaming_tool_calls` rows are the audit source.
 
 When the requested cursor is outside the bounded in-memory replay window, the
 stream sends a `gap` event with `requestedCursor`, `availableFrom`,
@@ -608,12 +669,6 @@ stream sends a `gap` event with `requestedCursor`, `availableFrom`,
 continue from the latest cursor. Heartbeats are sent as SSE comments so idle
 connections remain detectable. Slow viewers are disconnected once their
 bounded stream queue fills and can reconnect from the last delivered cursor.
-
-The verbose event data includes bounded `raw` fields for the opt-in terminal
-view. These may contain prompts, system/developer instructions, model
-reasoning, evidence, tool arguments, and tool results. The daemon does not
-persist a second transcript for attachment and the stream exposes no control
-or prompt-submission action.
 
 ### POST /api/dream/exclusions/requeue
 
@@ -687,6 +742,53 @@ return `400`; a fully handled request returns `200`.
 `agentId` uses scoped-agent resolution and cannot cross the credential's agent
 scope.
 
+**Provenance by operation.** Content operations (claims, entities, links)
+require exact-quote evidence. Archives and entity merges require hygiene
+attention provenance (`attention:$<index>` or `attention:<uuid>`).
+`merge_aspects` and `rename_aspect` restructure an entity's existing aspects
+without adding facts, so any pass may apply them with a `reason` and no
+evidence or attention; a `merge_aspects` that cites a hygiene flag still
+resolves that flag. An entity holds at most
+`memory.pipelineV2.traversal.maxWriteAspectsPerEntity` aspects (default 20).
+Creating one past the cap fails with the entity's existing aspects listed, so
+the pass can file under one of them or merge or rename to make room.
+
+**Claim time.** `add_claim_value`, `set_claim_value`, and
+`supersede_claim_value` accept `occurredAt` and `occurredUntil` for an event,
+`validFrom` and `validUntil` for a state, and `timePrecision` (`day`, `week`,
+`month`, `year`, or `approximate`). Values are ISO dates or timestamps resolved
+against the cited source's capture time; a date-only value defaults to `day`
+precision. `supersede_claim_value` also accepts `reviewAfter`. The time is
+stored on the claim and returned in its version history, and the claim's
+semantic memory gets matching `occurred` and `valid` temporal edges, so
+temporal recall finds claims by when the event happened rather than when it
+was filed. An `occurred` edge without `occurredUntil` spans the precision:
+a day for `day` and `approximate`, a week, month, or year otherwise. Edges are derived from the claim and removed when its memory is
+purged.
+
+When a claim arrives for a slot whose active claim has a later evidence time
+(`validFrom`, else `occurredAt`), the incoming claim is recorded as already
+superseded by the active one and the result names it in
+`supersededByNewerEvidence`. When the evidence times are equal (two updates on
+the same day) or neither claim has one, the claim whose cited source was
+captured later stays current, so the order Dreaming happens to file sources in
+does not decide the current value. A claim whose source has no capture time
+falls back to the newest write.
+
+Claim text that contains a relative time such as "yesterday", "last
+weekend", or "three weeks ago" and no absolute date is rejected before any
+write, with an error asking for the absolute date and the matching time field.
+A relative phrase kept next to its resolved date ("the next week (week of
+2023-06-05)") is allowed, as are durations ("in one day") and vague times with
+no anchor ("recently").
+
+Claim text that names an ISO date (`2023-04-15`) must also set a claim time
+(`occurredAt`, `validFrom`, `validUntil`, or `reviewAfter`); otherwise that
+operation is rejected with an error asking for the time field, using
+`timePrecision: approximate` when the source is vague ("shortly before
+2023-04-15"). Without a stored time, date-filtered recall cannot find the
+claim.
+
 ### GET /api/dream/passes/:passId/tools
 
 Return the local, ordered Pi capability trace for one Dreaming pass: every
@@ -713,18 +815,48 @@ JSON Schema. Pi sessions, restricted Dreaming MCP, and `signet dream` bind
 this same registry; clients must not reproduce a separate tool list. Requires
 `modify` permission.
 
-The registry includes `list_contradictions`, a read-only, bounded
-agent-scoped view of persisted competing-claim observations. It exposes both
-claim snapshots and their source/evidence metadata without selecting a winner;
-correction still goes through `apply_ontology_ops` and the normal proposal
-governance path.
+`list_aspect_claims` returns each active claim with its evidence quote and
+`source_ref`; `include: ["contradictions"]` adds the aspect's persisted
+competing-claim observations, exposing claim snapshots and their source and
+evidence metadata without selecting a winner. Correction still goes through
+`apply_ontology_ops` and the normal proposal governance path. Dependency links
+come from `get_entity` with `include: ["links"]`. `walk_links`, `get_evidence`,
+and `list_contradictions` were removed from the registry; callers use these
+options instead.
+
+Each pass prompt also carries the pending attention for the pass's scopes
+(hygiene, review_due, contested_claim, evidence_requeue, and surprisal, as fits
+the pass mode), up to 20 records per kind with long text bounded, so a pass
+works its queue without polling `attention_list`. `attention_list` remains for
+kinds marked `"more": true` and for re-checking after the pass flags something.
+The prompt ends with the current date and time in the daemon's local timezone,
+for judging what is current, upcoming, or past due; relative times inside
+evidence still resolve against each source's `capturedAt`.
+
+A `contested_claim` record with reason `source_changed` names a claim whose
+source was edited after the claim was filed and no longer contains the cited
+quote. Source re-indexing writes it instead of deleting the claim. A content
+pass reads the source's current text and keeps the claim (`decline_attention`),
+supersedes it with a quote from the new text, or archives it with
+`archive_claim_value` citing the record as `attention:<id>`, the one archive a
+content pass may make. Deleting a synced file or provider item writes the same
+record with reason `source_removed`, and the pass archives the claim unless other
+evidence still states it. Removing a whole source still purges its Dreaming rows.
 
 `memory_head_commit` is the sole working-memory publication capability. Submit
 its complete retained entry set with exact source/quote support and the revision
 and hash from `memory_head_read`, under the active content pass. The owner renders
-the body and records removals for omitted entries. `curate_memory_head` is retired
-and returns 404; historical freeform audit rows remain intact. Record deferrals
-and no-change explanations with `runbook_write`.
+the body and records removals for omitted entries. The rendered body, one
+`- text` line per entry, must be at most 1000 tokens. `memory_head_read` reports
+the head's `tokens` and `maxTokens`, plus `committedTokens` for the committed
+entries during a content pass. An over-budget commit returns `INVALID_HEAD`
+with its `tokens` and `maxTokens` and is not staged, so the pass can shorten the
+entries and commit again. `curate_memory_head` is retired
+and returns 404; historical freeform audit rows remain intact. Every content
+pass stages exactly one commit, even when nothing changes: resubmit the current
+entries, or an empty entry set while the head is still empty. An empty set never
+clears a published head. Record deferrals and no-change explanations with
+`runbook_write`.
 
 ### POST /api/dream/tools/:capability
 
@@ -755,19 +887,67 @@ reasoner can consult them before proposing a write; cited operation validation
 and semantic writes remain daemon-owned. The request body cannot supply a
 second agent scope inside `input`. A writer failure after a committed prefix
 returns `503` with `retryable: true`, `retryFrom`, and the committed `items`;
-retry only `operations.slice(retryFrom)`, never the returned prefix. `runbook_read` returns recent scoped pass
-outcomes, applied/rejected operations, evidence windows, unresolved
-quarantines, and notes; `runbook_write` stores one short structured note on a
-currently running pass. CLI callers supply that pass with `--pass-id`; the Pi
+retry only `operations.slice(retryFrom)`, never the returned prefix.
+`runbook_write` stores one short structured note on a currently running pass.
+`zoom_history` opens a line of the scope's pass history (see **Pass history**
+below): `zoom_history(id, n)` returns the two lines it was merged from, and
+`n = 1` returns that pass's record (note, operation counts and failures,
+evidence window, unresolved quarantines). CLI callers supply that pass with `--pass-id`; the Pi
 and restricted ACPX bindings receive it from the daemon-owned pass context.
+
+**Pass history.** Each Dreaming pass starts with the scope's pass history in
+its prompt instead of reading recent pass logs: one line per earlier pass,
+oldest first, with older passes folded pairwise into coarser lines so the
+history stays within a fixed budget (about 24 KB) however many passes have
+run. Lines read `id+n|text`, covering passes `id` through `id+n-1`. After a
+pass finishes, while it still holds its slot, the daemon asks the same
+Dreaming model, in a fresh request with no tools and no pass context, to
+compress that pass's stored record into one line of at most 512 bytes, and to
+merge the oldest pair of lines when the history outgrows its budget. Lines are
+stored in `dreaming_history_nodes` and derived from the pass records, which
+stay the verbatim source; a pass whose line could not be built is shown as not
+yet summarized and is retried after the next pass. History is kept per scope set: a pass sees
+only the history of passes whose scopes are all within its own, each shown
+under a `scopes=` heading when there is more than one, and `zoom_history`
+refuses lines outside the pass's scopes.
 
 ### POST /api/dream/trigger
 
 Manually trigger a dreaming pass. Requires `admin` permission.
 Returns `202 Accepted` immediately and runs the pass in the background
 (passes can take up to several minutes on large graphs).
-Returns 409 if a pass is already running. Returns 503 if the
-dreaming worker is not started.
+The daemon keeps the worker available for manual triggers when automatic
+Dreaming is disabled; scheduled sweeps remain idle. The pipeline must be
+enabled, must not be paused, and mutations must not be frozen. Returns 409 when
+no pass can start, 503 if the pipeline prevents worker startup, and 503 with
+`"No inference provider is connected"` when no inference route resolves.
+
+An incremental trigger may start several passes. The daemon splits the agents
+that are not already in a running pass into up to `memory.dreaming.maxConcurrentPasses`
+groups (default 2), balanced by evidence backlog, and runs one pass per group.
+It never starts more passes than `worker.maxLlmConcurrency` allows, because a
+pass waiting for a shared LLM permit would spend its own timeout waiting. The
+daemon allows that many Pi agent workers plus three for retained dashboard chats.
+Each pass may read and write only its own group's agents, and an agent is in at
+most one running pass. The first pass starts immediately; the other groups start
+only after it completes a tool call, so an unavailable provider is not called once
+per group. The response's `passId` is the first pass. `worker.activePasses` in
+`GET /api/dream/status` lists every running pass; the trigger is complete when it
+is empty. Compact passes, directed passes, and scheduled content and hygiene
+passes run alone. `maxOutputTokens` is unset by default, so each reply may use
+the model's own output limit. `maxInputTokens` (default 128,000) sizes evidence
+reads: a delivery-queue page holds up to a sixteenth of it (32,000 characters by
+default, at least 16,000), so most sessions arrive whole instead of in
+2,000-character fragments. Lower it for a model with a small context window.
+A Dreaming pass retries provider throttling and transient provider errors up to
+eight times with exponential backoff capped at 60 seconds (about four minutes in
+total) before the pass fails; interactive chat keeps the shorter default.
+`memory.dreaming.codemode` (default `false`) moves Dreaming's read-only lookups
+(`search_entities`, `get_entity`, `list_aspect_claims`, `validate_proposal`,
+`attention_list`, `zoom_history`)
+behind Pi's `codemode` tool, so a pass can batch them in one script. Evidence
+reads and writes stay direct calls, and scripts cannot call them. Nested calls
+run through the same audited tools and are traced like direct calls.
 
 Poll `GET /api/dream/status` and check `passes[0].status` for completion, or
 use `GET /api/dream/passes/:passId/events` for a live read-only view.
@@ -785,6 +965,12 @@ use `GET /api/dream/passes/:passId/events` for a live read-only view.
 and defaults to the daemon configured agent; `agent_id`, the `agentId` query
 parameter, the `agent_id` query parameter, and `x-signet-agent-id` are also
 accepted.
+
+Optional `instructionSourceRef` identifies already-recorded evidence in the resolved
+agent scope. The daemon retrieves the complete instruction from that evidence;
+inaccessible, missing, or fragmented instructions fail explicitly. A directed
+pass stays within that agent scope and runs even if its normal backlog is empty.
+The instruction uses the existing audited Dreaming tools and citation gates.
 
 Explicit triggers always run the combined `incremental` runbook (hygiene
 queue first, then content ingestion). The worker's scheduled sweep passes,

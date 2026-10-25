@@ -23,7 +23,7 @@ test("Biome 2 baseline exposes non-writing quality checks", async () => {
 	const packageJson = await readJson<PackageJson>("package.json");
 	const biomeConfig = await readJson<BiomeConfig>("biome.json");
 
-	expect(packageJson.devDependencies["@biomejs/biome"]).toMatch(/^\^2\./);
+	expect(packageJson.devDependencies["@biomejs/biome"]).toMatch(/^\^?2\./);
 	expect(biomeConfig.$schema).toContain("/schemas/2.");
 	expect(packageJson.scripts.lint).toBe("bun run lint:check");
 	expect(packageJson.scripts["lint:check"]).toBe("biome check .");

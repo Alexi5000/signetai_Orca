@@ -1,22 +1,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { resolveWorkspaceLayout } from "@signet/core";
 import type { DaemonRuntime } from "@signet/core";
-
-/**
- * Daemon lifecycle record.
- *
- * The daemon writes its state to `.daemon/lifecycle.json` at startup and on
- * every catchable exit path (signal handlers, fatal errors). The record is the
- * one durable artifact that survives the process itself, so a later
- * `signet status` / `signet doctor` can tell a clean shutdown apart from an
- * external kill or a hard crash (issue #1148): a process that died without
- * writing `clean` (SIGKILL, OOM, segfault) leaves the record stuck at
- * `starting`/`running`, and the CLI reports an unrecorded death instead of a
- * silent disappearance.
- *
- * The record is written synchronously and atomically (temp file + rename) so a
- * concurrent reader never observes a partial write.
- */
 
 export type DaemonLifecycleState = "starting" | "running" | "clean" | "error";
 
@@ -25,13 +10,11 @@ export interface DaemonLifecycle {
 	readonly pid: number;
 	readonly version: string;
 	readonly startedAt: string;
-	/** Runtime selected for this process: the release binary or the Bun JS bundle. */
 	readonly runtime?: DaemonRuntime;
-	/** systemd transient unit name (Linux service-manager launch), when known. */
 	readonly systemdUnit?: string;
+	readonly startAttemptId?: string;
 	readonly exitedAt?: string;
 	readonly exitCode?: number;
-	/** Exit-path label: "signal:SIGTERM" | "signal:SIGINT" | "error:uncaughtException" | ... */
 	readonly reason?: string;
 	readonly error?: string;
 }
@@ -44,8 +27,6 @@ export type DaemonPreviousExitReasonCategory =
 	| "unhandled_rejection"
 	| "startup"
 	| "other";
-
-/** Bounded fields for the anonymous daemon.previous_exit event. */
 export interface DaemonPreviousExitTelemetry {
 	readonly classification: DaemonPreviousExitClassification;
 	readonly previousVersion?: string;
@@ -90,12 +71,6 @@ function reasonCategory(reason: string | undefined): DaemonPreviousExitReasonCat
 	if (reason.startsWith("error:")) return "other";
 	return null;
 }
-
-/**
- * Convert the previous durable record into bounded anonymous telemetry fields.
- * A terminal record is a catchable exit; a starting/running record is an
- * unrecorded death because the process did not reach a terminal exit path.
- */
 export function classifyPreviousDaemonExit(
 	record: DaemonLifecycle | null,
 	currentStartedAt: string,
@@ -147,11 +122,19 @@ export function previousExitTelemetryProperties(
 	return properties;
 }
 
-export function lifecyclePath(agentsDir: string): string {
-	return join(agentsDir, ".daemon", "lifecycle.json");
+export function terminalLifecycleFields(
+	reason: string,
+	exitCode: number,
+	error: unknown,
+	exitedAt: string,
+): Pick<DaemonLifecycle, "state" | "exitedAt" | "exitCode" | "reason" | "error"> {
+	if (error === undefined || error === null) return { state: "clean", exitedAt, exitCode, reason };
+	return { state: "error", exitedAt, exitCode, reason, error: error instanceof Error ? error.message : String(error) };
 }
 
-/** Tolerant read: a missing or corrupt record returns null, never throws. */
+export function lifecyclePath(agentsDir: string): string {
+	return join(resolveWorkspaceLayout(agentsDir).runtime, "lifecycle.json");
+}
 export function readDaemonLifecycle(agentsDir: string): DaemonLifecycle | null {
 	try {
 		const raw = readFileSync(lifecyclePath(agentsDir), "utf-8");
@@ -164,8 +147,6 @@ export function readDaemonLifecycle(agentsDir: string): DaemonLifecycle | null {
 		return null;
 	}
 }
-
-/** Best-effort atomic write; recording must never take the daemon down. */
 export function writeDaemonLifecycle(agentsDir: string, record: DaemonLifecycle): void {
 	const path = lifecyclePath(agentsDir);
 	try {
@@ -173,7 +154,5 @@ export function writeDaemonLifecycle(agentsDir: string, record: DaemonLifecycle)
 		const tmpPath = `${path}.tmp`;
 		writeFileSync(tmpPath, JSON.stringify(record, null, 2));
 		renameSync(tmpPath, path);
-	} catch {
-		// Best effort.
-	}
+	} catch {}
 }

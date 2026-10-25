@@ -61,3 +61,12 @@ test("unsafe directory and filename do not redirect writes", () => {
 	expect(() => appendPrivateDaemonLog(root, "injected")).toThrow();
 	expect(() => openPrivateDaemonLog(root, "../outside" as "startup.log")).toThrow();
 });
+
+test("v2 workspaces use private logs under the canonical runtime directory", () => {
+	const root = workspace();
+	writeFileSync(join(root, "workspace-layout.json"), '{"version":2}\n');
+	appendPrivateDaemonLog(root, "v2 startup");
+	const path = join(root, "runtime", "logs", "startup.log");
+	expect(readFileSync(path, "utf8")).toBe("v2 startup");
+	if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o600);
+});

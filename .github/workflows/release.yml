@@ -7,20 +7,114 @@ on:
         description: "Resume build and publish for an existing tag, for example v0.207.1"
         required: false
         type: string
+      signing_preflight_only:
+        description: "Run macOS signing acceptance checks without creating a release"
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  macos-signing-preflight:
+    if: "!contains(github.event.head_commit.message, 'chore: release')"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            platform: darwin-x64
+            asset: signet-darwin-x64
+          - os: xcode-27
+            platform: darwin-arm64
+            asset: signet-darwin-arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      SIGNET_NATIVE_PLATFORM: ${{ matrix.platform }}
+      RELEASE_ASSET: ${{ matrix.asset }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Check for code changes
+        id: changes
+        env:
+          RESUME_INPUT: ${{ inputs.resume_from_tag }}
+          SIGNING_PREFLIGHT_ONLY: ${{ inputs.signing_preflight_only }}
+        run: |
+          if [ "$SIGNING_PREFLIGHT_ONLY" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Explicit signing-only run; checking both macOS targets"
+            exit 0
+          fi
+          if [ -n "$RESUME_INPUT" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Resume requested; signing preflight is not required"
+            exit 0
+          fi
+          git fetch --force --tags origin +refs/heads/main:refs/remotes/origin/main
+          CODE_CHANGES=$(scripts/release-code-changes.sh --since-release origin/main)
+          if [ -z "$CODE_CHANGES" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No code changes detected; skipping signing preflight"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Code changes detected; running macOS signing preflight"
+          fi
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        if: steps.changes.outputs.skip != 'true'
+        with:
+          bun-version-file: package.json
+
+      - name: Install dependencies
+        if: steps.changes.outputs.skip != 'true'
+        run: bun install
+
+      - name: Build workspace dependencies
+        if: steps.changes.outputs.skip != 'true'
+        run: bun run build
+
+      - name: Build dashboard assets
+        if: steps.changes.outputs.skip != 'true'
+        run: bun run build:dashboard
+
+      - name: Build native Signet binary
+        if: steps.changes.outputs.skip != 'true'
+        run: bun run build:native-bun
+
+      - name: Sign and verify macOS native binary with Developer ID
+        if: steps.changes.outputs.skip != 'true'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash scripts/sign-macos-native.sh "./dist/native/${RELEASE_ASSET}"
+
+      - name: Smoke signed native binary
+        if: steps.changes.outputs.skip != 'true'
+        shell: bash
+        run: ./dist/native/"$RELEASE_ASSET" --help > /dev/null
+
   release:
+    needs: macos-signing-preflight
     runs-on: ubuntu-latest
     env:
-      # Release builds use the daemon and native package paths, not Electron.
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     concurrency:
-      group: nightly-release-pipeline
-      cancel-in-progress: true
-    # Skip release commits (prevent loops) and non-code commits
-    if: "vars.RELEASES_ENABLED == 'true' && !contains(github.event.head_commit.message, 'chore: release')"
+      group: ${{ inputs.resume_from_tag && format('nightly-release-resume-{0}', inputs.resume_from_tag) || 'nightly-release-pipeline' }}
+      cancel-in-progress: false
+    if: >-
+      always() && vars.RELEASES_ENABLED == 'true' &&
+      !contains(github.event.head_commit.message, 'chore: release') &&
+      inputs.signing_preflight_only != true &&
+      needs.macos-signing-preflight.result == 'success'
 
     permissions:
       contents: write
@@ -76,16 +170,9 @@ jobs:
             echo "Resume requested for $RESUME_INPUT"
             exit 0
           fi
-          CODE_CHANGES=$(git diff --name-only HEAD~1 HEAD -- \
-            'platform/**' 'surfaces/**' 'integrations/**' 'libs/**' 'dist/**' 'plugins/**' 'runtimes/**' 'scripts/**' \
-            'package.json' 'bunfig.toml' 'tsconfig*.json' \
-            '.github/workflows/**' \
-            | grep -v '\.md$' \
-            | grep -v '\.jpg$' \
-            | grep -v '\.jpeg$' \
-            | grep -v '\.png$' \
-            | grep -v '\.svg$' \
-            | head -1 || true)
+          set -euo pipefail
+          git fetch --force --tags origin +refs/heads/main:refs/remotes/origin/main
+          CODE_CHANGES=$(scripts/release-code-changes.sh --since-release origin/main)
           if [ -z "$CODE_CHANGES" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
             echo "No code changes detected, skipping release"
@@ -95,6 +182,8 @@ jobs:
           fi
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
         if: steps.changes.outputs.skip != 'true'
 
       - name: Install dependencies
@@ -123,10 +212,6 @@ jobs:
       - name: Sync with remote main
         if: steps.changes.outputs.skip != 'true' && inputs.resume_from_tag == ''
         run: |
-          # Rebase onto the latest remote main before bumping so the version
-          # commit and tag land on top of the final tree — not a stale snapshot
-          # that would get rewritten later, leaving asset build and publish jobs
-          # checking out the wrong commit.
           git reset --hard HEAD
           git clean -fd
           git pull --rebase origin main
@@ -174,17 +259,9 @@ jobs:
           echo "BUMP_LEVEL=$BUMP" >> $GITHUB_ENV
           echo "bump_level=$BUMP" >> $GITHUB_OUTPUT
           rm -f .bump-level
-
-          # Keep all release-owned version surfaces aligned. This covers
-          # package.json files, publishable workspace dependency rewrites,
-          # Cargo.toml manifests, Cargo.lock files, and generated manifest
-          # copies so the release commit passes the same guard as PRs.
           bun scripts/version-sync.ts --to "$NEW_VERSION"
 
           bun scripts/changelog.ts --version "$NEW_VERSION"
-
-          # Keep lockfile aligned with workspace version bumps so frozen installs
-          # (Docker smoke and consumer builds) stay deterministic.
           bun install
 
           git add -A
@@ -208,9 +285,6 @@ jobs:
             exit 1
           fi
           tag="v$NEW_VERSION"
-          # The tag is pushed before this step. First reuse an existing draft
-          # release, then create it. A transient 5xx is retried; a concurrent
-          # create (409) is resolved by fetching the release on the next pass.
           for attempt in 1 2 3; do
             if gh release view "$tag" --json isDraft >/dev/null 2>&1; then
               echo "Reusing existing GitHub release $tag"
@@ -240,10 +314,9 @@ jobs:
       skip: ${{ steps.changes.outputs.skip }}
       bump_level: ${{ steps.bump_version.outputs.bump_level }}
 
-
   build-native:
     needs: release
-    if: needs.release.result == 'success' && needs.release.outputs.skip != 'true' && needs.release.outputs.version != ''
+    if: needs.release.result == 'success' && needs.release.outputs.skip != 'true' && needs.release.outputs.version != '' && inputs.signing_preflight_only != true
     permissions:
       contents: write
     strategy:
@@ -259,7 +332,7 @@ jobs:
           - os: macos-15-intel
             platform: darwin-x64
             asset: signet-darwin-x64
-          - os: macos-14
+          - os: xcode-27
             platform: darwin-arm64
             asset: signet-darwin-arm64
           - os: windows-latest
@@ -277,6 +350,8 @@ jobs:
           ref: v${{ needs.release.outputs.version }}
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
 
       - name: Install dependencies
         run: bun install
@@ -290,6 +365,15 @@ jobs:
       - name: Build native Signet binary
         run: bun run build:native-bun
 
+      - name: Sign and verify macOS native binary with Developer ID
+        if: startsWith(matrix.platform, 'darwin-')
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash scripts/sign-macos-native.sh "./dist/native/${RELEASE_ASSET}"
+
       - name: Smoke native binary
         shell: bash
         run: ./dist/native/"$RELEASE_ASSET" --help > /dev/null
@@ -298,25 +382,23 @@ jobs:
         shell: bash
         run: test -s ./dist/native/"$RELEASE_ASSET"
 
+      - name: Verify embedded Bun runtime
+        shell: bash
+        env:
+          SIGNET_RUNTIME_VERSION_SMOKE: "1"
+        run: |
+          actual="$(./dist/native/"$RELEASE_ASSET" | bun -e 'const value = JSON.parse(await Bun.stdin.text()); process.stdout.write(value.bun)')"
+          expected="$(bun -e 'const value = JSON.parse(await Bun.file("package.json").text()); process.stdout.write(value.packageManager.replace(/^bun@/, ""))')"
+          test "$actual" = "$expected"
+
       - name: Native release runtime smoke
         shell: bash
         env:
-          # Release CI validates the compiled binary and event-loop isolation
-          # separately. Avoid external model downloads and Hugging Face rate limits.
           SIGNET_NATIVE_EMBEDDING_SMOKE: "0"
-          # Keep the compiled DB-owner dispatch gate on even when the broader
-          # embedding smoke is disabled. This must fail if the worker asset is
-          # missing from the release binary.
           SIGNET_DB_OWNER_SMOKE: "1"
-          # Exact Dreaming backlog accounting must resolve its embedded WASM
-          # asset from inside the compiled binary and its materialized worker.
           SIGNET_DREAMING_TOKEN_SMOKE: "1"
-          # Dreaming must launch its scoped MCP server from the compiled binary
-          # without resolving a JavaScript entrypoint under /$bunfs.
           SIGNET_DREAMING_MCP_SMOKE: "1"
           SIGNET_NATIVE_SMOKE_BINARY: ./dist/native/${{ matrix.asset }}
-          # The smoke boots a real default-config daemon; keep its telemetry
-          # out of the Signet PostHog project.
           SIGNET_TELEMETRY_OPTOUT: "1"
         run: bun test scripts/native-embedding-runtime-smoke.test.ts scripts/native-dreaming-mcp-smoke.test.ts scripts/native-dreaming-finalize-smoke.test.ts scripts/native-worker-bundle-contract.test.ts
 
@@ -342,10 +424,7 @@ jobs:
   publish:
     needs: [release, build-native]
     runs-on: ubuntu-latest
-    # Publish only when every native binary matrix leg completed and uploaded
-    # its binary/checksum pair. This job is also the sole release finalizer:
-    # it waits for every desktop asset before undrafting the release.
-    if: always() && needs.release.result == 'success' && needs.build-native.result == 'success' && needs.release.outputs.skip != 'true' && needs.release.outputs.version != ''
+    if: always() && needs.release.result == 'success' && needs.build-native.result == 'success' && needs.release.outputs.skip != 'true' && needs.release.outputs.version != '' && inputs.signing_preflight_only != true
     permissions:
       contents: write
     env:
@@ -357,6 +436,8 @@ jobs:
           ref: v${{ needs.release.outputs.version }}
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
 
       - name: Install dependencies
         run: bun install
@@ -374,10 +455,6 @@ jobs:
       - name: Generate and upload native manifest
         run: |
           set -euo pipefail
-          # Build the connector plugin-asset tarball and the Bun JavaScript
-          # daemon runtime before generating the manifest so it can pick up
-          # both SHA-256 values and sizes. The tarballs are extracted into
-          # the same `runtime/` layout used by npm installs.
           SIGNET_VERSION="$NEW_VERSION" bun scripts/build-connector-assets.ts
           gh release upload "v${NEW_VERSION}" dist/native/signet-connectors-"${NEW_VERSION}".tar.gz --clobber
           bun run build:daemon-js-assets
@@ -453,9 +530,6 @@ jobs:
             "optionalDependencies.signetai-darwin-x64=${release_url}/signetai-darwin-x64-${NEW_VERSION}.tgz" \
             "optionalDependencies.signetai-darwin-arm64=${release_url}/signetai-darwin-arm64-${NEW_VERSION}.tgz" \
             "optionalDependencies.signetai-win32-x64=${release_url}/signetai-win32-x64-${NEW_VERSION}.tgz"
-          # The install-native.js postinstall reads native-manifest.json from the
-          # wrapper package root to download connector assets. The generate step
-          # writes it to dist/native/; copy it into the wrapper before publish.
           cp dist/native/native-manifest.json dist/signetai/native-manifest.json
 
       - name: Validate publish manifests
@@ -479,14 +553,13 @@ jobs:
             current=$(npm view "${package_name}@${NEW_VERSION}" version 2>/dev/null || echo "0.0.0")
             if [ "$current" = "$NEW_VERSION" ]; then
               echo "${package_name}@${NEW_VERSION} already published, refreshing next tag"
-              npm dist-tag add "${package_name}@${NEW_VERSION}" next
-              return
+            elif [ "$optional" = "true" ]; then
+              (cd "$package_dir" && npm publish --tag release-staging --access public) || return 0
+            else
+              (cd "$package_dir" && npm publish --tag release-staging --access public)
             fi
-            if [ "$optional" = "true" ]; then
-              (cd "$package_dir" && npm publish --tag next --access public) || true
-              return
-            fi
-            (cd "$package_dir" && npm publish --tag next --access public)
+            npm dist-tag rm "${package_name}" release-staging >/dev/null 2>&1 || true
+            scripts/advance-npm-dist-tag.sh "${package_name}" "${NEW_VERSION}" next
           }
 
           STAGED_NPM_ROOT="${RUNNER_TEMP}/signet-npm-publish"
@@ -498,6 +571,7 @@ jobs:
           publish_npm_package "${STAGED_NPM_ROOT}/connector-gemini"
           publish_npm_package "${STAGED_NPM_ROOT}/connector-hermes-agent"
           publish_npm_package "${STAGED_NPM_ROOT}/connector-kimi"
+          publish_npm_package "${STAGED_NPM_ROOT}/connector-muse-code"
           publish_npm_package "${STAGED_NPM_ROOT}/connector-oh-my-pi"
           publish_npm_package "${STAGED_NPM_ROOT}/connector-openclaw"
           publish_npm_package "${STAGED_NPM_ROOT}/connector-opencode"
@@ -531,7 +605,7 @@ jobs:
             "latest.yml"
           )
 
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 90); do
             assets=$(scripts/retry-github-release.sh gh release view "v${NEW_VERSION}" --json assets --jq '.assets[].name' --repo "${GITHUB_REPOSITORY}" 2>/dev/null || true)
             missing=()
             for asset in "${expected[@]}"; do
@@ -543,13 +617,20 @@ jobs:
               echo "All desktop release assets are present"
               break
             fi
-            if [ "${attempt}" -eq 60 ]; then
+            if [ "${attempt}" -eq 90 ]; then
               echo "::error::Timed out waiting for desktop release assets: ${missing[*]}"
               exit 1
             fi
-            echo "Waiting for desktop release assets (attempt ${attempt}/60): ${missing[*]}"
+            echo "Waiting for desktop release assets (attempt ${attempt}/90): ${missing[*]}"
             sleep 30
           done
+
+          manifest_dir="${RUNNER_TEMP}/mac-update-manifest"
+          mkdir -p "${manifest_dir}"
+          scripts/retry-github-release.sh gh release download "v${NEW_VERSION}" --pattern "latest-mac.yml" --dir "${manifest_dir}" --repo "${GITHUB_REPOSITORY}"
+          bun surfaces/desktop/scripts/merge-mac-update-manifest.ts \
+            --verify "${manifest_dir}/latest-mac.yml" \
+            --version "${NEW_VERSION}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

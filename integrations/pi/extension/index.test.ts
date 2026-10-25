@@ -12,15 +12,13 @@ import SignetPiExtension, {
 	searchSourceArtifacts,
 } from "./src/index.js";
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
 const tempDirs: string[] = [];
 const servers: Array<{ stop: () => void }> = [];
+const originalWarn = console.warn;
 let savedEnv: Record<string, string | undefined> = {};
 
 afterEach(() => {
+	console.warn = originalWarn;
 	for (const dir of tempDirs.splice(0)) {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -48,24 +46,18 @@ function makeTempDir() {
 	tempDirs.push(dir);
 	return dir;
 }
-
-/** Creates a temp dir inside homedir so it can be addressed as ~/relative-path. */
 function makeTempDirInHome() {
 	const dir = mkdtempSync(join(homedir(), ".signet-pi-test-"));
 	tempDirs.push(dir);
 	return dir;
 }
 
-// ============================================================================
-// loadConfig
-// ============================================================================
-
 describe("loadConfig", () => {
 	it("defaults to enabled when no env var or config file exists", () => {
 		saveEnv("SIGNET_ENABLED", "PI_CODING_AGENT_DIR");
 		// biome-ignore lint/performance/noDelete: assigning undefined to process.env stores the string "undefined"
 		delete process.env.SIGNET_ENABLED;
-		process.env.PI_CODING_AGENT_DIR = makeTempDir(); // empty dir — no signet.json
+		process.env.PI_CODING_AGENT_DIR = makeTempDir();
 		expect(loadConfig().enabled).toBe(true);
 	});
 
@@ -101,7 +93,6 @@ describe("loadConfig", () => {
 		const dir = makeTempDirInHome();
 		mkdirSync(join(dir, "extensions"), { recursive: true });
 		writeFileSync(join(dir, "extensions", "signet.json"), JSON.stringify({ enabled: false }));
-		// Express the path as ~/relative so tilde expansion is required
 		const rel = relative(homedir(), dir);
 		process.env.PI_CODING_AGENT_DIR = `~/${rel}`;
 		// biome-ignore lint/performance/noDelete: assigning undefined to process.env stores the string "undefined"
@@ -115,12 +106,8 @@ describe("loadConfig", () => {
 		delete process.env.SIGNET_ENABLED;
 		// biome-ignore lint/performance/noDelete: assigning undefined to process.env stores the string "undefined"
 		delete process.env.PI_CODING_AGENT_DIR;
-
-		// Set XDG_CONFIG_HOME to an isolated temp dir so we don't touch the real config
 		const configHome = makeTempDir();
 		process.env.XDG_CONFIG_HOME = configHome;
-
-		// Write a signet/pi.json pointing at an agent dir containing signet.json
 		const agentDir = makeTempDir();
 		mkdirSync(join(agentDir, "extensions"), { recursive: true });
 		writeFileSync(join(agentDir, "extensions", "signet.json"), JSON.stringify({ enabled: false }));
@@ -140,16 +127,11 @@ describe("loadConfig", () => {
 		// biome-ignore lint/performance/noDelete: assigning undefined to process.env stores the string "undefined"
 		delete process.env.PI_CODING_AGENT_DIR;
 		process.env.SIGNET_BYPASS = "1";
-		// loadConfig does not include bypass — it's checked at factory call time
 		const config = loadConfig();
 		expect(config.enabled).toBe(true);
 		expect(config).not.toHaveProperty("bypass");
 	});
 });
-
-// ============================================================================
-// parseRememberArgs
-// ============================================================================
 
 describe("parseRememberArgs", () => {
 	it("parses plain content with no flags", () => {
@@ -189,10 +171,6 @@ describe("parseRememberArgs", () => {
 		expect(result.content).toBe("plain content");
 	});
 });
-
-// ============================================================================
-// recallMemories (regression: must read data.results, not data.memories)
-// ============================================================================
 
 describe("recallMemories", () => {
 	it("returns memories from data.results field (not data.memories)", async () => {
@@ -294,10 +272,6 @@ describe("recallMemories", () => {
 	});
 });
 
-// ============================================================================
-// searchSourceArtifacts and searchSessions
-// ============================================================================
-
 describe("Signet search helpers", () => {
 	it("source search posts sourceOnly recall requests", async () => {
 		let capturedPath: string | undefined;
@@ -362,9 +336,28 @@ describe("Signet search helpers", () => {
 	});
 });
 
-// ============================================================================
-// rememberContent (regression: must include harness field)
-// ============================================================================
+describe("daemon-unavailable helper behavior", () => {
+	it("rejects direct requests with concise unavailable errors and no console warnings", async () => {
+		const warnings: string[] = [];
+		console.warn = (...args: unknown[]) => {
+			warnings.push(args.map(String).join(" "));
+		};
+
+		const offlineServer = Bun.serve({
+			port: 0,
+			fetch: () => new Response(),
+		});
+		const offlinePort = offlineServer.port;
+		offlineServer.stop();
+		const daemonUrl = `http://127.0.0.1:${offlinePort}`;
+
+		await expect(recallMemories(daemonUrl, "query")).rejects.toThrow("Recall failed: offline");
+		await expect(rememberContent(daemonUrl, "memory")).rejects.toThrow("Remember failed: offline");
+		await expect(searchSourceArtifacts(daemonUrl, "query")).rejects.toThrow("Source search failed: offline");
+		await expect(searchSessions(daemonUrl, "query")).rejects.toThrow("Session search failed: offline");
+		expect(warnings).toEqual([]);
+	});
+});
 
 describe("rememberContent", () => {
 	it("includes harness field in the request body and POSTs to /api/hooks/remember", async () => {
@@ -423,10 +416,6 @@ describe("rememberContent", () => {
 	});
 });
 
-// ============================================================================
-// SignetPiExtension integration
-// ============================================================================
-
 interface HandlerMap {
 	[event: string]: Array<(event: unknown, ctx: unknown) => unknown>;
 }
@@ -460,8 +449,6 @@ describe("SignetPiExtension", () => {
 		expect(registered.has("before_agent_start")).toBe(true);
 		expect(registered.has("context")).toBe(true);
 		expect(registered.has("session_before_compact")).toBe(true);
-		// pi-mono compat: the before-events must be registered so fork/switch
-		// tracking works under pi-mono (which only emits the before-variants).
 		expect(registered.has("session_before_switch")).toBe(true);
 		expect(registered.has("session_before_fork")).toBe(true);
 		expect(registered.has("session_switch")).toBe(true);
@@ -510,13 +497,8 @@ describe("SignetPiExtension", () => {
 				theme: { fg: (_color: string, text: string) => text },
 			},
 		};
-
-		// Establish the active session so endPreviousSession has a session to end.
 		await handlers.session_start[0]?.({}, ctx);
-		// before-event (emitted by both current pi and pi-mono): end previous session.
 		await handlers.session_before_switch[0]?.({ type: "session_before_switch", reason: "new" }, ctx);
-		// post-event (current pi only): refresh the new session. pi-mono refreshes
-		// via session_start (reason fork/new/resume) instead.
 		await handlers.session_switch[0]?.({ type: "session_switch", reason: "new" }, ctx);
 
 		const posts = requests.filter((r) => r.method === "POST");
@@ -525,7 +507,6 @@ describe("SignetPiExtension", () => {
 			"/api/hooks/session-end",
 			"/api/hooks/session-start",
 		]);
-		// Exactly one session-end across before + post events — no double post.
 		expect(posts.filter((r) => r.path === "/api/hooks/session-end")).toHaveLength(1);
 		const end = posts.find((r) => r.path === "/api/hooks/session-end");
 		expect(end?.body).toMatchObject({
@@ -592,8 +573,6 @@ describe("SignetPiExtension", () => {
 	});
 
 	it("pi-mono flow: before-event ends the old session, then session_start establishes the new one", async () => {
-		// pi-mono only emits session_before_switch (no session_switch post-event) and
-		// follows it with session_start (reason new/resume) carrying the NEW session.
 		const requests: Array<{ method: string; path: string; body: unknown }> = [];
 		const server = Bun.serve({
 			port: 0,
@@ -635,21 +614,15 @@ describe("SignetPiExtension", () => {
 				theme: { fg: (_color: string, text: string) => text },
 			},
 		});
-
-		// 1) Old session A is active.
 		await handlers.session_start[0]?.({}, ctxFor("session-A"));
-		// 2) pi-mono before-event fires while A is still the active session.
 		await handlers.session_before_switch[0]?.({ type: "session_before_switch", reason: "new" }, ctxFor("session-A"));
-		// 3) pi-mono follows with session_start for the NEW session B (no session_switch).
 		await handlers.session_start[0]?.({}, ctxFor("session-B"));
 
 		const posts = requests.filter((r) => r.method === "POST");
 		const ends = posts.filter((r) => r.path === "/api/hooks/session-end");
 		const starts = posts.filter((r) => r.path === "/api/hooks/session-start");
-		// Exactly one session-end, targeting the old session A.
 		expect(ends).toHaveLength(1);
 		expect(ends[0]?.body).toMatchObject({ harness: "pi", reason: "session_switch", sessionKey: "session-A" });
-		// session-start fired for both A (initial) and B (after switch).
 		expect(starts.map((r) => (r.body as { sessionKey?: string }).sessionKey)).toEqual(["session-A", "session-B"]);
 	});
 
@@ -672,14 +645,10 @@ describe("SignetPiExtension", () => {
 		};
 
 		SignetPiExtension(pi as never);
-
-		// Automatic hooks should NOT be registered
 		expect(events.has("session_start")).toBe(false);
 		expect(events.has("before_agent_start")).toBe(false);
 		expect(events.has("context")).toBe(false);
 		expect(events.has("session_before_compact")).toBe(false);
-
-		// Commands and tools should still be registered
 		expect(commandCount).toBeGreaterThan(0);
 		expect(toolCount).toBeGreaterThan(0);
 	});
@@ -968,6 +937,120 @@ describe("SignetPiExtension", () => {
 				message.content.includes("peer-notification-content"),
 		);
 		expect(peerMessage).toBeDefined();
+	});
+
+	it("input does not wait for prompt-submit and before_agent_start does not retry a failed submit", async () => {
+		let promptSubmits = 0;
+		let releasePromptSubmit: () => void = () => {};
+		const promptSubmitGate = new Promise<void>((resolve) => {
+			releasePromptSubmit = resolve;
+		});
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				const path = new URL(req.url).pathname;
+				if (path === "/api/hooks/session-start") return Response.json({});
+				if (path === "/api/hooks/user-prompt-submit") {
+					promptSubmits += 1;
+					await promptSubmitGate;
+					return new Response("daemon busy", { status: 503 });
+				}
+				if (path === "/api/hooks/notifications") return Response.json({});
+				return new Response("not found", { status: 404 });
+			},
+		});
+		servers.push(server);
+		process.env.SIGNET_DAEMON_URL = `http://127.0.0.1:${server.port}`;
+
+		const handlers: HandlerMap = {};
+		const pi = {
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				(handlers[event] ??= []).push(handler);
+			},
+			registerCommand(_name: string, _opts: unknown) {},
+			registerTool(_opts: unknown) {},
+		};
+		SignetPiExtension(pi as never);
+		const ctx = {
+			cwd: "/tmp/pi-project",
+			sessionManager: {
+				getBranch: () => [],
+				getEntries: () => [],
+				getHeader: () => ({ id: "session-pi-slow", cwd: "/tmp/pi-project" }),
+				getSessionFile: () => undefined,
+				getSessionId: () => "session-pi-slow",
+			},
+			ui: {
+				notify: () => {},
+				setStatus: () => {},
+				theme: { fg: (_color: string, text: string) => text },
+			},
+		};
+
+		try {
+			const input = Promise.resolve(handlers.input[0]?.({ text: "hello" }, ctx)).then(() => "accepted");
+			const outcome = await Promise.race([input, Bun.sleep(250).then(() => "blocked")]);
+			expect(outcome).toBe("accepted");
+		} finally {
+			releasePromptSubmit();
+		}
+
+		await handlers.before_agent_start[0]?.({ prompt: "hello" }, ctx);
+		const result = await handlers.context[0]?.({ messages: [] }, ctx);
+		expect(promptSubmits).toBe(1);
+		const messages = (result as { messages?: Array<{ customType?: string }> } | undefined)?.messages ?? [];
+		expect(messages.some((message) => message.customType === "signet-pi-hidden-recall")).toBe(false);
+	});
+
+	it("delivers recall for a prompt submitted on input through the next context event", async () => {
+		let promptSubmits = 0;
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				const path = new URL(req.url).pathname;
+				if (path === "/api/hooks/session-start") return Response.json({});
+				if (path === "/api/hooks/user-prompt-submit") {
+					promptSubmits += 1;
+					return Response.json({ dynamicContext: "[signet:recall]\n- Steered recall" });
+				}
+				if (path === "/api/hooks/notifications") return Response.json({});
+				return new Response("not found", { status: 404 });
+			},
+		});
+		servers.push(server);
+		process.env.SIGNET_DAEMON_URL = `http://127.0.0.1:${server.port}`;
+
+		const handlers: HandlerMap = {};
+		const pi = {
+			on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				(handlers[event] ??= []).push(handler);
+			},
+			registerCommand(_name: string, _opts: unknown) {},
+			registerTool(_opts: unknown) {},
+		};
+		SignetPiExtension(pi as never);
+		const ctx = {
+			cwd: "/tmp/pi-project",
+			sessionManager: {
+				getBranch: () => [],
+				getEntries: () => [],
+				getHeader: () => ({ id: "session-pi-steer", cwd: "/tmp/pi-project" }),
+				getSessionFile: () => undefined,
+				getSessionId: () => "session-pi-steer",
+			},
+			ui: {
+				notify: () => {},
+				setStatus: () => {},
+				theme: { fg: (_color: string, text: string) => text },
+			},
+		};
+
+		await handlers.input[0]?.({ text: "steer toward the recalled fact" }, ctx);
+		const result = await handlers.context[0]?.({ messages: [] }, ctx);
+		const messages = (result as { messages: Array<{ customType?: string; content?: unknown }> }).messages;
+		const recall = messages.find((message) => message.customType === "signet-pi-hidden-recall");
+		expect(recall?.content as string).toContain("Steered recall");
+		expect(promptSubmits).toBe(1);
 	});
 
 	it("session_before_compact posts pre-compaction guidance with session metadata", async () => {

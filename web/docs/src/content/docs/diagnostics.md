@@ -14,7 +14,7 @@ curl -fsS http://127.0.0.1:3850/health/ready
 curl -fsS http://127.0.0.1:3850/api/diagnostics
 ```
 
-`/health/live` answers whether the process is up. `/health/ready` includes readiness gates. `/api/diagnostics` returns the detailed report. Its `workloads` block is scoped to the requested agent and includes active inference/Pi and MCP requests, provider semaphore running and pending counts, oldest ages, and Dreaming pass and attention backlog counts and ages. The focused `/api/diagnostics/workloads` endpoint returns the same bounded workload snapshot. In authenticated deployments, diagnostics require the appropriate operator or admin permission.
+`/health/live` answers whether the process is up. `/health/ready` includes readiness gates. `/api/diagnostics` returns the detailed report. `signet daemon start` waits for liveness, not full readiness; if the process exits early or the 60-second startup deadline expires, its error includes the current lifecycle record plus available stderr or systemd journal output. Use `signet daemon status --json` and `/health/ready` to distinguish a live but not-yet-ready daemon. Its `workloads` block is scoped to the requested agent and includes active inference/Pi and MCP requests, provider semaphore running and pending counts, oldest ages, and Dreaming pass and attention backlog counts and ages. The focused `/api/diagnostics/workloads` endpoint returns the same bounded workload snapshot. In authenticated deployments, diagnostics require the appropriate operator or admin permission.
 
 Use the report to identify the failing domain before taking action. Do not treat a low composite score as a diagnosis by itself.
 
@@ -41,7 +41,17 @@ POST /api/repair/requeue-dead
 POST /api/repair/release-leases
 POST /api/repair/check-fts
 POST /api/repair/retention-sweep
+POST /api/repair/resync-vec
+POST /api/repair/clean-orphans
 ```
+
+Vector repair is scoped to one resolved agent. `resync-vec` fills canonical
+embeddings missing from the derived index and retains derived rows with no
+provable owner. Its `remaining` field is a bounded 0/1 presence marker; resume
+while `status` is `running`. On startup the daemon also backfills embeddings
+missing from the active vector projection (the staging table after a model
+migration), so vectors an older daemon wrote to the inactive table become
+searchable again after a restart.
 
 The daemon's full-database integrity scan runs in a single-flight worker after
 HTTP readiness, with a 30-second wall-clock budget and periodic progress logs.
@@ -49,6 +59,14 @@ It transactionally rebuilds disposable telemetry indexes when only
 `telemetry_events` is corrupt. A confirmed failure is reported by `/health` and
 `/health/ready`, with actionable offline repair guidance. If the audit store
 prevents committing a verified repair, the default remains fail-closed.
+
+The incremental integrity check also runs in bounded slices. It continues past
+FTS5 virtual tables and reports those objects as `unverifiable` without marking
+the rest of the database unhealthy. A schema change resets its saved position
+so new objects are not skipped. FTS startup recovery and legacy `VACUUM` conversion
+start only after the sweep completes without integrity failures and no migration
+backup is pending. Unavailable verification or retained corruption keeps those
+writes deferred, as does a shutdown already in progress.
 
 Examples:
 

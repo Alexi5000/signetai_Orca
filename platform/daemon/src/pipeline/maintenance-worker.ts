@@ -1,14 +1,3 @@
-/**
- * Autonomous maintenance worker.
- *
- * Periodically runs diagnostics and, when health degrades, invokes
- * the appropriate repair action. Starts in observe-only mode by
- * default; graduates to execute mode via config.
- *
- * The interval is single-flight: a slow cycle is allowed to finish before
- * another cycle starts.
- */
-
 import type { DbAccessor, SyncDbCallSiteToken } from "../db-accessor";
 import type { DbOwnerMaintenance } from "../db-owner-maintenance";
 import { ownerQueryAll, ownerQueryOne } from "../db-owner-maintenance";
@@ -42,14 +31,9 @@ import { isSystemPressureHigh } from "../system-pressure";
 import { decayAspectWeights, recordFeedbackTelemetry } from "./aspect-feedback";
 import { invalidateTraversalCache } from "./graph-traversal";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 export interface MaintenanceHandle {
 	stop(): void;
 	readonly running: boolean;
-	/** Run a single maintenance cycle (for testing) */
 	tick(): Promise<MaintenanceCycleResult>;
 }
 
@@ -66,10 +50,6 @@ export interface RepairRecommendation {
 	readonly action: string;
 	readonly trigger: string;
 }
-
-// ---------------------------------------------------------------------------
-// Recommendation engine
-// ---------------------------------------------------------------------------
 
 function buildRecommendations(
 	report: DiagnosticsReport,
@@ -154,10 +134,6 @@ async function getGraphAgentIds(
 	return ids.length > 0 ? ids : ["default"];
 }
 
-// ---------------------------------------------------------------------------
-// Execution
-// ---------------------------------------------------------------------------
-
 interface ExecutionDeps {
 	accessor: DbAccessor;
 	cfg: PipelineV2Config;
@@ -198,7 +174,7 @@ async function executeRecommendation(
 		case "repairEmbeddingIndex": {
 			if (deps.embedding === null) return null;
 			const embedding = deps.embedding;
-			const admission = acquireEmbeddingRepairLease(
+			const admission = await acquireEmbeddingRepairLease(
 				deps.accessor,
 				deps.cfg.repair.reembedCooldownMs,
 				deps.cfg.repair.reembedHourlyBudget,
@@ -213,11 +189,12 @@ async function executeRecommendation(
 			}
 			const lease = admission.lease;
 
-			const finish = (affected: number, error?: string): void => {
-				finishEmbeddingRepairLease(deps.accessor, lease, {
+			const finish = async (affected: number, error?: string): Promise<void> => {
+				await finishEmbeddingRepairLease(deps.accessor, lease, {
 					successful: [],
 					affected,
 					failed: [],
+					agentId: embedding.agentId,
 					model: embedding.cfg.model,
 					pollMs: deps.cfg.embeddingTracker.pollMs,
 					eligibility: (db) => isActiveEmbeddingConfig(db, embedding.cfg),
@@ -233,7 +210,9 @@ async function executeRecommendation(
 						: 1;
 				const result =
 					stats.orphaned > 0
-						? await cleanOrphanedEmbeddings(deps.accessor, deps.cfg, ctx, deps.limiter, batchSize, embedding.agentId)
+						? await cleanOrphanedEmbeddings(deps.accessor, deps.cfg, ctx, deps.limiter, batchSize, embedding.agentId, {
+								maxBatches: 1,
+							})
 						: stats.gap.unembedded > 0
 							? await reembedMissingMemories(
 									deps.accessor,
@@ -247,6 +226,7 @@ async function executeRecommendation(
 									false,
 									false,
 									undefined,
+									lease,
 								)
 							: await reembedModelMigration(
 									deps.accessor,
@@ -258,7 +238,7 @@ async function executeRecommendation(
 									embedding.agentId,
 									batchSize,
 								);
-				finish(result.affected, result.success ? undefined : result.message);
+				await finish(result.affected, result.success ? undefined : result.message);
 				return {
 					action: rec.action,
 					success: result.success,
@@ -268,7 +248,7 @@ async function executeRecommendation(
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				finish(0, message);
+				await finish(0, message);
 				return { action: rec.action, success: false, affected: 0, message };
 			}
 		}
@@ -276,10 +256,6 @@ async function executeRecommendation(
 			return null;
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Halt tracking — stop repeating ineffective repairs
-// ---------------------------------------------------------------------------
 
 const MAX_INEFFECTIVE_RUNS = 3;
 
@@ -307,10 +283,6 @@ function createHaltTracker(): {
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Main loop
-// ---------------------------------------------------------------------------
-
 export function startMaintenanceWorker(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
@@ -324,10 +296,6 @@ export function startMaintenanceWorker(
 	let inFlight: Promise<MaintenanceCycleResult> | null = null;
 	const limiter = createRateLimiter();
 	const haltTracker = createHaltTracker();
-
-	// cfg is captured by value — changes require a pipeline restart.
-	// This is intentional: hot-reloading mid-cycle could violate the
-	// rate limiter's assumptions about cooldown/budget windows.
 	const deps: ExecutionDeps = {
 		accessor,
 		cfg,
@@ -341,19 +309,18 @@ export function startMaintenanceWorker(
 		const readDiagnostics = async (siteToken: SyncDbCallSiteToken): Promise<DiagnosticsReport> =>
 			deps.ownerMaintenance
 				? await deps.ownerMaintenance.diagnostics(tracker.stats)
-				: // Each caller supplies the original static token for this compatibility fallback.
-					// DYNAMIC_SITE_TOKEN
+				: // DYNAMIC_SITE_TOKEN
 					await accessor.withReadDbAsync(async (db) => getDiagnostics(db, tracker), { siteToken });
 		if (deps.ownerMaintenance && !(await deps.ownerMaintenance.queueIsHealthy())) {
-			const report = await readDiagnostics("pipeline/maintenance-worker.ts:338");
+			const report = await readDiagnostics("pipeline/maintenance-worker.ts:315");
 			logger.info("maintenance", "Cycle deferred while the owner maintenance lane is unhealthy");
 			return { report, recommendations: [], executed: [], feedbackDecayedAspects: 0, feedbackPropagatedAttributes: 0 };
 		}
 		if (isSystemPressureHigh()) {
-			const report = await readDiagnostics("pipeline/maintenance-worker.ts:345");
+			const report = await readDiagnostics("pipeline/maintenance-worker.ts:320");
 			return { report, recommendations: [], executed: [], feedbackDecayedAspects: 0, feedbackPropagatedAttributes: 0 };
 		}
-		const report = await readDiagnostics("pipeline/maintenance-worker.ts:350");
+		const report = await readDiagnostics("pipeline/maintenance-worker.ts:323");
 
 		const embeddingStats = deps.embedding
 			? await getEmbeddingRepairStats(accessor, deps.embedding.cfg, deps.embedding.agentId)
@@ -403,8 +370,6 @@ export function startMaintenanceWorker(
 				feedbackPropagatedAttributes,
 			};
 		}
-
-		// Execute mode
 		const ctx: RepairContext = {
 			reason: "autonomous maintenance",
 			actor: "maintenance-worker",
@@ -426,10 +391,8 @@ export function startMaintenanceWorker(
 				executed.push(result);
 			}
 		}
-
-		// Re-check health to evaluate improvement
 		if (executed.length > 0) {
-			const postReport = await readDiagnostics("pipeline/maintenance-worker.ts:428");
+			const postReport = await readDiagnostics("pipeline/maintenance-worker.ts:395");
 			const improved = postReport.composite.score > preScore;
 
 			for (const exec of executed) {
@@ -461,15 +424,9 @@ export function startMaintenanceWorker(
 			});
 		}
 
-		// Temporal manifest and MEMORY projection are owned by the direct
-		// transcript-to-Dreaming path. No summary condensation worker runs here.
-
 		if (feedbackDecayedAspects > 0 || feedbackPropagatedAttributes > 0) {
 			invalidateTraversalCache();
 		}
-
-		// Dead memory hygiene: warn when stale/low-confidence memories accumulate.
-		// No auto-deletion — use GET /api/repair/dead-memories to review and act.
 		try {
 			const countRow = deps.ownerMaintenance
 				? await ownerQueryOne<{ n: number }>(
@@ -508,12 +465,7 @@ export function startMaintenanceWorker(
 					hint: "Review with GET /api/repair/dead-memories and clean up with POST /api/repair/dead-memories/forget",
 				});
 			}
-		} catch {
-			// Non-fatal — dead memory scan should never interrupt the maintenance cycle
-		}
-
-		// Reclaim free pages from DROP/DELETE/promotion operations (#1139).
-		// Only run when the free-page ratio is high and the system is not under pressure.
+		} catch {}
 		try {
 			const owner = deps.ownerMaintenance;
 			if (owner) {
@@ -531,9 +483,7 @@ export function startMaintenanceWorker(
 				const total = pages?.page_count ?? 0;
 				if (total > 0 && free / total >= 0.2) await reclaimIncrementalVacuum(owner.owner);
 			}
-		} catch {
-			// Non-fatal — vacuum should never interrupt the maintenance cycle
-		}
+		} catch {}
 
 		return {
 			report,
@@ -562,8 +512,6 @@ export function startMaintenanceWorker(
 		);
 		return cycle;
 	}
-
-	// Only start the interval if autonomous maintenance is allowed
 	if (cfg.autonomous.enabled && !cfg.autonomous.frozen) {
 		timer = setInterval(() => {
 			if (!running) return;

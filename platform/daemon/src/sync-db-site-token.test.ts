@@ -3,11 +3,11 @@ import { classifySyncDbSiteToken } from "./sync-db-site-token.js";
 
 describe("sync DB site tokens", () => {
 	it("preserves source and semantic token classification", () => {
-		for (const token of ["file.ts:12", "a/b/c.ts:42", "/a/b.ts:3", "a//b.ts:1"]) {
+		for (const token of ["file.ts:12", "a/b/c.ts:42", "/a/b.ts:3"]) {
 			expect(classifySyncDbSiteToken(token)).toBe("source-location");
 		}
 		expect(classifySyncDbSiteToken("db:memory.read.owner")).toBe("semantic");
-		for (const token of ["a.ts", "a b.ts:1", "a.ts:no", "a:b:1"]) {
+		for (const token of ["a.ts", "a b.ts:1", "a.ts:no", "a:b:1", "a//b.ts:1"]) {
 			expect(classifySyncDbSiteToken(token)).toBeNull();
 		}
 	});

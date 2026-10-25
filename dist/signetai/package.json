@@ -1,6 +1,6 @@
 {
   "name": "signetai",
-  "version": "0.226.1",
+  "version": "0.237.17",
   "description": "Signet native CLI installer wrapper",
   "type": "module",
   "bin": {
@@ -12,6 +12,7 @@
     "bin/native-platforms.js",
     "bin/signet.js",
     "dist/mcp-stdio.js",
+    "dist/tiktoken_bg.wasm",
     "runtime",
     "native-manifest.json",
     "scripts",

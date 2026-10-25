@@ -1,8 +1,8 @@
 {
 	"name": "signet",
-	"version": "0.226.1",
+	"version": "0.237.17",
 	"private": true,
-	"packageManager": "bun@1.3.11",
+	"packageManager": "bun@1.4.2",
 	"description": "Local-first identity, memory, and secrets for AI agents",
 	"repository": {
 		"type": "git",
@@ -23,25 +23,29 @@
 	],
 	"overrides": {
 		"ws": "8.21.2",
-		"sharp": "0.35.3",
+		"sharp": "0.35.5",
 		"postcss": "8.5.25",
 		"@babel/core": "7.29.7",
-		"js-yaml": "4.3.1",
-		"qs": "6.15.3",
-		"body-parser": "2.3.0",
+		"js-yaml": "4.3.2",
+		"qs": "6.16.1",
+		"body-parser": "2.4.0",
 		"express-rate-limit": "8.6.2",
-		"ip-address": "10.4.0",
-		"fast-uri": "3.1.5",
+		"ip-address": "10.7.4",
+		"fast-uri": "3.1.9",
 		"tar": "7.5.22",
 		"tmp": "0.2.7",
 		"protobufjs": "7.6.5",
 		"@protobufjs/utf8": "1.1.2",
-		"svgo": "4.0.2",
+		"svgo": "4.1.0",
 		"form-data": "4.0.6",
 		"fast-xml-builder": "1.3.0",
-		"adm-zip": "0.6.0",
-		"undici": "8.10.0",
-		"esbuild": "0.28.1"
+		"adm-zip": "0.6.1",
+		"undici": "8.12.3",
+		"esbuild": "0.28.1",
+		"@ai-sdk/provider-utils": "3.0.41",
+		"@modelcontextprotocol/sdk": "1.32.2",
+		"toml": "5.0.1",
+		"zod": "4.6.7"
 	},
 	"scripts": {
 		"build": "bun run build:core && bun run build:connector-base && bun run build:opencode-plugin && bun run build:native && bun run build:oh-my-pi-extension && bun run build:connector-oh-my-pi && bun run build:pi-extension && bun run build:connector-pi && bun run build:deps && bun run build:signetai",
@@ -53,7 +57,7 @@
 		"build:oh-my-pi-extension": "cd integrations/oh-my-pi/extension && bun run build",
 		"build:pi-extension": "cd integrations/pi/extension && bun run build",
 		"build:connector-pi": "cd integrations/pi/connector && bun run build",
-		"build:deps": "bun run --filter '@signet/sdk' build && bun run --filter '@signet/connector-claude-code' --filter '@signet/connector-codex' --filter '@signet/connector-forge' --filter '@signet/connector-gemini' --filter '@signet/connector-hermes-agent' --filter '@signet/connector-kimi' --filter '@signet/connector-opencode' --filter '@signet/connector-openclaw' --filter '@signetai/*' --filter '@signet/daemon' build",
+		"build:deps": "bun run --filter '@signet/sdk' build && bun run --filter '@signet/connector-claude-code' --filter '@signet/connector-codex' --filter '@signet/connector-forge' --filter '@signet/connector-gemini' --filter '@signet/connector-hermes-agent' --filter '@signet/connector-kimi' --filter '@signet/connector-muse-code' --filter '@signet/connector-opencode' --filter '@signet/connector-openclaw' --filter '@signetai/*' --filter '@signet/daemon' build",
 		"build:signetai": "cd dist/signetai && bun run build",
 		"build:native-bun": "bun scripts/build-native-bun.ts",
 		"native:manifest": "bun scripts/generate-native-manifest.ts",
@@ -65,13 +69,18 @@
 		"start": "cd platform/daemon && bun run start",
 		"dev": "bun run --filter '*' dev",
 		"test": "bun run test:workspace",
-		"test:workspace": "bun run build && bun run test:hermetic scripts tests platform/core platform/daemon platform/native surfaces/cli surfaces/dashboard surfaces/desktop surfaces/tray integrations libs memorybench web/workers && bun run --filter '@signet/codex-plugin' test",
+		"test:workspace": "bun run build && bun run test:hermetic ./scripts ./tests ./platform/core ./platform/daemon ./platform/native ./surfaces/cli ./surfaces/dashboard ./surfaces/desktop ./surfaces/tray ./surfaces/browser-extension ./integrations ./libs ./memorybench ./web/marketing ./web/workers && bun run --filter '@signet/docs' test:search && bun run --filter '@signet/codex-plugin' test",
 		"test:hermetic": "bun scripts/run-hermetic-tests.ts",
 		"lint": "bun run lint:check",
 		"lint:check": "biome check .",
 		"lint:fix": "biome check --write .",
 		"format": "biome format --write .",
 		"format:check": "biome format .",
+		"comments:check": "bun scripts/strip-comments.ts --check",
+		"comments:write": "bun scripts/strip-comments.ts --write",
+		"check:production-comments": "bun scripts/check-production-comments.ts",
+		"audit:database-ownership": "bun scripts/audit-database-ownership.ts",
+		"audit:agent-identity": "bun scripts/audit-agent-identity.ts",
 		"typecheck": "bun run --filter '*' typecheck",
 		"version:sync": "bun scripts/version-sync.ts",
 		"dev:web": "cd web/marketing && bun run dev",
@@ -90,16 +99,17 @@
 		"prepare": "bun run hooks:install"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "^2.5.5",
-		"@opencode-ai/plugin": "^1.18.13",
+		"@biomejs/biome": "2.5.8",
+		"@opencode-ai/plugin": "^1.19.4",
 		"@signet/sdk": "workspace:*",
-		"@types/node": "^24.5.2",
-		"bun-types": "^1.3.9",
-		"esbuild": "^0.25.0",
-		"hono": "^4.13.0",
+		"@types/node": "^24.19.2",
+		"bun-types": "1.4.2",
+		"esbuild": "^0.28.1",
+		"hono": "^4.13.13",
 		"node-gyp": "^12.4.0",
-		"turbo": "^2.9.14",
-		"typescript": "^5.7.0"
+		"turbo": "^2.11.10",
+		"typescript": "^5.9.3",
+		"yaml": "^2.9.1"
 	},
 	"keywords": [
 		"ai",
@@ -123,5 +133,8 @@
 		"bun",
 		"sqlite",
 		"signet"
-	]
+	],
+	"patchedDependencies": {
+		"@getzep/zep-cloud@3.18.0": "patches/@getzep%2Fzep-cloud@3.18.0.patch"
+	}
 }

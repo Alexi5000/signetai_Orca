@@ -13,6 +13,7 @@ export const NPM_PACKAGE_RENAMES: ReadonlyMap<string, string> = new Map([
 	["@signet/connector-gemini", "@signetai/connector-gemini"],
 	["@signet/connector-hermes-agent", "@signetai/connector-hermes-agent"],
 	["@signet/connector-kimi", "@signetai/connector-kimi"],
+	["@signet/connector-muse-code", "@signetai/connector-muse-code"],
 	["@signet/connector-oh-my-pi", "@signetai/connector-oh-my-pi"],
 	["@signet/connector-openclaw", "@signetai/connector-openclaw"],
 	["@signet/connector-opencode", "@signetai/connector-opencode"],
@@ -29,6 +30,7 @@ export const PUBLISH_TARGETS = [
 	["integrations/gemini/connector", "connector-gemini"],
 	["integrations/hermes-agent/connector", "connector-hermes-agent"],
 	["integrations/kimi/connector", "connector-kimi"],
+	["integrations/muse-code/connector", "connector-muse-code"],
 	["integrations/oh-my-pi/connector", "connector-oh-my-pi"],
 	["integrations/openclaw/connector", "connector-openclaw"],
 	["integrations/opencode/connector", "connector-opencode"],
@@ -86,7 +88,6 @@ function rewriteTextFiles(dir: string): void {
 			rewriteTextFiles(path);
 			continue;
 		}
-		// Inspect and read through one descriptor so the checks apply to the bytes we rewrite.
 		const fd = openSync(path, "r");
 		let raw: string | null = null;
 		let isDirectory = false;

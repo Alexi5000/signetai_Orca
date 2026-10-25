@@ -1,5 +1,5 @@
 import type { ProviderName } from "../../types/provider"
-import type { BenchmarkName } from "../../types/benchmark"
+import type { BenchmarkConfig, BenchmarkName } from "../../types/benchmark"
 import type { PhaseId, SamplingConfig, SampleType } from "../../types/checkpoint"
 import type { ConcurrencyConfig } from "../../types/concurrency"
 import { PHASE_ORDER, getPhasesFromPhase } from "../../types/checkpoint"
@@ -8,7 +8,13 @@ import { getAvailableProviders } from "../../providers"
 import { getAvailableBenchmarks } from "../../benchmarks"
 import { listAvailableModels, DEFAULT_ANSWERING_MODEL } from "../../utils/models"
 import { logger } from "../../utils/logger"
-import { appendCsvValues, parseCommaSeparated, readIdListFile } from "../args"
+import {
+  appendCsvValues,
+  applyBenchmarkConfigArg,
+  isBenchmarkConfigFlag,
+  parseCommaSeparated,
+  readIdListFile,
+} from "../args"
 
 const DEFAULT_JUDGE_MODEL = "gpt-4o"
 
@@ -26,6 +32,7 @@ interface RunArgs {
   force?: boolean
   fromPhase?: PhaseId
   concurrency?: ConcurrencyConfig
+  benchmarkConfig?: BenchmarkConfig
 }
 
 function generateRunId(): string {
@@ -38,6 +45,7 @@ function generateRunId(): string {
 export function parseRunArgs(args: string[]): RunArgs | null {
   const parsed: Partial<RunArgs> = {}
   const concurrency: ConcurrencyConfig = {}
+  const benchmarkConfig: BenchmarkConfig = {}
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
@@ -116,6 +124,12 @@ export function parseRunArgs(args: string[]): RunArgs | null {
       concurrency.evaluate = parseInt(args[++i], 10)
     } else if (arg === "--force") {
       parsed.force = true
+    } else if (isBenchmarkConfigFlag(arg)) {
+      const error = applyBenchmarkConfigArg(benchmarkConfig, arg, args[++i])
+      if (error) {
+        logger.error(error)
+        return null
+      }
     }
   }
 
@@ -129,6 +143,9 @@ export function parseRunArgs(args: string[]): RunArgs | null {
 
   if (Object.keys(concurrency).length > 0) {
     parsed.concurrency = concurrency
+  }
+  if (Object.keys(benchmarkConfig).length > 0) {
+    parsed.benchmarkConfig = benchmarkConfig
   }
 
   return parsed as RunArgs
@@ -167,18 +184,18 @@ export async function runCommand(args: string[]): Promise<void> {
     console.log("  --concurrency-answer N    Concurrency for answer phase")
     console.log("  --concurrency-evaluate N  Concurrency for evaluate phase")
     console.log("  --force                Clear existing checkpoint and start fresh")
+    console.log("  --data-path DIR        Prepared BEAM snapshot root")
+    console.log("  --dataset-revision FP  BEAM dataset fingerprint from 'beam prepare'")
+    console.log("  --retrieval-top-k N    BEAM evidence count (default 5)")
+    console.log("  --evaluation-profile P BEAM scoring profile: paper or custom-judge")
     console.log("")
     console.log(`Available models: ${listAvailableModels().join(", ")}`)
     return
   }
 
   const checkpointManager = new CheckpointManager()
-
-  // Check if run exists
   if (checkpointManager.exists(parsed.runId)) {
     const checkpoint = checkpointManager.load(parsed.runId)!
-
-    // If provider/benchmark provided, validate they match
     if (parsed.provider && parsed.provider !== checkpoint.provider) {
       logger.error(
         `Run ${parsed.runId} exists with provider ${checkpoint.provider}, not ${parsed.provider}`
@@ -191,8 +208,6 @@ export async function runCommand(args: string[]): Promise<void> {
       )
       return
     }
-
-    // Use stored values
     parsed.provider = checkpoint.provider
     parsed.benchmark = checkpoint.benchmark
     parsed.judgeModel = parsed.judgeModel || checkpoint.judge
@@ -200,7 +215,6 @@ export async function runCommand(args: string[]): Promise<void> {
 
     logger.info(`Continuing run ${parsed.runId} (${checkpoint.provider}/${checkpoint.benchmark})`)
   } else {
-    // New run - provider and benchmark required
     if (!parsed.provider || !parsed.benchmark) {
       logger.error("New run requires -p/--provider and -b/--benchmark")
       return
@@ -215,8 +229,6 @@ export async function runCommand(args: string[]): Promise<void> {
       console.error(`Invalid benchmark: ${parsed.benchmark}`)
       return
     }
-
-    // Apply defaults for new run
     parsed.judgeModel = parsed.judgeModel || DEFAULT_JUDGE_MODEL
   }
 
@@ -246,6 +258,7 @@ export async function runCommand(args: string[]): Promise<void> {
     questionTypes: parsed.questionTypes,
     sampling,
     concurrency: parsed.concurrency,
+    benchmarkConfig: parsed.benchmarkConfig,
     force: parsed.force,
     phases,
   })

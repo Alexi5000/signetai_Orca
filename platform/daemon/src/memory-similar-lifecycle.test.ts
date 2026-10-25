@@ -1,33 +1,13 @@
-/**
- * Regression test for GET /memory/similar lifecycle correctness.
- *
- * Bug: the similarity-search route read the query embedding and fetched
- * candidate memories without applying the lifecycle gate that standard recall
- * enforces (is_deleted = 0, superseded_by IS NULL, stale_at IS NULL). Deleted,
- * superseded, stale, and aggregate-recall projection rows could therefore
- * surface as similar memories — or supply the query vector themselves.
- *
- * These tests exercise the real route + DB plumbing (migrated SQLite with the
- * sqlite-vec extension) and assert that only current, non-derived memories are
- * returned, and that a tombstoned source id yields a 404 rather than a search.
- */
-
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Hono } from "hono";
+import { Hono } from "hono";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
 import { syncVecInsert, vectorToBlob } from "./db-helpers";
+import { createDbOwnerClient, type DbOwnerClient } from "./db-owner-client";
 
 const DIMENSIONS = 768;
-
-/**
- * Build a 768-d vector that is nearly identical to `base` (used as the query
- * source) so the candidate lands in the top-K. Only the first `signal` dims
- * carry non-zero values; the rest are zero. Two vectors sharing the same
- * signal prefix have cosine similarity ~1.
- */
 function vec(signal: number[]): number[] {
 	const out = new Array<number>(DIMENSIONS).fill(0);
 	for (let i = 0; i < signal.length; i++) out[i] = signal[i];
@@ -35,13 +15,14 @@ function vec(signal: number[]): number[] {
 }
 
 let app: Hono;
+let recallOwner: DbOwnerClient | null = null;
+let registerMemoryRoutes: typeof import("./routes/memory-routes").registerMemoryRoutes;
 let agentsDir = "";
-const dbFiles = ["memories.db", "memories.db-shm", "memories.db-wal"];
 let originalSignetPath: string | undefined;
 
 function resetDbFiles(): void {
-	for (const file of dbFiles) {
-		rmSync(join(agentsDir, "memory", file), { force: true });
+	for (const file of readdirSync(join(agentsDir, "memory"))) {
+		if (file.startsWith("memories.db")) rmSync(join(agentsDir, "memory", file), { force: true });
 	}
 }
 
@@ -110,25 +91,29 @@ memory:
 `,
 		);
 		process.env.SIGNET_PATH = agentsDir;
-
-		const daemon = await import("./daemon");
-		app = daemon.app;
+		registerMemoryRoutes = (await import("./routes/memory-routes")).registerMemoryRoutes;
 	});
 
-	beforeEach(() => {
-		closeDbAccessor();
+	beforeEach(async () => {
+		await closeDbAccessor();
 		resetDbFiles();
-		initDbAccessor(join(agentsDir, "memory", "memories.db"));
+		const dbPath = join(agentsDir, "memory", "memories.db");
+		initDbAccessor(dbPath);
+		recallOwner = createDbOwnerClient({ dbPath, workerRole: "recall" });
+		app = new Hono();
+		registerMemoryRoutes(app, { recallOwner });
 	});
 
-	afterEach(() => {
-		closeDbAccessor();
+	afterEach(async () => {
+		await recallOwner?.close();
+		recallOwner = null;
+		await closeDbAccessor();
 	});
 
-	afterAll(() => {
-		closeDbAccessor();
+	afterAll(async () => {
+		await closeDbAccessor();
 		if (originalSignetPath === undefined) {
-			process.env.SIGNET_PATH = undefined;
+			delete process.env.SIGNET_PATH;
 		} else {
 			process.env.SIGNET_PATH = originalSignetPath;
 		}
@@ -137,9 +122,6 @@ memory:
 
 	it("does not surface deleted, superseded, stale, or aggregate-recall candidates", async () => {
 		const baseSignal = [1, 0, 0];
-		// All candidates share the same signal prefix so they are equally
-		// similar to the query source — the only thing that can exclude one is
-		// its lifecycle state.
 		seedMemory({ id: "current", content: "current fact", embeddingId: "emb-current", signal: vec(baseSignal) });
 		seedMemory({
 			id: "deleted",
@@ -176,8 +158,6 @@ memory:
 		const ids = body.results.map((r) => r.id);
 
 		expect(ids).toHaveLength(0);
-		// The only other current, non-derived candidate is "current" itself,
-		// which is excluded by the self-filter, so results should be empty.
 		expect(ids).not.toContain("deleted");
 		expect(ids).not.toContain("superseded");
 		expect(ids).not.toContain("stale");
@@ -230,8 +210,6 @@ memory:
 	});
 
 	it("surfaces a valid current candidate alongside a suppressed stale one", async () => {
-		// Distinct signals so the current candidate is the closest match after
-		// the stale one is filtered out.
 		seedMemory({ id: "anchor", content: "anchor", embeddingId: "emb-anchor", signal: vec([1, 0, 0]) });
 		seedMemory({
 			id: "stale-cand",

@@ -1,26 +1,22 @@
-/**
- * Policy-gated repair actions for the memory pipeline.
- *
- * Each action checks the policy gate and rate limiter before running.
- * Operators bypass the autonomousEnabled check; agents do not.
- * All actions respect autonomousFrozen regardless of actor type.
- */
-
 import {
 	memoriesFtsNeedsTokenizerRepair,
 	readMemoriesFtsIndexRowCount,
 	readMemoriesFtsSql,
 	recreateMemoriesFts,
+	activeVectorProjectionTable,
 } from "@signet/core";
 import { normalizeAndHashContent } from "./content-normalization";
 import type { IntegrityCheckStatus } from "./database-integrity";
-import type { DbAccessor, ReadDb, WriteDb } from "./db-accessor";
+import type { DbAccessor, ReadDb, SyncDbCallSiteToken, WriteDb } from "./db-accessor";
 import { toFtsSchemaQueryDb } from "./db-accessor";
-import { getDbOwnerMaintenance, type DbOwnerMaintenance } from "./db-owner-maintenance";
+import {
+	isDbOwnerMaintenanceClosing,
+	type DbOwnerMaintenance,
+	withRegisteredDbOwnerMaintenance,
+} from "./db-owner-maintenance";
 import {
 	countChanges,
 	readLiveVecDimensions,
-	syncVecDeleteByEmbeddingIds,
 	syncVecDeleteBySourceExceptHash,
 	syncVecInsert,
 	tableExists,
@@ -41,16 +37,30 @@ import {
 	readEmbeddingIndexState,
 	resolveActiveEmbeddingConfig,
 } from "./embedding-index-state";
-import { type EmbeddingRepairState, readEmbeddingRepairState } from "./embedding-repair-state";
+import { embeddingProfileFingerprint } from "./embedding-profile";
+import {
+	acquireEmbeddingRepairLease,
+	finishEmbeddingRepairLease,
+	isEmbeddingRepairLeaseActive,
+	loadEmbeddingRepairFailures,
+	type EmbeddingRepairCheckpoint,
+	type EmbeddingRepairKey,
+	type EmbeddingRepairLease,
+	type EmbeddingRepairState,
+	ensureEmbeddingRepairCheckpoint,
+	readEmbeddingRepairCheckpoint,
+	readEmbeddingRepairState,
+	updateEmbeddingRepairCheckpoint,
+} from "./embedding-repair-state";
 import { classifyEntityQuality } from "./entity-quality";
 import { logger } from "./logger";
+import { reconcileOntologyContradictionsInTx } from "./ontology-contradictions";
 import type { EmbeddingConfig, PipelineV2Config } from "./memory-config";
 import { recoverStaleLeases } from "./pipeline/stale-leases";
+import { isSystemPressureHigh } from "./system-pressure";
 import { insertHistoryEvent } from "./transactions";
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+import { runVectorRepair, type VectorRepairOptions, type VectorRepairResult } from "./vector-repair";
+import { yieldEvery } from "./async-yield";
 
 export interface RepairContext {
 	readonly reason: string;
@@ -64,14 +74,10 @@ export interface RepairResult {
 	readonly success: boolean;
 	readonly affected: number;
 	readonly message: string;
-	/** Present on dry-run previews; ids the action *would* touch (capped). */
 	readonly preview?: readonly string[];
-	/** Count of rows that matched the filter (capped for log size). */
 	readonly totalMatching?: number;
 	readonly details?: Readonly<Record<string, unknown>>;
 }
-
-/** Filters accepted by `requeueDeadJobs` / `cancelObsoleteJobs` / `pruneTerminalJobs`. */
 export interface JobFilterOptions {
 	readonly dryRun?: boolean;
 	readonly ids?: readonly string[];
@@ -86,10 +92,6 @@ export interface RepairGateCheck {
 	readonly allowed: boolean;
 	readonly reason?: string;
 }
-
-// ---------------------------------------------------------------------------
-// Rate limiter
-// ---------------------------------------------------------------------------
 
 interface RateLimiterEntry {
 	lastRunAt: number;
@@ -119,8 +121,6 @@ export function createRateLimiter(): RateLimiter {
 					reason: `cooldown active, ${remainingMs}ms remaining`,
 				};
 			}
-
-			// Reset hourly counter if the window has passed
 			const effectiveCount = now >= entry.hourResetAt ? 0 : entry.hourlyCount;
 			if (effectiveCount >= hourlyBudget) {
 				return {
@@ -144,8 +144,6 @@ export function createRateLimiter(): RateLimiter {
 				});
 				return;
 			}
-
-			// Reset hourly count if the window has passed
 			if (now >= entry.hourResetAt) {
 				entry.hourlyCount = 1;
 				entry.hourResetAt = now + 60 * 60 * 1000;
@@ -156,10 +154,6 @@ export function createRateLimiter(): RateLimiter {
 		},
 	};
 }
-
-// ---------------------------------------------------------------------------
-// Policy gate
-// ---------------------------------------------------------------------------
 
 export function checkRepairGate(
 	cfg: PipelineV2Config,
@@ -172,26 +166,18 @@ export function checkRepairGate(
 	if (cfg.autonomous.frozen) {
 		return { allowed: false, reason: "autonomous.frozen is set" };
 	}
-
-	// Agents require autonomous.enabled; operators and daemon bypass this check
 	if (ctx.actorType === "agent" && !cfg.autonomous.enabled) {
 		return {
 			allowed: false,
 			reason: "autonomous.enabled is false; agents cannot trigger repairs",
 		};
 	}
-
-	// Operators and daemon bypass rate limiting — only agents are throttled
 	if (ctx.actorType === "operator" || ctx.actorType === "daemon") {
 		return { allowed: true };
 	}
 
 	return limiter.check(action, cooldownMs, hourlyBudget);
 }
-
-// ---------------------------------------------------------------------------
-// Audit helper
-// ---------------------------------------------------------------------------
 
 function writeRepairAudit(db: WriteDb, action: string, ctx: RepairContext, affected: number, message: string): void {
 	insertHistoryEvent(db, {
@@ -208,37 +194,28 @@ function writeRepairAudit(db: WriteDb, action: string, ctx: RepairContext, affec
 	});
 }
 
-// ---------------------------------------------------------------------------
-// Repair actions
-// ---------------------------------------------------------------------------
-
 const DEFAULT_REQUEUE_BATCH = 50;
-// FTS rebuilds are heavyweight; cap their hourly budget at 5
 const FTS_HOURLY_BUDGET = 5;
 
-async function withRepairWriteTx<T>(accessor: DbAccessor, fn: (db: WriteDb) => T): Promise<T> {
+async function withRepairWriteTx<T>(
+	accessor: DbAccessor,
+	fn: (db: WriteDb) => T,
+	operationId: SyncDbCallSiteToken,
+	signal?: AbortSignal,
+): Promise<T> {
 	if (accessor.withWriteTxAsync) {
-		return accessor.withWriteTxAsync(fn, { siteToken: "db:repair.write.tx" });
+		// DYNAMIC_SITE_TOKEN
+		return accessor.withWriteTxAsync(fn, { siteToken: operationId, operation: operationId, signal });
 	}
 	throw new Error("async write API is unavailable");
 }
-
-// Hold an autonomous rebuild until the same mismatch is observed on a second
-// check, so a transient spike from in-flight artifact writes cannot trigger a
-// rebuild on every maintenance cycle (#1142).
 let ftsMismatchPendingRebuild = false;
 let ftsRebuildInFlight = false;
-
-/** Reset the FTS rebuild confirmation state (for tests). */
 export function resetFtsRebuildConfirmation(): void {
 	ftsMismatchPendingRebuild = false;
 	ftsRebuildInFlight = false;
 }
-
-// ---- Issue #901 shared constants ----
-/** Capped number of ids returned in dry-run previews. */
 const PREVIEW_CAP = 100;
-/** Hard cap on rows touched by a single apply/cancel/prune call. */
 const MAX_BATCH_HARD_CAP = 1000;
 const RETIRED_SUMMARY_REPAIR_MESSAGE =
 	"summary worker retired; session transcripts are completed at session end and delivered directly to Dreaming";
@@ -250,26 +227,6 @@ function rejectRetiredSummaryRepair(
 	if (!options.tables?.includes("summary")) return null;
 	return { action, success: false, affected: 0, message: RETIRED_SUMMARY_REPAIR_MESSAGE };
 }
-
-/**
- * Reset dead jobs to pending so the worker will retry them.
- *
- * Issue #901 — accepts an `options` parameter for selective requeue:
- * `dryRun` returns a preview without mutating data; `ids` targets a
- * specific set; `olderThanMs` and `errorPattern` narrow further. All
- * options compose, default behavior is preserved when `options` is
- * omitted (existing callers stay correct).
- */
-
-/**
- * Allocate the bounded requeue budget across selected queues so a default
- * both-queue repair makes progress in every non-empty queue (issue #1052).
- *
- * Each selected non-empty queue receives one reserved slot; the remaining
- * capacity is split, and capacity a queue cannot use (fewer matches than its
- * share) is refilled from the other queue. Single-table selections keep the
- * full cap.
- */
 export async function requeueDeadJobs(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
@@ -290,30 +247,36 @@ export async function requeueDeadJobs(
 		return { action, success: false, affected: 0, message: gate.reason ?? "denied by policy gate" };
 	}
 
-	const result = await withRepairWriteTx(accessor, (db) => {
-		const wantsMemory = !options.tables || options.tables.includes("memory");
-		const selected = wantsMemory
-			? buildDeadRequeueSql(db, "memory_jobs", maxBatch, options)
-			: { sql: "", params: [], ids: [], totalMatching: 0 };
-		const ids = selected.ids;
-		if (dryRun) {
-			return {
-				affected: 0,
-				preview: ids.map((row) => row.id).slice(0, PREVIEW_CAP),
-				totalMatching: selected.totalMatching,
-			};
-		}
-		if (ids.length === 0)
-			return { affected: 0, preview: [] as readonly string[], totalMatching: selected.totalMatching };
-		const placeholders = ids.map(() => "?").join(", ");
-		const now = new Date().toISOString();
-		const changed = db
-			.prepare(`UPDATE memory_jobs SET status = 'pending', attempts = 0, updated_at = ? WHERE id IN (${placeholders})`)
-			.run(now, ...ids.map((row) => row.id));
-		const affected = countChanges(changed);
-		writeRepairAudit(db, action, ctx, affected, `requeued ${affected} dead memory job(s) to pending`);
-		return { affected, preview: [] as readonly string[], totalMatching: selected.totalMatching };
-	});
+	const result = await withRepairWriteTx(
+		accessor,
+		(db) => {
+			const wantsMemory = !options.tables || options.tables.includes("memory");
+			const selected = wantsMemory
+				? buildDeadRequeueSql(db, "memory_jobs", maxBatch, options)
+				: { sql: "", params: [], ids: [], totalMatching: 0 };
+			const ids = selected.ids;
+			if (dryRun) {
+				return {
+					affected: 0,
+					preview: ids.map((row) => row.id).slice(0, PREVIEW_CAP),
+					totalMatching: selected.totalMatching,
+				};
+			}
+			if (ids.length === 0)
+				return { affected: 0, preview: [] as readonly string[], totalMatching: selected.totalMatching };
+			const placeholders = ids.map(() => "?").join(", ");
+			const now = new Date().toISOString();
+			const changed = db
+				.prepare(
+					`UPDATE memory_jobs SET status = 'pending', attempts = 0, updated_at = ? WHERE id IN (${placeholders})`,
+				)
+				.run(now, ...ids.map((row) => row.id));
+			const affected = countChanges(changed);
+			writeRepairAudit(db, action, ctx, affected, `requeued ${affected} dead memory job(s) to pending`);
+			return { affected, preview: [] as readonly string[], totalMatching: selected.totalMatching };
+		},
+		"db:repair.requeue-dead.write",
+	);
 
 	if (!dryRun) limiter.record(action);
 	logger.info("pipeline", "repair: requeued dead memory jobs", {
@@ -356,19 +319,23 @@ export async function releaseStaleLeases(
 
 	const cutoff = new Date(Date.now() - cfg.worker.leaseTimeoutMs).toISOString();
 
-	const result = await withRepairWriteTx(accessor, (db) => {
-		const now = new Date().toISOString();
-		const recovered = recoverStaleLeases(db, { cutoff, now });
-		const msg =
-			recovered.dead > 0
-				? `released ${recovered.pending} stale lease(s) back to pending and dead-lettered ${recovered.dead} exhausted job(s)`
-				: `released ${recovered.pending} stale lease(s) back to pending`;
-		writeRepairAudit(db, action, ctx, recovered.total, msg);
-		return {
-			msg,
-			recovered,
-		};
-	});
+	const result = await withRepairWriteTx(
+		accessor,
+		(db) => {
+			const now = new Date().toISOString();
+			const recovered = recoverStaleLeases(db, { cutoff, now });
+			const msg =
+				recovered.dead > 0
+					? `released ${recovered.pending} stale lease(s) back to pending and dead-lettered ${recovered.dead} exhausted job(s)`
+					: `released ${recovered.pending} stale lease(s) back to pending`;
+			writeRepairAudit(db, action, ctx, recovered.total, msg);
+			return {
+				msg,
+				recovered,
+			};
+		},
+		"db:repair.release-leases.write",
+	);
 
 	limiter.record(action);
 	logger.info("pipeline", "repair: released stale leases", {
@@ -387,20 +354,30 @@ export async function releaseStaleLeases(
 		message: result.msg,
 	};
 }
-
-/**
- * Check FTS row count and tokenizer definition, optionally rebuilding.
- * Uses a longer cooldown since FTS recreation is expensive.
- */
 export async function checkFtsConsistency(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
 	ctx: RepairContext,
 	limiter: RateLimiter,
 	repair = false,
-	ownerMaintenance: DbOwnerMaintenance | null = getDbOwnerMaintenance(),
+	ownerMaintenance?: DbOwnerMaintenance | null,
 ): Promise<RepairResult> {
 	const action = "checkFtsConsistency";
+	if (ownerMaintenance === undefined) {
+		const registeredResult = await withRegisteredDbOwnerMaintenance((maintenance) =>
+			checkFtsConsistency(accessor, cfg, ctx, limiter, repair, maintenance),
+		);
+		if (registeredResult !== undefined) return registeredResult;
+		if (isDbOwnerMaintenanceClosing()) {
+			return {
+				action,
+				success: false,
+				affected: 0,
+				message: "DB owner maintenance is closing",
+			};
+		}
+		return await checkFtsConsistency(accessor, cfg, ctx, limiter, repair, null);
+	}
 	const gate = checkRepairGate(cfg, ctx, limiter, action, cfg.repair.reembedCooldownMs, FTS_HOURLY_BUDGET);
 
 	if (!gate.allowed) {
@@ -415,16 +392,10 @@ export async function checkFtsConsistency(
 	const { memCount, ftsCount, ftsMissing, tokenizerDrift } = await accessor.withReadDbAsync(
 		async (db) => {
 			const memRow = db.prepare("SELECT COUNT(*) as n FROM memories").get() as { n: number };
-
-			// Guard against missing FTS index state (can happen on upgrades before
-			// self-heal). Count the physical docsize rows, not the external-content
-			// table, whose COUNT(*) resolves through memories and includes tombstones.
 			let ftsN: number | null = null;
 			try {
 				ftsN = readMemoriesFtsIndexRowCount(toFtsSchemaQueryDb(db));
-			} catch {
-				// Missing FTS shadow state.
-			}
+			} catch {}
 			const missing = ftsN === null;
 			const ftsSql = missing ? null : readMemoriesFtsSql(toFtsSchemaQueryDb(db));
 			return {
@@ -434,11 +405,8 @@ export async function checkFtsConsistency(
 				tokenizerDrift: memoriesFtsNeedsTokenizerRepair(ftsSql),
 			};
 		},
-		{ siteToken: "repair-actions.ts:415" },
+		{ siteToken: "db:repair.fts-consistency.read" },
 	);
-
-	// If FTS table is missing entirely, report it (startup self-heal
-	// via ensureFtsTable should have caught this, but handle gracefully)
 	if (ftsMissing) {
 		limiter.record(action);
 		const msg = repair
@@ -478,25 +446,28 @@ export async function checkFtsConsistency(
 							reason: ctx.reason,
 							actorType: ctx.actorType,
 							requestId: ctx.requestId,
-							message: "FTS recreated with unicode61 tokenizer",
+							message: "FTS recreated with the porter unicode61 tokenizer",
 						},
 					});
 				} else {
-					await withRepairWriteTx(accessor, (db) => {
-						recreateMemoriesFts(db);
-						writeRepairAudit(db, action, ctx, 1, "FTS recreated with unicode61 tokenizer");
-					});
+					await withRepairWriteTx(
+						accessor,
+						(db) => {
+							recreateMemoriesFts(db);
+							writeRepairAudit(db, action, ctx, 1, "FTS recreated with the porter unicode61 tokenizer");
+						},
+						"db:repair.fts.tokenizer-rebuild",
+					);
 				}
 			} finally {
 				ftsRebuildInFlight = false;
 			}
-			// The recreate is itself a full rebuild; any prior mismatch is moot.
 			ftsMismatchPendingRebuild = false;
 		}
 
 		limiter.record(action);
 		const message = repair
-			? "FTS tokenizer drift detected — recreated with unicode61 tokenizer"
+			? "FTS tokenizer drift detected — recreated with the porter unicode61 tokenizer"
 			: "FTS tokenizer drift detected — run with repair=true to recreate";
 		logger.warn("pipeline", "repair: FTS tokenizer drift", {
 			memCount,
@@ -511,17 +482,10 @@ export async function checkFtsConsistency(
 			message,
 		};
 	}
-
-	// The physical FTS index must contain one document for every canonical
-	// memory row, including tombstones. Async writer admission keeps a repair
-	// out of the request call stack while preserving the existing transaction.
 	const mismatch = memCount !== ftsCount;
 
 	let rebuilt = false;
 	if (mismatch && repair) {
-		// Operator-triggered repairs are explicit intent and rebuild at once;
-		// autonomous repair waits for a second observation so a transient
-		// mismatch cannot trigger a synchronous rebuild every cycle (#1142).
 		const confirmed = ctx.actorType === "operator" || ftsMismatchPendingRebuild;
 		if (confirmed) {
 			if (ftsRebuildInFlight) {
@@ -548,10 +512,14 @@ export async function checkFtsConsistency(
 						},
 					});
 				} else {
-					await withRepairWriteTx(accessor, (db) => {
-						db.prepare("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')").run();
-						writeRepairAudit(db, action, ctx, 1, `FTS rebuilt: ${memCount} canonical vs ${ftsCount} indexed rows`);
-					});
+					await withRepairWriteTx(
+						accessor,
+						(db) => {
+							db.prepare("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')").run();
+							writeRepairAudit(db, action, ctx, 1, `FTS rebuilt: ${memCount} canonical vs ${ftsCount} indexed rows`);
+						},
+						"db:repair.fts.rebuild",
+					);
 				}
 			} finally {
 				ftsRebuildInFlight = false;
@@ -593,10 +561,6 @@ export async function checkFtsConsistency(
 		message,
 	};
 }
-
-/**
- * Trigger a retention sweep immediately via the retention worker handle.
- */
 export async function triggerRetentionSweep(
 	cfg: PipelineV2Config,
 	ctx: RepairContext,
@@ -631,10 +595,6 @@ export async function triggerRetentionSweep(
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Embedding gap diagnostics
-// ---------------------------------------------------------------------------
-
 export interface EmbeddingGapStats {
 	readonly unembedded: number;
 	readonly total: number;
@@ -642,7 +602,6 @@ export interface EmbeddingGapStats {
 	readonly complete: boolean;
 	readonly coverage: string;
 	readonly staging: EmbeddingMigrationCoverage | null;
-	/** Durable autonomous-tracker admission and completion state. */
 	readonly repair: EmbeddingRepairState | null;
 }
 
@@ -682,21 +641,8 @@ function countOrphanedEmbeddings(db: ReadDb, agentId?: string): number {
 	return row?.n ?? 0;
 }
 
-function listOrphanedEmbeddingIds(db: WriteDb, limit: number, agentId?: string): Array<{ id: string }> {
-	const query = orphanedEmbeddingQuery(agentId);
-	return db
-		.prepare(
-			`SELECT e.id FROM embeddings e
-			 LEFT JOIN memories m ON e.source_type = 'memory' AND e.source_id = m.id
-			 ${query.join}
-			 WHERE ${query.where}
-			 LIMIT ?`,
-		)
-		.all(...query.args, limit) as Array<{ id: string }>;
-}
-
 export async function getEmbeddingGapStats(accessor: DbAccessor, agentId: string): Promise<EmbeddingGapStats> {
-	const repair = readEmbeddingRepairState(accessor);
+	const repair = await readEmbeddingRepairState(accessor, agentId);
 	return await accessor.withReadDbAsync(
 		async (db) => {
 			const totalRow = db
@@ -713,9 +659,6 @@ export async function getEmbeddingGapStats(accessor: DbAccessor, agentId: string
 					? stagingCoverage(db, state.staging.dimensions, state.staging.fingerprint)
 					: null;
 			const complete = unembedded === 0 && (staging === null || staging.ready);
-			// Floor to one decimal so a near-complete store never rounds up to
-			// 100% while embeddings are still missing (issue #906). When the
-			// store is complete the ratio is exactly 100%.
 			const pct = total > 0 ? (embedded / total) * 100 : 100;
 			const displayed = complete ? pct : Math.floor(pct * 10) / 10;
 
@@ -729,7 +672,7 @@ export async function getEmbeddingGapStats(accessor: DbAccessor, agentId: string
 				repair,
 			};
 		},
-		{ siteToken: "repair-actions.ts:700" },
+		{ siteToken: "db:repair.embedding-gap.read" },
 	);
 }
 
@@ -741,19 +684,41 @@ export async function getEmbeddingRepairStats(
 	const gap = await getEmbeddingGapStats(accessor, agentId);
 	const migration = await accessor.withReadDbAsync(
 		async (db) => countEmbeddingMigrationRows(db, embeddingCfg.model, embeddingCfg.dimensions, false, agentId),
-		{ siteToken: "repair-actions.ts:742" },
+		{ siteToken: "db:repair.embedding-migration.read" },
 	);
 	const orphaned = await accessor.withReadDbAsync(async (db) => countOrphanedEmbeddings(db, agentId), {
-		siteToken: "repair-actions.ts:746",
+		siteToken: "db:repair.orphaned-embeddings.read",
 	});
 	return { gap, migration, orphaned };
 }
 
-// ---------------------------------------------------------------------------
-// Re-embed missing memories
-// ---------------------------------------------------------------------------
+const MAX_REEMBED_BATCH = 20;
+const DEFAULT_REEMBED_BATCH = MAX_REEMBED_BATCH;
+const DEFAULT_REEMBED_BYTES = 4 * 1024 * 1024;
+const MAX_REEMBED_BYTES = 16 * 1024 * 1024;
+const DEFAULT_REEMBED_RUN_BUDGET_MS = 30_000;
+const MAX_REEMBED_RUN_BUDGET_MS = 120_000;
 
-const DEFAULT_REEMBED_BATCH = 50;
+export interface ReembedOptions {
+	readonly maxVectorBytes?: number;
+	readonly runBudgetMs?: number;
+	readonly signal?: AbortSignal;
+}
+
+interface ReembedEmbeddingOptions {
+	readonly signal?: AbortSignal;
+}
+
+type ReembedEmbeddingFunction = (
+	content: string,
+	cfg: EmbeddingConfig,
+	options?: ReembedEmbeddingOptions,
+) => Promise<number[] | null>;
+
+function normalizeBoundedRepairOption(value: number | undefined, fallback: number, maximum: number): number {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) return fallback;
+	return Math.min(maximum, Math.floor(value));
+}
 
 function normalizeRepairAgentId(agentId: string | null | undefined): string {
 	const trimmed = agentId?.trim();
@@ -767,34 +732,43 @@ interface ReembedBatchOutcome {
 	readonly stale: number;
 	readonly crossAgentHashConflicts: number;
 	readonly profileChanged: boolean;
+	readonly leaseLost: boolean;
+	readonly cancelled: boolean;
+	readonly timedOut: boolean;
+	readonly byteLimitReached: boolean;
+	readonly successful: readonly EmbeddingRepairKey[];
+	readonly failedKeys: readonly EmbeddingRepairKey[];
 }
 
-let reembedInProgress = false;
-
-type MissingMemorySelector = (db: ReadDb, limit: number) => ReadonlyArray<UnembeddedRow>;
+type MissingMemorySelector = (db: ReadDb, limit: number, model?: string, now?: string) => ReadonlyArray<UnembeddedRow>;
 
 async function reembedMissingMemoriesBatch(
 	accessor: DbAccessor,
-	embeddingFn: (content: string, cfg: EmbeddingConfig) => Promise<number[] | null>,
+	embeddingFn: ReembedEmbeddingFunction,
 	embeddingCfg: EmbeddingConfig,
 	batchSize: number,
 	agentId: string,
+	repairLease?: EmbeddingRepairLease,
+	options?: ReembedOptions,
 ): Promise<ReembedBatchOutcome> {
 	return reembedMissingMemoriesBatchWithSelector(
 		accessor,
 		embeddingFn,
 		embeddingCfg,
 		batchSize,
-		(db, limit) => listUnembeddedMemories(db, limit, agentId),
+		(db, limit, model, now) => listUnembeddedMemories(db, limit, agentId, model, now),
 		agentId,
+		repairLease,
+		options,
 	);
 }
 
 async function reembedAllMissingMemoriesBatch(
 	accessor: DbAccessor,
-	embeddingFn: (content: string, cfg: EmbeddingConfig) => Promise<number[] | null>,
+	embeddingFn: ReembedEmbeddingFunction,
 	embeddingCfg: EmbeddingConfig,
 	batchSize: number,
+	options?: ReembedOptions,
 ): Promise<ReembedBatchOutcome> {
 	return reembedMissingMemoriesBatchWithSelector(
 		accessor,
@@ -802,29 +776,48 @@ async function reembedAllMissingMemoriesBatch(
 		embeddingCfg,
 		batchSize,
 		listAllUnembeddedMemories,
+		undefined,
+		undefined,
+		options,
 	);
 }
 
 async function reembedMissingMemoriesBatchWithSelector(
 	accessor: DbAccessor,
-	embeddingFn: (content: string, cfg: EmbeddingConfig) => Promise<number[] | null>,
+	embeddingFn: ReembedEmbeddingFunction,
 	embeddingCfg: EmbeddingConfig,
 	batchSize: number,
 	select: MissingMemorySelector,
 	agentId?: string,
+	repairLease?: EmbeddingRepairLease,
+	options?: ReembedOptions,
 ): Promise<ReembedBatchOutcome> {
-	const unembedded = await accessor.withReadDbAsync(async (db) => select(db, batchSize), {
-		siteToken: "db:repair.missing-memory-selection.read",
-	});
-	return reembedMissingMemoriesBatchForRows(accessor, embeddingFn, embeddingCfg, unembedded, agentId);
+	const selectedAt = new Date().toISOString();
+	const unembedded = await accessor.withReadDbAsync(
+		async (db) => select(db, batchSize, embeddingCfg.model, selectedAt),
+		{
+			siteToken: "db:repair.missing-memory-selection.read",
+		},
+	);
+	return reembedMissingMemoriesBatchForRows(
+		accessor,
+		embeddingFn,
+		embeddingCfg,
+		unembedded,
+		agentId,
+		repairLease,
+		options,
+	);
 }
 
 async function reembedMissingMemoriesBatchForRows(
 	accessor: DbAccessor,
-	embeddingFn: (content: string, cfg: EmbeddingConfig) => Promise<number[] | null>,
+	embeddingFn: ReembedEmbeddingFunction,
 	embeddingCfg: EmbeddingConfig,
 	unembedded: ReadonlyArray<UnembeddedRow>,
 	agentId?: string,
+	repairLease?: EmbeddingRepairLease,
+	options: ReembedOptions = {},
 ): Promise<ReembedBatchOutcome> {
 	if (unembedded.length === 0) {
 		return {
@@ -834,23 +827,88 @@ async function reembedMissingMemoriesBatchForRows(
 			stale: 0,
 			crossAgentHashConflicts: 0,
 			profileChanged: false,
+			leaseLost: false,
+			cancelled: false,
+			timedOut: false,
+			byteLimitReached: false,
+			successful: [],
+			failedKeys: [],
 		};
 	}
 
-	const repairable = unembedded.filter((memory) => memory.knownCrossAgentHashConflict !== 1);
-	const knownCrossAgentHashConflicts = unembedded.length - repairable.length;
+	const failureKey = (memory: UnembeddedRow): EmbeddingRepairKey => ({
+		id: memory.id,
+		contentHash: memory.contentHash ?? normalizeAndHashContent(memory.content).contentHash,
+	});
+	const persistedFailures = await loadEmbeddingRepairFailures(accessor, unembedded.map(failureKey), embeddingCfg.model);
+	const now = Date.now();
+	const repairable = unembedded.filter((memory) => {
+		if (memory.knownCrossAgentHashConflict === 1) return false;
+		const key = failureKey(memory);
+		const failure = persistedFailures.get(`${key.id}:${key.contentHash}:${embeddingCfg.model}`);
+		return failure === undefined || failure.retryAt <= now;
+	});
+	const knownCrossAgentHashConflicts = unembedded.filter((memory) => memory.knownCrossAgentHashConflict === 1).length;
+	const selectedEligible = repairable.length + knownCrossAgentHashConflicts;
+	const failedKeys: EmbeddingRepairKey[] = [];
 	const results: Array<{
 		memory: UnembeddedRow;
 		vector: readonly number[];
 	}> = [];
+	const maxBytes = normalizeBoundedRepairOption(options.maxVectorBytes, DEFAULT_REEMBED_BYTES, MAX_REEMBED_BYTES);
+	const runBudgetMs = normalizeBoundedRepairOption(
+		options.runBudgetMs,
+		DEFAULT_REEMBED_RUN_BUDGET_MS,
+		MAX_REEMBED_RUN_BUDGET_MS,
+	);
+	const startedAt = Date.now();
+	let bytesUsed = 0;
+	let cancelled = options.signal?.aborted === true;
+	let timedOut = false;
+	let byteLimitReached = false;
 
 	for (const mem of repairable) {
+		if (cancelled) break;
+		if (Date.now() - startedAt >= runBudgetMs) {
+			timedOut = true;
+			break;
+		}
+		const contentBytes = new TextEncoder().encode(mem.content).byteLength;
+		if (bytesUsed + contentBytes >= maxBytes) {
+			byteLimitReached = true;
+			break;
+		}
 		try {
-			const vec = await embeddingFn(mem.content, embeddingCfg);
+			const vec = await embeddingFn(
+				mem.content,
+				embeddingCfg,
+				options.signal === undefined ? undefined : { signal: options.signal },
+			);
+			if (options.signal?.aborted === true) {
+				cancelled = true;
+				break;
+			}
+			if (Date.now() - startedAt >= runBudgetMs) {
+				timedOut = true;
+				break;
+			}
 			if (vec) {
+				const vectorBytes = vec.length * Float32Array.BYTES_PER_ELEMENT;
+				if (bytesUsed + contentBytes + vectorBytes > maxBytes) {
+					byteLimitReached = true;
+					break;
+				}
+				bytesUsed += contentBytes + vectorBytes;
 				results.push({ memory: mem, vector: vec });
+			} else {
+				failedKeys.push(failureKey(mem));
 			}
 		} catch (err) {
+			if (options.signal?.aborted === true) {
+				cancelled = true;
+				break;
+			}
+			failedKeys.push(failureKey(mem));
 			logger.warn("pipeline", "re-embed: embedding failed", {
 				memoryId: mem.id,
 				error: (err as Error).message,
@@ -858,103 +916,122 @@ async function reembedMissingMemoriesBatchForRows(
 		}
 	}
 
-	if (results.length === 0) {
+	if (cancelled || timedOut) {
 		return {
-			selected: unembedded.length,
+			selected: selectedEligible,
 			written: 0,
-			failed: repairable.length,
+			failed: 0,
 			stale: 0,
 			crossAgentHashConflicts: knownCrossAgentHashConflicts,
 			profileChanged: false,
+			leaseLost: false,
+			cancelled,
+			timedOut,
+			byteLimitReached: false,
+			successful: [],
+			failedKeys: [],
 		};
 	}
 
-	const writeOutcome = await withRepairWriteTx(accessor, (db) => {
-		// Provider work happens outside the transaction. Promotion can therefore
-		// change the active vector space while this batch is being encoded.
-		// Never commit vectors from the superseded profile.
-		if (!isActiveEmbeddingConfig(db, embeddingCfg)) {
-			return { count: 0, stale: 0, crossAgentHashConflicts: 0, profileChanged: true };
-		}
-		const now = new Date().toISOString();
-		let count = 0;
-		let stale = 0;
-		let crossAgentHashConflicts = 0;
-		// Hoisted outside loop (pattern: db.prepare inside a loop is flagged)
-		const readCurrentMemory = db.prepare(
-			"SELECT content, content_hash, agent_id FROM memories WHERE id = ? AND is_deleted = 0",
-		);
-		const writeHash = db.prepare("UPDATE memories SET content_hash = ? WHERE id = ? AND content_hash IS NULL");
-		// Guard against unique constraint violation: idx_memories_content_hash_unique
-		// is a partial unique index on (content_hash) WHERE content_hash IS NOT NULL AND is_deleted = 0.
-		// If another non-deleted memory already owns the same hash, writing it back would throw
-		// and abort the entire batch. Skip the write-back in that case -- the dedup worker
-		// will soft-delete the duplicate in a later pass.
-		const checkHash = db.prepare(
-			"SELECT id FROM memories WHERE content_hash = ? AND is_deleted = 0 AND id <> ? LIMIT 1",
-		);
-		const readEmbeddingByHash = db.prepare("SELECT id, agent_id FROM embeddings WHERE content_hash = ? LIMIT 1");
+	if (results.length === 0) {
+		return {
+			selected: selectedEligible,
+			written: 0,
+			failed: failedKeys.length,
+			stale: 0,
+			crossAgentHashConflicts: knownCrossAgentHashConflicts,
+			profileChanged: false,
+			leaseLost: false,
+			cancelled: false,
+			timedOut: false,
+			byteLimitReached,
+			successful: [],
+			failedKeys,
+		};
+	}
 
-		for (const { memory, vector } of results) {
-			const current = readCurrentMemory.get(memory.id) as
-				| { content: string; content_hash: string | null; agent_id: string | null }
-				| null
-				| undefined;
-			if (current == null) {
-				stale++;
-				continue;
+	const writeOutcome = await withRepairWriteTx(
+		accessor,
+		(db) => {
+			if (repairLease !== undefined && !isEmbeddingRepairLeaseActive(db, repairLease)) {
+				return {
+					count: 0,
+					stale: 0,
+					crossAgentHashConflicts: 0,
+					profileChanged: false,
+					leaseLost: true,
+					successful: [],
+				};
 			}
-
-			// Provider work happened before this transaction. Re-read the memory
-			// so a concurrent content mutation cannot receive a vector for its old
-			// content or hash.
-			if (current.content !== memory.content || current.content_hash !== memory.contentHash) {
-				stale++;
-				continue;
+			if (!isActiveEmbeddingConfig(db, embeddingCfg)) {
+				return {
+					count: 0,
+					stale: 0,
+					crossAgentHashConflicts: 0,
+					profileChanged: true,
+					leaseLost: false,
+					successful: [],
+				};
 			}
-			if (normalizeRepairAgentId(current.agent_id) !== normalizeRepairAgentId(memory.agentId)) {
-				stale++;
-				continue;
-			}
+			const now = new Date().toISOString();
+			let count = 0;
+			let stale = 0;
+			let crossAgentHashConflicts = 0;
+			const successful: EmbeddingRepairKey[] = [];
+			const readCurrentMemory = db.prepare(
+				"SELECT content, content_hash, agent_id FROM memories WHERE id = ? AND is_deleted = 0",
+			);
+			const writeHash = db.prepare("UPDATE memories SET content_hash = ? WHERE id = ? AND content_hash IS NULL");
+			const checkHash = db.prepare(
+				"SELECT id FROM memories WHERE content_hash = ? AND is_deleted = 0 AND id <> ? LIMIT 1",
+			);
+			const readEmbeddingByHash = db.prepare("SELECT id, agent_id FROM embeddings WHERE content_hash = ? LIMIT 1");
 
-			const contentHash =
-				typeof current.content_hash === "string" && current.content_hash.trim().length > 0
-					? current.content_hash
-					: normalizeAndHashContent(current.content).contentHash;
-			const memoryAgentId = normalizeRepairAgentId(current.agent_id ?? agentId);
-
-			// Write computed hash back to the memories row when it was NULL.
-			// Without this, the embedding-coverage queries can never use the
-			// content_hash match branch for these rows, so they keep showing up
-			// as unembedded and the backfill cycles indefinitely.
-			if (current.content_hash == null) {
-				const collision = checkHash.get(contentHash, memory.id) as { id: string } | undefined;
-				if (!collision) writeHash.run(contentHash, memory.id);
-			}
-
-			// content_hash is globally unique in the embeddings table, while the
-			// repair selection is agent-scoped. A hash peer owned by another agent
-			// must never be updated by this repair, or its vector and source fields
-			// become cross-agent data corruption.
-			const existing = readEmbeddingByHash.get(contentHash) as { id: string; agent_id: string | null } | undefined;
-			if (existing) {
-				const existingAgentId = normalizeRepairAgentId(existing.agent_id);
-				if (existingAgentId !== memoryAgentId) {
-					crossAgentHashConflicts++;
+			for (const { memory, vector } of results) {
+				const current = readCurrentMemory.get(memory.id) as
+					| { content: string; content_hash: string | null; agent_id: string | null }
+					| null
+					| undefined;
+				if (current == null) {
+					stale++;
 					continue;
 				}
-			}
+				if (current.content !== memory.content || current.content_hash !== memory.contentHash) {
+					stale++;
+					continue;
+				}
+				if (normalizeRepairAgentId(current.agent_id) !== normalizeRepairAgentId(memory.agentId)) {
+					stale++;
+					continue;
+				}
 
-			const embId = crypto.randomUUID();
-			const blob = vectorToBlob(vector);
-			syncVecDeleteBySourceExceptHash(db, "memory", memory.id, contentHash);
-			db.prepare(
-				`DELETE FROM embeddings
+				const contentHash =
+					typeof current.content_hash === "string" && current.content_hash.trim().length > 0
+						? current.content_hash
+						: normalizeAndHashContent(current.content).contentHash;
+				const memoryAgentId = normalizeRepairAgentId(current.agent_id ?? agentId);
+				if (current.content_hash == null) {
+					const collision = checkHash.get(contentHash, memory.id) as { id: string } | undefined;
+					if (!collision) writeHash.run(contentHash, memory.id);
+				}
+				const existing = readEmbeddingByHash.get(contentHash) as { id: string; agent_id: string | null } | undefined;
+				if (existing) {
+					const existingAgentId = normalizeRepairAgentId(existing.agent_id);
+					if (existingAgentId !== memoryAgentId) {
+						crossAgentHashConflicts++;
+						continue;
+					}
+				}
+
+				const embId = crypto.randomUUID();
+				const blob = vectorToBlob(vector);
+				syncVecDeleteBySourceExceptHash(db, "memory", memory.id, contentHash);
+				db.prepare(
+					`DELETE FROM embeddings
 				 WHERE source_type = 'memory' AND source_id = ?
 				   AND content_hash <> ?`,
-			).run(memory.id, contentHash);
-			const result = db
-				.prepare(
+				).run(memory.id, contentHash);
+				db.prepare(
 					`INSERT INTO embeddings
 					 (id, content_hash, vector, dimensions, source_type,
 					  source_id, chunk_text, created_at, agent_id)
@@ -965,55 +1042,64 @@ async function reembedMissingMemoriesBatchForRows(
 					   source_type = excluded.source_type,
 					   chunk_text = excluded.chunk_text,
 					   created_at = excluded.created_at`,
-				)
-				.run(embId, contentHash, blob, vector.length, memory.id, memory.content, now, memoryAgentId);
-			// Resolve actual embedding ID (may differ from embId on conflict)
-			const actualRow = db.prepare("SELECT id FROM embeddings WHERE content_hash = ?").get(contentHash) as
-				| { id: string }
-				| undefined;
-			if (actualRow) {
-				syncVecInsert(db, actualRow.id, vector);
-				count++;
+				).run(embId, contentHash, blob, vector.length, memory.id, memory.content, now, memoryAgentId);
+				const actualRow = db.prepare("SELECT id FROM embeddings WHERE content_hash = ?").get(contentHash) as
+					| { id: string }
+					| undefined;
+				if (actualRow) {
+					syncVecInsert(db, actualRow.id, vector);
+					count++;
+					successful.push({ id: memory.id, contentHash });
+				}
 			}
-		}
 
-		return { count, stale, crossAgentHashConflicts, profileChanged: false };
-	});
+			return { count, stale, crossAgentHashConflicts, profileChanged: false, leaseLost: false, successful };
+		},
+		"db:repair.reembed-missing.write",
+	);
 
 	return {
-		selected: unembedded.length,
+		selected: selectedEligible,
 		written: writeOutcome.count,
-		failed: repairable.length - results.length,
+		failed: failedKeys.length,
 		stale: writeOutcome.stale,
 		crossAgentHashConflicts: knownCrossAgentHashConflicts + writeOutcome.crossAgentHashConflicts,
 		profileChanged: writeOutcome.profileChanged,
+		leaseLost: writeOutcome.leaseLost,
+		cancelled: false,
+		timedOut: false,
+		byteLimitReached,
+		successful: writeOutcome.successful,
+		failedKeys,
 	};
 }
-
-/**
- * Backfill embeddings for memories that have no vector.
- *
- * Embedding fetches are async network calls so this function is async
- * and carefully avoids calling the provider inside a write transaction.
- */
 export async function reembedMissingMemories(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
 	ctx: RepairContext,
 	limiter: RateLimiter,
-	embeddingFn: (content: string, cfg: EmbeddingConfig) => Promise<number[] | null>,
+	embeddingFn: ReembedEmbeddingFunction,
 	embeddingCfg: EmbeddingConfig,
 	agentId: string,
 	batchSize: number = DEFAULT_REEMBED_BATCH,
 	dryRun = false,
 	runToCompletion = false,
-	cooldownMsOverride?: number,
+	operationId?: string,
+	existingLease?: EmbeddingRepairLease,
+	options?: ReembedOptions,
 ): Promise<RepairResult> {
 	const action = "reembedMissingMemories";
-	const effectiveCooldownMs =
-		typeof cooldownMsOverride === "number" && Number.isFinite(cooldownMsOverride)
-			? Math.max(0, Math.floor(cooldownMsOverride))
-			: cfg.repair.reembedCooldownMs;
+	const normalizedAgentId = normalizeRepairAgentId(agentId);
+	if (!Number.isFinite(batchSize) || batchSize <= 0 || !Number.isInteger(batchSize)) {
+		return {
+			action,
+			success: false,
+			affected: 0,
+			message: "batchSize must be a positive integer",
+			details: { invalidInput: true },
+		};
+	}
+	const effectiveCooldownMs = cfg.repair.reembedCooldownMs;
 	const gate = checkRepairGate(cfg, ctx, limiter, action, effectiveCooldownMs, cfg.repair.reembedHourlyBudget);
 
 	if (!gate.allowed) {
@@ -1026,34 +1112,17 @@ export async function reembedMissingMemories(
 	}
 
 	const normalizedBatchSize =
-		Number.isFinite(batchSize) && batchSize > 0 ? Math.max(1, Math.floor(batchSize)) : DEFAULT_REEMBED_BATCH;
-
-	// `embeddingCfg` is the raw configured value (e.g. from agent.yaml), which
-	// carries no `profile`. The durable active generation may have been
-	// promoted with a named profile (e.g. by a prior --model-mismatch
-	// migration), so its persisted fingerprint includes that profile id.
-	// Comparing the raw config's identity fingerprint against that persisted
-	// fingerprint in isActiveEmbeddingConfig always mismatches — not a race,
-	// a permanent false positive that fails every batch with "embedding
-	// profile changed during provider work" (issue: reembed never resolves
-	// the active profile before writing). Resolve once, matching the same
-	// profile the durable index actually owns, before doing any work.
+		Number.isFinite(batchSize) && batchSize > 0
+			? Math.min(MAX_REEMBED_BATCH, Math.max(1, Math.floor(batchSize)))
+			: DEFAULT_REEMBED_BATCH;
 	const resolvedEmbeddingCfg = await accessor.withReadDbAsync(
 		async (db) => resolveActiveEmbeddingConfig(db, embeddingCfg),
 		{ siteToken: "db:repair.active-embedding-config.read" },
 	);
-
-	const initialStats = await getEmbeddingGapStats(accessor, agentId);
-	if (initialStats.unembedded === 0) {
-		return {
-			action,
-			success: true,
-			affected: 0,
-			message: "no unembedded memories found",
-		};
-	}
+	const resolvedProfileFingerprint = embeddingProfileFingerprint(resolvedEmbeddingCfg);
 
 	if (dryRun) {
+		const initialStats = await getEmbeddingGapStats(accessor, normalizedAgentId);
 		return {
 			action,
 			success: true,
@@ -1062,129 +1131,297 @@ export async function reembedMissingMemories(
 		};
 	}
 
-	if (reembedInProgress) {
+	const checkpointId = runToCompletion ? (operationId ?? `embedding-repair-${crypto.randomUUID()}`) : undefined;
+	let checkpoint: EmbeddingRepairCheckpoint | null = null;
+	if (checkpointId !== undefined) {
+		checkpoint =
+			operationId === undefined
+				? await ensureEmbeddingRepairCheckpoint(
+						accessor,
+						checkpointId,
+						normalizedAgentId,
+						resolvedEmbeddingCfg.model,
+						resolvedProfileFingerprint,
+					)
+				: await readEmbeddingRepairCheckpoint(accessor, checkpointId);
+		if (checkpoint === null) {
+			return {
+				action,
+				success: false,
+				affected: 0,
+				message: `embedding repair operation ${checkpointId} was not found`,
+			};
+		}
+		if (checkpoint.agentId !== normalizedAgentId || checkpoint.model !== resolvedEmbeddingCfg.model) {
+			const mismatch = `embedding repair operation ${checkpointId} does not match the requested agent or model`;
+			await updateEmbeddingRepairCheckpoint(accessor, checkpointId, {
+				batches: 0,
+				status: "failed",
+				lastError: mismatch,
+			});
+			return {
+				action,
+				success: false,
+				affected: 0,
+				message: mismatch,
+			};
+		}
+		if (checkpoint.profileFingerprint === null) {
+			checkpoint = await updateEmbeddingRepairCheckpoint(accessor, checkpointId, {
+				batches: 0,
+				profileFingerprint: resolvedProfileFingerprint,
+			});
+		} else if (checkpoint.profileFingerprint !== resolvedProfileFingerprint) {
+			const mismatch = `embedding repair operation ${checkpointId} does not match the active embedding profile`;
+			await updateEmbeddingRepairCheckpoint(accessor, checkpointId, {
+				batches: 0,
+				status: "failed",
+				lastError: mismatch,
+			});
+			return {
+				action,
+				success: false,
+				affected: 0,
+				message: mismatch,
+			};
+		}
+		if (checkpoint.status === "complete") {
+			return {
+				action,
+				success: true,
+				affected: checkpoint.written,
+				message: `embedding repair operation ${checkpointId} is already complete`,
+				details: { operationId: checkpointId, status: checkpoint.status, remaining: 0, batches: checkpoint.batches },
+			};
+		}
+		if (checkpoint.status === "failed") {
+			return {
+				action,
+				success: false,
+				affected: checkpoint.written,
+				message: checkpoint.lastError ?? `embedding repair operation ${checkpointId} failed`,
+				details: { operationId: checkpointId, status: checkpoint.status, batches: checkpoint.batches },
+			};
+		}
+	}
+
+	const initialStats = await getEmbeddingGapStats(accessor, normalizedAgentId);
+	if (initialStats.unembedded === 0) {
+		if (checkpointId !== undefined) {
+			checkpoint = await updateEmbeddingRepairCheckpoint(accessor, checkpointId, { batches: 0, status: "complete" });
+		}
+		return {
+			action,
+			success: true,
+			affected: 0,
+			message: "no unembedded memories found",
+			...(checkpointId === undefined
+				? {}
+				: {
+						details: { operationId: checkpointId, status: "complete", remaining: 0, batches: checkpoint?.batches ?? 0 },
+					}),
+		};
+	}
+
+	const admission =
+		existingLease === undefined
+			? await acquireEmbeddingRepairLease(accessor, effectiveCooldownMs, cfg.repair.reembedHourlyBudget)
+			: { allowed: true, lease: existingLease };
+	if (!admission.allowed || admission.lease === undefined) {
 		return {
 			action,
 			success: false,
 			affected: 0,
-			message: "re-embed already in progress",
+			message: admission.reason ?? "embedding repair admission denied",
+			...(checkpointId === undefined ? {} : { details: { operationId: checkpointId, status: "running" } }),
 		};
 	}
 
-	reembedInProgress = true;
+	const lease = admission.lease;
+	let outcome: ReembedBatchOutcome | null = null;
+	let thrown: unknown = null;
 	try {
-		let attempted = 0;
-		let written = 0;
-		let failed = 0;
-		let stale = 0;
-		let crossAgentHashConflicts = 0;
-		let batches = 0;
-		let profileChanged = false;
+		outcome = await reembedMissingMemoriesBatch(
+			accessor,
+			embeddingFn,
+			resolvedEmbeddingCfg,
+			normalizedBatchSize,
+			normalizedAgentId,
+			lease,
+			options,
+		);
+	} catch (error) {
+		thrown = error;
+	}
 
-		while (true) {
-			const outcome = await reembedMissingMemoriesBatch(
-				accessor,
-				embeddingFn,
-				resolvedEmbeddingCfg,
-				normalizedBatchSize,
-				agentId,
-			);
+	let finishError: unknown = null;
+	try {
+		await finishEmbeddingRepairLease(accessor, lease, {
+			successful: outcome?.successful ?? [],
+			failed: outcome?.failedKeys ?? [],
+			affected: outcome?.written ?? 0,
+			agentId: normalizedAgentId,
+			model: resolvedEmbeddingCfg.model,
+			pollMs: cfg.embeddingTracker.pollMs,
+			eligibility: outcome?.profileChanged === true ? false : (db) => isActiveEmbeddingConfig(db, resolvedEmbeddingCfg),
+			...(thrown instanceof Error
+				? { error: thrown.message }
+				: outcome?.cancelled
+					? { error: "embedding repair cancelled" }
+					: outcome?.timedOut
+						? { error: "embedding repair batch time budget exceeded" }
+						: outcome?.byteLimitReached
+							? { error: "embedding repair batch byte budget reached" }
+							: {}),
+		});
+	} catch (error) {
+		finishError = error;
+	}
 
-			if (outcome.selected === 0) break;
-
-			attempted += outcome.selected;
-			written += outcome.written;
-			failed += outcome.failed;
-			stale += outcome.stale;
-			crossAgentHashConflicts += outcome.crossAgentHashConflicts;
-			batches++;
-			profileChanged ||= outcome.profileChanged;
-			if (outcome.profileChanged) break;
-
-			if (!runToCompletion) break;
-			if (outcome.selected < normalizedBatchSize) break;
-			if (outcome.written === 0) break;
+	if (thrown !== null || finishError !== null) {
+		if (checkpointId !== undefined) {
+			await updateEmbeddingRepairCheckpoint(accessor, checkpointId, {
+				status: "failed",
+				lastError:
+					thrown instanceof Error
+						? thrown.message
+						: finishError instanceof Error
+							? finishError.message
+							: String(thrown ?? finishError),
+			});
 		}
+		throw thrown ?? finishError;
+	}
 
-		if (attempted === 0) {
-			return {
-				action,
-				success: true,
-				affected: 0,
-				message: "no unembedded memories found",
-			};
-		}
-
-		if (profileChanged) {
-			return {
-				action,
-				success: false,
-				affected: written,
-				message: "embedding profile changed during provider work; skipped stale vectors",
-			};
-		}
-
-		if (written === 0) {
-			if (crossAgentHashConflicts > 0) {
-				return {
-					action,
-					success: false,
-					affected: 0,
-					message: `${crossAgentHashConflicts} selected memory(s) could not be persisted under the current global uniqueness constraint because their content hash is owned by another agent`,
-					details: { selected: attempted, failed, stale, crossAgentHashConflicts },
-				};
-			}
+	if (outcome === null || outcome.selected === 0) {
+		const remaining = (await getEmbeddingGapStats(accessor, normalizedAgentId)).unembedded;
+		if (remaining > 0) {
 			return {
 				action,
 				success: false,
 				affected: 0,
-				message:
-					stale > 0
-						? `re-embedded 0 of ${attempted} memories because ${stale} changed during provider work`
-						: `embedding provider returned no vectors for ${attempted} memories`,
+				message: "no eligible unembedded memories; persisted retry backoff is still active",
+				...(checkpointId === undefined ? {} : { details: { operationId: checkpointId, status: "running", remaining } }),
 			};
 		}
-
-		const remaining = (await getEmbeddingGapStats(accessor, agentId)).unembedded;
-		const scope = runToCompletion ? `across ${batches} batch(es)` : "in one batch";
-		const msg =
-			failed > 0
-				? `re-embedded ${written} of ${attempted} memories ${scope} (${failed} failed, ${remaining} still missing)`
-				: `re-embedded ${written} of ${attempted} memories ${scope} (${remaining} still missing)`;
-		const conflictMessage =
-			crossAgentHashConflicts > 0
-				? `${crossAgentHashConflicts} selected memory(s) could not be persisted because their content hash is owned by another agent under the current global uniqueness constraint`
-				: "";
-		const resultMessage = conflictMessage.length > 0 ? `${msg}; ${conflictMessage}` : msg;
-
-		await withRepairWriteTx(accessor, (db) => {
-			writeRepairAudit(db, action, ctx, written, resultMessage);
-		});
-
-		limiter.record(action);
-		logger.info("pipeline", "repair: re-embedded missing memories", {
-			affected: written,
-			attempted,
-			failed,
-			remaining,
-			batches,
-			runToCompletion,
-			actor: ctx.actor,
-			reason: ctx.reason,
-		});
-
+		if (checkpointId !== undefined) {
+			checkpoint = await updateEmbeddingRepairCheckpoint(accessor, checkpointId, { batches: 0, status: "complete" });
+		}
 		return {
 			action,
-			success: crossAgentHashConflicts === 0,
-			affected: written,
-			message: resultMessage,
-			...(crossAgentHashConflicts > 0
-				? { details: { selected: attempted, failed, stale, crossAgentHashConflicts } }
-				: {}),
+			success: true,
+			affected: 0,
+			message: "no unembedded memories found",
+			...(checkpointId === undefined
+				? {}
+				: {
+						details: { operationId: checkpointId, status: "complete", remaining: 0, batches: checkpoint?.batches ?? 0 },
+					}),
 		};
-	} finally {
-		reembedInProgress = false;
 	}
+
+	const attempted = outcome.selected;
+	const written = outcome.written;
+	const failed = outcome.failed;
+	const stale = outcome.stale;
+	const crossAgentHashConflicts = outcome.crossAgentHashConflicts;
+	const remaining = (await getEmbeddingGapStats(accessor, normalizedAgentId)).unembedded;
+	const noProgress = written === 0;
+	const operationStatus: "running" | "complete" | "failed" =
+		outcome.leaseLost || outcome.profileChanged || crossAgentHashConflicts > 0 || (noProgress && stale > 0)
+			? "failed"
+			: remaining === 0
+				? "complete"
+				: "running";
+	const conflictMessage =
+		crossAgentHashConflicts > 0
+			? `${crossAgentHashConflicts} selected memory(s) could not be persisted because their content hash is owned by another agent under the current global uniqueness constraint`
+			: "";
+	const progressMessage = outcome.leaseLost
+		? "embedding repair lease was lost before persistence"
+		: outcome.profileChanged
+			? "embedding profile changed during provider work; skipped stale vectors"
+			: outcome.cancelled
+				? "embedding repair was cancelled before persistence"
+				: outcome.timedOut
+					? `embedding repair batch time budget exceeded after ${written} persisted memories`
+					: outcome.byteLimitReached
+						? `embedding repair batch byte budget reached after ${written} persisted memories`
+						: written === 0
+							? crossAgentHashConflicts > 0
+								? conflictMessage
+								: stale > 0
+									? `re-embedded 0 of ${attempted} memories because ${stale} changed during provider work`
+									: `embedding provider returned no vectors for ${attempted} memories`
+							: failed > 0
+								? `re-embedded ${written} of ${attempted} memories in one bounded batch (${failed} failed, ${remaining} still missing)`
+								: `re-embedded ${written} of ${attempted} memories in one bounded batch (${remaining} still missing)`;
+	const resultMessage = conflictMessage.length > 0 ? `${progressMessage}; ${conflictMessage}` : progressMessage;
+
+	if (checkpointId !== undefined) {
+		checkpoint = await updateEmbeddingRepairCheckpoint(accessor, checkpointId, {
+			status: operationStatus,
+			selected: attempted,
+			written,
+			failed,
+			stale,
+			crossAgentHashConflicts,
+			lastError:
+				operationStatus === "failed" || failed > 0 || outcome.cancelled || outcome.timedOut || outcome.byteLimitReached
+					? resultMessage
+					: null,
+		});
+	}
+
+	if (written > 0) {
+		await withRepairWriteTx(
+			accessor,
+			(db) => {
+				writeRepairAudit(db, action, ctx, written, resultMessage);
+			},
+			"db:repair.reembed-missing.audit",
+		);
+		limiter.record(action);
+	}
+
+	logger.info("pipeline", "repair: re-embedded missing memories", {
+		affected: written,
+		attempted,
+		failed,
+		remaining,
+		batches: 1,
+		runToCompletion,
+		operationId: checkpointId,
+		actor: ctx.actor,
+		reason: ctx.reason,
+	});
+
+	return {
+		action,
+		success:
+			operationStatus !== "failed" &&
+			crossAgentHashConflicts === 0 &&
+			failed === 0 &&
+			!outcome.cancelled &&
+			!outcome.timedOut &&
+			!outcome.byteLimitReached,
+		affected: written,
+		message:
+			checkpointId === undefined ? resultMessage : `${resultMessage}; operation ${checkpointId} is ${operationStatus}`,
+		details: {
+			selected: attempted,
+			failed,
+			stale,
+			crossAgentHashConflicts,
+			...(outcome.cancelled ? { cancelled: true } : {}),
+			...(outcome.timedOut ? { timedOut: true } : {}),
+			...(outcome.byteLimitReached ? { byteLimitReached: true } : {}),
+			...(outcome.leaseLost ? { leaseLost: true } : {}),
+			...(checkpointId === undefined
+				? {}
+				: { operationId: checkpointId, status: operationStatus, remaining, batches: checkpoint?.batches ?? 1 }),
+		},
+	};
 }
 
 export async function reembedModelMigration(
@@ -1219,8 +1456,6 @@ export async function reembedModelMigration(
 		selected: totalMatching,
 		selectedThisBatch: rows.length,
 		agentId,
-		// Provider identity was not persisted by historical schemas. Report that
-		// explicitly rather than implying a provider mismatch can be inferred.
 		sources: sources.map((source) => ({ ...source, provider: "not-recorded" })),
 		target: { provider: embeddingCfg.provider, model: embeddingCfg.model, dimensions: embeddingCfg.dimensions },
 		estimatedBatches: Math.ceil(totalMatching / size),
@@ -1238,12 +1473,6 @@ export async function reembedModelMigration(
 			totalMatching,
 			details,
 		};
-	// Refuse a live run when the vec_embeddings virtual table is pinned to a
-	// different dimension than the configured target. syncVecInsert would
-	// otherwise throw a dimension mismatch that db-helpers silently swallows,
-	// leaving embeddings updated but vec_embeddings serving stale vectors until
-	// a daemon restart. The operator must restart the daemon (which rebuilds
-	// the vec table at the new dimension) and then re-run the migration.
 	if (vecDimensionMismatch) {
 		return {
 			action,
@@ -1288,9 +1517,6 @@ export async function reembedModelMigration(
 					ownershipChanged: boolean;
 					crossAgentConflict: boolean;
 				} => {
-					// Provider work happens outside the transaction. Promotion can therefore
-					// change the active vector space while this row is being encoded.
-					// Never commit a vector or model marker from the superseded profile.
 					if (!isActiveEmbeddingConfig(db, embeddingCfg))
 						return {
 							wrote: false,
@@ -1310,9 +1536,6 @@ export async function reembedModelMigration(
 							ownershipChanged: false,
 							crossAgentConflict: false,
 						};
-					// The provider encoded row.content before this transaction. If the
-					// memory changed while it awaited the provider, its vector belongs to
-					// the old row version and must not be committed under the new one.
 					if (current.content_hash !== row.contentHash || current.content !== row.content) {
 						return {
 							wrote: false,
@@ -1368,6 +1591,7 @@ export async function reembedModelMigration(
 						crossAgentConflict: false,
 					};
 				},
+				"db:repair.reembed-migration.write",
 			);
 			if (writeOutcome.profileChanged) {
 				profileChanged = true;
@@ -1411,10 +1635,12 @@ export async function reembedModelMigration(
 	}
 	if (written > 0) {
 		try {
-			await withRepairWriteTx(accessor, (db) => writeRepairAudit(db, action, ctx, written, message));
+			await withRepairWriteTx(
+				accessor,
+				(db) => writeRepairAudit(db, action, ctx, written, message),
+				"db:repair.reembed-migration.audit",
+			);
 		} catch (error) {
-			// The repair work is already committed per-row; a failed audit write
-			// must not discard the partial-progress result the caller needs.
 			logger.warn("pipeline", "re-embed migration: audit write failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
@@ -1430,16 +1656,6 @@ export async function reembedModelMigration(
 		details: { ...details, failed, contentChanged, ownershipChanged, crossAgentConflict },
 	};
 }
-
-// ---------------------------------------------------------------------------
-// Clean orphaned embeddings
-// ---------------------------------------------------------------------------
-
-/**
- * Remove embeddings whose source memory is deleted or missing, unless the
- * vector is still covering an active memory with the same content hash.
- * Syncs vec_embeddings to match.
- */
 export async function cleanOrphanedEmbeddings(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
@@ -1447,7 +1663,8 @@ export async function cleanOrphanedEmbeddings(
 	limiter: RateLimiter,
 	maxBatch = Number.MAX_SAFE_INTEGER,
 	agentId?: string,
-): Promise<RepairResult> {
+	options?: Omit<VectorRepairOptions, "agentId" | "batchSize">,
+): Promise<VectorRepairResult> {
 	const action = "cleanOrphanedEmbeddings";
 	const gate = checkRepairGate(cfg, ctx, limiter, action, cfg.repair.requeueCooldownMs, cfg.repair.requeueHourlyBudget);
 
@@ -1457,79 +1674,49 @@ export async function cleanOrphanedEmbeddings(
 			success: false,
 			affected: 0,
 			message: gate.reason ?? "denied by policy gate",
+			operation: "clean-orphans",
+			agentId: normalizeRepairAgentId(agentId),
+			checkpointId: "not-created",
+			phase: "orphan-embeddings",
+			status: "failed",
+			cursor: null,
+			processed: 0,
+			skipped: 0,
+			failed: 0,
+			remaining: 0,
+			remainingStatus: "none",
+			batches: 0,
 		};
 	}
 
-	const limit = Number.isFinite(maxBatch) && maxBatch > 0 ? Math.floor(maxBatch) : Number.MAX_SAFE_INTEGER;
-	const affected = await withRepairWriteTx(accessor, (db) => {
-		const orphans = listOrphanedEmbeddingIds(db, limit, agentId);
-
-		if (orphans.length === 0) return 0;
-
-		const ids = orphans.map((r) => r.id);
-		if (!syncVecDeleteByEmbeddingIds(db, ids)) {
-			throw new Error("failed to reconcile vec_embeddings before orphan cleanup");
-		}
-
-		const placeholders = ids.map(() => "?").join(", ");
-		const result = db.prepare(`DELETE FROM embeddings WHERE id IN (${placeholders})`).run(...ids);
-
-		const count = countChanges(result);
-		const msg = `cleaned ${count} orphaned embedding(s)`;
-		writeRepairAudit(db, action, ctx, count, msg);
-		return count;
+	const result = await runVectorRepair(accessor, ctx, "clean-orphans", {
+		agentId: normalizeRepairAgentId(agentId),
+		batchSize: maxBatch,
+		...options,
 	});
-
-	limiter.record(action);
+	if (!result.success && result.failed > 0 && options?.throwOnFailure !== false) {
+		throw new Error("failed to reconcile vec_embeddings before orphan cleanup");
+	}
+	if (result.success && result.status === "complete") limiter.record(action);
 	logger.info("pipeline", "repair: cleaned orphaned embeddings", {
-		affected,
+		affected: result.affected,
+		processed: result.processed,
+		remaining: result.remaining,
+		checkpointId: result.checkpointId,
+		agentId: result.agentId,
 		actor: ctx.actor,
 		reason: ctx.reason,
 	});
-
-	return {
-		action,
-		success: true,
-		affected,
-		message: `cleaned ${affected} orphaned embedding(s)`,
-	};
+	return result;
 }
-
-// ---------------------------------------------------------------------------
-// Resync vec index
-// ---------------------------------------------------------------------------
-
-interface VecResyncStats {
-	readonly vecAvailable: boolean;
-	readonly inserted: number;
-	readonly deleted: number;
-	readonly skipped: number;
-}
-
-function blobToFloat32Vector(raw: unknown): Float32Array | null {
-	if (raw instanceof Float32Array) return raw;
-	if (raw instanceof ArrayBuffer) {
-		if (raw.byteLength % 4 !== 0) return null;
-		return new Float32Array(raw.slice(0));
-	}
-	if (ArrayBuffer.isView(raw)) {
-		const buffer = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
-		if (buffer.byteLength % 4 !== 0) return null;
-		return new Float32Array(buffer);
-	}
-	return null;
-}
-
-/**
- * Reconcile vec_embeddings with embeddings by deleting orphan vec rows
- * and inserting rows missing from the vec index.
- */
 export async function resyncVectorIndex(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
 	ctx: RepairContext,
 	limiter: RateLimiter,
-): Promise<RepairResult> {
+	agentId = "default",
+	options?: Omit<VectorRepairOptions, "agentId">,
+): Promise<VectorRepairResult> {
 	const action = "resyncVectorIndex";
 	const gate = checkRepairGate(cfg, ctx, limiter, action, cfg.repair.reembedCooldownMs, cfg.repair.reembedHourlyBudget);
 
@@ -1539,113 +1726,37 @@ export async function resyncVectorIndex(
 			success: false,
 			affected: 0,
 			message: gate.reason ?? "denied by policy gate",
+			operation: "resync",
+			agentId: normalizeRepairAgentId(agentId),
+			checkpointId: "not-created",
+			phase: "missing-vectors",
+			status: "failed",
+			cursor: null,
+			processed: 0,
+			skipped: 0,
+			failed: 0,
+			remaining: 0,
+			remainingStatus: "none",
+			batches: 0,
 		};
 	}
 
-	const stats: VecResyncStats = await withRepairWriteTx(accessor, (db): VecResyncStats => {
-		try {
-			db.prepare("SELECT 1 FROM vec_embeddings LIMIT 1").get();
-		} catch {
-			return {
-				vecAvailable: false,
-				inserted: 0,
-				deleted: 0,
-				skipped: 0,
-			};
-		}
-
-		const orphanRows = db
-			.prepare(
-				`SELECT v.id
-				 FROM vec_embeddings v
-				 LEFT JOIN embeddings e ON e.id = v.id
-				 WHERE e.id IS NULL`,
-			)
-			.all() as Array<{ id: string }>;
-
-		let deleted = 0;
-		if (orphanRows.length > 0) {
-			const remove = db.prepare("DELETE FROM vec_embeddings WHERE id = ?");
-			for (const row of orphanRows) {
-				const result = remove.run(row.id);
-				if (countChanges(result) > 0) deleted++;
-			}
-		}
-
-		const missingRows = db
-			.prepare(
-				`SELECT e.id, e.vector
-				 FROM embeddings e
-				 LEFT JOIN vec_embeddings v ON v.id = e.id
-				 WHERE v.id IS NULL`,
-			)
-			.all() as Array<{ id: string; vector: unknown }>;
-
-		let inserted = 0;
-		let skipped = 0;
-		const insert = db.prepare("INSERT OR REPLACE INTO vec_embeddings (id, embedding) VALUES (?, ?)");
-
-		for (const row of missingRows) {
-			const vector = blobToFloat32Vector(row.vector);
-			if (!vector) {
-				skipped++;
-				continue;
-			}
-			const result = insert.run(row.id, vector);
-			if (countChanges(result) > 0) inserted++;
-		}
-
-		const affected = inserted + deleted;
-		const msg =
-			skipped > 0
-				? `resynced vec index (+${inserted}/-${deleted}, skipped ${skipped} malformed vector(s))`
-				: `resynced vec index (+${inserted}/-${deleted})`;
-		writeRepairAudit(db, action, ctx, affected, msg);
-
-		return {
-			vecAvailable: true,
-			inserted,
-			deleted,
-			skipped,
-		};
+	const result = await runVectorRepair(accessor, ctx, "resync", {
+		agentId: normalizeRepairAgentId(agentId),
+		...options,
 	});
-
-	if (!stats.vecAvailable) {
-		return {
-			action,
-			success: false,
-			affected: 0,
-			message: "vec_embeddings table not found; restart daemon to initialize vector index",
-		};
-	}
-
-	limiter.record(action);
-	const affected = stats.inserted + stats.deleted;
-	const message =
-		stats.skipped > 0
-			? `resynced vec index (+${stats.inserted}/-${stats.deleted}, skipped ${stats.skipped} malformed vector(s))`
-			: `resynced vec index (+${stats.inserted}/-${stats.deleted})`;
-
+	if (result.success && result.status === "complete") limiter.record(action);
 	logger.info("pipeline", "repair: resynced vec index", {
-		affected,
-		inserted: stats.inserted,
-		deleted: stats.deleted,
-		skipped: stats.skipped,
+		affected: result.affected,
+		processed: result.processed,
+		remaining: result.remaining,
+		checkpointId: result.checkpointId,
+		agentId: result.agentId,
 		actor: ctx.actor,
 		reason: ctx.reason,
 	});
-
-	return {
-		action,
-		success: true,
-		affected,
-		message,
-	};
+	return result;
 }
-
-// ---------------------------------------------------------------------------
-// Deduplication stats (read-only)
-// ---------------------------------------------------------------------------
 
 export interface DedupStats {
 	readonly exactClusters: number;
@@ -1682,10 +1793,6 @@ export async function getDedupStats(accessor: DbAccessor): Promise<DedupStats> {
 	);
 }
 
-// ---------------------------------------------------------------------------
-// Deduplication action
-// ---------------------------------------------------------------------------
-
 interface DedupCandidate {
 	readonly id: string;
 	readonly content: string;
@@ -1707,9 +1814,8 @@ function scoreDedupCandidate(c: DedupCandidate): number {
 	let s = c.importance * 3;
 	s += Math.min(c.access_count, 50) / 50;
 	s += Math.min(c.update_count, 20) / 20;
-	// Recency tiebreaker — normalized to a small range
 	const updatedMs = new Date(c.updated_at).getTime();
-	s += updatedMs / 1e15; // tiny but deterministic
+	s += updatedMs / 1e15;
 	if (c.pinned) s += 100;
 	if (c.manual_override) s += 100;
 	return s;
@@ -1737,14 +1843,11 @@ function processCluster(
 	candidates: readonly DedupCandidate[],
 	ctx: RepairContext,
 ): { keeperId: string; removed: number } | null {
-	// Safety: skip if any member is protected
 	if (candidates.some((c) => c.pinned || c.manual_override)) {
 		return null;
 	}
 
 	if (candidates.length < 2) return null;
-
-	// Score and pick keeper
 	let bestIdx = 0;
 	let bestScore = Number.NEGATIVE_INFINITY;
 	for (let i = 0; i < candidates.length; i++) {
@@ -1758,8 +1861,6 @@ function processCluster(
 	const keeper = candidates[bestIdx];
 	const losers = candidates.filter((_, i) => i !== bestIdx);
 	const now = new Date().toISOString();
-
-	// Merge tags into keeper
 	let mergedTags = keeper.tags;
 	for (const loser of losers) {
 		mergedTags = mergeTags(mergedTags, loser.tags);
@@ -1768,8 +1869,6 @@ function processCluster(
 	if (mergedTags !== keeper.tags) {
 		db.prepare("UPDATE memories SET tags = ?, updated_at = ? WHERE id = ?").run(mergedTags, now, keeper.id);
 	}
-
-	// Audit keeper
 	insertHistoryEvent(db, {
 		memoryId: keeper.id,
 		event: "merged",
@@ -1785,8 +1884,6 @@ function processCluster(
 		actorType: ctx.actorType,
 		requestId: ctx.requestId,
 	});
-
-	// Soft-delete losers
 	for (const loser of losers) {
 		db.prepare("UPDATE memories SET is_deleted = 1, deleted_at = ?, updated_at = ? WHERE id = ?").run(
 			now,
@@ -1840,8 +1937,6 @@ export async function deduplicateMemories(
 	const semanticThreshold = options?.semanticThreshold ?? cfg.repair.dedupSemanticThreshold;
 	const dryRun = options?.dryRun ?? false;
 	const semanticEnabled = options?.semanticEnabled ?? false;
-
-	// Phase 1: Exact hash clusters
 	const hashClusters = await accessor.withReadDbAsync(
 		async (db) => {
 			return db
@@ -1883,54 +1978,58 @@ export async function deduplicateMemories(
 
 	let totalRemoved = 0;
 	let totalClusters = 0;
-
-	// Process exact hash clusters (scope-aware: only dedup within same scope)
 	for (const cluster of hashClusters) {
-		const removed = await withRepairWriteTx(accessor, (db) => {
-			const scopeFilter = cluster.scope_key === "__NULL__" ? "AND scope IS NULL" : "AND scope = ?";
-			const scopeArgs = cluster.scope_key === "__NULL__" ? [] : [cluster.scope_key];
-			const candidates = db
-				.prepare(
-					`SELECT id, content, content_hash, tags, importance,
+		const removed = await withRepairWriteTx(
+			accessor,
+			(db) => {
+				const scopeFilter = cluster.scope_key === "__NULL__" ? "AND scope IS NULL" : "AND scope = ?";
+				const scopeArgs = cluster.scope_key === "__NULL__" ? [] : [cluster.scope_key];
+				const candidates = db
+					.prepare(
+						`SELECT id, content, content_hash, tags, importance,
 							access_count, update_count, updated_at, pinned, manual_override
 					 FROM memories
 					 WHERE content_hash = ? AND is_deleted = 0
 					   AND pinned = 0 AND manual_override = 0
 					   ${scopeFilter}
 					 ORDER BY importance DESC`,
-				)
-				.all(cluster.content_hash, ...scopeArgs) as DedupCandidate[];
+					)
+					.all(cluster.content_hash, ...scopeArgs) as DedupCandidate[];
 
-			const result = processCluster(db, candidates, ctx);
-			return result?.removed ?? 0;
-		});
+				const result = processCluster(db, candidates, ctx);
+				return result?.removed ?? 0;
+			},
+			"db:repair.deduplicate.exact.write",
+		);
 
 		if (removed > 0) {
 			totalRemoved += removed;
 			totalClusters++;
 		}
 	}
-
-	// Phase 2: Semantic clusters (only if exact phase didn't fill batch)
 	if (semanticEnabled && totalClusters < batchSize) {
 		const semanticClusters = await findSemanticDuplicates(accessor, semanticThreshold, batchSize - totalClusters);
 
 		for (const cluster of semanticClusters) {
-			const removed = await withRepairWriteTx(accessor, (db) => {
-				const ids = cluster.map((c) => c.id);
-				const placeholders = ids.map(() => "?").join(", ");
-				const candidates = db
-					.prepare(
-						`SELECT id, content, content_hash, tags, importance,
+			const removed = await withRepairWriteTx(
+				accessor,
+				(db) => {
+					const ids = cluster.map((c) => c.id);
+					const placeholders = ids.map(() => "?").join(", ");
+					const candidates = db
+						.prepare(
+							`SELECT id, content, content_hash, tags, importance,
 								access_count, update_count, updated_at, pinned, manual_override
 						 FROM memories
 						 WHERE id IN (${placeholders}) AND is_deleted = 0`,
-					)
-					.all(...ids) as DedupCandidate[];
+						)
+						.all(...ids) as DedupCandidate[];
 
-				const result = processCluster(db, candidates, ctx);
-				return result?.removed ?? 0;
-			});
+					const result = processCluster(db, candidates, ctx);
+					return result?.removed ?? 0;
+				},
+				"db:repair.deduplicate.semantic.write",
+			);
 
 			if (removed > 0) {
 				totalRemoved += removed;
@@ -1958,10 +2057,6 @@ export async function deduplicateMemories(
 		message: msg,
 	};
 }
-
-// ---------------------------------------------------------------------------
-// Semantic duplicate finder
-// ---------------------------------------------------------------------------
 
 interface SemanticCandidate {
 	readonly id: string;
@@ -1998,19 +2093,18 @@ async function findSemanticDuplicates(
 
 		const neighbors = await accessor.withReadDbAsync(
 			async (db) => {
-				// Get the vector for this candidate's embedding
-				const vecRow = db.prepare("SELECT embedding FROM vec_embeddings WHERE id = ?").get(candidate.embedding_id) as
+				const vecTable = activeVectorProjectionTable(db);
+				const vecRow = db.prepare(`SELECT embedding FROM ${vecTable} WHERE id = ?`).get(candidate.embedding_id) as
 					| { embedding: ArrayBuffer }
 					| undefined;
 
 				if (!vecRow) return [];
 
 				const queryVec = new Float32Array(vecRow.embedding);
-				// KNN search for nearby vectors
 				const rows = db
 					.prepare(
 						`SELECT e.source_id, v.distance
-					 FROM vec_embeddings v
+					 FROM ${vecTable} v
 					 JOIN embeddings e ON v.id = e.id
 					 JOIN memories m ON e.source_id = m.id
 					 WHERE v.embedding MATCH ? AND k = 6
@@ -2018,8 +2112,6 @@ async function findSemanticDuplicates(
 					 ORDER BY v.distance`,
 					)
 					.all(queryVec) as Array<{ source_id: string; distance: number }>;
-
-				// Convert distance to cosine similarity and filter
 				return rows
 					.filter((r) => r.source_id !== candidate.id)
 					.filter((r) => {
@@ -2042,17 +2134,6 @@ async function findSemanticDuplicates(
 
 	return clusters;
 }
-
-// ---------------------------------------------------------------------------
-// pruneChunkGroupEntities
-// ---------------------------------------------------------------------------
-
-/**
- * Delete chunk_group entities — document-chunk indexing artifacts with no
- * semantic role in the knowledge graph. They have 0 mentions, no aspects,
- * no attributes, and no dependencies. FK cascades clean entity_aspects and
- * entity_dependencies automatically.
- */
 export async function pruneChunkGroupEntities(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
@@ -2083,32 +2164,25 @@ export async function pruneChunkGroupEntities(
 		};
 	}
 
-	const affected = await withRepairWriteTx(accessor, (db) => {
-		const ids = db.prepare("SELECT id FROM entities WHERE entity_type = 'chunk_group' LIMIT ?").all(batchSize) as {
-			id: string;
-		}[];
-		if (ids.length === 0) return 0;
-		const placeholders = ids.map(() => "?").join(",");
-		db.prepare(`DELETE FROM entities WHERE id IN (${placeholders})`).run(...ids.map((r) => r.id));
-		writeRepairAudit(db, action, ctx, ids.length, `deleted ${ids.length} chunk_group entities`);
-		return ids.length;
-	});
+	const affected = await withRepairWriteTx(
+		accessor,
+		(db) => {
+			const ids = db.prepare("SELECT id FROM entities WHERE entity_type = 'chunk_group' LIMIT ?").all(batchSize) as {
+				id: string;
+			}[];
+			if (ids.length === 0) return 0;
+			const placeholders = ids.map(() => "?").join(",");
+			db.prepare(`DELETE FROM entities WHERE id IN (${placeholders})`).run(...ids.map((r) => r.id));
+			writeRepairAudit(db, action, ctx, ids.length, `deleted ${ids.length} chunk_group entities`);
+			return ids.length;
+		},
+		"db:repair.prune-chunk-groups.write",
+	);
 
 	limiter.record(action);
 	logger.info("pipeline", "repair: pruned chunk_group entities", { affected, actor: ctx.actor });
 	return { action, success: true, affected, message: `deleted ${affected} chunk_group entities` };
 }
-
-// ---------------------------------------------------------------------------
-// pruneSingletonExtractedEntities
-// ---------------------------------------------------------------------------
-
-/**
- * Delete extracted entities with mention_count <= maxMentions that have no
- * entity_aspects or entity_attributes — transient extractions that never
- * became meaningful knowledge. Cleans memory_entity_mentions and relations
- * manually (no FK cascade on those tables).
- */
 export async function pruneSingletonExtractedEntities(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
@@ -2167,20 +2241,21 @@ export async function pruneSingletonExtractedEntities(
 		return { action, success: true, affected: 0, message: "no singleton extracted entities found" };
 	}
 
-	const affected = await withRepairWriteTx(accessor, (db) => {
-		const ids = candidates.map((r) => r.id);
-		const placeholders = ids.map(() => "?").join(",");
-		// Clean mention links (no FK cascade)
-		db.prepare(`DELETE FROM memory_entity_mentions WHERE entity_id IN (${placeholders})`).run(...ids);
-		// Clean relations (no FK cascade)
-		db.prepare(
-			`DELETE FROM relations WHERE source_entity_id IN (${placeholders}) OR target_entity_id IN (${placeholders})`,
-		).run(...ids, ...ids);
-		// Delete entities — cascades entity_aspects and entity_dependencies
-		db.prepare(`DELETE FROM entities WHERE id IN (${placeholders})`).run(...ids);
-		writeRepairAudit(db, action, ctx, ids.length, `deleted ${ids.length} singleton extracted entities`);
-		return ids.length;
-	});
+	const affected = await withRepairWriteTx(
+		accessor,
+		(db) => {
+			const ids = candidates.map((r) => r.id);
+			const placeholders = ids.map(() => "?").join(",");
+			db.prepare(`DELETE FROM memory_entity_mentions WHERE entity_id IN (${placeholders})`).run(...ids);
+			db.prepare(
+				`DELETE FROM relations WHERE source_entity_id IN (${placeholders}) OR target_entity_id IN (${placeholders})`,
+			).run(...ids, ...ids);
+			db.prepare(`DELETE FROM entities WHERE id IN (${placeholders})`).run(...ids);
+			writeRepairAudit(db, action, ctx, ids.length, `deleted ${ids.length} singleton extracted entities`);
+			return ids.length;
+		},
+		"db:repair.prune-singleton-entities.write",
+	);
 
 	limiter.record(action);
 	logger.info("pipeline", "repair: pruned singleton extracted entities", {
@@ -2195,15 +2270,110 @@ export async function pruneSingletonExtractedEntities(
 	};
 }
 
-// ---------------------------------------------------------------------------
-// pruneGenericEntities
-// ---------------------------------------------------------------------------
-
 interface GenericEntityCandidate {
 	readonly id: string;
 	readonly name: string;
 	readonly entity_type: string;
+	readonly updated_at: string;
 	reason?: string;
+}
+
+export interface GenericEntityCursor {
+	readonly updatedAt: string;
+	readonly id: string;
+	readonly agentId?: string;
+	readonly scanGeneration?: number;
+}
+
+export interface PruneGenericEntitiesOptions {
+	readonly batchSize?: number;
+	readonly candidateLimit?: number;
+	readonly inspectionLimit?: number;
+	readonly dryRun?: boolean;
+	readonly agentId?: string;
+	readonly cursor?: GenericEntityCursor;
+	readonly deadlineAt?: number;
+	readonly signal?: AbortSignal;
+}
+
+export const GENERIC_ENTITY_DEFAULT_INSPECTION_LIMIT = 1_000;
+export const GENERIC_ENTITY_MAX_INSPECTION_LIMIT = 5_000;
+const GENERIC_ENTITY_MAX_SCAN_DURATION_MS = 5_000;
+const GENERIC_ENTITY_MAX_CANDIDATE_LIMIT = 500;
+const GENERIC_ENTITY_SCAN_PAGE_SIZE = 100;
+
+type GenericEntityStopReason =
+	| "candidate_limit"
+	| "inspection_limit"
+	| "deadline"
+	| "cancelled"
+	| "pressure"
+	| "changed";
+
+function normalizeGenericEntityCursor(value: unknown): GenericEntityCursor | null | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const cursor = value as {
+		updatedAt?: unknown;
+		updated_at?: unknown;
+		id?: unknown;
+		agentId?: unknown;
+		scanGeneration?: unknown;
+	};
+	const updatedAt = typeof cursor.updatedAt === "string" ? cursor.updatedAt : cursor.updated_at;
+	if (
+		typeof updatedAt !== "string" ||
+		updatedAt.length === 0 ||
+		typeof cursor.id !== "string" ||
+		cursor.id.length === 0 ||
+		(typeof cursor.agentId !== "undefined" && (typeof cursor.agentId !== "string" || cursor.agentId.length === 0)) ||
+		(typeof cursor.scanGeneration !== "undefined" &&
+			(typeof cursor.scanGeneration !== "number" ||
+				!Number.isSafeInteger(cursor.scanGeneration) ||
+				cursor.scanGeneration < 0)) ||
+		(cursor.agentId === undefined) !== (cursor.scanGeneration === undefined)
+	) {
+		return null;
+	}
+	return {
+		updatedAt,
+		id: cursor.id,
+		agentId: cursor.agentId,
+		scanGeneration: cursor.scanGeneration,
+	};
+}
+
+function readGenericEntityPruneScanGeneration(db: ReadDb | WriteDb): number {
+	const row = db.prepare("SELECT generation FROM generic_entity_prune_scan_state WHERE id = 1").get();
+	const generation = row?.generation;
+	if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
+		throw new Error("generic entity prune scan generation is unavailable");
+	}
+	return generation;
+}
+
+function genericEntityScanDetails(
+	candidateLimit: number,
+	inspectionLimit: number,
+	inspected: number,
+	matched: number,
+	cursor: Pick<GenericEntityCursor, "updatedAt" | "id"> | undefined,
+	agentId: string,
+	scanGeneration: number | undefined,
+	complete: boolean,
+	stopReason: GenericEntityStopReason | undefined,
+): Readonly<Record<string, unknown>> {
+	return {
+		status: complete ? "complete" : "partial",
+		complete,
+		candidateLimit,
+		inspectionLimit,
+		inspected,
+		matched,
+		remaining: complete ? 0 : "unknown",
+		cursor: cursor === undefined || scanGeneration === undefined ? null : { ...cursor, agentId, scanGeneration },
+		...(complete || stopReason === undefined ? {} : { reason: stopReason }),
+	};
 }
 
 function deleteEntityGraphRows(db: WriteDb, ids: readonly string[]): void {
@@ -2232,18 +2402,12 @@ function deleteEntityGraphRows(db: WriteDb, ids: readonly string[]): void {
 	db.prepare(`DELETE FROM entity_aspects WHERE entity_id IN (${placeholders})`).run(...ids);
 	db.prepare(`DELETE FROM entities WHERE id IN (${placeholders})`).run(...ids);
 }
-
-/**
- * Delete concrete-ontology violations such as pronouns, metadata labels,
- * headings, discourse fragments, and non-concrete extraction types. Defaults
- * to dry-run at the route layer so operators can inspect candidates first.
- */
 export async function pruneGenericEntities(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
 	ctx: RepairContext,
 	limiter: RateLimiter,
-	options?: { batchSize?: number; dryRun?: boolean; agentId?: string },
+	options?: PruneGenericEntitiesOptions,
 ): Promise<RepairResult> {
 	const action = "pruneGenericEntities";
 	const gate = checkRepairGate(cfg, ctx, limiter, action, 60_000, 10);
@@ -2251,40 +2415,195 @@ export async function pruneGenericEntities(
 		return { action, success: false, affected: 0, message: gate.reason ?? "denied" };
 	}
 
-	const batchSize = Math.max(1, Math.min(Math.floor(options?.batchSize ?? 100), 500));
-	const agentId = options?.agentId ?? "default";
-	const candidates = await accessor.withReadDbAsync(
-		async (db) => {
-			const candidates: GenericEntityCandidate[] = [];
-			const pageSize = Math.max(batchSize * 10, 500);
-			let offset = 0;
-			const selectPage = db.prepare(
-				`SELECT e.id, e.name, e.entity_type
-			 FROM entities e
-			 WHERE e.agent_id = ?
-			   AND COALESCE(e.pinned, 0) = 0
-			   AND e.entity_type NOT IN ('skill')
-			   AND NOT EXISTS (SELECT 1 FROM skill_meta sm WHERE sm.entity_id = e.id)
-			 ORDER BY e.updated_at DESC
-			 LIMIT ? OFFSET ?`,
-			);
-
-			for (;;) {
-				const rows = selectPage.all(agentId, pageSize, offset) as GenericEntityCandidate[];
-				if (rows.length === 0) break;
-				for (const row of rows) {
-					const quality = classifyEntityQuality(row.name, row.entity_type);
-					if (!quality.ok) {
-						candidates.push({ ...row, reason: quality.reason });
-						if (candidates.length >= batchSize) return candidates;
-					}
-				}
-				offset += rows.length;
-			}
-			return candidates;
-		},
-		{ siteToken: "db:repair.generic-entity-candidates.read" },
+	const candidateLimitInput = options?.candidateLimit ?? options?.batchSize ?? 100;
+	const candidateLimit = Number.isFinite(candidateLimitInput)
+		? Math.max(1, Math.min(Math.floor(candidateLimitInput), GENERIC_ENTITY_MAX_CANDIDATE_LIMIT))
+		: 100;
+	const defaultInspectionLimit = Math.min(
+		GENERIC_ENTITY_MAX_INSPECTION_LIMIT,
+		Math.max(GENERIC_ENTITY_DEFAULT_INSPECTION_LIMIT, candidateLimit * 10),
 	);
+	const inspectionLimitInput = options?.inspectionLimit ?? defaultInspectionLimit;
+	const inspectionLimit = Number.isFinite(inspectionLimitInput)
+		? Math.max(1, Math.min(Math.floor(inspectionLimitInput), GENERIC_ENTITY_MAX_INSPECTION_LIMIT))
+		: defaultInspectionLimit;
+	const agentId = options?.agentId ?? "default";
+	const scanStartedAt = performance.now();
+	const defaultDeadlineAt = scanStartedAt + GENERIC_ENTITY_MAX_SCAN_DURATION_MS;
+	const deadlineAt =
+		typeof options?.deadlineAt === "number" && Number.isFinite(options.deadlineAt)
+			? Math.min(options.deadlineAt, defaultDeadlineAt)
+			: defaultDeadlineAt;
+	const normalizedCursor = normalizeGenericEntityCursor(options?.cursor);
+	if (normalizedCursor === null) {
+		return {
+			action,
+			success: false,
+			affected: 0,
+			message: "cursor must include non-empty updatedAt and id strings",
+			details: { invalidInput: true },
+		};
+	}
+
+	const candidates: GenericEntityCandidate[] = [];
+	let cursor: Pick<GenericEntityCursor, "updatedAt" | "id"> | undefined = normalizedCursor;
+	let scanGeneration = normalizedCursor?.scanGeneration;
+	if (normalizedCursor && (normalizedCursor.agentId !== agentId || normalizedCursor.scanGeneration === undefined)) {
+		cursor = undefined;
+	}
+	let inspected = 0;
+	let matched = 0;
+	let complete = false;
+	let stopReason: GenericEntityStopReason | undefined;
+	const yieldBetweenPages = yieldEvery(1);
+
+	while (inspected < inspectionLimit && candidates.length < candidateLimit && !complete) {
+		if (options?.signal?.aborted) {
+			stopReason = "cancelled";
+			break;
+		}
+		if (isSystemPressureHigh()) {
+			stopReason = "pressure";
+			break;
+		}
+		if (performance.now() >= deadlineAt) {
+			stopReason = "deadline";
+			break;
+		}
+
+		const pageLimit = Math.min(GENERIC_ENTITY_SCAN_PAGE_SIZE, inspectionLimit - inspected);
+		let page: {
+			readonly rows: GenericEntityCandidate[];
+			readonly generationBefore: number;
+			readonly generationAfter: number;
+		};
+		try {
+			page = await accessor.withReadDbAsync(
+				async (db) => {
+					const generationBefore = readGenericEntityPruneScanGeneration(db);
+					const query = cursor
+						? `SELECT e.id, e.name, e.entity_type, e.updated_at
+						   FROM entities e
+						  WHERE e.agent_id = ?
+						    AND COALESCE(e.pinned, 0) = 0
+						    AND e.entity_type NOT IN ('skill')
+						    AND NOT EXISTS (SELECT 1 FROM skill_meta sm WHERE sm.entity_id = e.id)
+						    AND (e.updated_at < ? OR (e.updated_at = ? AND e.id < ?))
+						  ORDER BY e.updated_at DESC, e.id DESC
+						  LIMIT ?`
+						: `SELECT e.id, e.name, e.entity_type, e.updated_at
+						   FROM entities e
+						  WHERE e.agent_id = ?
+						    AND COALESCE(e.pinned, 0) = 0
+						    AND e.entity_type NOT IN ('skill')
+						    AND NOT EXISTS (SELECT 1 FROM skill_meta sm WHERE sm.entity_id = e.id)
+						  ORDER BY e.updated_at DESC, e.id DESC
+						  LIMIT ?`;
+					const statement = db.prepare(query);
+					const values = cursor
+						? [agentId, cursor.updatedAt, cursor.updatedAt, cursor.id, pageLimit + 1]
+						: [agentId, pageLimit + 1];
+					const rows = statement.all(...values) as GenericEntityCandidate[];
+					const generationAfter = readGenericEntityPruneScanGeneration(db);
+					return { rows, generationBefore, generationAfter };
+				},
+				{
+					siteToken: "db:repair.generic-entity-candidates.read",
+					operation: "repair.pruneGenericEntities.scan",
+					signal: options?.signal,
+				},
+			);
+		} catch (error) {
+			if (options?.signal?.aborted) {
+				stopReason = "cancelled";
+				break;
+			}
+			throw error;
+		}
+
+		if (performance.now() >= deadlineAt) {
+			stopReason = "deadline";
+			break;
+		}
+		if (page.generationBefore !== page.generationAfter) {
+			stopReason = "changed";
+			cursor = undefined;
+			candidates.length = 0;
+			break;
+		}
+		if (scanGeneration === undefined) {
+			scanGeneration = page.generationAfter;
+		} else if (page.generationAfter !== scanGeneration) {
+			if (inspected === 0) {
+				cursor = undefined;
+				scanGeneration = page.generationAfter;
+				continue;
+			}
+			stopReason = "changed";
+			cursor = undefined;
+			candidates.length = 0;
+			break;
+		}
+		const rows = page.rows;
+		if (rows.length === 0) {
+			complete = true;
+			break;
+		}
+
+		const hasMore = rows.length > pageLimit;
+		const pageRows = rows.slice(0, pageLimit);
+		let processedRows = 0;
+		for (const row of pageRows) {
+			processedRows += 1;
+			inspected += 1;
+			cursor = { updatedAt: row.updated_at, id: row.id };
+			const quality = classifyEntityQuality(row.name, row.entity_type);
+			if (!quality.ok) {
+				matched += 1;
+				candidates.push({ ...row, reason: quality.reason });
+			}
+			if (candidates.length >= candidateLimit) {
+				stopReason = "candidate_limit";
+				break;
+			}
+			if (inspected >= inspectionLimit) {
+				stopReason = "inspection_limit";
+				break;
+			}
+			if (options?.signal?.aborted) {
+				stopReason = "cancelled";
+				break;
+			}
+			if (performance.now() >= deadlineAt) {
+				stopReason = "deadline";
+				break;
+			}
+		}
+
+		if (stopReason !== undefined) {
+			complete = !hasMore && processedRows === pageRows.length;
+			break;
+		}
+		if (!hasMore) {
+			complete = true;
+			break;
+		}
+		await yieldBetweenPages();
+	}
+
+	const scanDetails = (): Readonly<Record<string, unknown>> =>
+		genericEntityScanDetails(
+			candidateLimit,
+			inspectionLimit,
+			inspected,
+			matched,
+			cursor,
+			agentId,
+			scanGeneration,
+			complete,
+			stopReason,
+		);
+	const partialSuffix = !complete ? `; partial scan after ${inspected} inspected row(s), resume with cursor` : "";
 
 	if (options?.dryRun ?? true) {
 		const preview = candidates
@@ -2295,39 +2614,130 @@ export async function pruneGenericEntities(
 			action,
 			success: true,
 			affected: candidates.length,
-			message: `dry-run: would delete ${candidates.length} generic/non-concrete entities${preview ? `: ${preview}` : ""}`,
+			message: `dry-run: would delete ${candidates.length} generic/non-concrete entities${preview ? `: ${preview}` : ""}${partialSuffix}`,
+			details: scanDetails(),
+		};
+	}
+
+	if (options?.signal?.aborted || isSystemPressureHigh()) {
+		stopReason = options?.signal?.aborted ? "cancelled" : "pressure";
+		complete = false;
+		return {
+			action,
+			success: true,
+			affected: 0,
+			message: `partial scan stopped before persistence (${stopReason}); no changes applied`,
+			details: scanDetails(),
 		};
 	}
 
 	if (candidates.length === 0) {
-		return { action, success: true, affected: 0, message: "no generic/non-concrete entities found" };
+		return {
+			action,
+			success: true,
+			affected: 0,
+			message: `no generic/non-concrete entities found${partialSuffix}`,
+			details: scanDetails(),
+		};
 	}
 
-	const affected = await withRepairWriteTx(accessor, (db) => {
-		const ids = candidates.map((row) => row.id);
-		deleteEntityGraphRows(db, ids);
-		writeRepairAudit(
-			db,
-			action,
-			ctx,
-			ids.length,
-			`deleted ${ids.length} generic/non-concrete entities for agent ${agentId}`,
+	let affected: number;
+	let skippedChanged = 0;
+	let scanChanged = false;
+	try {
+		const outcome = await withRepairWriteTx(
+			accessor,
+			(db) => {
+				if (readGenericEntityPruneScanGeneration(db) !== scanGeneration) {
+					scanChanged = true;
+					cursor = undefined;
+					return 0;
+				}
+				const candidatesById = new Map(candidates.map((row) => [row.id, row]));
+				const placeholders = candidates.map(() => "?").join(",");
+				const currentRows = db
+					.prepare(
+						`SELECT e.id, e.name, e.entity_type, e.updated_at
+						   FROM entities e
+						  WHERE e.agent_id = ?
+						    AND COALESCE(e.pinned, 0) = 0
+						    AND e.entity_type NOT IN ('skill')
+						    AND NOT EXISTS (SELECT 1 FROM skill_meta sm WHERE sm.entity_id = e.id)
+						    AND e.id IN (${placeholders})`,
+					)
+					.all(agentId, ...candidates.map((row) => row.id)) as GenericEntityCandidate[];
+				const ids = currentRows
+					.filter((row) => {
+						const scanned = candidatesById.get(row.id);
+						return (
+							scanned !== undefined &&
+							row.name === scanned.name &&
+							row.entity_type === scanned.entity_type &&
+							row.updated_at === scanned.updated_at &&
+							!classifyEntityQuality(row.name, row.entity_type).ok
+						);
+					})
+					.map((row) => row.id);
+				skippedChanged = candidates.length - ids.length;
+				if (ids.length === 0) return 0;
+
+				deleteEntityGraphRows(db, ids);
+				for (const entityId of ids) reconcileOntologyContradictionsInTx(db, { agentId, entityId });
+				writeRepairAudit(
+					db,
+					action,
+					ctx,
+					ids.length,
+					`deleted ${ids.length} generic/non-concrete entities for agent ${agentId}`,
+				);
+				return ids.length;
+			},
+			"db:repair.prune-generic-entities.write",
+			options?.signal,
 		);
-		return ids.length;
-	});
+		affected = outcome;
+	} catch (error) {
+		if (options?.signal?.aborted) {
+			stopReason = "cancelled";
+			complete = false;
+			return {
+				action,
+				success: true,
+				affected: 0,
+				message: "partial scan stopped before persistence (cancelled); no changes applied",
+				details: scanDetails(),
+			};
+		}
+		throw error;
+	}
+
+	if (scanChanged) {
+		stopReason = "changed";
+		complete = false;
+		return {
+			action,
+			success: true,
+			affected: 0,
+			message: "partial scan changed before persistence; no changes applied",
+			details: scanDetails(),
+		};
+	}
 
 	limiter.record(action);
 	logger.info("pipeline", "repair: pruned generic/non-concrete entities", {
 		affected,
+		skippedChanged,
 		agentId,
 		actor: ctx.actor,
 	});
-	return { action, success: true, affected, message: `deleted ${affected} generic/non-concrete entities` };
+	return {
+		action,
+		success: true,
+		affected,
+		message: `deleted ${affected} generic/non-concrete entities${skippedChanged > 0 ? `; skipped ${skippedChanged} changed before deletion` : ""}${partialSuffix}`,
+		details: { ...scanDetails(), skippedChanged },
+	};
 }
-
-// ---------------------------------------------------------------------------
-// Dead memory hygiene
-// ---------------------------------------------------------------------------
 
 export interface DeadMemory {
 	readonly id: string;
@@ -2342,22 +2752,10 @@ export const DEAD_MEMORY_DEFAULT_CONFIDENCE = 0.1;
 export const DEAD_MEMORY_DEFAULT_ACCESS_DAYS = 90;
 
 export interface DeadMemoryOpts {
-	/** Max confidence to flag as dead. Default: 0.10. */
 	readonly maxConfidence?: number;
-	/** Days since last access (or creation if never accessed) to flag as stale. Default: 90. */
 	readonly maxAccessDays?: number;
-	/** Max rows to return. Default: 200. */
 	readonly limit?: number;
 }
-
-/**
- * Find memories that are candidates for deletion:
- * - Low confidence (below threshold), OR
- * - Never accessed and old, OR
- * - Not accessed in maxAccessDays
- *
- * Never flags memories with importance > 0.8 regardless of other criteria.
- */
 export function findDeadMemories(db: ReadDb, opts: DeadMemoryOpts = {}): DeadMemory[] {
 	const maxConf = opts.maxConfidence ?? DEAD_MEMORY_DEFAULT_CONFIDENCE;
 	const maxDays = opts.maxAccessDays ?? DEAD_MEMORY_DEFAULT_ACCESS_DAYS;
@@ -2397,39 +2795,34 @@ export function findDeadMemories(db: ReadDb, opts: DeadMemoryOpts = {}): DeadMem
 		return { ...row, reason };
 	});
 }
-
-/**
- * Soft-delete a batch of memories by ID in a single transaction.
- * Returns the number actually deleted (skips already-deleted).
- */
 export async function forgetDeadMemories(accessor: DbAccessor, ids: readonly string[]): Promise<number> {
 	if (ids.length === 0) return 0;
 	const now = new Date().toISOString();
-	return await withRepairWriteTx(accessor, (db) => {
-		const stmt = db.prepare("UPDATE memories SET is_deleted = 1, deleted_at = ? WHERE id = ? AND is_deleted = 0");
-		let total = 0;
-		for (const id of ids) {
-			total += countChanges(stmt.run(now, id));
-		}
-		writeRepairAudit(
-			db,
-			"forget-dead-memories",
-			{
-				actor: "api",
-				reason: "dead-memory hygiene",
-				actorType: "daemon",
-				requestId: undefined,
-			},
-			total,
-			`soft-deleted ${total} dead memories`,
-		);
-		return total;
-	});
+	return await withRepairWriteTx(
+		accessor,
+		(db) => {
+			const stmt = db.prepare("UPDATE memories SET is_deleted = 1, deleted_at = ? WHERE id = ? AND is_deleted = 0");
+			let total = 0;
+			for (const id of ids) {
+				total += countChanges(stmt.run(now, id));
+			}
+			writeRepairAudit(
+				db,
+				"forget-dead-memories",
+				{
+					actor: "api",
+					reason: "dead-memory hygiene",
+					actorType: "daemon",
+					requestId: undefined,
+				},
+				total,
+				`soft-deleted ${total} dead memories`,
+			);
+			return total;
+		},
+		"db:repair.forget-dead-memories.write",
+	);
 }
-
-// ---------------------------------------------------------------------------
-// SQLite integrity check
-// ---------------------------------------------------------------------------
 
 export interface IntegrityCheckResult {
 	readonly ok: boolean;
@@ -2445,11 +2838,6 @@ function readIntegrityCheck(db: ReadDb, pragma: "quick_check" | "integrity_check
 	if (messages.length === 1 && messages[0] === "ok") return { ok: true, messages: [] };
 	return { ok: false, messages };
 }
-
-/**
- * Run both SQLite integrity modes. quick_check is cheap and useful for
- * broad damage; integrity_check is the authoritative result for indexes.
- */
 export async function integrityCheck(accessor: DbAccessor): Promise<IntegrityCheckResult> {
 	return await accessor.withReadDbAsync(
 		async (db) => {
@@ -2461,10 +2849,6 @@ export async function integrityCheck(accessor: DbAccessor): Promise<IntegrityChe
 	);
 }
 
-// ---------------------------------------------------------------------------
-// Rebuild derived search indexes
-// ---------------------------------------------------------------------------
-
 export interface RebuildIndexesResult {
 	readonly integrity: { ok: boolean; messages: readonly string[] };
 	readonly fts: { repaired: boolean; message: string };
@@ -2475,15 +2859,6 @@ export interface RebuildIndexesResult {
 	};
 	readonly summary: string;
 }
-
-/**
- * Run a coordinated repair of all derived search indexes in sequence:
- * 1. PRAGMA integrity_check — fail fast if DB is corrupt
- * 2. FTS consistency check + rebuild if needed
- * 3. Re-embed memories missing vector embeddings
- *
- * Intended for recovery after SQLite repair or schema migration.
- */
 export async function rebuildDerivedIndexes(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
@@ -2493,11 +2868,7 @@ export async function rebuildDerivedIndexes(
 	embeddingCfg: EmbeddingConfig,
 ): Promise<RebuildIndexesResult> {
 	const integrity = await integrityCheck(accessor);
-
-	// Step 1: FTS rebuild
 	const ftsResult = await checkFtsConsistency(accessor, cfg, ctx, limiter, true);
-
-	// Step 2: Re-embed missing memories (batch of 200, not full sweep)
 	const reembedResult = await reembedAllMissingMemoriesBatch(accessor, embeddingFn, embeddingCfg, 200);
 
 	const parts: string[] = [];
@@ -2529,10 +2900,6 @@ export async function rebuildDerivedIndexes(
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers shared by selective repair actions (issue #901)
-// ---------------------------------------------------------------------------
-
 interface DeadMatchRow {
 	readonly id: string;
 }
@@ -2543,12 +2910,6 @@ interface BuiltSql {
 	readonly ids: readonly DeadMatchRow[];
 	readonly totalMatching: number;
 }
-
-/**
- * Build a parameterized SELECT that enumerates dead rows matching the
- * filter. The `placeholderIdColumn` arg identifies the column that
- * uniquely identifies the row inside the memory queue.
- */
 function buildDeadRequeueWhere(
 	db: ReadDb,
 	table: "memory_jobs",
@@ -2561,9 +2922,6 @@ function buildDeadRequeueWhere(
 	const where: string[] = ["status = 'dead'"];
 	const params: unknown[] = [];
 	if (table === "memory_jobs") {
-		// The extraction worker is gone. Startup already promoted each legacy
-		// extract source to Dreaming before terminalizing its job, so requeueing
-		// it would create work with no consumer.
 		where.push("job_type <> 'extract'");
 	}
 
@@ -2594,9 +2952,6 @@ function countDeadRequeueMatches(db: ReadDb, table: "memory_jobs", options: JobF
 }
 
 function buildDeadRequeueSql(db: ReadDb, table: "memory_jobs", limit: number, options: JobFilterOptions): BuiltSql {
-	// The match count is a property of the filter, not the selection budget:
-	// a zero budget must still report how many rows matched so dry-run totals
-	// never silently drop a backlog (issue #1052).
 	const totalMatching = countDeadRequeueMatches(db, table, options);
 	if (limit <= 0) {
 		return { sql: "", params: [], ids: [], totalMatching };
@@ -2620,13 +2975,6 @@ interface CancelPruneBuilt {
 	readonly rows: readonly CancelPruneMatchRow[];
 	readonly totalMatching: number;
 }
-
-/**
- * Build a parameterized SELECT for `cancelObsoleteJobs` and
- * `pruneTerminalJobs`. Captures the full row as JSON so the action can
- * copy it to the audit/archive table inside the same write tx. Unlike
- * requeue, terminal cleanup deliberately includes retired `extract` rows.
- */
 function buildCancelPruneSql(
 	db: ReadDb,
 	table: "memory_jobs",
@@ -2672,20 +3020,11 @@ function buildCancelPruneSql(
 	return { rows, totalMatching };
 }
 
-/** `cancelled` is the soft-cancel status #901 introduces; total prune is hard delete. */
-
 interface CancelResultMeta {
 	readonly affected: number;
 	readonly preview: readonly string[];
 	readonly totalMatching: number;
 }
-
-/**
- * Cancel obsolete jobs by copying them to `job_cancellations` and flipping
- * their source `status` to `cancelled`. Never hard-deletes the source
- * row. Default selection: rows where `status IN ('dead','completed')`
- * and `created_at < now - olderThanMs` (default 30 days).
- */
 export async function cancelObsoleteJobs(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
@@ -2711,82 +3050,81 @@ export async function cancelObsoleteJobs(
 
 	const olderThanMs = options.olderThanMs ?? 30 * 24 * 60 * 60 * 1000;
 	const wantsMemory = !options.tables || options.tables.includes("memory");
-	const result = await withRepairWriteTx<CancelResultMeta>(accessor, (db) => {
-		if (!tableExists(db, "job_cancellations")) {
-			throw new Error("job_cancellations table missing; run migrations");
-		}
+	const result = await withRepairWriteTx<CancelResultMeta>(
+		accessor,
+		(db) => {
+			if (!tableExists(db, "job_cancellations")) {
+				throw new Error("job_cancellations table missing; run migrations");
+			}
 
-		const selection = {
-			...options,
-			olderThanMs,
-			maxBatch: options.maxBatch ?? MAX_BATCH_HARD_CAP,
-		};
-		const targets: Array<{
-			readonly table: "memory_jobs";
-			readonly rows: readonly CancelPruneMatchRow[];
-			readonly totalMatching: number;
-		}> = [];
-		// `--max-batch` is an aggregate cap across ALL selected tables, not a
-		// per-table cap. Select memory first, then hand only the remaining
-		// budget to summary so a both-queue operation can never exceed the
-		// requested blast radius (issue #1053).
-		let remaining = Math.min(selection.maxBatch ?? MAX_BATCH_HARD_CAP, MAX_BATCH_HARD_CAP);
-		if (wantsMemory) {
-			const r = buildCancelPruneSql(db, "memory_jobs", ["dead", "completed"], {
-				...selection,
-				maxBatch: remaining,
-			});
-			targets.push({ table: "memory_jobs", rows: r.rows, totalMatching: r.totalMatching });
-			remaining = Math.max(0, remaining - r.rows.length);
-		}
+			const selection = {
+				...options,
+				olderThanMs,
+				maxBatch: options.maxBatch ?? MAX_BATCH_HARD_CAP,
+			};
+			const targets: Array<{
+				readonly table: "memory_jobs";
+				readonly rows: readonly CancelPruneMatchRow[];
+				readonly totalMatching: number;
+			}> = [];
+			const remaining = Math.min(selection.maxBatch ?? MAX_BATCH_HARD_CAP, MAX_BATCH_HARD_CAP);
+			if (wantsMemory) {
+				const r = buildCancelPruneSql(db, "memory_jobs", ["dead", "completed"], {
+					...selection,
+					maxBatch: remaining,
+				});
+				targets.push({ table: "memory_jobs", rows: r.rows, totalMatching: r.totalMatching });
+			}
 
-		const totalMatching = targets.reduce((acc, t) => acc + t.totalMatching, 0);
+			const totalMatching = targets.reduce((acc, t) => acc + t.totalMatching, 0);
 
-		if (dryRun) {
+			if (dryRun) {
+				const previewIds: string[] = [];
+				for (const t of targets) {
+					for (const r of t.rows) previewIds.push(`${t.table}:${r.id}`);
+					if (previewIds.length >= PREVIEW_CAP) break;
+				}
+				return {
+					affected: 0,
+					preview: previewIds.slice(0, PREVIEW_CAP),
+					totalMatching,
+				};
+			}
+
+			let affected = 0;
 			const previewIds: string[] = [];
 			for (const t of targets) {
-				for (const r of t.rows) previewIds.push(`${t.table}:${r.id}`);
-				if (previewIds.length >= PREVIEW_CAP) break;
-			}
-			return {
-				affected: 0,
-				preview: previewIds.slice(0, PREVIEW_CAP),
-				totalMatching,
-			};
-		}
-
-		let affected = 0;
-		const previewIds: string[] = [];
-		for (const t of targets) {
-			for (const row of t.rows) {
-				const cancellationId = `cancel-${t.table}-${row.id}-${Date.now()}`;
-				const now = new Date().toISOString();
-				db.prepare(
-					`INSERT INTO job_cancellations
+				for (const row of t.rows) {
+					const cancellationId = `cancel-${t.table}-${row.id}-${Date.now()}`;
+					const now = new Date().toISOString();
+					db.prepare(
+						`INSERT INTO job_cancellations
 					 (id, source_table, source_id, status_before, payload_json,
 					  reason, actor, actor_type, request_id, created_at)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				).run(
-					cancellationId,
-					t.table,
-					row.id,
-					String(row.payload.status ?? ""),
-					JSON.stringify(row.payload),
-					ctx.reason,
-					ctx.actor,
-					ctx.actorType,
-					ctx.requestId ?? null,
-					now,
-				);
+					).run(
+						cancellationId,
+						t.table,
+						row.id,
+						String(row.payload.status ?? ""),
+						JSON.stringify(row.payload),
+						ctx.reason,
+						ctx.actor,
+						ctx.actorType,
+						ctx.requestId ?? null,
+						now,
+					);
 
-				db.prepare(`UPDATE ${t.table} SET status = 'cancelled' WHERE id = ?`).run(row.id);
-				affected += 1;
-				if (previewIds.length < PREVIEW_CAP) previewIds.push(`${t.table}:${row.id}`);
+					db.prepare(`UPDATE ${t.table} SET status = 'cancelled' WHERE id = ?`).run(row.id);
+					affected += 1;
+					if (previewIds.length < PREVIEW_CAP) previewIds.push(`${t.table}:${row.id}`);
+				}
 			}
-		}
-		writeRepairAudit(db, action, ctx, affected, `cancelled ${affected} obsolete job(s)`);
-		return { affected, preview: previewIds, totalMatching };
-	});
+			writeRepairAudit(db, action, ctx, affected, `cancelled ${affected} obsolete job(s)`);
+			return { affected, preview: previewIds, totalMatching };
+		},
+		"db:repair.cancel-obsolete-jobs.write",
+	);
 
 	if (!dryRun) limiter.record(action);
 	logger.info("pipeline", "repair: cancelled obsolete jobs", {
@@ -2815,12 +3153,6 @@ interface PruneResultMeta {
 	readonly preview: readonly string[];
 	readonly totalMatching: number;
 }
-
-/**
- * Prune terminal jobs (cancelled / completed / dead) older than the
- * configured retention window. Before delete, copies the full row to
- * `job_archive` to preserve provenance. Hard cap is 1000 rows per call.
- */
 export async function pruneTerminalJobs(
 	accessor: DbAccessor,
 	cfg: PipelineV2Config,
@@ -2845,96 +3177,97 @@ export async function pruneTerminalJobs(
 	}
 
 	const wantsMemory = !options.tables || options.tables.includes("memory");
-	const result = await withRepairWriteTx<PruneResultMeta>(accessor, (db) => {
-		if (!tableExists(db, "job_archive")) {
-			throw new Error("job_archive table missing; run migrations");
-		}
+	const result = await withRepairWriteTx<PruneResultMeta>(
+		accessor,
+		(db) => {
+			if (!tableExists(db, "job_archive")) {
+				throw new Error("job_archive table missing; run migrations");
+			}
 
-		const targets: Array<{
-			readonly table: "memory_jobs";
-			readonly statusList: readonly string[];
-			readonly cutoff: number;
-		}> = [];
-		if (wantsMemory) {
-			targets.push({
-				table: "memory_jobs",
-				statusList: ["dead", "cancelled", "completed"],
-				cutoff: options.retentionMs ?? 90 * 24 * 60 * 60 * 1000,
-			});
-		}
+			const targets: Array<{
+				readonly table: "memory_jobs";
+				readonly statusList: readonly string[];
+				readonly cutoff: number;
+			}> = [];
+			if (wantsMemory) {
+				targets.push({
+					table: "memory_jobs",
+					statusList: ["dead", "cancelled", "completed"],
+					cutoff: options.retentionMs ?? 90 * 24 * 60 * 60 * 1000,
+				});
+			}
 
-		const perTable: Array<{
-			readonly rows: readonly CancelPruneMatchRow[];
-			readonly totalMatching: number;
-		}> = [];
-		let totalMatching = 0;
-		// `--max-batch` is an aggregate cap across ALL selected tables; the
-		// remaining budget carries across tables so a both-queue prune can
-		// never exceed the requested blast radius (issue #1053).
-		let remaining = Math.min(options.maxBatch ?? MAX_BATCH_HARD_CAP, MAX_BATCH_HARD_CAP);
-		for (const t of targets) {
-			const selection: JobFilterOptions = {
-				...options,
-				olderThanMs: t.cutoff,
-				maxBatch: remaining,
-			};
-			const r = buildCancelPruneSql(db, t.table, t.statusList, selection);
-			perTable.push({ rows: r.rows, totalMatching: r.totalMatching });
-			totalMatching += r.totalMatching;
-			remaining = Math.max(0, remaining - r.rows.length);
-		}
+			const perTable: Array<{
+				readonly rows: readonly CancelPruneMatchRow[];
+				readonly totalMatching: number;
+			}> = [];
+			let totalMatching = 0;
+			let remaining = Math.min(options.maxBatch ?? MAX_BATCH_HARD_CAP, MAX_BATCH_HARD_CAP);
+			for (const t of targets) {
+				const selection: JobFilterOptions = {
+					...options,
+					olderThanMs: t.cutoff,
+					maxBatch: remaining,
+				};
+				const r = buildCancelPruneSql(db, t.table, t.statusList, selection);
+				perTable.push({ rows: r.rows, totalMatching: r.totalMatching });
+				totalMatching += r.totalMatching;
+				remaining = Math.max(0, remaining - r.rows.length);
+			}
 
-		if (dryRun) {
+			if (dryRun) {
+				const previewIds: string[] = [];
+				for (let i = 0; i < perTable.length; i += 1) {
+					const t = targets[i];
+					if (!t) continue;
+					const pt = perTable[i];
+					if (!pt) continue;
+					for (const row of pt.rows) previewIds.push(`${t.table}:${row.id}`);
+					if (previewIds.length >= PREVIEW_CAP) break;
+				}
+				return {
+					affected: 0,
+					preview: previewIds.slice(0, PREVIEW_CAP),
+					totalMatching,
+				};
+			}
+
+			let affected = 0;
 			const previewIds: string[] = [];
 			for (let i = 0; i < perTable.length; i += 1) {
 				const t = targets[i];
 				if (!t) continue;
 				const pt = perTable[i];
 				if (!pt) continue;
-				for (const row of pt.rows) previewIds.push(`${t.table}:${row.id}`);
-				if (previewIds.length >= PREVIEW_CAP) break;
-			}
-			return {
-				affected: 0,
-				preview: previewIds.slice(0, PREVIEW_CAP),
-				totalMatching,
-			};
-		}
-
-		let affected = 0;
-		const previewIds: string[] = [];
-		for (let i = 0; i < perTable.length; i += 1) {
-			const t = targets[i];
-			if (!t) continue;
-			const pt = perTable[i];
-			if (!pt) continue;
-			for (const row of pt.rows) {
-				const archiveId = `archive-${t.table}-${row.id}-${Date.now()}`;
-				const now = new Date().toISOString();
-				db.prepare(
-					`INSERT INTO job_archive
+				for (const row of pt.rows) {
+					const archiveId = `archive-${t.table}-${row.id}-${Date.now()}`;
+					const now = new Date().toISOString();
+					db.prepare(
+						`INSERT INTO job_archive
 					 (id, source_table, source_id, status, payload_json,
 					  archived_at, archived_by, reason, created_at)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				).run(
-					archiveId,
-					t.table,
-					row.id,
-					String(row.payload.status ?? ""),
-					JSON.stringify(row.payload),
-					now,
-					ctx.actor,
-					ctx.reason,
-					now,
-				);
-				db.prepare(`DELETE FROM ${t.table} WHERE id = ?`).run(row.id);
-				affected += 1;
-				if (previewIds.length < PREVIEW_CAP) previewIds.push(`${t.table}:${row.id}`);
+					).run(
+						archiveId,
+						t.table,
+						row.id,
+						String(row.payload.status ?? ""),
+						JSON.stringify(row.payload),
+						now,
+						ctx.actor,
+						ctx.reason,
+						now,
+					);
+					db.prepare(`DELETE FROM ${t.table} WHERE id = ?`).run(row.id);
+					affected += 1;
+					if (previewIds.length < PREVIEW_CAP) previewIds.push(`${t.table}:${row.id}`);
+				}
 			}
-		}
-		writeRepairAudit(db, action, ctx, affected, `pruned ${affected} terminal job(s)`);
-		return { affected, preview: previewIds, totalMatching };
-	});
+			writeRepairAudit(db, action, ctx, affected, `pruned ${affected} terminal job(s)`);
+			return { affected, preview: previewIds, totalMatching };
+		},
+		"db:repair.prune-terminal-jobs.write",
+	);
 
 	if (!dryRun) limiter.record(action);
 	logger.info("pipeline", "repair: pruned terminal jobs", {

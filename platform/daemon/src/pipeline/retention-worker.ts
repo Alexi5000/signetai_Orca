@@ -1,29 +1,13 @@
-/**
- * Retention worker: purges expired data in safe order.
- *
- * Purge order (spec section 32.5 D2.3):
- *   1. Graph links (memory_entity_mentions for deleted memories)
- *   2. Embeddings for deleted memories
- *   3. Tombstones (hard-delete soft-deleted memories past retention;
- *      FTS cleanup is handled by the memories_ad trigger)
- *   4. History events past retention window
- *   5. Completed jobs past retention window
- *   6. Dead-letter jobs past retention window
- *
- * Runs on a configurable interval. Each purge step is a separate
- * short transaction to avoid holding write locks.
- */
-
 import type { DbAccessor, WriteDb } from "../db-accessor";
 import type { DbOwnerMaintenance } from "../db-owner-maintenance";
+import { startDependencyHistoryCompaction } from "../dependency-history-compaction";
+import { getDatabaseIntegrityStatus } from "../database-integrity";
 
 async function writeTx<T>(accessor: DbAccessor, fn: (db: WriteDb) => T): Promise<T> {
 	const writer = accessor.withWriteTxAsync;
 	if (!writer) throw new Error("async write API is unavailable");
 	return writer(fn);
 }
-
-/** Typed shape of a row fetched from the memories table for cold archival. */
 interface MemoryRow {
 	readonly id: unknown;
 	readonly type: unknown;
@@ -51,26 +35,20 @@ import { countChanges, syncVecDeleteByEmbeddingIds } from "../db-helpers";
 import { logger } from "../logger";
 import { isSystemPressureHigh } from "../system-pressure";
 import { txDecrementEntityMentions } from "./graph-transactions";
-import { invalidateTraversalCache } from "./graph-traversal";
 import { runWriteBatches } from "../yielding-writes";
+import { txDeleteMemoryTemporalEdges } from "../temporal-edges";
 
 export interface RetentionConfig {
-	/** How often to run the retention sweep (ms) */
 	readonly intervalMs: number;
-	/** Soft-deleted memories: ms before hard purge (default 30 days) */
 	readonly tombstoneRetentionMs: number;
-	/** History events: ms before purge (default 180 days) */
 	readonly historyRetentionMs: number;
-	/** Completed jobs: ms before purge (default 14 days) */
 	readonly completedJobRetentionMs: number;
-	/** Dead-letter jobs: ms before purge (default 30 days) */
 	readonly deadJobRetentionMs: number;
-	/** Max rows to purge per step per sweep (backpressure) */
 	readonly batchLimit: number;
 }
 
 export const DEFAULT_RETENTION: RetentionConfig = {
-	intervalMs: 6 * 60 * 60 * 1000, // 6 hours
+	intervalMs: 6 * 60 * 60 * 1000,
 	tombstoneRetentionMs: 30 * 24 * 60 * 60 * 1000,
 	historyRetentionMs: 180 * 24 * 60 * 60 * 1000,
 	completedJobRetentionMs: 14 * 24 * 60 * 60 * 1000,
@@ -81,13 +59,11 @@ export const DEFAULT_RETENTION: RetentionConfig = {
 export interface RetentionHandle {
 	stop(): void;
 	readonly running: boolean;
-	/** Run a single sweep immediately (for testing) */
 	sweep(): Promise<RetentionSweepResult>;
 }
 
 export interface RetentionSweepResult {
 	graphLinksPurged: number;
-	entitiesOrphaned: number;
 	embeddingsPurged: number;
 	tombstonesPurged: number;
 	historyPurged: number;
@@ -99,7 +75,6 @@ export interface RetentionSweepResult {
 
 const EMPTY_RETENTION_RESULT: RetentionSweepResult = {
 	graphLinksPurged: 0,
-	entitiesOrphaned: 0,
 	embeddingsPurged: 0,
 	tombstonesPurged: 0,
 	historyPurged: 0,
@@ -109,12 +84,7 @@ const EMPTY_RETENTION_RESULT: RetentionSweepResult = {
 	deadTranscriptCaptureJobsPurged: 0,
 };
 
-function purgeGraphLinks(
-	db: WriteDb,
-	cutoff: string,
-	limit: number,
-): { mentionsPurged: number; entitiesOrphaned: number } {
-	// Find tombstoned memory IDs past retention
+function purgeGraphLinks(db: WriteDb, cutoff: string, limit: number): number {
 	const expiredIds = db
 		.prepare(
 			`SELECT id FROM memories
@@ -123,12 +93,10 @@ function purgeGraphLinks(
 		)
 		.all(cutoff, limit) as Array<{ id: string }>;
 
-	if (expiredIds.length === 0) return { mentionsPurged: 0, entitiesOrphaned: 0 };
+	if (expiredIds.length === 0) return 0;
 
 	const placeholders = expiredIds.map(() => "?").join(", ");
 	const ids = expiredIds.map((r) => r.id);
-
-	// Capture affected entity IDs before deleting mention links
 	const affectedEntities = db
 		.prepare(
 			`SELECT DISTINCT entity_id FROM memory_entity_mentions
@@ -142,13 +110,8 @@ function purgeGraphLinks(
 			 WHERE memory_id IN (${placeholders})`,
 		)
 		.run(...ids);
-	const mentionsPurged = countChanges(result);
-
-	// Decrement entity mention counts and clean orphans
-	const entityIds = affectedEntities.map((r) => r.entity_id);
-	const { entitiesOrphaned } = txDecrementEntityMentions(db, { entityIds });
-
-	return { mentionsPurged, entitiesOrphaned };
+	txDecrementEntityMentions(db, { entityIds: affectedEntities.map((r) => r.entity_id) });
+	return countChanges(result);
 }
 
 function purgeEmbeddings(db: WriteDb, cutoff: string, limit: number): number {
@@ -164,8 +127,6 @@ function purgeEmbeddings(db: WriteDb, cutoff: string, limit: number): number {
 
 	const placeholders = expiredIds.map(() => "?").join(", ");
 	const ids = expiredIds.map((r) => r.id);
-
-	// Sync vec_embeddings before deleting from embeddings
 	const embRows = db
 		.prepare(
 			`SELECT id FROM embeddings
@@ -188,15 +149,6 @@ function purgeEmbeddings(db: WriteDb, cutoff: string, limit: number): number {
 		.run(...ids);
 	return countChanges(result);
 }
-
-/**
- * Archive memories to the cold tier before hard-deleting them.
- *
- * Copies the memory rows into `memories_cold` with the given reason.
- * Uses INSERT OR IGNORE so re-archiving the same ID is a no-op.
- * Gracefully skips if the cold table doesn't exist yet (migration
- * may not have run).
- */
 export function archiveToCold(
 	db: WriteDb,
 	memoryIds: ReadonlyArray<string>,
@@ -204,8 +156,6 @@ export function archiveToCold(
 	coldSourceId?: string,
 ): void {
 	if (memoryIds.length === 0) return;
-
-	// Check if memories_cold table exists (migration may not have run yet)
 	const tableExists = db
 		.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memories_cold'`)
 		.get();
@@ -218,13 +168,7 @@ export function archiveToCold(
 
 	const placeholders = memoryIds.map(() => "?").join(", ");
 	const now = new Date().toISOString();
-
-	// Fetch full rows so we can store a complete JSON snapshot (truly lossless —
-	// captures all columns regardless of future schema additions).
 	const rows = db.prepare(`SELECT * FROM memories WHERE id IN (${placeholders})`).all(...memoryIds) as MemoryRow[];
-
-	// Each archival event gets a fresh archive_id so multiple snapshots for the
-	// same memory (e.g. supersession then purge) are preserved independently.
 	const stmt = db.prepare(`
 		INSERT INTO memories_cold (
 			archive_id, memory_id, type, category, content, confidence, importance,
@@ -281,18 +225,12 @@ function purgeTombstones(db: WriteDb, cutoff: string, limit: number): number {
 
 	const placeholders = expiredIds.map(() => "?").join(", ");
 	const ids = expiredIds.map((r) => r.id);
-
-	// Archive to cold tier before deleting
 	archiveToCold(db, ids, "retention_decay");
-
-	// Hard-delete the memory rows; the memories_ad trigger handles FTS cleanup.
-	// We count selected IDs rather than .changes because FTS triggers inflate it.
+	txDeleteMemoryTemporalEdges(db, ids);
 	db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...ids);
 
 	return expiredIds.length;
 }
-
-// LIMIT stays inside a SELECT because DELETE ... LIMIT is optional in SQLite.
 function purgeExpiredRows(
 	db: WriteDb,
 	table: string,
@@ -364,26 +302,12 @@ export async function runRetentionSweepOnce(
 	const historyCutoff = new Date(now - normalizedCfg.historyRetentionMs).toISOString();
 	const completedJobCutoff = new Date(now - normalizedCfg.completedJobRetentionMs).toISOString();
 	const deadJobCutoff = new Date(now - normalizedCfg.deadJobRetentionMs).toISOString();
-
-	// A retention batch has dependent graph, vector, canonical, and archival
-	// writes. Keep them together so a vec failure cannot commit irreversible
-	// provenance cleanup while leaving the canonical embedding retryable.
-	const retentionResult = await writeTx(accessor, (db) => {
-		const graph = purgeGraphLinks(db, tombstoneCutoff, normalizedCfg.batchLimit);
-		const embeddingsPurged = purgeEmbeddings(db, tombstoneCutoff, normalizedCfg.batchLimit);
-		const tombstonesPurged = purgeTombstones(db, tombstoneCutoff, normalizedCfg.batchLimit);
-		return { ...graph, embeddingsPurged, tombstonesPurged };
+	const { graphLinksPurged, embeddingsPurged, tombstonesPurged } = await writeTx(accessor, (db) => {
+		const graphLinks = purgeGraphLinks(db, tombstoneCutoff, normalizedCfg.batchLimit);
+		const embeddings = purgeEmbeddings(db, tombstoneCutoff, normalizedCfg.batchLimit);
+		const tombstones = purgeTombstones(db, tombstoneCutoff, normalizedCfg.batchLimit);
+		return { graphLinksPurged: graphLinks, embeddingsPurged: embeddings, tombstonesPurged: tombstones };
 	});
-	const graphLinksPurged = retentionResult.mentionsPurged;
-	const entitiesOrphaned = retentionResult.entitiesOrphaned;
-	const embeddingsPurged = retentionResult.embeddingsPurged;
-	const tombstonesPurged = retentionResult.tombstonesPurged;
-
-	if (entitiesOrphaned > 0) invalidateTraversalCache();
-
-	// The remaining steps are independent bounded transactions. Drain them
-	// through the shared yielding writer so a sweep gives the event loop a turn
-	// between each maintenance batch.
 	const steps = [
 		{ table: "memory_history", where: "created_at < ?", cutoff: historyCutoff, allowMissingTable: false },
 		{
@@ -429,7 +353,6 @@ export async function runRetentionSweepOnce(
 
 	return {
 		graphLinksPurged,
-		entitiesOrphaned,
 		embeddingsPurged,
 		tombstonesPurged,
 		historyPurged,
@@ -453,7 +376,6 @@ export function startRetentionWorker(
 		const result = await runRetentionSweepOnce(accessor, normalizedCfg, ownerMaintenance);
 		const total =
 			result.graphLinksPurged +
-			result.entitiesOrphaned +
 			result.embeddingsPurged +
 			result.tombstonesPurged +
 			result.historyPurged +
@@ -469,6 +391,10 @@ export function startRetentionWorker(
 	}
 
 	async function runScheduledSweep(): Promise<void> {
+		if (running && ownerMaintenance && getDatabaseIntegrityStatus().phase !== "complete") {
+			timer = setTimeout(runScheduledSweep, 60_000);
+			return;
+		}
 		if (running && !isSystemPressureHigh()) {
 			await doSweep().catch((e) => {
 				logger.warn("retention", "Sweep error", {
@@ -478,10 +404,13 @@ export function startRetentionWorker(
 		}
 		if (running) timer = setTimeout(runScheduledSweep, normalizedCfg.intervalMs);
 	}
-
-	// First sweep shortly after boot; a daemon that restarts more often than
-	// intervalMs would otherwise never purge.
 	timer = setTimeout(runScheduledSweep, 60_000);
+	const dependencyHistoryCompaction = ownerMaintenance
+		? startDependencyHistoryCompaction(ownerMaintenance.owner, {
+				idleIntervalMs: normalizedCfg.intervalMs,
+				queueIsHealthy: ownerMaintenance.queueIsHealthy,
+			})
+		: null;
 
 	logger.info("retention", "Worker started", {
 		intervalMs: normalizedCfg.intervalMs,
@@ -499,6 +428,7 @@ export function startRetentionWorker(
 				clearTimeout(timer);
 				timer = null;
 			}
+			void dependencyHistoryCompaction?.stop();
 			logger.info("retention", "Worker stopped");
 		},
 		sweep: doSweep,

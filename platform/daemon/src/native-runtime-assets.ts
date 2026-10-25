@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	closeSync,
+	constants,
 	existsSync,
+	fstatSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
@@ -92,30 +96,16 @@ export function resolveEmbeddedDashboardAsset(requestPath: string): EmbeddedDash
 }
 
 const privateCacheFallbacks = new Map<string, string>();
-
-/**
- * Whether `dir` is a real directory owned by this user that no other user
- * could have written into. Owner-only read/execute bits are tightened.
- */
 function isTrustedPrivateDir(dir: string): boolean {
 	const st = lstatSync(dir);
 	if (st.isSymbolicLink() || !st.isDirectory()) return false;
 	if (process.platform === "win32") return true;
 	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
 	if (uid !== undefined && st.uid !== uid) return false;
-	// Group/other-writable: another user may have planted content.
 	if ((st.mode & 0o022) !== 0) return false;
 	if ((st.mode & 0o077) !== 0) chmodSync(dir, 0o700);
 	return true;
 }
-
-/**
- * Resolve the content-addressed cache directory `tmpdir()/<name>`, reused
- * across runs. The shared temp root is world-writable, so the directory must
- * be created owner-only (0o700) and verified to be ours before any cached
- * code is trusted; otherwise a fresh private mkdtemp directory is used for
- * the rest of this process.
- */
 function ensurePrivateCacheDir(name: string): string {
 	const fallback = privateCacheFallbacks.get(name);
 	if (fallback !== undefined) return fallback;
@@ -159,9 +149,7 @@ function materializeEmbeddedWorker(path: string, content: Buffer): void {
 				} else if (attempt === 0) {
 					try {
 						unlinkSync(path);
-					} catch {
-						// Another publisher may be repairing the same hash-keyed path.
-					}
+					} catch {}
 				}
 			}
 		}
@@ -181,10 +169,6 @@ export function resolveEmbeddedWorkerPath(name: string): string | null {
 	materializeEmbeddedWorker(path, Buffer.from(worker.contentBase64, "base64"));
 	return path;
 }
-
-// Materializes an embedded native `.node` addon so callers can `require()` it
-// by absolute path -- some N-API packages (e.g. `@napi-rs/keyring`) don't
-// survive Bun `--compile` bundling by package name.
 export function materializeEmbeddedNativeAddon(name: string): string | null {
 	const asset = (nativeRuntimeAssets().nativeAddons ?? []).find((a) => a.name === name);
 	if (!asset) return null;
@@ -204,16 +188,12 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 			try {
 				const entryHash = createHash("sha256").update(readFileSync(entryPath)).digest("hex").slice(0, 16);
 				isValidHashFile = entry.endsWith(`${entryHash}.node`);
-			} catch {
-				// An unreadable destination is corrupt and eligible for one-shot cleanup.
-			}
+			} catch {}
 		}
 		if (isValidHashFile) continue;
 		try {
 			unlinkSync(entryPath);
-		} catch {
-			// A stale addon may still be loaded on Windows; retry next start.
-		}
+		} catch {}
 	}
 	const valid = () =>
 		existsSync(path) && createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 16) === hash;
@@ -222,9 +202,6 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 		const tempPath = join(tempDir, "addon.node");
 		try {
 			writeFileSync(tempPath, content, { flag: "wx" });
-			// The temp is fully written before rename, so the loader never sees
-			// partial content. Hash-keyed names mean we never replace a live file.
-			// Concurrent identical publishers converge on one valid destination.
 			let published = false;
 			for (let attempt = 0; attempt < 2 && !published; attempt += 1) {
 				try {
@@ -236,12 +213,9 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 					if (valid()) {
 						published = true;
 					} else if (attempt === 0) {
-						// A corrupt destination is not loadable/locked; replace it once.
 						try {
 							unlinkSync(path);
-						} catch {
-							/* another publisher may be repairing it */
-						}
+						} catch {}
 					}
 				}
 			}
@@ -250,6 +224,46 @@ export function materializeEmbeddedNativeAddon(name: string): string | null {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	}
+	return path;
+}
+
+const materializedLibraries = new Map<string, string>();
+export function materializeEmbeddedNativeLibrary(name: string, fileName: string): string | null {
+	const asset = (nativeRuntimeAssets().nativeAddons ?? []).find((a) => a.name === name);
+	if (!asset) return null;
+
+	const content = Buffer.from(asset.contentBase64, "base64");
+	const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
+	const safeName = name.replace(/[^a-zA-Z0-9_.-]/g, "_");
+	if (fileName !== fileName.replace(/[^a-zA-Z0-9_.-]/g, "_") || fileName === "." || fileName === "..") {
+		throw new Error("Invalid native library filename");
+	}
+	const dir = ensurePrivateCacheDir(`signet-native-library-${safeName}-${hash}`);
+	const path = join(dir, fileName);
+	let valid = false;
+	let fd: number | undefined;
+	try {
+		const entry = lstatSync(path);
+		if (!entry.isFile() || entry.nlink !== 1) throw new Error("Invalid native library cache entry");
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		const opened = fstatSync(fd);
+		if (!opened.isFile() || opened.nlink !== 1 || opened.ino !== entry.ino || opened.dev !== entry.dev) {
+			throw new Error("Native library cache entry changed");
+		}
+		valid = opened.size === content.length && readFileSync(fd).equals(content);
+	} catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+	if (!valid) writeFileAtomicSync(path, content, { mode: 0o600, followSymlinks: false, fsync: true });
+	const previous = materializedLibraries.get(name);
+	if (previous && previous !== path) {
+		try {
+			unlinkSync(previous);
+		} catch {}
+	}
+	materializedLibraries.set(name, path);
 	return path;
 }
 
@@ -265,7 +279,6 @@ export function materializeEmbeddedWasmAssets(): string | null {
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	for (const asset of assets) {
 		const path = join(dir, asset.name.replace(/[/\\]/g, "_"));
-		// Create-if-missing without a check-then-write window.
 		writeFileExclusiveSync(path, Buffer.from(asset.contentBase64, "base64"));
 	}
 	return dir;
@@ -285,7 +298,6 @@ export function materializeEmbeddedAssetTree(kind: "connectors" | "graphiq" | "s
 		if (parts.length === 0 || parts.includes("..")) continue;
 		const path = join(root, ...parts);
 		mkdirSync(dirname(path), { recursive: true });
-		// Create-if-missing (O_EXCL); the asset mode is applied to the descriptor.
 		writeFileExclusiveSync(path, Buffer.from(asset.contentBase64, "base64"), { mode: asset.mode });
 	}
 	if (kind === "connectors") {

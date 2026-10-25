@@ -1,8 +1,3 @@
-/**
- * Global Hono middleware extracted from daemon.ts.
- * Registers CORS, shutdown guard, auth, and request logging.
- */
-
 import type { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
@@ -19,8 +14,6 @@ export function registerGlobalMiddleware(app: Hono): void {
 		}
 		return next();
 	});
-
-	// MW-1: CORS
 	app.use(
 		"*",
 		cors({
@@ -28,20 +21,13 @@ export function registerGlobalMiddleware(app: Hono): void {
 			credentials: true,
 		}),
 	);
-
-	// MW-2: Shutdown guard
 	app.use("*", async (c, next) => {
-		// Liveness/readiness probes must keep answering during shutdown: /health
-		// and /health/live report liveness, /health/ready returns its structured
-		// 503 rather than the guard's generic one.
 		if (shuttingDown && !c.req.path.startsWith("/health")) {
 			c.status(503);
 			return c.json({ error: "shutting down" });
 		}
 		return next();
 	});
-
-	// MW-3: Auth
 	app.use("*", async (c, next) => {
 		if (authConfig.mode !== "local" && !authSecret) {
 			c.status(503);
@@ -50,9 +36,6 @@ export function registerGlobalMiddleware(app: Hono): void {
 		const mw = createAuthMiddleware(authConfig, authSecret, (token) => verifyApiKey(getDbAccessor(), token));
 		return mw(c, next);
 	});
-
-	// Transcript uploads enforce their larger limit as they stream into staging.
-	// Other bodies stay bounded even when Transfer-Encoding is chunked.
 	const limitBody = bodyLimit({
 		maxSize: 10 * 1_048_576,
 		onError: (c) => c.json({ error: "payload too large" }, 413),
@@ -62,8 +45,6 @@ export function registerGlobalMiddleware(app: Hono): void {
 			? next()
 			: limitBody(c, next),
 	);
-
-	// MW-4: Request logging + analytics
 	app.use("*", async (c, next) => {
 		const start = Date.now();
 		await next();

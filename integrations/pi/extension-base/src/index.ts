@@ -36,6 +36,7 @@ export {
 	type DaemonClientConfig,
 	type DaemonFetchFailure,
 	type DaemonFetchResult,
+	type DaemonStatusClient,
 } from "./daemon-client.js";
 
 export {
@@ -46,8 +47,9 @@ export {
 	ensureSessionContext,
 	flushPendingSessionEnds,
 	refreshSessionStart,
+	beginPromptSubmit,
 	requestNotifications,
-	requestRecallForPrompt,
+	settlePromptSubmit,
 	type LifecycleConfig,
 	type LifecycleDeps,
 	type SessionRef,
@@ -60,6 +62,7 @@ export {
 	type BaseSessionState,
 	type PendingSessionEnd,
 	type PendingSessionSwitch,
+	type PromptRecall,
 	evictOldestKey,
 	MAX_ENDED_SESSIONS,
 	MAX_PENDING_PER_SESSION,

@@ -51,7 +51,6 @@ import { getInferenceRouterOrNull } from "../inference-router";
 import { fetchInternal } from "../internal-fetch.js";
 import { logger } from "../logger";
 import { type EmbeddingConfig, loadMemoryConfig } from "../memory-config";
-import { upsertMemoryContentSafetyInTx } from "../memory-content-safety";
 import { normalizeMarkdownBody, writeCompactionArtifact } from "../memory-lineage.js";
 import { type RecallParams, hybridRecall } from "../memory-search";
 import {
@@ -63,9 +62,11 @@ import {
 import { getSynthesisWorker, readLastSynthesisTime } from "../pipeline";
 import { type PipelineCauseFamily, normalizePipelineCause, recordPipelineOperation } from "../pipeline-operation";
 import { DEFAULT_SYNTHESIS_WORKER_CONFIG } from "../pipeline/synthesis-worker";
+import { openBoundedSse } from "../sse-stream.js";
 import { effectiveRecallLimit, recordRecallAttempt, recordRecallOutcome } from "../recall-telemetry";
 import { isNoiseSession } from "../session-noise";
 import { advanceRecallContextEpochAsync } from "../session-recall-dedupe";
+import { sessionStartRecallKey } from "../session-start-state";
 import {
 	type RuntimePath,
 	claimSession,
@@ -111,8 +112,6 @@ export function stampHarness(harness: string | undefined): void {
 		harnessLastSeen.set(harness, new Date().toISOString());
 	}
 }
-
-/** Provider outages are the 503-class cause and dominate compound hook degradation. */
 export function preferHookRecallCause(
 	current: PipelineCauseFamily | undefined,
 	candidate: PipelineCauseFamily,
@@ -166,19 +165,12 @@ async function recordHookRecallOperation(handler: () => Promise<Response>): Prom
 		throw error;
 	}
 }
-
-/** Read the runtime path from header or body, preferring header. */
 function resolveRuntimePath(c: Context, body?: { runtimePath?: string }): RuntimePath | undefined {
 	const header = c.req.header("x-signet-runtime-path");
 	const val = header || body?.runtimePath;
 	if (val === "plugin" || val === "legacy") return val;
 	return undefined;
 }
-
-/**
- * Check that a mid-session hook call is from the path that claimed the
- * session. Returns a 409 Response if there's a conflict, or null if ok.
- */
 function checkSessionClaim(
 	c: Context,
 	sessionKey: string | undefined,
@@ -279,13 +271,9 @@ function parseOptionalNonNegativeInt(value: unknown): number | undefined {
 	const parsed = Number(text);
 	return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
-
-// Guard against recursive hook calls from spawned agent contexts
 function isInternalCall(c: Context): boolean {
 	return c.req.header("x-signet-no-hooks") === "1";
 }
-
-// Check whether the session is bypassed (hooks return no-op responses)
 function checkBypass(body?: { sessionKey?: string; sessionId?: string; agentId?: string }): boolean {
 	const key = body?.sessionKey ?? body?.sessionId;
 	if (!key) return false;
@@ -365,12 +353,6 @@ export function listLiveSessions(agentId: string): Array<{
 	}
 	return [...byKey.values()].sort((a, b) => b.claimedAt.localeCompare(a.claimedAt));
 }
-
-// ============================================================================
-// Hooks Routes
-// ============================================================================
-
-// Session start hook - provides context/memories for injection
 function registerSessionStart(app: Hono): void {
 	app.post("/api/hooks/session-start", async (c) => {
 		if (isInternalCall(c)) {
@@ -424,9 +406,7 @@ function registerSessionStart(app: Hono): void {
 
 			try {
 				autoConnectGraphiq(parseOptionalString(body.project));
-			} catch {
-				// auto-connect is best-effort; never block session-start
-			}
+			} catch {}
 
 			if (checkBypass(body)) {
 				return c.json({ inject: "", stableSystemPrompt: "", dynamicContext: "", memories: [], bypassed: true });
@@ -461,12 +441,6 @@ function registerSessionStart(app: Hono): void {
 		}
 	});
 }
-
-// Bound concurrent prompt-submit work. Subagent-heavy sessions fire many
-// user-prompt-submit hooks at once; without a cap the requests stack on the
-// single event loop, /health starves, and the watchdog kills the daemon
-// (#1059). Past the cap the hook rejects with 503 so callers retry instead
-// of queueing indefinitely.
 export const PROMPT_SUBMIT_MAX_IN_FLIGHT = 8;
 
 export type PromptSubmitAdmission = ConcurrencyAdmission;
@@ -476,13 +450,9 @@ export function createPromptSubmitAdmission(maxInFlight: number): PromptSubmitAd
 }
 
 let promptSubmitAdmission: PromptSubmitAdmission = createPromptSubmitAdmission(PROMPT_SUBMIT_MAX_IN_FLIGHT);
-
-/** Test seam; mirrors native-embedding's __*ForTests pattern. */
 export function __setPromptSubmitAdmissionForTests(admission: PromptSubmitAdmission | null): void {
 	promptSubmitAdmission = admission ?? createPromptSubmitAdmission(PROMPT_SUBMIT_MAX_IN_FLIGHT);
 }
-
-// User prompt submit hook - inject relevant memories per prompt
 function registerUserPromptSubmit(app: Hono): void {
 	app.post("/api/hooks/user-prompt-submit", async (c) => {
 		if (isInternalCall(c)) {
@@ -583,8 +553,6 @@ function registerUserPromptSubmit(app: Hono): void {
 		}
 	});
 }
-
-// Lightweight notification hook for high-frequency harness lifecycle events.
 function registerNotifications(app: Hono): void {
 	app.post("/api/hooks/notifications", async (c) => {
 		if (isInternalCall(c)) return c.json({ inject: "" });
@@ -641,8 +609,6 @@ function registerNotifications(app: Hono): void {
 		}
 	});
 }
-
-// Session end hook - extract memories from transcript
 function registerSessionEnd(app: Hono): void {
 	app.post("/api/hooks/session-end", async (c) => {
 		if (isInternalCall(c)) {
@@ -653,6 +619,9 @@ function registerSessionEnd(app: Hono): void {
 
 			if (!body.harness) {
 				return c.json({ error: "harness is required" }, 400);
+			}
+			if (body.lastAssistantMessage !== undefined && typeof body.lastAssistantMessage !== "string") {
+				return c.json({ error: "lastAssistantMessage must be a string" }, 400);
 			}
 			const capturedAt = parseIsoTimestamp(body.capturedAt, "capturedAt");
 			if (capturedAt.error) return c.json({ error: capturedAt.error }, 400);
@@ -668,7 +637,7 @@ function registerSessionEnd(app: Hono): void {
 			const conflict = skipConflictingSessionEnd(sessionKey, runtimePath, agentId);
 			if (conflict) return c.json(conflict);
 			const transcriptPath = parseOptionalString(body.transcriptPath);
-			if (transcriptPath) {
+			if (transcriptPath || parseOptionalString(body.lastAssistantMessage)) {
 				const denied = await requirePermission("remember", authConfig)(c, () => Promise.resolve());
 				if (denied) return denied;
 				const scopedAgent = resolveScopedAgentId(c, agentId);
@@ -699,7 +668,6 @@ function registerSessionEnd(app: Hono): void {
 					removeAgentPresence(sessionKey);
 				}
 				if (transcriptPath) {
-					// recordSkillsFromTranscript is throw-proof by contract — safe in setImmediate.
 					setImmediate(() =>
 						recordSkillsFromTranscript({
 							transcriptPath,
@@ -737,10 +705,6 @@ function registerSessionEnd(app: Hono): void {
 		return c.json(job);
 	});
 }
-
-// Harness-emitted skill invocations (claude-code PostToolUse, opencode
-// tool.execute.after, ...). Records source='agent' rows deduped on
-// (agentId, harness, sessionId, toolUseId) so a re-fired hook records once.
 function registerSkillInvocation(app: Hono): void {
 	app.post("/api/hooks/skill-invocation", async (c) => {
 		if (isInternalCall(c)) {
@@ -806,8 +770,6 @@ function registerSkillInvocation(app: Hono): void {
 		}
 	});
 }
-
-// Mid-session checkpoint extraction (long-lived sessions)
 function registerCheckpointExtract(app: Hono): void {
 	app.post("/api/hooks/session-checkpoint-extract", async (c) => {
 		if (isInternalCall(c)) {
@@ -852,8 +814,6 @@ function registerCheckpointExtract(app: Hono): void {
 		}
 	});
 }
-
-// Remember hook - explicit memory save
 function registerRemember(app: Hono): void {
 	app.post("/api/hooks/remember", async (c) => {
 		if (isInternalCall(c)) {
@@ -897,8 +857,6 @@ function registerRemember(app: Hono): void {
 		}
 	});
 }
-
-// Recall hook - explicit memory query
 function registerRecall(app: Hono): void {
 	app.post("/api/hooks/recall", async (c) => {
 		if (isInternalCall(c)) {
@@ -948,8 +906,6 @@ function registerRecall(app: Hono): void {
 					agentId: body.agentId ?? c.req.header("x-signet-agent-id"),
 					sessionKey: body.sessionKey,
 				});
-
-				// When aggregate save is requested, enforce scope for non-admin tokens.
 				if (aggregateSaveRequested) {
 					const aggAuth = c.get("auth");
 					if (aggAuth?.claims && aggAuth.claims.role !== "admin") {
@@ -1058,8 +1014,6 @@ function registerRecall(app: Hono): void {
 		});
 	});
 }
-
-// Pre-compaction hook - provides summary instructions
 function registerPreCompaction(app: Hono): void {
 	app.post("/api/hooks/pre-compaction", async (c) => {
 		try {
@@ -1126,8 +1080,6 @@ function registerPreCompaction(app: Hono): void {
 		}
 	});
 }
-
-// Save compaction summary (convenience endpoint)
 function registerCompactionComplete(app: Hono): void {
 	app.post("/api/hooks/compaction-complete", async (c) => {
 		try {
@@ -1136,6 +1088,7 @@ function registerCompactionComplete(app: Hono): void {
 				summary: string;
 				sessionKey?: string;
 				project?: string;
+				cwd?: string;
 				agentId?: string;
 				runtimePath?: string;
 			};
@@ -1186,7 +1139,7 @@ function registerCompactionComplete(app: Hono): void {
 									 WHERE session_key = ? AND agent_id = ?`,
 								)
 								.get(body.sessionKey, agentId) as { project: string | null } | undefined,
-						"routes/hooks-routes.ts:1180",
+						"db:hooks.session-transcript.project.read",
 					)
 				: undefined;
 			const requestedProject = transcriptRow?.project ?? parseOptionalString(body.project);
@@ -1195,6 +1148,7 @@ function registerCompactionComplete(app: Hono): void {
 				return c.json({ error: scopedProject.error }, 403);
 			}
 			const project = scopedProject.project ?? null;
+			const cwd = parseOptionalString(body.cwd);
 
 			const sessionId = body.sessionKey ?? `compaction:${now}`;
 			const noise = isNoiseSession({
@@ -1228,16 +1182,8 @@ function registerCompactionComplete(app: Hono): void {
 						now,
 						now,
 						"system",
-						// This is the keyword/vector-recall projection. The temporal-DAG
-						// compaction node below is the canonical episodic Dreaming input.
 						null,
 					);
-					upsertMemoryContentSafetyInTx(db, {
-						agentId,
-						sourceKind: "memory",
-						sourceId: summaryId,
-						content: summary,
-					});
 
 					const table = db
 						.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_summaries'`)
@@ -1266,12 +1212,6 @@ function registerCompactionComplete(app: Hono): void {
 						JSON.stringify({ source: "compaction-complete" }),
 						now,
 					);
-					upsertMemoryContentSafetyInTx(db, {
-						agentId,
-						sourceKind: "summary",
-						sourceId: nodeId,
-						content: summary,
-					});
 					upsertThreadHead(db as unknown as Database, {
 						agentId,
 						nodeId,
@@ -1283,7 +1223,7 @@ function registerCompactionComplete(app: Hono): void {
 						sourceRef: body.sessionKey ?? null,
 						harness: body.harness,
 					});
-				}, "routes/hooks-routes.ts:1209");
+				}, "db:hooks.session-summary.memory.write");
 
 				try {
 					await writeCompactionArtifact({
@@ -1310,8 +1250,14 @@ function registerCompactionComplete(app: Hono): void {
 				memoryId: summaryId ?? "skipped-temp-session",
 			});
 
-			const epoch = await advanceRecallContextEpochAsync({
+			const recallSessionKey = sessionStartRecallKey({
+				harness: body.harness,
+				project: project ?? undefined,
+				cwd: cwd ?? undefined,
 				sessionKey: body.sessionKey,
+			});
+			const epoch = await advanceRecallContextEpochAsync({
+				sessionKey: recallSessionKey,
 				agentId,
 				reason: "compaction-complete",
 				sourceRef: summaryId ?? body.sessionKey ?? undefined,
@@ -1320,6 +1266,7 @@ function registerCompactionComplete(app: Hono): void {
 				harness: body.harness,
 				agentId,
 				project: project ?? undefined,
+				cwd: cwd ?? undefined,
 				sessionKey: body.sessionKey,
 			});
 
@@ -1345,7 +1292,7 @@ function registerCompactionComplete(app: Hono): void {
 								agentId,
 							);
 						}
-					}, "routes/hooks-routes.ts:1329");
+					}, "db:hooks.compaction.transcript-state.delete");
 				} catch (err) {
 					logger.warn("hooks", "Failed to reset checkpoint state after compaction (non-fatal)", {
 						error: err instanceof Error ? err.message : String(err),
@@ -1377,6 +1324,7 @@ function registerCompactionComplete(app: Hono): void {
 				success: true,
 				memoryId: summaryId,
 				contextEpoch: epoch.contextEpoch,
+				dedupeDegraded: epoch.failedOpen === true,
 			});
 		} catch (e) {
 			logger.error("hooks", "Compaction complete failed", e as Error);
@@ -1384,10 +1332,6 @@ function registerCompactionComplete(app: Hono): void {
 		}
 	});
 }
-
-// ============================================================================
-// Cross-Agent Collaboration API
-// ============================================================================
 
 const AGENT_MESSAGE_TYPES: readonly AgentMessageType[] = ["assist_request", "decision_update", "info", "question"];
 const MAX_CROSS_AGENT_MESSAGE_CHARS = 65_536;
@@ -1731,7 +1675,6 @@ function registerCrossAgentStream(app: Hono): void {
 		const project = parseOptionalString(c.req.query("project"));
 		const includeSelf = parseOptionalBoolean(c.req.query("include_self")) ?? false;
 		const includeSent = parseOptionalBoolean(c.req.query("include_sent")) ?? false;
-		const encoder = new TextEncoder();
 		const scopedAgent = resolveScopedAgentId(c, requestedAgentId, "default");
 		if (scopedAgent.error) {
 			return c.json({ error: scopedAgent.error }, 403);
@@ -1745,27 +1688,17 @@ function registerCrossAgentStream(app: Hono): void {
 		}
 		const agentId = scopedAgent.agentId;
 
-		const stream = new ReadableStream({
-			start(controller) {
-				let dead = false;
-				const cleanup = () => {
-					if (dead) return;
-					dead = true;
-					clearInterval(keepAlive);
-					unsubscribe();
-					try {
-						controller.close();
-					} catch {}
-				};
-
-				const writeEvent = (event: unknown) => {
-					if (dead) return;
-					try {
-						const data = `data: ${JSON.stringify(event)}\n\n`;
-						controller.enqueue(encoder.encode(data));
-					} catch {
-						cleanup();
-					}
+		const sse = openBoundedSse({
+			requestSignal: c.req.raw.signal,
+			highWaterMarkBytes: 1024 * 1024,
+			maxFrameBytes: 512 * 1024,
+			heartbeat: { intervalMs: 15_000, comment: "keepalive" },
+			onStart(producer) {
+				let unsubscribe = (): void => {};
+				producer.addDisposer(() => unsubscribe());
+				if (producer.signal.aborted) return;
+				const writeEvent = (event: unknown): void => {
+					producer.write(event);
 				};
 
 				writeEvent({
@@ -1775,6 +1708,7 @@ function registerCrossAgentStream(app: Hono): void {
 					project,
 					timestamp: new Date().toISOString(),
 				});
+				if (producer.isClosed) return;
 
 				writeEvent({
 					type: "snapshot",
@@ -1794,8 +1728,9 @@ function registerCrossAgentStream(app: Hono): void {
 					}),
 					timestamp: new Date().toISOString(),
 				});
+				if (producer.isClosed) return;
 
-				const unsubscribe = subscribeCrossAgentEvents((event) => {
+				const nextUnsubscribe = subscribeCrossAgentEvents((event) => {
 					if (event.type === "message") {
 						if (
 							!isMessageVisibleToAgent(event.message, {
@@ -1824,42 +1759,20 @@ function registerCrossAgentStream(app: Hono): void {
 
 					writeEvent(event);
 				});
-
-				const keepAlive = setInterval(() => {
-					if (dead) return;
-					try {
-						controller.enqueue(encoder.encode(": keepalive\n\n"));
-					} catch {
-						cleanup();
-					}
-				}, 15_000);
-
-				c.req.raw.signal.addEventListener("abort", cleanup);
+				unsubscribe = nextUnsubscribe;
+				if (producer.isClosed) unsubscribe();
 			},
 		});
 
-		return new Response(stream, {
-			headers: {
-				"Content-Type": "text/event-stream",
-				"Cache-Control": "no-cache",
-				Connection: "keep-alive",
-			},
-		});
+		return sse.response;
 	});
 }
 
-// ============================================================================
-// Synthesis Routes
-// ============================================================================
-
 function registerSynthesis(app: Hono): void {
-	// Get synthesis config
 	app.get("/api/hooks/synthesis/config", (c) => {
 		const config = DEFAULT_SYNTHESIS_WORKER_CONFIG;
 		return c.json(config);
 	});
-
-	// Request MEMORY.md synthesis
 	app.post("/api/hooks/synthesis", async (c) => {
 		try {
 			const body = (await c.req.json()) as SynthesisRequest & { agentId?: string; sessionKey?: string };
@@ -1880,8 +1793,6 @@ function registerSynthesis(app: Hono): void {
 			return c.json({ error: "Synthesis request failed" }, 500);
 		}
 	});
-
-	// Retired: Dreaming's manifest-gated path is the sole MEMORY.md publisher.
 	app.post("/api/hooks/synthesis/complete", async (c) => {
 		return c.json(
 			{
@@ -1895,8 +1806,6 @@ function registerSynthesis(app: Hono): void {
 			410,
 		);
 	});
-
-	// Trigger immediate MEMORY.md synthesis
 	app.post("/api/synthesis/trigger", async (c) => {
 		try {
 			const worker = getSynthesisWorker();
@@ -1910,8 +1819,6 @@ function registerSynthesis(app: Hono): void {
 			return c.json({ error: "Synthesis trigger failed" }, 500);
 		}
 	});
-
-	// Synthesis worker status
 	app.get("/api/synthesis/status", (c) => {
 		const worker = getSynthesisWorker();
 		const config = DEFAULT_SYNTHESIS_WORKER_CONFIG;
@@ -1923,14 +1830,6 @@ function registerSynthesis(app: Hono): void {
 		});
 	});
 }
-
-/**
- * Wrap an embed function so embeddings produced during a recall hook are
- * attributed to the recall source. Query-role embeddings (the search query
- * vector) are "recall"; the document-role embed aggregateRecall performs on
- * the synthesized aggregate memory content is a memory write, so it records
- * as "memory-capture". Both carry the resolved agent id.
- */
 function recallAttributedEmbedFn(
 	embedFn: typeof fetchEmbedding,
 	agentId: string,

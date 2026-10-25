@@ -4,7 +4,7 @@ import { readStaticIdentity } from "@signet/core";
 import { emitLifecycleObservation } from "@signet/lifecycle-proof";
 import type { DaemonClient } from "./daemon-client.js";
 import { readTrimmedRuntimeEnv, readTrimmedString } from "./helpers.js";
-import type { BaseSessionState } from "./session-state.js";
+import type { BaseSessionState, PromptRecall } from "./session-state.js";
 import { buildTranscriptFromEntries, readSessionFileSnapshot } from "./transcript.js";
 import type { BaseExtensionContext, BaseSessionEntry } from "./types.js";
 
@@ -111,8 +111,6 @@ export async function flushPendingSessionEnds(deps: LifecycleDeps): Promise<bool
 
 		const snapshot = readSessionFileSnapshot(pending.sessionFile, deps.config.excludedCustomTypes);
 		if (!snapshot.loaded) {
-			// Session file still not on disk (e.g. after /new); release
-			// the daemon claim so the stale session stops appearing.
 			await submitSessionEnd(deps, {
 				sessionId: pending.sessionId,
 				agentId: pending.agentId,
@@ -246,10 +244,6 @@ export async function endPreviousSession(
 	if (deps.state.sessionAlreadyEnded(sessionId)) return;
 
 	if (!previousSnapshot.loaded) {
-		// /new triggers session_switch before the prior session file is
-		// flushed to disk. Release the daemon claim immediately so the
-		// old session disappears from the tracker; the transcript is
-		// still queued for deferred retry below.
 		if (sessionId) {
 			await submitSessionEnd(deps, {
 				sessionId,
@@ -309,20 +303,13 @@ export async function requestNotifications(
 	return inject;
 }
 
-export async function requestRecallForPrompt(
+async function submitPrompt(
 	deps: LifecycleDeps,
 	ctx: BaseExtensionContext,
-	userText: string,
-): Promise<void> {
-	await flushPendingSessionEnds(deps);
-
-	const prompt = readTrimmedString(userText);
-	if (!prompt) return;
-
+	session: SessionRef & { readonly sessionId: string },
+	prompt: string,
+): Promise<PromptRecall | undefined> {
 	await ensureSessionContext(deps, ctx);
-	const session = currentSessionRef(ctx);
-	if (!session.sessionId) return;
-
 	const result = await deps.client.post<UserPromptSubmitResult>(
 		"/api/hooks/user-prompt-submit",
 		{
@@ -335,7 +322,7 @@ export async function requestRecallForPrompt(
 		},
 		deps.config.promptSubmitTimeout,
 	);
-	if (!result) return;
+	if (!result) return undefined;
 	emitLifecycleObservation({
 		stage: "prompt-submit",
 		sessionId: session.sessionId,
@@ -347,12 +334,33 @@ export async function requestRecallForPrompt(
 		await refreshSessionStart(deps, ctx);
 	}
 
-	const inject = readTrimmedString(result.dynamicContext) ?? readTrimmedString(result.inject);
-	if (inject) {
-		deps.state.queuePendingRecall(session.sessionId, inject);
-	}
-	const clockContext = readTrimmedString(result.clockContext);
-	if (clockContext) {
-		deps.state.queuePendingClock(session.sessionId, clockContext);
-	}
+	return {
+		inject: readTrimmedString(result.dynamicContext) ?? readTrimmedString(result.inject),
+		clockContext: readTrimmedString(result.clockContext),
+	};
+}
+
+export function beginPromptSubmit(deps: LifecycleDeps, ctx: BaseExtensionContext, userText: string): void {
+	const session = currentSessionRef(ctx);
+	const sessionId = session.sessionId;
+	if (!sessionId) return;
+	deps.state.clearPendingRecall(sessionId);
+	deps.state.clearPendingClock(sessionId);
+
+	const prompt = readTrimmedString(userText);
+	if (!prompt) return;
+
+	const submit = submitPrompt(deps, ctx, { ...session, sessionId }, prompt);
+	submit.catch(() => undefined);
+	deps.state.setPendingPromptSubmit(sessionId, submit);
+}
+
+export async function settlePromptSubmit(deps: LifecycleDeps, ctx: BaseExtensionContext): Promise<void> {
+	const sessionId = currentSessionRef(ctx).sessionId;
+	const submit = deps.state.takePendingPromptSubmit(sessionId);
+	if (!sessionId || !submit) return;
+
+	const recall = await submit;
+	if (recall?.inject) deps.state.queuePendingRecall(sessionId, recall.inject);
+	if (recall?.clockContext) deps.state.queuePendingClock(sessionId, recall.clockContext);
 }

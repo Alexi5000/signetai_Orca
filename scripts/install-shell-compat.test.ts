@@ -29,6 +29,7 @@ describe("install.sh shell compatibility", () => {
 		const fixtureDir = join(workspace, "fixtures");
 		const downloadDir = join(workspace, "downloads");
 		const argsPath = join(workspace, "install-args");
+		const requestsPath = join(workspace, "requests");
 		mkdirSync(binDir);
 		mkdirSync(fixtureDir);
 		mkdirSync(downloadDir);
@@ -49,10 +50,6 @@ describe("install.sh shell compatibility", () => {
 			]) {
 				linkCommand(binDir, command);
 			}
-
-			// Keep the fixture aligned with the host that runs the shell test. The
-			// installer intentionally derives its asset key from uname, so a
-			// Linux-only manifest makes this otherwise portable test fail on macOS.
 			const hostOs = spawnSync("uname", ["-s"], { encoding: "utf8" }).stdout.trim().toLowerCase();
 			const hostArch = spawnSync("uname", ["-m"], { encoding: "utf8" }).stdout.trim();
 			const fixtureOs = hostOs === "darwin" ? "darwin" : hostOs === "linux" ? "linux" : hostOs;
@@ -64,21 +61,22 @@ describe("install.sh shell compatibility", () => {
 			writeFileSync(
 				curl,
 				`#!/bin/sh
-output=""
-url=""
-while [ "$#" -gt 0 ]; do
-	case "$1" in
-		-o) output="$2"; shift 2 ;;
-		*) url="$1"; shift ;;
-	esac
-done
-file="\${url##*/}"
-if [ -n "$output" ]; then
-	cp "$FIXTURE_ROOT/$file" "$output"
-else
-	cat "$FIXTURE_ROOT/$file"
-fi
-`,
+				output=""
+				url=""
+				while [ "$#" -gt 0 ]; do
+					case "$1" in
+						-o) output="$2"; shift 2 ;;
+						*) url="$1"; shift ;;
+					esac
+				done
+				printf '%s\\n' "$url" >> "$SIGNET_REQUESTS"
+				file="\${url##*/}"
+				if [ -n "$output" ]; then
+					cp "$FIXTURE_ROOT/$file" "$output"
+				else
+					cat "$FIXTURE_ROOT/$file"
+				fi
+				`,
 			);
 			chmodSync(curl, 0o755);
 
@@ -114,28 +112,45 @@ printf '%s\\n' "$@" > "$SIGNET_INSTALL_ARGS"
 					},
 				}),
 			);
+			writeFileSync(join(fixtureDir, "next"), JSON.stringify({ version: "nightly-test" }));
 
 			for (const shell of ["bash", "zsh"]) {
 				const shellPath = Bun.which(shell);
 				if (!shellPath) {
 					throw new Error(`Required test shell is not installed: ${shell}`);
 				}
-				for (const invocation of ["direct", "source"]) {
+				for (const scenario of [
+					{ name: "direct", nightly: false, source: false, forwarded: ["--json"] },
+					{ name: "source", nightly: false, source: true, forwarded: ["--json"] },
+					{ name: "nightly-direct", nightly: true, source: false, forwarded: ["--json"] },
+					{ name: "nightly-source", nightly: true, source: true, forwarded: ["--json"] },
+					{ name: "no-forwarded-args", nightly: false, source: false, forwarded: [] },
+					{ name: "nightly-only", nightly: true, source: false, forwarded: [] },
+					{ name: "nightly-only-source", nightly: true, source: true, forwarded: [] },
+				] as const) {
+					const { nightly, source } = scenario;
 					rmSync(argsPath, { force: true });
-					const args = invocation === "source" ? ["-c", 'source "$1" --json', shell, installer] : [installer, "--json"];
+					rmSync(requestsPath, { force: true });
+					const installerFlags = [...(nightly ? ["--nightly"] : []), ...scenario.forwarded].join(" ");
+					const args = source
+						? ["-c", `source "$1" ${installerFlags}`, shell, installer]
+						: [installer, ...(nightly ? ["--nightly"] : []), ...scenario.forwarded];
 					const result = spawnSync(shellPath, args, {
 						encoding: "utf8",
 						env: {
 							...process.env,
 							FIXTURE_ROOT: fixtureDir,
 							PATH: binDir,
-							SIGNET_DOWNLOAD_BASE: "https://fixtures.invalid/v-test",
+							SIGNET_RELEASES_DOWNLOAD_BASE: "https://fixtures.invalid/releases",
 							SIGNET_DOWNLOAD_DIR: downloadDir,
 							SIGNET_INSTALL_ARGS: argsPath,
+							SIGNET_REQUESTS: requestsPath,
+							SIGNET_NIGHTLY_VERSION_API: "https://fixtures.invalid/next",
+							...(nightly ? {} : { SIGNET_DOWNLOAD_BASE: "https://fixtures.invalid/v-test" }),
 						},
 					});
 
-					expect(result.status, `${shell} ${invocation} stderr:\n${result.stderr}`).toBe(0);
+					expect(result.status, `${shell} ${scenario.name} stderr:\n${result.stderr}`).toBe(0);
 					expect(readFileSync(argsPath, "utf8").split("\n")).toEqual([
 						"install",
 						"--force",
@@ -143,9 +158,15 @@ printf '%s\\n' "$@" > "$SIGNET_INSTALL_ARGS"
 						join(downloadDir, connectorName),
 						"--daemon-js-assets",
 						join(downloadDir, daemonJsName),
-						"--json",
+						...scenario.forwarded,
 						"",
 					]);
+					if (nightly) {
+						const requests = readFileSync(requestsPath, "utf8");
+						expect(requests).toContain("https://fixtures.invalid/next");
+						expect(requests).toContain("https://fixtures.invalid/releases/vnightly-test/native-manifest.json");
+						expect(readFileSync(argsPath, "utf8")).not.toContain("--nightly");
+					}
 				}
 			}
 		} finally {

@@ -6,34 +6,1451 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
-### 2026-09-13
-- Bug fixes: scope event provenance; normalize owner transport errors; fence dispatching owner jobs; close owner metrics fences; fence expired owner jobs.
+### 2026-10-24
+- Bug fixes: keep temporal window fill when vector reads fail; decode owner hex in linear time and bound vector pages; page transcript evidence by bytes; keep paged recall reads in scope and bounded; decode and page traversal vectors; page transcript evidence reads; retry stapler validation on lost Apple connection; dedupe escaped PATH profile entries; escape shell metachars in PATH line; print PATH commands after piped install.
 
-### 2026-09-12
-- Features: polish landing page experience; refresh Signet landing page.
+### 2026-10-23
+- Bug fixes: skip subagent transcripts in recovery scan; forward home overrides to service daemon; send Anthropic auth headers on probe.
+- Docs: sync translations.
 
-### 2026-09-10
-- Features: add dynamic connector health dashboard; add daemon JS bundle path flag; add selectable Bun JS runtime.
-- Bug fixes: enforce connector deadlines across native I/O; bound connector inspection and avoid unverified healthy status; harden Bun daemon runtime and installer.
+### 2026-10-18
+- Bug fixes: register implicit agents as isolated.
 
-### 2026-09-09
-- Features: add ChatGPT desktop plugin path.
-- Bug fixes: make episodic artifact indexing self-healing; index memory_artifacts by source_sha256 for the backlog probe; require maintenance before admission; restore maintenance before admission; cancel stale cache work on stop; keep worker available at startup.
-- Refactoring: dedupe setup/cache code.
+### 2026-10-14
+- Bug fixes: guarantee integrity progress past slow probes and shadowed rowids; check large tables in bounded chunks during integrity sweeps; compact no-op dependency history rebuild pairs; say a rejected memory head commit may be retried; enforce the memory head token budget when it is staged; require a note's own graph structure before skipping it; look up indexed Obsidian documents by canonical path; skip unchanged native source files in the owner.
 
-### 2026-09-08
-- Bug fixes: route OpenCode Pi calls; reuse shared recall accessor; enumerate macOS transcript directories by fd; use descriptor-relative macOS transcript paths; close migration schema probes; retry transcript upload finalization; make transcript uploads resilient at scale; support resumable transcript imports on Windows; retain Windows rollback backup until next install; isolate deferred Windows cleanup process; finish Windows native update replacement; simplify portable purge; bounded deletes portable to SQLite without DELETE LIMIT.
+### 2026-10-13
+- Bug fixes: ignore hygiene passes when marking import nudges seen; consume whitespace-only evidence tails; stop re-arming seen import nudges; keep suppressed passes off stalls; match imported transcript cursors; stop stall attention driving passes; demote stalled continuations; advance evidence by reviewed text; pin bun-types in extension workspaces.
+- Performance: bound import attention drain check.
+- Docs: name migration 169 as latest.
 
-### 2026-09-07
-- Features: make Windows a first-class install target; ship cross-platform desktop support.
-- Bug fixes: build core before website deploy; remove private Pi dependency; await token worker teardown; isolate source worker runtime; align DB audit call sites; preserve concurrent resources; reject missing macOS Python; harden cross-platform installs; keep bundled Pi dependency local; remove bundled pi runtime dep; protect managed AppImage updates; tighten packaged runtime and tests; expand Windows support and unify native shell; address PR #1858 review findings; survive all DB owner availability rejections, not just deadlines; hide the setup link once a harness connection exists; survive DB owner deadline exhaustion and build the embedding worker; stage connector assets so harness install works in the app; widen mac header inset clear of the traffic lights; edge-to-edge shell and mac traffic-light clearance; restore macOS traffic lights and correct the dock icon size; make the packaged daemon bootable and install on macOS; unblock dreaming startup; drop delegation memory writes; fence integrity deadline workers; preserve legacy tilde paths; support Windows home fallback; skip install without git; preserve external embedding selection; allow undeclared tool capability.
-- Refactoring: remove dead source worker commands; share integrity child lifecycle; remove dead setup scan; share agent dir logic; isolate harness integration paths; centralize process launching.
-- Docs: trim contributor guide; document harness API boundary.
+### 2026-10-08
+- Bug fixes: stop orphaning nightly releases; read failure and pass times as UTC; keep supported carried entries; revalidate carried head entries; bind head fence and carry entries; stop content passes staling their head; count every purged mention; bind memory-head commits to the running pass; keep aliases and assertions on merge; reconcile contradictions on skill uninstall; stop reconciling contradictions on read; bound native embedding input; defer incomplete transcript backfill; stop blocking input on prompt-submit; keep transcript seq monotonic per key; keep identity in portable import; record ontology claim actor; cascade and audit agent removal; stop retention from deleting entities; check pid hints and relative paths; scope daemon stop to its workspace; keep opt-in for existing workspaces; list memory setup under Needs attention; show the pipeline on when unset; wait for a provider instead of pausing.
+- Docs: address review on docs template; add screenshots for docs template PR; add page template and rewrite core pages; refresh for 1.0 and post-1.0 direction; note native updater cap in 1.0 post.
 
-### 2026-09-06
-- Bug fixes: apply existing setup provider; clean retired setup fields; enable dreaming defaults.
+### 2026-10-07
+- Features: stem the memory keyword index; return bounded transcript evidence; rerank with a local cross-encoder fused with retrieval order; record each pass's peak context; tell each pass the current local date and time; list pending attention in the pass prompt and fold idle tools; let any pass merge and rename aspects at the aspect cap; carry pass history as a compacted view instead of runbook reads; give claims structured event time and validity; add a seeded proportional LongMemEval question sampler; support subscription providers for Dreaming; edit Dreaming concurrency and input budget in Advanced settings; run read-only lookups through Pi codemode behind a flag; pick the agent shown in the memory graph; run incremental passes for disjoint agent groups concurrently; add Muse Code connector.
+- Bug fixes: report the full queue when the admission wait outlasts the deadline; stop source sync from writing claims and deleting Dreaming's; resolve memory claim citations; declare root YAML dependency; flag Dreaming claims for review when a source is edited; isolate pipeline config fixture; synchronize benchmark dependencies; fill a date window's empty slots with its other memories; require a claim time when a claim names a date; run the Supermemory provider against a self-hosted server; place transcript excerpts by cross-encoder relevance; keep same-attribute updates in one claim slot, ordered by capture; drain new-memory embeddings back to back; find relative-time claims filed with approximate dates; let the transcript recovery child exit after its scan; embed sqlite-vec in the compiled binary; make the cross-encoder work in the compiled binary; say what each named thing is when filing a claim; give attention-only scopes their own pass or let them wait; leave scopes with nothing to do out of incremental passes; give history compaction more time and name provider failures; reject relative times per operation and file history by scopes used; keep pass history inside each pass's scopes; keep dates and states out of entity names; only reject relative times that have no absolute date; widen or drop an empty temporal filter instead of returning nothing; replace heuristic content safety with credential redaction; remove ranking rules tuned to LongMemEval questions; poll Dreaming status with bounded concurrency; wait for maintenance admission instead of failing Dreaming; wait for queued transcript captures past the request timeout; let commits that stage only Biome-ignored files pass; file one fact per claim and finish identified work; file each named speaker on their own entity; let instruction-following models file user disclosures; show sign-in for unauthenticated OAuth providers; drop the Pi tool-call budget and queue calls past eight in flight; keep evidence delivery durable when a tool trace is truncated; backfill missing vectors into the active projection slot; ride out provider throttling instead of failing the pass; count an entity as a recall hub only when it is generic; file what users disclose about themselves when asking for advice; record sources whose failed citation a retry filed; keep hygiene failures from withholding read evidence; name the citation whose quote is not verbatim; say why a hygiene op does not match its attention; say when a hygiene op cites an unknown attention id; say which operation and id failed to resolve; keep vector-only recall hits through shaping and dampening; write vectors to the active projection slot; embed new memories without the re-embed repair budget; bound status measure=1 to the backlog probe; keep filed sources when an uncited write fails; let the queue continue partly read sources; bound the backlog probe to sources still waiting; file each evidence page, keep user-specific deliverables; measure the exact backlog for status measure=1; let status measure the backlog on request; keep the graph rendering without entity agent IDs; close new evidence delivery halfway through a pass; withhold evidence when a failed write cannot be attributed; size the Pi agent worker pool from the shared LLM limit; admit no more passes than there are Pi agent workers; admit no more passes than the shared LLM limit; stop capping Dreaming replies below the model's limit; keep content passes and pass failures from stalling Dreaming; stop Dreaming from losing or re-reading queued evidence; close pause guard and unfreeze gaps; keep pipeline pause on one route; control pause and Dreaming; keep setup from re-pausing the pipeline after it resumes; scope session-end assistant writes; align hook and MCP runtime state.
+- Performance: size evidence pages from the Dreaming input budget.
+- Docs: note that pass history is scoped; correct the cost model's per-token rate and cache share; add a Dreaming cost model to the benchmarking skill; advise against gpt-6-luna as a Dreaming model for now; add a benchmarking skill with run tooling and a results ledger; sync translations; list Muse Code in README and site.
 
 ## Release Ledger
+
+## [0.237.17] - 2026-10-24
+
+Release summary: 7 bug fixes.
+Tag range: `v0.237.16..v0.237.17`.
+
+### Bug Fixes
+
+- **daemon**: keep temporal window fill when vector reads fail
+- **daemon**: decode owner hex in linear time and bound vector pages
+- **daemon**: page transcript evidence by bytes
+- **daemon**: keep paged recall reads in scope and bounded
+- **daemon**: decode and page traversal vectors
+- **daemon**: page transcript evidence reads
+- **desktop**: retry stapler validation on lost Apple connection
+
+## [0.237.16] - 2026-10-24
+
+Release summary: 3 bug fixes.
+Tag range: `v0.237.15..v0.237.16`.
+
+### Bug Fixes
+
+- **cli**: dedupe escaped PATH profile entries
+- **cli**: escape shell metachars in PATH line
+- **cli**: print PATH commands after piped install
+
+## [0.237.15] - 2026-10-23
+
+Release summary: 3 bug fixes and 1 docs update.
+Tag range: `v0.237.14..v0.237.15`.
+
+### Bug Fixes
+
+- **daemon**: skip subagent transcripts in recovery scan
+- **cli**: forward home overrides to service daemon
+- **daemon**: send Anthropic auth headers on probe
+
+### Docs
+
+- **readme**: sync translations
+
+## [0.237.14] - 2026-10-18
+
+Release summary: 1 bug fix.
+Tag range: `v0.237.13..v0.237.14`.
+
+### Bug Fixes
+
+- **daemon**: register implicit agents as isolated
+
+## [0.237.13] - 2026-10-14
+
+Release summary: 5 bug fixes.
+Tag range: `v0.237.12..v0.237.13`.
+
+### Bug Fixes
+
+- **daemon**: guarantee integrity progress past slow probes and shadowed rowids
+- **daemon**: check large tables in bounded chunks during integrity sweeps
+- **daemon**: compact no-op dependency history rebuild pairs
+- **dreaming**: say a rejected memory head commit may be retried
+- **dreaming**: enforce the memory head token budget when it is staged
+
+## [0.237.12] - 2026-10-14
+
+Release summary: 3 bug fixes.
+Tag range: `v0.237.11..v0.237.12`.
+
+### Bug Fixes
+
+- **daemon**: require a note's own graph structure before skipping it
+- **daemon**: look up indexed Obsidian documents by canonical path
+- **daemon**: skip unchanged native source files in the owner
+
+## [0.237.11] - 2026-10-13
+
+Release summary: 9 bug fixes, 1 performance improvement, and 1 docs update.
+Tag range: `v0.237.10..v0.237.11`.
+
+### Bug Fixes
+
+- **dreaming**: ignore hygiene passes when marking import nudges seen
+- **dreaming**: consume whitespace-only evidence tails
+- **dreaming**: stop re-arming seen import nudges
+- **dreaming**: keep suppressed passes off stalls
+- **dreaming**: match imported transcript cursors
+- **dreaming**: stop stall attention driving passes
+- **dreaming**: demote stalled continuations
+- **dreaming**: advance evidence by reviewed text
+- **ci**: pin bun-types in extension workspaces
+
+### Performance
+
+- **dreaming**: bound import attention drain check
+
+### Docs
+
+- **storage**: name migration 169 as latest
+
+## [0.237.10] - 2026-10-08
+
+Release summary: 2 bug fixes.
+Tag range: `v0.237.9..v0.237.10`.
+
+### Bug Fixes
+
+- **ci**: stop orphaning nightly releases
+- **dreaming**: read failure and pass times as UTC
+
+## [0.237.9] - 2026-10-08
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.237.8..v0.237.9`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
+## [0.237.8] - 2026-10-08
+
+Release summary: 4 bug fixes and 3 docs updates.
+Tag range: `v0.237.7..v0.237.8`.
+
+### Bug Fixes
+
+- **dreaming**: keep supported carried entries
+- **dreaming**: revalidate carried head entries
+- **dreaming**: bind head fence and carry entries
+- **dreaming**: stop content passes staling their head
+
+### Docs
+
+- **web**: address review on docs template
+- add screenshots for docs template PR
+- **web**: add page template and rewrite core pages
+
+## [0.237.7] - 2026-10-08
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.237.6..v0.237.7`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
+## [0.237.6] - 2026-10-08
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.237.5..v0.237.6`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
+## [0.237.5] - 2026-10-08
+
+Release summary: 5 bug fixes.
+Tag range: `v0.237.4..v0.237.5`.
+
+### Bug Fixes
+
+- **daemon**: count every purged mention
+- **dreaming**: bind memory-head commits to the running pass
+- **daemon**: keep aliases and assertions on merge
+- **daemon**: reconcile contradictions on skill uninstall
+- **daemon**: stop reconciling contradictions on read
+
+## [0.237.4] - 2026-10-08
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.237.3..v0.237.4`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
+## [0.237.3] - 2026-10-08
+
+Release summary: 1 docs update.
+Tag range: `v0.237.2..v0.237.3`.
+
+### Docs
+
+- **roadmap**: refresh for 1.0 and post-1.0 direction
+
+## [0.237.2] - 2026-10-08
+
+Release summary: 8 bug fixes.
+Tag range: `v0.237.1..v0.237.2`.
+
+### Bug Fixes
+
+- **daemon**: bound native embedding input
+- **daemon**: defer incomplete transcript backfill
+- **pi**: stop blocking input on prompt-submit
+- **daemon**: keep transcript seq monotonic per key
+- **cli**: keep identity in portable import
+- **daemon**: record ontology claim actor
+- **daemon**: cascade and audit agent removal
+- **daemon**: stop retention from deleting entities
+
+## [0.237.1] - 2026-10-08
+
+Release summary: 6 bug fixes and 1 docs update.
+Tag range: `v0.237.0..v0.237.1`.
+
+### Bug Fixes
+
+- **cli**: check pid hints and relative paths
+- **cli**: scope daemon stop to its workspace
+- **dreaming**: keep opt-in for existing workspaces
+- **dashboard**: list memory setup under Needs attention
+- **dashboard**: show the pipeline on when unset
+- **dreaming**: wait for a provider instead of pausing
+
+### Docs
+
+- **blog**: note native updater cap in 1.0 post
+
+## [0.237.0] - 2026-10-07
+
+Release summary: 15 features, 67 bug fixes, 1 performance improvement, and 7 docs updates.
+Tag range: `v0.236.1..v0.237.0`.
+
+### Features
+
+- **recall**: stem the memory keyword index
+- **recall**: return bounded transcript evidence
+- **recall**: rerank with a local cross-encoder fused with retrieval order
+- **dreaming**: record each pass's peak context
+- **dreaming**: tell each pass the current local date and time
+- **dreaming**: list pending attention in the pass prompt and fold idle tools
+- **dreaming**: let any pass merge and rename aspects at the aspect cap
+- **dreaming**: carry pass history as a compacted view instead of runbook reads
+- **dreaming**: give claims structured event time and validity
+- **bench**: add a seeded proportional LongMemEval question sampler
+- **bench**: support subscription providers for Dreaming
+- **dashboard**: edit Dreaming concurrency and input budget in Advanced settings
+- **dreaming**: run read-only lookups through Pi codemode behind a flag
+- **dashboard**: pick the agent shown in the memory graph
+- **dreaming**: run incremental passes for disjoint agent groups concurrently
+
+### Bug Fixes
+
+- **daemon**: report the full queue when the admission wait outlasts the deadline
+- **sources**: stop source sync from writing claims and deleting Dreaming's
+- **sources**: resolve memory claim citations
+- **bench**: declare root YAML dependency
+- **sources**: flag Dreaming claims for review when a source is edited
+- **test**: isolate pipeline config fixture
+- **bench**: synchronize benchmark dependencies
+- **recall**: fill a date window's empty slots with its other memories
+- **dreaming**: require a claim time when a claim names a date
+- **memorybench**: run the Supermemory provider against a self-hosted server
+- **recall**: place transcript excerpts by cross-encoder relevance
+- **dreaming**: keep same-attribute updates in one claim slot, ordered by capture
+- **embeddings**: drain new-memory embeddings back to back
+- **recall**: find relative-time claims filed with approximate dates
+- **daemon**: let the transcript recovery child exit after its scan
+- **native**: embed sqlite-vec in the compiled binary
+- **recall**: make the cross-encoder work in the compiled binary
+- **dreaming**: say what each named thing is when filing a claim
+- **dreaming**: give attention-only scopes their own pass or let them wait
+- **dreaming**: leave scopes with nothing to do out of incremental passes
+- **dreaming**: give history compaction more time and name provider failures
+- **dreaming**: reject relative times per operation and file history by scopes used
+- **dreaming**: keep pass history inside each pass's scopes
+- **dreaming**: keep dates and states out of entity names
+- **dreaming**: only reject relative times that have no absolute date
+- **recall**: widen or drop an empty temporal filter instead of returning nothing
+- **memory**: replace heuristic content safety with credential redaction
+- **recall**: remove ranking rules tuned to LongMemEval questions
+- **memorybench**: poll Dreaming status with bounded concurrency
+- **daemon**: wait for maintenance admission instead of failing Dreaming
+- **memorybench**: wait for queued transcript captures past the request timeout
+- **hooks**: let commits that stage only Biome-ignored files pass
+- **dreaming**: file one fact per claim and finish identified work
+- **dreaming**: file each named speaker on their own entity
+- **dreaming**: let instruction-following models file user disclosures
+- **dashboard**: show sign-in for unauthenticated OAuth providers
+- **daemon**: drop the Pi tool-call budget and queue calls past eight in flight
+- **dreaming**: keep evidence delivery durable when a tool trace is truncated
+- **daemon**: backfill missing vectors into the active projection slot
+- **dreaming**: ride out provider throttling instead of failing the pass
+- **daemon**: count an entity as a recall hub only when it is generic
+- **dreaming**: file what users disclose about themselves when asking for advice
+- **dreaming**: record sources whose failed citation a retry filed
+- **dreaming**: keep hygiene failures from withholding read evidence
+- **dreaming**: name the citation whose quote is not verbatim
+- **dreaming**: say why a hygiene op does not match its attention
+- **dreaming**: say when a hygiene op cites an unknown attention id
+- **dreaming**: say which operation and id failed to resolve
+- **daemon**: keep vector-only recall hits through shaping and dampening
+- **daemon**: write vectors to the active projection slot
+- **daemon**: embed new memories without the re-embed repair budget
+- **dreaming**: bound status measure=1 to the backlog probe
+- **dreaming**: keep filed sources when an uncited write fails
+- **dreaming**: let the queue continue partly read sources
+- **dreaming**: bound the backlog probe to sources still waiting
+- **dreaming**: file each evidence page, keep user-specific deliverables
+- **dreaming**: measure the exact backlog for status measure=1
+- **dreaming**: let status measure the backlog on request
+- **dashboard**: keep the graph rendering without entity agent IDs
+- **dreaming**: close new evidence delivery halfway through a pass
+- **dreaming**: withhold evidence when a failed write cannot be attributed
+- **daemon**: size the Pi agent worker pool from the shared LLM limit
+- **dreaming**: admit no more passes than there are Pi agent workers
+- **dreaming**: admit no more passes than the shared LLM limit
+- **daemon**: stop capping Dreaming replies below the model's limit
+- **daemon**: keep content passes and pass failures from stalling Dreaming
+- **daemon**: stop Dreaming from losing or re-reading queued evidence
+
+### Performance
+
+- **dreaming**: size evidence pages from the Dreaming input budget
+
+### Docs
+
+- **dreaming**: note that pass history is scoped
+- **agents**: correct the cost model's per-token rate and cache share
+- **agents**: add a Dreaming cost model to the benchmarking skill
+- **agents**: advise against gpt-6-luna as a Dreaming model for now
+- **agents**: add a benchmarking skill with run tooling and a results ledger
+- **readme**: sync translations
+- list Muse Code in README and site
+
+## [0.236.1] - 2026-10-07
+
+Release summary: 4 bug fixes.
+Tag range: `v0.236.0..v0.236.1`.
+
+### Bug Fixes
+
+- **daemon**: close pause guard and unfreeze gaps
+- **daemon**: keep pipeline pause on one route
+- **dashboard**: control pause and Dreaming
+- **dashboard**: keep setup from re-pausing the pipeline after it resumes
+
+## [0.236.0] - 2026-10-07
+
+Release summary: 1 feature and 2 bug fixes.
+Tag range: `v0.235.2..v0.236.0`.
+
+### Features
+
+- **muse-code**: add Muse Code connector
+
+### Bug Fixes
+
+- **daemon**: scope session-end assistant writes
+- **muse-code**: align hook and MCP runtime state
+
+## [0.235.2] - 2026-10-06
+
+Release summary: 1 bug fix.
+Tag range: `v0.235.1..v0.235.2`.
+
+### Bug Fixes
+
+- **cli**: check Bun before desktop source installation
+
+## [0.235.1] - 2026-10-06
+
+Release summary: 1 bug fix.
+Tag range: `v0.235.0..v0.235.1`.
+
+### Bug Fixes
+
+- **update**: accept native binaries above 256 MiB
+
+## [0.235.0] - 2026-10-06
+
+Release summary: 4 features, 13 bug fixes, and 3 docs updates.
+Tag range: `v0.234.0..v0.235.0`.
+
+### Features
+
+- **dashboard**: show what a credential may do, manage keys
+- **dashboard**: warn before sessions end, count down retries
+- **daemon**: report effective permissions in whoami
+- **dashboard**: sign in when the daemon requires auth
+
+### Bug Fixes
+
+- **daemon**: count key management against the admin limit once
+- **dashboard**: count only usable keys as active
+- **dashboard**: address review of permission gating
+- **dashboard**: list a new API key once
+- **dashboard**: spend fewer admin calls on API keys
+- **daemon**: return 403 and 429 from combined auth guards
+- **cli**: say why the auth mode check failed
+- **cli**: skip handoff in local mode, flag dead targets
+- **dashboard**: bound session rechecks, follow other tabs
+- **daemon**: keep open paths off the key database
+- **dashboard**: redeem handoff links in an open tab
+- **cli**: open the resolved daemon in signet dashboard
+- **daemon**: verify API keys on whoami, add session exchange
+
+### Docs
+
+- cover dashboard key management and permission states
+- add a Teams guide for shared daemons
+- document dashboard sign-in and session routes
+
+## [0.234.0] - 2026-10-06
+
+Release summary: 16 features and 5 bug fixes.
+Tag range: `v0.233.0..v0.234.0`.
+
+### Features
+
+- **dashboard**: show sample skills in demo mode
+- **dashboard**: add the Skills library
+- **dashboard**: make the memory graph readable and navigable
+- **dashboard**: scale the memory chat and calm the graph
+- **dashboard**: bring Dreams up to Home's polish
+- **dashboard**: pin the sidebar toggle in the header
+- **dashboard**: put the sidebar toggle in the content corner
+- **dashboard**: move the sidebar toggle to the window corner
+- **dashboard**: let the sidebar expand to show page names
+- **dashboard**: anchor the brand where header and sidebar meet
+- **dashboard**: explain source problems where they appear
+- **dashboard**: compact the home System column
+- **dashboard**: scroll recent memories in place
+- **dashboard**: raise the daily brief and quiet the lists
+- **dashboard**: unify home section headers and status
+- **dashboard**: responsive home layout and type scale
+
+### Bug Fixes
+
+- **daemon**: read multiline skill descriptions from frontmatter
+- **dashboard**: restore graph layout and keep the inspector clear of chat
+- **dashboard**: smooth the chat dock to sidebar transition
+- **dashboard**: calmer Dreams and correct pass times
+- **sources**: page health reads and report failed checks as unknown
+
+## [0.233.0] - 2026-10-05
+
+Release summary: 2 features, 4 bug fixes, and 2 docs updates.
+Tag range: `v0.232.1..v0.233.0`.
+
+### Features
+
+- **web**: redesign homepage and blog
+- **sources**: add Notion source provider
+
+### Bug Fixes
+
+- **sources**: refresh changed Notion properties
+- **sources**: bound Notion syncs and block passes
+- **dashboard**: use the canonical Notion logo
+- **sources**: harden Notion block and purge logic
+
+### Docs
+
+- **readme**: sync translations
+- **readme**: list Notion as a supported source
+
+## [0.232.1] - 2026-10-05
+
+Release summary: 1 docs update.
+Tag range: `v0.232.0..v0.232.1`.
+
+### Docs
+
+- **readme**: add German, Korean, Simplified Chinese, and Japanese translations
+
+## [0.232.0] - 2026-10-05
+
+Release summary: 3 features, 22 bug fixes, 1 refactor, and 2 docs updates.
+Tag range: `v0.231.2..v0.232.0`.
+
+### Features
+
+- **cli**: report blocked layout upgrades in status
+- **cli**: create new workspaces on layout v2
+- **daemon**: upgrade v1 workspaces to v2 in place
+
+### Bug Fixes
+
+- **core**: anchor v2 storage roots in gitignore
+- **docker**: defer to an interrupted layout upgrade
+- **daemon**: verify v1 data before finishing upgrades
+- **docker**: keep legacy volumes on layout v1
+- **cli**: keep same-millisecond snapshots apart
+- report v2 storage in status and diagnostics
+- **daemon**: recognize older template test dirs
+- **daemon**: harden layout upgrade recovery
+- **setup**: reject incomplete v2 databases
+- **daemon**: validate upgrade record paths
+- **setup**: preserve legacy workspace state
+- **workspace**: preserve legacy state
+- **setup**: preserve transcript-only workspaces
+- **workspace**: harden recovery checks
+- **workspace**: verify interrupted move identity
+- **workspace**: reject missing upgrade moves
+- **daemon**: keep original transcript provenance
+- **docker**: resolve workspace paths through layout
+- **daemon**: resume upgrades from the daemon entry
+- **daemon**: scope upgrade rollback and resume
+- **daemon**: harden in-place layout upgrade
+- resolve runtime paths through layout
+
+### Refactoring
+
+- **workspace**: remove relocation migration
+
+### Docs
+
+- **workspace**: narrow the transcript upgrade row
+- **workspace**: describe v2 paths and memory/ rule
+
+## [0.231.2] - 2026-10-05
+
+Release summary: 2 bug fixes.
+Tag range: `v0.231.1..v0.231.2`.
+
+### Bug Fixes
+
+- **connectors**: use shared MCP resolver
+- **connector-base**: register native Signet binary as MCP stdio server
+
+## [0.231.1] - 2026-10-05
+
+Release summary: 1 bug fix.
+Tag range: `v0.231.0..v0.231.1`.
+
+### Bug Fixes
+
+- **core**: create macOS descriptor files with a mode openat actually reads
+
+## [0.231.0] - 2026-10-05
+
+Release summary: 1 feature and 5 bug fixes.
+Tag range: `v0.230.11..v0.231.0`.
+
+### Features
+
+- **desktop**: Liquid Glass macOS app icon via Icon Composer
+
+### Bug Fixes
+
+- **desktop**: require exact manifest zip names
+- **desktop**: verify published macOS manifest
+- **desktop**: publish one macOS update manifest for both architectures
+- **desktop**: ship precompiled Assets.car instead of compiling .icon in CI
+- **desktop**: select Xcode 26 for deep-link package CI; drop comments
+
+## [0.230.11] - 2026-10-05
+
+Release summary: 2 bug fixes.
+Tag range: `v0.230.10..v0.230.11`.
+
+### Bug Fixes
+
+- **desktop**: gate mac updates on release team
+- **desktop**: stop offering updates unsigned macOS builds cannot install
+
+## [0.230.10] - 2026-10-04
+
+Release summary: 11 bug fixes and 1 docs update.
+Tag range: `v0.230.9..v0.230.10`.
+
+### Bug Fixes
+
+- **docs**: close search before client navigation
+- **core**: fail closed on keyring probe errors
+- **telemetry**: persist and deliver first-use events in recorded order
+- **secrets**: release the store lock without exposing an empty lock directory
+- **daemon**: decode source-chunk fallback vectors from the DB owner
+- **daemon**: record a clean shutdown when no cleanup error occurred
+- **daemon**: yield every reindex batch instead of every 2,500 files
+- **daemon**: stop sharing default pipeline config by reference
+- **secrets**: allow machine-id encryption only when the host has no keyring
+- launch git and protection subprocesses through the shared adapter
+- **daemon**: mark routed targets unavailable on any HTTP auth failure
+
+### Docs
+
+- **api**: sync the route reference with the daemon
+
+## [0.230.9] - 2026-10-04
+
+Release summary: 4 bug fixes.
+Tag range: `v0.230.8..v0.230.9`.
+
+### Bug Fixes
+
+- **daemon**: flush final SSE drop summaries
+- **daemon**: retain SSE fallback framing
+- **daemon**: preserve bounded SSE delivery
+- **daemon**: bound SSE buffering and teardown
+
+## [0.230.8] - 2026-10-03
+
+Release summary: 1 bug fix.
+Tag range: `v0.230.7..v0.230.8`.
+
+### Bug Fixes
+
+- **daemon**: share in-flight connector inspections
+
+## [0.230.7] - 2026-10-03
+
+Release summary: 4 bug fixes and 2 docs updates.
+Tag range: `v0.230.6..v0.230.7`.
+
+### Bug Fixes
+
+- **dashboard**: let connector rows pass wheel scroll
+- **daemon**: keep better-sqlite3 external in bun build
+- **desktop**: stage the real bun binary
+- **install**: verify native updates atomically
+
+### Docs
+
+- **readme**: add dashboard screenshot
+- **readme**: refresh overview, install, and trust sections
+
+## [0.230.6] - 2026-10-03
+
+Release summary: 4 bug fixes and 1 docs update.
+Tag range: `v0.230.5..v0.230.6`.
+
+### Bug Fixes
+
+- **desktop**: clarify retired Windows app
+- **cli**: preserve retryable Windows migration
+- **desktop**: migrate legacy Windows install
+- **desktop**: preserve installed bundles and restore runtime connectivity
+
+### Docs
+
+- **desktop**: clarify legacy cleanup
+
+## [0.230.5] - 2026-10-03
+
+Release summary: 3 bug fixes.
+Tag range: `v0.230.4..v0.230.5`.
+
+### Bug Fixes
+
+- **daemon**: fold ASCII only in evidence search
+- **daemon**: tighten evidence search and recall cites
+- **dashboard**: let memory chat find saved memories
+
+## [0.230.4] - 2026-10-03
+
+Release summary: 3 bug fixes.
+Tag range: `v0.230.3..v0.230.4`.
+
+### Bug Fixes
+
+- **daemon**: guard prune resume generation
+- **daemon**: fence bounded prune scans
+- **daemon**: bound generic entity pruning scans
+
+## [0.230.3] - 2026-10-03
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.230.2..v0.230.3`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
+## [0.230.2] - 2026-10-03
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.230.1..v0.230.2`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
+## [0.230.1] - 2026-10-02
+
+Release summary: 2 bug fixes.
+Tag range: `v0.230.0..v0.230.1`.
+
+### Bug Fixes
+
+- **ci**: update native Dreaming smoke payload
+- **secrets**: authorize macOS keychain access for API-key saves
+
+## [0.230.0] - 2026-10-02
+
+Release summary: 1 feature, 4 bug fixes, and 2 docs updates.
+Tag range: `v0.229.9..v0.230.0`.
+
+### Features
+
+- **dashboard**: add 2D memory graph and persistent Pi chat
+
+### Bug Fixes
+
+- **dashboard**: remove false graph attribution
+- **dreaming**: commit memory head with pass finalization
+- scope model catalog and gate dreaming completion
+- **chat**: compare live credentials without password hashing
+
+### Docs
+
+- **dashboard**: drop graph attribution entry
+- **dashboard**: remove duplicate license note
+
+## [0.229.9] - 2026-10-02
+
+Release summary: 1 bug fix.
+Tag range: `v0.229.8..v0.229.9`.
+
+### Bug Fixes
+
+- **release**: retry GitHub asset upload timeouts
+
+## [0.229.8] - 2026-10-02
+
+Release summary: 1 bug fix.
+Tag range: `v0.229.7..v0.229.8`.
+
+### Bug Fixes
+
+- **secrets**: classify absent default macOS keychain as unavailable
+
+## [0.229.7] - 2026-10-02
+
+Release summary: 1 bug fix and 1 docs update.
+Tag range: `v0.229.6..v0.229.7`.
+
+### Bug Fixes
+
+- **secrets**: recover macOS OAuth keychain authorization
+
+### Docs
+
+- **readme**: clarify opening and use cases
+
+## [0.229.6] - 2026-10-02
+
+Release summary: 1 bug fix.
+Tag range: `v0.229.5..v0.229.6`.
+
+### Bug Fixes
+
+- **secrets**: stop macOS keychain prompt loops
+
+## [0.229.5] - 2026-10-02
+
+Release summary: 1 bug fix.
+Tag range: `v0.229.4..v0.229.5`.
+
+### Bug Fixes
+
+- **desktop**: preserve macOS verification copy
+
+## [0.229.4] - 2026-10-02
+
+Release summary: 14 bug fixes and 1 refactor.
+Tag range: `v0.229.3..v0.229.4`.
+
+### Bug Fixes
+
+- **release**: use keychain search list
+- **release**: parse signing keychain lists
+- **release**: harden signing probe recovery
+- **release**: add codesign key access
+- **release**: use matched signing identity
+- **release**: support Bash 3.2 signing
+- **release**: harden macOS signing lookup
+- **release**: sign by certificate fingerprint
+- **release**: guard fallback signing identity
+- **release**: report macOS keychain lookup details
+- **release**: match signing team suffix
+- **release**: skip identity policy filter
+- **release**: bypass trust-only identity scan
+- **release**: preflight macOS signing
+
+### Refactoring
+
+- **dashboard**: rebuild guided onboarding
+
+## [0.229.3] - 2026-10-01
+
+Release summary: 4 bug fixes.
+Tag range: `v0.229.2..v0.229.3`.
+
+### Bug Fixes
+
+- **dreaming**: default on in onboarding
+- **dreaming**: refresh route DB site tokens
+- **dreaming**: enforce trigger gates
+- **dreaming**: allow manual triggers
+
+## [0.229.2] - 2026-10-01
+
+Release summary: 3 refactors.
+Tag range: `v0.229.1..v0.229.2`.
+
+### Refactoring
+
+- **dashboard**: align controls with repository guardrails
+- **dashboard**: refresh connector source inventory
+- **dashboard**: consolidate UI and cache daemon reads
+
+## [0.229.1] - 2026-09-30
+
+Release summary: 3 bug fixes.
+Tag range: `v0.229.0..v0.229.1`.
+
+### Bug Fixes
+
+- **hermes**: check ownership on opened marker
+- **hermes**: protect swapped uninstall entries
+- **hermes**: support macOS secure filesystem paths
+
+## [0.229.0] - 2026-09-30
+
+Release summary: 1 feature, 3 bug fixes, and 1 docs update.
+Tag range: `v0.228.10..v0.229.0`.
+
+### Features
+
+- **models**: refresh Pi model presets
+
+### Bug Fixes
+
+- **cli**: add cross-platform desktop handoff
+- **cli**: guide first-run setup in dashboard
+- **cli**: open first-run onboarding
+
+### Docs
+
+- show dashboard onboarding screenshot
+
+## [0.228.10] - 2026-09-29
+
+Release summary: 1 bug fix.
+Tag range: `v0.228.9..v0.228.10`.
+
+### Bug Fixes
+
+- **dreaming**: allow canonical source refs
+
+## [0.228.9] - 2026-09-29
+
+Release summary: 2 bug fixes.
+Tag range: `v0.228.8..v0.228.9`.
+
+### Bug Fixes
+
+- **native**: pass inline codesign requirements
+- **secrets**: stabilize macOS keyring signing
+
+## [0.228.8] - 2026-09-29
+
+Release summary: 1 bug fix and 1 docs update.
+Tag range: `v0.228.7..v0.228.8`.
+
+### Bug Fixes
+
+- **install**: handle empty args in Bash 3.2
+
+### Docs
+
+- **daemon**: move owner protocol reference
+
+## [0.228.7] - 2026-09-29
+
+Release summary: 1 bug fix.
+Tag range: `v0.228.6..v0.228.7`.
+
+### Bug Fixes
+
+- **cli**: set up unconfigured workspaces on start
+
+## [0.228.6] - 2026-09-28
+
+Release summary: 2 bug fixes.
+Tag range: `v0.228.5..v0.228.6`.
+
+### Bug Fixes
+
+- **release**: verify arm64 on macOS 27
+- **runtime**: upgrade Bun to 1.4.2
+
+## [0.228.5] - 2026-09-28
+
+Release summary: 2 bug fixes.
+Tag range: `v0.228.4..v0.228.5`.
+
+### Bug Fixes
+
+- **cli**: retain status telemetry
+- **cli**: reduce Windows console flashes
+
+## [0.228.4] - 2026-09-27
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.228.3..v0.228.4`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
+## [0.228.3] - 2026-09-27
+
+Release summary: 2 bug fixes and 1 docs update.
+Tag range: `v0.228.2..v0.228.3`.
+
+### Bug Fixes
+
+- **cli**: nest workspace layout migration
+- **daemon**: clarify recovered context
+
+### Docs
+
+- **pipeline**: clarify checkpoint authority
+
+## [0.228.2] - 2026-09-27
+
+Release summary: 2 bug fixes.
+Tag range: `v0.228.1..v0.228.2`.
+
+### Bug Fixes
+
+- **core**: stat macOS symlinks by descriptor
+- **dream**: expose attach reasoning
+
+## [0.228.1] - 2026-09-27
+
+Release summary: 2 bug fixes.
+Tag range: `v0.228.0..v0.228.1`.
+
+### Bug Fixes
+
+- **dashboard**: mirror daemon toggle resolution
+- **desktop**: repair Windows app and settings UX
+
+## [0.228.0] - 2026-09-26
+
+Release summary: 25 features, 62 bug fixes, 1 refactor, and 2 docs updates.
+Tag range: `v0.227.1..v0.228.0`.
+
+### Features
+
+- **workspace**: add migration recovery controls
+- **cli**: harden workspace migration
+- **core**: add descriptor-rooted fs
+- **import**: unify durable admission pipeline
+- **import**: wire durable admission and canonical inbox layout
+- **daemon**: add bounded manual inbox worker
+- **daemon**: fence git writer by migration generation
+- **daemon**: fence transcript and import writers
+- **daemon**: fence db owner admission during migration drain
+- add verified root git archive retirement
+- **cli**: expose workspace migration lifecycle
+- converge uploads on durable admission boundary
+- wire protection evidence into daemon and cli
+- execute disposable restore verification
+- **daemon**: add migration control drain boundary
+- **import**: finalize db-owned admission lifecycle
+- unify protection contract across surfaces
+- **dashboard**: add protection and durable import status
+- add shared component protection status
+- **git**: add independent skills repository setup
+- **cli**: add stopped resumable workspace migration engine
+- **daemon**: add workspace migration writer barrier
+- **transcripts**: make JSONL authoritative for completed capture
+- add durable workspace import inbox admission
+- **workspace**: add canonical v1/v2 layout resolver
+
+### Bug Fixes
+
+- **cli**: back up migration snapshot via sqlite wrapper
+- **hooks**: take main's scoped pre-commit during rebase
+- **daemon,cli**: repair rebase conflict resolutions
+- **dashboard**: render storage move notice as a header strip
+- **dashboard**: clarify storage move notice
+- **migration**: close destination recovery races
+- **cli**: recover migration lease after hard process exit
+- **migration**: preserve journal ownership and verify production sources
+- scope migration drain to source daemon identity
+- refuse migration filesystems that discard permissions
+- **workspace**: reconcile migrated artifacts and completed transcripts
+- **transcripts**: resolve migrated v1 artifact links in v2 lineage
+- **migration**: reject missing source database during read-only preflight
+- **migration**: retain legacy transcript artifacts in active layout
+- **migration**: verify SQLite snapshot rows before cutover
+- **dashboard**: make protection evidence readable in narrow panes
+- **docs**: validate package map at its owning source
+- **daemon**: fail closed on unverified secret restore
+- **cli**: fail closed when resuming workspace migration
+- **docs**: keep route drift scanner within lint guardrails
+- **workspace**: restore production build and repository guardrails
+- **daemon**: reconcile runtime audits
+- **core**: preserve workspace source state
+- verify protection receipt digests
+- recover published inbox imports
+- **core**: nest migration 158 ledger rebuild
+- **import**: repair scoped admission recovery
+- **import**: recover published inbox imports
+- **cli**: harden migration verification
+- **cli**: require migration readiness
+- **core**: fence descriptor removal
+- wire safe root git migration
+- harden workspace migration cutover
+- **daemon**: wire shared owner barrier
+- **daemon**: fence db owner admissions
+- harden protection status reachability
+- **import**: map admission conflicts
+- **daemon**: expose writer drain boundary
+- harden protection restore evidence
+- **import**: harden admission recovery
+- **migration**: close filesystem review gaps
+- **git**: preserve managed ignore state
+- **workspace**: preserve custom setup paths
+- **workspace**: harden v2 migration
+- **cli**: resolve v2 workspace database paths
+- **protection**: align status across surfaces
+- **import**: wire durable manual inbox admission lifecycle
+- require verified protection and restore evidence
+- **daemon**: enforce transcript import agent scope
+- **workspace**: finish v2 layout adoption
+- **cli**: harden stopped workspace migration lifecycle
+- **cli**: wire migration lifecycle to canonical workspace state
+- **workspace**: preserve legacy layout contracts
+- decouple git sync from unmanaged roots
+- harden migration filesystem journal
+- adopt canonical workspace layout across runtime surfaces
+- **daemon**: route transcript uploads away from document imports
+- fail closed on unverified restores
+- **git**: enforce root ownership and decouple ignore updates
+- make workspace migration resumable and fenced
+- **import**: harden inbox admission recovery
+- **runtime**: route database paths through workspace layout
+
+### Refactoring
+
+- **cli**: keep migration SQLite verification in database owner
+
+### Docs
+
+- reconcile workspace routes and drift detection
+- document workspace v2 migration and ownership
+
+## [0.227.1] - 2026-09-26
+
+Release summary: 4 bug fixes.
+Tag range: `v0.227.0..v0.227.1`.
+
+### Bug Fixes
+
+- **hooks**: scope typecheck to affected workspaces
+- **native**: resolve windows tokenizer wasm path
+- **search**: satisfy comment-strip and event-loop ledger policies
+- **search**: repair recall scope and bounds
+
+## [0.227.0] - 2026-09-25
+
+Release summary: 1 feature, 1 bug fix, and 1 docs update.
+Tag range: `v0.226.28..v0.227.0`.
+
+### Features
+
+- **status**: daemon-owned workspace stats, honest queue counts, Dreaming state
+
+### Bug Fixes
+
+- **status**: satisfy comment-strip and event-loop ledger policies
+
+### Docs
+
+- **status**: note legacy-schema semantics for workspace memory count
+
+## [0.226.28] - 2026-09-25
+
+Release summary: 7 bug fixes.
+Tag range: `v0.226.27..v0.226.28`.
+
+### Bug Fixes
+
+- **sdk**: preserve request deadlines and cancellation
+- **daemon**: validate plugin manifest values
+- **ontology**: handle missing proposal evidence
+- **memorybench**: reject invalid judge verdicts
+- **dreaming**: keep attempt fenced on read errors
+- **dreaming**: reconcile late pass creation
+- **dreaming**: release trigger on scope failure
+
+## [0.226.27] - 2026-09-25
+
+Release summary: 18 bug fixes, 1 refactor, and 1 docs update.
+Tag range: `v0.226.26..v0.226.27`.
+
+### Bug Fixes
+
+- **reviews**: preserve legacy MCP records
+- **native**: validate tokenizer wasm path
+- **mcp**: sync retired ledger artifacts
+- **mcp**: drop exports for removed OS types
+- **native**: clear stale binary outputs
+- **bundle**: stabilize Node WASM names
+- **bundle**: externalize Bun FFI fallback
+- **native**: stabilize daemon asset builds
+- **native**: keep worker bundles single-file
+- **mcp**: make stdio bundle portable
+- **mcp**: remove stale retirement references
+- **build**: externalize native keyring
+- **migrations**: retire legacy invocation slot
+- **daemon**: await startup source cleanup
+- **sources**: lease transcript import target
+- **daemon**: refresh sync DB audit ledger
+- **sources**: serialize source mutations
+- **sources**: accept deferred removal
+
+### Refactoring
+
+- **mcp**: remove external server surface
+
+### Docs
+
+- **migrations**: update latest schema reference
+
+## [0.226.26] - 2026-09-24
+
+Release summary: 1 bug fix and 1 performance improvement.
+Tag range: `v0.226.25..v0.226.26`.
+
+### Bug Fixes
+
+- **web**: tolerate missing blog bodies
+
+### Performance
+
+- **knowledge**: batch navigation claims
+
+## [0.226.25] - 2026-09-24
+
+Release summary: 1 bug fix.
+Tag range: `v0.226.24..v0.226.25`.
+
+### Bug Fixes
+
+- **daemon**: harden session recall dedupe
+
+## [0.226.24] - 2026-09-24
+
+Release summary: 11 bug fixes.
+Tag range: `v0.226.23..v0.226.24`.
+
+### Bug Fixes
+
+- **hermes-agent**: guard moved targets
+- **hermes**: harden entry removal
+- **hermes**: recheck removal identity
+- **hermes**: guard ambient uninstall
+- **hermes**: secure ambient profile writes
+- **hermes**: enforce profile marker ownership
+- **hermes**: harden profile removal
+- **hermes**: reject unsafe profile paths
+- **hermes**: harden profile writes
+- **hermes**: normalize profile paths
+- **hermes**: contain profile writes
+
+## [0.226.23] - 2026-09-24
+
+Release summary: internal maintenance release with no conventional commit entries captured.
+Tag range: `v0.226.22..v0.226.23`.
+
+No notable changes were captured from conventional commit subjects for this release.
+
+## [0.226.22] - 2026-09-24
+
+Release summary: 3 bug fixes.
+Tag range: `v0.226.21..v0.226.22`.
+
+### Bug Fixes
+
+- **core**: ignore desktop build artifacts in source sync
+- **secrets**: classify loader failures at boundary
+- **secrets**: classify missing keyring
+
+## [0.226.21] - 2026-09-24
+
+Release summary: 1 bug fix.
+Tag range: `v0.226.20..v0.226.21`.
+
+### Bug Fixes
+
+- **desktop**: preserve source changes during sync
+
+## [0.226.20] - 2026-09-24
+
+Release summary: 1 bug fix.
+Tag range: `v0.226.19..v0.226.20`.
+
+### Bug Fixes
+
+- **graph**: bound constellation work
+
+## [0.226.19] - 2026-09-23
+
+Release summary: 1 bug fix.
+Tag range: `v0.226.18..v0.226.19`.
+
+### Bug Fixes
+
+- **ci**: handle empty signing arrays
+
+## [0.226.18] - 2026-09-23
+
+Release summary: 7 bug fixes.
+Tag range: `v0.226.17..v0.226.18`.
+
+### Bug Fixes
+
+- **daemon**: stop vacuum work on shutdown
+- **cli**: reject stale lifecycle records
+- **daemon**: harden lifecycle attribution
+- **daemon**: force fatal exit during flush
+- **daemon**: preserve fatal shutdowns
+- **daemon**: bound startup recovery and shutdown
+- **daemon**: pace startup recovery and shutdown
+
+## [0.226.17] - 2026-09-23
+
+Release summary: 2 bug fixes.
+Tag range: `v0.226.16..v0.226.17`.
+
+### Bug Fixes
+
+- **cli**: tolerate slow Dream attach lookups
+- **cli**: clarify dream attach timeout errors
+
+## [0.226.16] - 2026-09-23
+
+Release summary: 7 bug fixes.
+Tag range: `v0.226.15..v0.226.16`.
+
+### Bug Fixes
+
+- keep comment cleanup security-safe
+- parse production comments structurally
+- recognize shell comment operators
+- preserve scalar payload comments
+- refresh purge line tokens
+- preserve only active directives
+- normalize stripped comment whitespace
+
+## [0.226.15] - 2026-09-22
+
+Release summary: 6 bug fixes.
+Tag range: `v0.226.14..v0.226.15`.
+
+### Bug Fixes
+
+- **db**: refresh route site tokens
+- **graph**: prevent label collisions
+- **graph**: bound semantic hover work
+- **graph**: track provenance roots
+- **graph**: expose ontology semantics
+- **ontology**: show source claims in graph
+
+## [0.226.14] - 2026-09-22
+
+Release summary: 4 bug fixes and 1 refactor.
+Tag range: `v0.226.13..v0.226.14`.
+
+### Bug Fixes
+
+- **pi**: close failed daemon responses
+- **pi**: harden all daemon requests
+- **pi**: silence daemon failures in TUI
+- close prepared SQLite statements on Windows (#1934)
+
+### Refactoring
+
+- **pi**: simplify daemon request handling
+
+## [0.226.13] - 2026-09-21
+
+Release summary: 1 bug fix.
+Tag range: `v0.226.12..v0.226.13`.
+
+### Bug Fixes
+
+- **daemon**: make HTTP embedding repair durable and bounded (#1930)
+
+## [0.226.12] - 2026-09-21
+
+Release summary: 4 bug fixes.
+Tag range: `v0.226.11..v0.226.12`.
+
+### Bug Fixes
+
+- **runtime**: qualify Bun 1.4.0
+- **core**: isolate native keyring
+- **daemon**: persist source item failures
+- bound source worker frames
+
+## [0.226.11] - 2026-09-21
+
+Release summary: 1 bug fix.
+Tag range: `v0.226.10..v0.226.11`.
+
+### Bug Fixes
+
+- **daemon**: simplify transcript capture ownership
+
+## [0.226.10] - 2026-09-20
+
+Release summary: 2 bug fixes and 1 refactor.
+Tag range: `v0.226.9..v0.226.10`.
+
+### Bug Fixes
+
+- **daemon**: avoid duplicate telemetry sweep
+- **daemon**: continue integrity past FTS
+
+### Refactoring
+
+- **daemon**: trim integrity cleanup
+
+## [0.226.9] - 2026-09-20
+
+Release summary: 4 bug fixes.
+Tag range: `v0.226.8..v0.226.9`.
+
+### Bug Fixes
+
+- **daemon**: capture UNC DB attribution
+- **daemon**: harden Windows DB attribution paths
+- **daemon**: preserve runtime DB attribution
+- **attribution**: accept absolute-path stack tokens in bundled runtime (#1764 regression)
+
+## [0.226.8] - 2026-09-20
+
+Release summary: 1 bug fix.
+Tag range: `v0.226.7..v0.226.8`.
+
+### Bug Fixes
+
+- **daemon**: use kernel-owned instance lock (#1928)
+
+## [0.226.7] - 2026-09-17
+
+Release summary: 3 bug fixes and 1 refactor.
+Tag range: `v0.226.6..v0.226.7`.
+
+### Bug Fixes
+
+- **daemon**: refresh event-loop ledger
+- **daemon**: harden vector repair safety
+- **daemon**: bound vector repair reconciliation (#1785)
+
+### Refactoring
+
+- **daemon**: deduplicate vector repair policy
+
+## [0.226.6] - 2026-09-16
+
+Release summary: 2 bug fixes.
+Tag range: `v0.226.5..v0.226.6`.
+
+### Bug Fixes
+
+- **daemon**: await workload diagnostics routes
+- **docs**: persist search across navigation
+
+## [0.226.5] - 2026-09-15
+
+Release summary: 1 bug fix.
+Tag range: `v0.226.4..v0.226.5`.
+
+### Bug Fixes
+
+- **daemon**: harden owner-routed graph recall (#1864)
+
+## [0.226.4] - 2026-09-15
+
+Release summary: 5 bug fixes and 2 refactors.
+Tag range: `v0.226.3..v0.226.4`.
+
+### Bug Fixes
+
+- **hooks**: refresh event-loop baseline
+- **hooks**: address review feedback
+- **hooks**: refresh event-loop baseline
+- **hooks**: avoid budget scan allocation
+- **hooks**: enforce session-start budget
+
+### Refactoring
+
+- **hooks**: remove stale render metric
+- **hooks**: bound session continuity context
+
+## [0.226.3] - 2026-09-15
+
+Release summary: 7 bug fixes, 1 refactor, and 1 docs update.
+Tag range: `v0.226.2..v0.226.3`.
+
+### Bug Fixes
+
+- **daemon**: fence health during owner close
+- **daemon**: fence retired owner operations
+- **daemon**: reject retired owner close
+- **daemon**: fence stale owner proxies
+- **daemon**: lease all owner operations
+- **daemon**: drain db owner health leases
+- **daemon**: unify db owner health authority
+
+### Refactoring
+
+- **daemon**: remove owner route fallbacks
+
+### Docs
+
+- warn against nightly production use
+
+## [0.226.2] - 2026-09-15
+
+Release summary: 3 bug fixes.
+Tag range: `v0.226.1..v0.226.2`.
+
+### Bug Fixes
+
+- bound connector rows and clarify unverified health
+- **dashboard**: handle invalid agent rosters
+- **dashboard**: restore transcript agent imports
 
 ## [0.226.1] - 2026-09-13
 

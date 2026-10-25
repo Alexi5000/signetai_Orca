@@ -10,7 +10,6 @@ export type SignetSourceProviderSettings = Readonly<Record<string, unknown>>;
 
 export interface SignetSourceEntry {
 	readonly id: string;
-	/** Unique lifecycle epoch. Unlike updatedAt, this is never reused. */
 	readonly generation?: string;
 	readonly kind: SignetSourceKind;
 	readonly name: string;
@@ -126,16 +125,28 @@ export interface AddGitHubSourceInput {
 	readonly now?: string;
 }
 
+export interface NotionSourceSettings {
+	readonly tokenRef: string;
+	readonly maxPages: number;
+}
+
+export interface AddNotionSourceInput {
+	readonly tokenRef: string;
+	readonly name?: string;
+	readonly maxPages?: number;
+	readonly now?: string;
+}
+
 export type ImportedSourceDuplicateMode = "skip" | "replace" | "reimport";
 
 export interface AddImportedSourceInput {
-	/** Stable daemon upload identity, so retrying finalization cannot create another Source. */
 	readonly importKey?: string;
 	readonly fileName: string;
 	readonly contentHash: string;
 	readonly format: string;
 	readonly agentId?: string;
 	readonly duplicateMode?: ImportedSourceDuplicateMode;
+	readonly sourceId?: string;
 	readonly now?: string;
 }
 
@@ -168,6 +179,8 @@ export const DEFAULT_GITHUB_DOC_PATHS = ["README.md", "CHANGELOG.md"] as const;
 export const DEFAULT_GITHUB_MAX_ITEMS_PER_REPO = 500;
 export const MAX_GITHUB_MAX_ITEMS_PER_REPO = 10_000;
 const VALID_GITHUB_RESOURCE_TYPES = new Set<string>(DEFAULT_GITHUB_RESOURCE_TYPES);
+export const DEFAULT_NOTION_MAX_PAGES = 500;
+export const MAX_NOTION_MAX_PAGES = 10_000;
 
 export function getAgentsDir(): string {
 	return resolveDefaultBasePath();
@@ -232,6 +245,14 @@ export function addDiscordSource(input: AddDiscordSourceInput, agentsDir = getAg
 
 export function addGitHubSource(input: AddGitHubSourceInput, agentsDir = getAgentsDir()): AddSourceResult {
 	return withSourcesConfigLock(agentsDir, () => addGitHubSourceUnlocked(input, agentsDir));
+}
+
+export function addNotionSource(input: AddNotionSourceInput, agentsDir = getAgentsDir()): AddSourceResult {
+	return withSourcesConfigLock(agentsDir, () => addNotionSourceUnlocked(input, agentsDir));
+}
+
+export function notionSourceId(tokenRef: string): string {
+	return `notion:${createHash("sha256").update(tokenRef.trim()).digest("hex").slice(0, 16)}`;
 }
 
 function addWebSourceUnlocked(input: AddWebSourceInput, agentsDir = getAgentsDir()): AddSourceResult {
@@ -307,11 +328,13 @@ export function addImportedSource(input: AddImportedSourceInput, agentsDir = get
 			return { ok: true, source: duplicate, created: false, duplicate: true };
 		}
 
-		const ownerSuffix = agentId ? `:${createHash("sha256").update(agentId).digest("hex").slice(0, 8)}` : "";
 		const sourceId =
 			duplicate && mode === "replace"
 				? duplicate.id
-				: `import:${contentHash.slice(0, 16)}${mode === "reimport" ? `:${randomUUID().slice(0, 8)}` : ownerSuffix}`;
+				: input.sourceId?.trim() ||
+					(mode === "reimport"
+						? `import:${contentHash.slice(0, 16)}:${randomUUID().slice(0, 8)}`
+						: deterministicImportedSourceId(contentHash, agentId));
 		const source: SignetSourceEntry = {
 			id: sourceId,
 			generation: newSourceGeneration(),
@@ -337,6 +360,14 @@ export function addImportedSource(input: AddImportedSourceInput, agentsDir = get
 		saveSourcesConfig({ version: SOURCES_CONFIG_VERSION, sources }, agentsDir);
 		return { ok: true, source, created: !duplicate || mode === "reimport", duplicate: Boolean(duplicate) };
 	});
+}
+
+export function deterministicImportedSourceId(contentHash: string, agentId?: string): string {
+	const normalizedAgentId = agentId?.trim() || undefined;
+	const ownerSuffix = normalizedAgentId
+		? `:${createHash("sha256").update(normalizedAgentId).digest("hex").slice(0, 8)}`
+		: "";
+	return `import:${contentHash.trim().toLowerCase().slice(0, 16)}${ownerSuffix}`;
 }
 
 function addDiscordSourceUnlocked(input: AddDiscordSourceInput, agentsDir = getAgentsDir()): AddSourceResult {
@@ -455,6 +486,69 @@ function addGitHubSourceChecked(input: AddGitHubSourceInput, agentsDir = getAgen
 	};
 	saveSourcesConfig({ version: SOURCES_CONFIG_VERSION, sources: [...cfg.sources, source] }, agentsDir);
 	return { ok: true, source, created: true };
+}
+
+function addNotionSourceUnlocked(input: AddNotionSourceInput, agentsDir = getAgentsDir()): AddSourceResult {
+	try {
+		return addNotionSourceChecked(input, agentsDir);
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		return { ok: false, error: detail };
+	}
+}
+
+function addNotionSourceChecked(input: AddNotionSourceInput, agentsDir = getAgentsDir()): AddSourceResult {
+	const now = input.now ?? new Date().toISOString();
+	const cfg = loadSourcesConfigForWrite(agentsDir);
+	const tokenRef = typeof input.tokenRef === "string" ? input.tokenRef.trim() : "";
+	const sourceId = notionSourceId(tokenRef);
+	const existing = cfg.sources.find((source) => source.id === sourceId);
+	const settings = buildNotionSettings(input, existing ? parseNotionSettings(existing.providerSettings) : undefined);
+	if ("error" in settings) return { ok: false, error: settings.error };
+	const root = `notion://integrations/${settings.tokenRef}`;
+	if (existing) {
+		const updated: SignetSourceEntry = {
+			...existing,
+			name: cleanName(input.name) ?? existing.name,
+			root,
+			enabled: true,
+			providerSettings: notionSettingsProviderSettings(settings),
+			generation: newSourceGeneration(),
+			updatedAt: now,
+		};
+		saveSourcesConfig(
+			{
+				version: SOURCES_CONFIG_VERSION,
+				sources: cfg.sources.map((source) => (source.id === existing.id ? updated : source)),
+			},
+			agentsDir,
+		);
+		return { ok: true, source: updated, created: false };
+	}
+
+	const source: SignetSourceEntry = {
+		id: sourceId,
+		generation: newSourceGeneration(),
+		kind: "notion",
+		name: cleanName(input.name) ?? "Notion",
+		root,
+		enabled: true,
+		mode: "read-only",
+		createdAt: now,
+		updatedAt: now,
+		providerSettings: notionSettingsProviderSettings(settings),
+	};
+	saveSourcesConfig({ version: SOURCES_CONFIG_VERSION, sources: [...cfg.sources, source] }, agentsDir);
+	return { ok: true, source, created: true };
+}
+
+export function parseNotionSettings(raw?: SignetSourceProviderSettings): NotionSourceSettings {
+	const tokenRef = typeof raw?.tokenRef === "string" ? raw.tokenRef.trim() : "";
+	if (!tokenRef) throw new Error("Notion source has no tokenRef");
+	return {
+		tokenRef,
+		maxPages: cleanPositiveInteger(raw?.maxPages, MAX_NOTION_MAX_PAGES) ?? DEFAULT_NOTION_MAX_PAGES,
+	};
 }
 
 export function parseDiscordSettings(raw?: SignetSourceProviderSettings): DiscordSourceSettings {
@@ -657,6 +751,24 @@ function buildGitHubSettings(
 	};
 }
 
+function buildNotionSettings(
+	input: AddNotionSourceInput,
+	existing?: NotionSourceSettings,
+): NotionSourceSettings | { readonly error: string } {
+	const tokenRef = typeof input.tokenRef === "string" ? input.tokenRef.trim() : "";
+	if (!tokenRef) return { error: "Notion tokenRef is required" };
+	if (looksLikeRawNotionToken(tokenRef))
+		return { error: "Notion tokenRef must be a secret reference, not a raw token" };
+	if (input.maxPages !== undefined && cleanPositiveInteger(input.maxPages, MAX_NOTION_MAX_PAGES) !== input.maxPages) {
+		return { error: `Notion maxPages must be an integer between 1 and ${MAX_NOTION_MAX_PAGES}` };
+	}
+	return { tokenRef, maxPages: input.maxPages ?? existing?.maxPages ?? DEFAULT_NOTION_MAX_PAGES };
+}
+
+function notionSettingsProviderSettings(settings: NotionSourceSettings): SignetSourceProviderSettings {
+	return { tokenRef: settings.tokenRef, maxPages: settings.maxPages };
+}
+
 function discordSettingsProviderSettings(settings: DiscordSourceSettings): SignetSourceProviderSettings {
 	return {
 		guildIds: settings.guildIds,
@@ -782,8 +894,6 @@ function markSourceIndexedUnlocked(
 export function removeSource(sourceId: string, agentsDir = getAgentsDir()): RemoveSourceResult {
 	return withSourcesConfigLock(agentsDir, () => removeSourceUnlocked(sourceId, agentsDir));
 }
-
-/** Remove a source only while the captured lifecycle generation is still live. */
 export function removeSourceIfGeneration(
 	sourceId: string,
 	generation: string | undefined,
@@ -868,9 +978,6 @@ function cleanName(value: string | undefined): string | null {
 	const trimmed = value?.trim();
 	return trimmed && trimmed.length > 0 ? trimmed : null;
 }
-
-/** Normalize the configured target and reject obvious SSRF destinations. The daemon
- * repeats this check after every redirect and resolves hostnames before fetching. */
 export function normalizePublicWebUrl(value: string): string | null {
 	const trimmed = value.trim();
 	if (!trimmed || trimmed.length > 2048) return null;
@@ -904,49 +1011,49 @@ export function normalizePublicWebUrl(value: string): string | null {
 }
 
 const NON_GLOBAL_IPV4_RANGES: readonly (readonly [number, number])[] = [
-	[0x00000000, 0x00ffffff], // This network
-	[0x0a000000, 0x0affffff], // Private use
-	[0x64400000, 0x647fffff], // Shared address space
-	[0x7f000000, 0x7fffffff], // Loopback
-	[0xa9fe0000, 0xa9feffff], // Link-local
-	[0xac100000, 0xac1fffff], // Private use
-	[0xc0000000, 0xc00000ff], // IETF protocol assignments
-	[0xc0000200, 0xc00002ff], // Documentation
-	[0xc01fc400, 0xc01fc4ff], // AS112-v4
-	[0xc034c100, 0xc034c1ff], // AMT
-	[0xc0586300, 0xc05863ff], // 6to4 anycast
-	[0xc0a80000, 0xc0a8ffff], // Private use
-	[0xc0af3000, 0xc0af30ff], // Direct Delegation AS112 Service
-	[0xc6120000, 0xc613ffff], // Benchmarking
-	[0xc6336400, 0xc63364ff], // Documentation
-	[0xcb007100, 0xcb0071ff], // Documentation
-	[0xe0000000, 0xffffffff], // Multicast and reserved
+	[0x00000000, 0x00ffffff],
+	[0x0a000000, 0x0affffff],
+	[0x64400000, 0x647fffff],
+	[0x7f000000, 0x7fffffff],
+	[0xa9fe0000, 0xa9feffff],
+	[0xac100000, 0xac1fffff],
+	[0xc0000000, 0xc00000ff],
+	[0xc0000200, 0xc00002ff],
+	[0xc01fc400, 0xc01fc4ff],
+	[0xc034c100, 0xc034c1ff],
+	[0xc0586300, 0xc05863ff],
+	[0xc0a80000, 0xc0a8ffff],
+	[0xc0af3000, 0xc0af30ff],
+	[0xc6120000, 0xc613ffff],
+	[0xc6336400, 0xc63364ff],
+	[0xcb007100, 0xcb0071ff],
+	[0xe0000000, 0xffffffff],
 ];
 
 const NON_GLOBAL_IPV6_RANGES: readonly (readonly [string, number])[] = [
-	["::", 96], // IPv4-compatible and unspecified
-	["::ffff:0:0", 96], // IPv4-mapped
-	["100::", 64], // Discard-only
-	["100:0:0:1::", 64], // Dummy IPv6 prefix
-	["2001::", 23], // IETF protocol assignments
-	["2001:0::", 32], // Teredo
-	["2001:1::", 32], // IETF protocol assignments
-	["2001:2::", 48], // Benchmarking
-	["2001:3::", 32], // IETF protocol assignments
-	["2001:4:112::", 48], // AS112-v6
-	["2001:8::", 32], // 6to4 anycast
-	["2001:10::", 28], // ORCHID
-	["2001:20::", 28], // ORCHIDv2
-	["2001:30::", 28], // Drone Remote ID protocol entity tags
-	["2001:db8::", 32], // Documentation
-	["3fff::", 20], // Documentation
-	["64:ff9b::", 96], // Well-known prefix for IPv4/IPv6 translation
-	["64:ff9b:1::", 48], // Local-use prefix for IPv4/IPv6 translation
-	["2620:4f:8000::", 48], // Direct Delegation AS112 Service
-	["fc00::", 7], // Unique local
-	["fe80::", 10], // Link-local
-	["fec0::", 10], // Deprecated site-local
-	["ff00::", 8], // Multicast
+	["::", 96],
+	["::ffff:0:0", 96],
+	["100::", 64],
+	["100:0:0:1::", 64],
+	["2001::", 23],
+	["2001:0::", 32],
+	["2001:1::", 32],
+	["2001:2::", 48],
+	["2001:3::", 32],
+	["2001:4:112::", 48],
+	["2001:8::", 32],
+	["2001:10::", 28],
+	["2001:20::", 28],
+	["2001:30::", 28],
+	["2001:db8::", 32],
+	["3fff::", 20],
+	["64:ff9b::", 96],
+	["64:ff9b:1::", 48],
+	["2620:4f:8000::", 48],
+	["fc00::", 7],
+	["fe80::", 10],
+	["fec0::", 10],
+	["ff00::", 8],
 ];
 
 function isUnsafeWebIp(host: string): boolean {
@@ -1112,6 +1219,14 @@ function looksLikeRawGitHubToken(value: string): boolean {
 	return (
 		/^github_pat_[A-Za-z0-9_]{20,}$/.test(withoutAuthScheme) || /^gh[opsru]_[A-Za-z0-9_]{20,}$/.test(withoutAuthScheme)
 	);
+}
+
+function looksLikeRawNotionToken(value: string): boolean {
+	const trimmed = value.trim();
+	const withoutHeaderPrefix = trimmed.replace(/^authorization:\s*/i, "").trim();
+	const withoutAuthScheme = withoutHeaderPrefix.replace(/^bearer\s+/i, "").trim();
+	if (withoutAuthScheme !== trimmed) return true;
+	return /^(ntn|secret)_[A-Za-z0-9]{20,}$/.test(withoutAuthScheme);
 }
 
 function cleanPositiveInteger(value: unknown, max: number): number | undefined {

@@ -1,13 +1,21 @@
 import { controlImport, createJob, createOwnerTranscriptImportStore } from "../transcript-import-store";
 import { DbOwnerError } from "../db-owner-client";
 import { randomUUID } from "node:crypto";
-import { addImportedSource, resolveDefaultBasePath, buildExportTranscriptRecord } from "@signet/core";
+import {
+	addImportedSource,
+	buildExportTranscriptRecord,
+	deterministicImportedSourceId,
+	loadSourcesConfig,
+	resolveDefaultBasePath,
+} from "@signet/core";
 import { Hono, type Context } from "hono";
 import { resolveDaemonAgentId } from "../agent-id";
 import { authConfig } from "./state";
-import { requirePermission } from "../auth";
+import { requirePermission, type AuthMode, type TokenClaims } from "../auth";
+import { resolveScopedAgent } from "../request-scope";
 import { dbOwnerQuery, dbOwnerTransaction } from "../db-owner-runtime";
 import { withTranscriptImportOperationLock } from "../transcript-import-operation-lock";
+import { beginSourceMutation, SOURCE_OPERATION_IN_PROGRESS_ERROR } from "../source-deletion-lock";
 import {
 	cleanupCancelledTranscriptImport,
 	bindTranscriptSource,
@@ -35,15 +43,44 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isDuplicateMode(value: unknown): value is ImportDuplicateMode {
 	return typeof value === "string" && (IMPORT_DUPLICATE_MODES as readonly string[]).includes(value);
 }
+export function resolveTranscriptImportAgent(
+	claims: TokenClaims | null,
+	authMode: AuthMode,
+	requestedAgentId: string | undefined,
+	fallbackAgentId: string,
+): string | null {
+	if (
+		claims === null &&
+		authMode === "local" &&
+		requestedAgentId?.trim() &&
+		requestedAgentId.trim() !== fallbackAgentId
+	)
+		return null;
+	const scoped = resolveScopedAgent(
+		claims,
+		authMode,
+		claims === null && authMode === "local" ? undefined : requestedAgentId,
+		fallbackAgentId,
+	);
+	return scoped.error ? null : scoped.agentId;
+}
+
 function agent(c: Context): string | null {
-	const resolved = resolveDaemonAgentId();
-	const requested = c.req.query("agentId") ?? c.req.query("agent_id");
-	return requested === undefined || requested === resolved ? resolved : null;
+	const requested = [
+		...(c.req.queries("agentId") ?? []),
+		...(c.req.queries("agent_id") ?? []),
+		c.req.header("x-signet-agent-id"),
+	].filter((value): value is string => value !== undefined && value.trim().length > 0);
+	const distinct = [...new Set(requested.map((value) => value.trim()))];
+	if (distinct.length > 1) return null;
+	return resolveTranscriptImportAgent(
+		c.get("auth")?.claims ?? null,
+		authConfig.mode,
+		distinct[0],
+		resolveDaemonAgentId(),
+	);
 }
 function bodyStream(request: Request): AsyncIterable<Uint8Array> {
-	// Bun's server Request clone does not preserve the streamed upload body here:
-	// the clone's reader reaches EOF even though the original body is non-empty.
-	// Consume the one-shot server stream directly; staging remains byte-streamed.
 	const body = request.body;
 	if (body === null) return (async function* (): AsyncGenerator<Uint8Array> {})();
 	return (async function* (): AsyncGenerator<Uint8Array> {
@@ -309,28 +346,55 @@ export function registerTranscriptImportRoutes(parent: Hono): void {
 				{ operation: "sources.import.finalize.file", lane: "read" },
 			);
 			if (!file) return c.json({ error: "import is no longer staging" }, 409);
-			const added = addImportedSource(
-				{
-					fileName: file.name,
-					contentHash: file.content_hash,
-					format: "jsonl",
-					agentId: upload.agentId,
-					duplicateMode: file.duplicate_mode,
-					importKey: `${upload.jobId}:${upload.fileId}:${upload.generation}`,
-				},
-				resolveDefaultBasePath(),
+			const importKey = `${upload.jobId}:${upload.fileId}:${upload.generation}`;
+			const sources = loadSourcesConfig(resolveDefaultBasePath()).sources;
+			const replay = sources.find(
+				(source) =>
+					source.kind === "import" &&
+					source.providerSettings?.agentId === upload.agentId &&
+					source.providerSettings?.importKey === importKey,
 			);
-			if (!added.ok) return c.json({ error: added.error }, 400);
-			await bindTranscriptSource(upload, added.source.id);
-			return c.json(
-				{
-					fileId: upload.fileId,
-					sourceId: added.source.id,
-					sizeBytes: file.size_bytes,
-					contentHash: file.content_hash,
-				},
-				201,
+			const duplicate = sources.find(
+				(source) =>
+					source.kind === "import" &&
+					source.providerSettings?.agentId === upload.agentId &&
+					source.providerSettings?.contentHash === file.content_hash,
 			);
+			const sourceId =
+				replay?.id ??
+				(file.duplicate_mode === "reimport"
+					? `import:${file.content_hash.slice(0, 16)}:${randomUUID().slice(0, 8)}`
+					: (duplicate?.id ?? deterministicImportedSourceId(file.content_hash, upload.agentId)));
+			const releaseSourceMutation = beginSourceMutation(sourceId);
+			if (releaseSourceMutation === undefined) return c.json({ error: SOURCE_OPERATION_IN_PROGRESS_ERROR }, 409);
+			try {
+				const added = addImportedSource(
+					{
+						fileName: file.name,
+						contentHash: file.content_hash,
+						format: "jsonl",
+						agentId: upload.agentId,
+						duplicateMode: file.duplicate_mode,
+						importKey,
+						sourceId,
+					},
+					resolveDefaultBasePath(),
+				);
+				if (!added.ok) return c.json({ error: added.error }, 400);
+				if (added.source.id !== sourceId) throw new Error("Imported Source identity changed during finalization");
+				await bindTranscriptSource(upload, added.source.id);
+				return c.json(
+					{
+						fileId: upload.fileId,
+						sourceId: added.source.id,
+						sizeBytes: file.size_bytes,
+						contentHash: file.content_hash,
+					},
+					201,
+				);
+			} finally {
+				releaseSourceMutation();
+			}
 		});
 	};
 

@@ -1,18 +1,3 @@
-/**
- * Secure filesystem primitives shared by the daemon, CLI, connectors, and tests.
- *
- * - Temporary directories are created with `mkdtemp` (unpredictable name,
- *   exclusive creation) and restricted to the owner (0o700).
- * - Temporary files are created exclusively (`wx` / O_EXCL) with mode 0o600,
- *   so another local user cannot pre-create, read, or swap them.
- * - Durable writes go through a private sibling temp file and an atomic
- *   rename. The final file keeps its previous permissions (or the process
- *   default for new files) so callers' visible behavior is unchanged, and
- *   readers never observe a partially written file.
- * - Reads that need metadata open the file first and `fstat` the descriptor,
- *   instead of `stat`-then-`open` on a path that can change in between.
- */
-
 import { randomBytes } from "node:crypto";
 import {
 	type Stats,
@@ -43,13 +28,9 @@ export const PRIVATE_FILE_MODE = 0o600;
 export type SecureWriteData = string | NodeJS.ArrayBufferView;
 
 export interface AtomicWriteOptions {
-	/** Final file mode. Defaults to the existing file's mode, or the process default (0o666 & ~umask) for new files. */
 	readonly mode?: number;
-	/** Text encoding for string data (default utf8). */
 	readonly encoding?: BufferEncoding;
-	/** Flush file data to disk before the rename (default false, matching ordinary writes). */
 	readonly fsync?: boolean;
-	/** Defaults to true for compatibility. False rejects linked and nonregular leaves. */
 	readonly followSymlinks?: boolean;
 }
 
@@ -70,7 +51,6 @@ function toBuffer(data: SecureWriteData, encoding: BufferEncoding = "utf8"): Buf
 }
 
 function defaultFileMode(): number {
-	// process.umask() with no argument is the only portable way to read the mask.
 	const mask = typeof process.umask === "function" ? process.umask() : 0o022;
 	return 0o666 & ~mask;
 }
@@ -78,22 +58,16 @@ function defaultFileMode(): number {
 function tempSiblingPath(target: string): string {
 	return join(dirname(target), `.${basename(target)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
 }
-
-/** Create a private (0o700) temporary directory with an unpredictable name. */
 export function createPrivateTempDir(prefix: string, parent: string = tmpdir()): string {
 	const dir = mkdtempSync(join(parent, prefix));
 	chmodSync(dir, PRIVATE_DIR_MODE);
 	return dir;
 }
-
-/** Async variant of {@link createPrivateTempDir}. */
 export async function createPrivateTempDirAsync(prefix: string, parent: string = tmpdir()): Promise<string> {
 	const dir = await mkdtemp(join(parent, prefix));
 	await chmod(dir, PRIVATE_DIR_MODE);
 	return dir;
 }
-
-/** Resolve the file that a write to `path` should replace, following an existing symlink. */
 function resolveWriteTargetSync(path: string, followSymlinks = true): { target: string; existingMode: number | null } {
 	let st: Stats;
 	try {
@@ -110,7 +84,6 @@ function resolveWriteTargetSync(path: string, followSymlinks = true): { target: 
 		try {
 			target = realpathSync(path);
 		} catch (error) {
-			// Dangling symlink: keep the previous behavior of writing through it.
 			if (isErrnoCode(error, "ENOENT")) return { target: path, existingMode: null };
 			throw error;
 		}
@@ -145,12 +118,6 @@ async function resolveWriteTarget(
 	}
 	return { target: path, existingMode: st.mode & 0o7777 };
 }
-
-/**
- * Write `path` atomically: data goes to an exclusively created 0o600 sibling
- * temp file, which is then renamed over the destination. Symlinked
- * destinations are preserved by replacing the link target.
- */
 export function writeFileAtomicSync(path: string, data: SecureWriteData, options: AtomicWriteOptions = {}): void {
 	const { target, existingMode } = resolveWriteTargetSync(path, options.followSymlinks);
 	const finalMode = options.mode ?? existingMode ?? defaultFileMode();
@@ -173,14 +140,10 @@ export function writeFileAtomicSync(path: string, data: SecureWriteData, options
 		if (!renamed) {
 			try {
 				unlinkSync(tmp);
-			} catch {
-				// Best-effort cleanup; preserve the original failure.
-			}
+			} catch {}
 		}
 	}
 }
-
-/** The selected root may be an alias; descendants must be unlinked. Ancestor directory mutation by another process is outside this boundary. */
 export function writeFileScopedAtomicSync(
 	root: string,
 	path: string,
@@ -206,8 +169,6 @@ export function writeFileScopedAtomicSync(
 	}
 	writeFileAtomicSync(join(canonicalRoot, suffix), data, { ...options, followSymlinks: false });
 }
-
-/** Async variant of {@link writeFileAtomicSync}. */
 export async function writeFileAtomic(
 	path: string,
 	data: SecureWriteData,
@@ -233,16 +194,10 @@ export async function writeFileAtomic(
 		if (!renamed) await unlink(tmp).catch(() => {});
 	}
 }
-
-/**
- * Publish complete content with a no-replace hard link from an exclusive staging file, replacing
- * `if (!existsSync(path)) writeFileSync(path, ...)`. Returns false when the
- * file already existed.
- */
 export function writeFileExclusiveSync(
 	path: string,
 	data: SecureWriteData,
-	options: { readonly mode?: number; readonly encoding?: BufferEncoding } = {},
+	options: { readonly mode?: number; readonly encoding?: BufferEncoding; readonly fsync?: boolean } = {},
 ): boolean {
 	const tmp = tempSiblingPath(path);
 	const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, PRIVATE_FILE_MODE);
@@ -252,6 +207,7 @@ export function writeFileExclusiveSync(
 			let offset = 0;
 			while (offset < buffer.length) offset += writeSync(fd, buffer, offset, buffer.length - offset);
 			fchmodSync(fd, options.mode ?? defaultFileMode());
+			if (options.fsync) fsyncSync(fd);
 		} finally {
 			closeSync(fd);
 		}
@@ -266,18 +222,12 @@ export function writeFileExclusiveSync(
 		unlinkSync(tmp);
 	}
 }
-
-/** Create `path` exclusively (O_EXCL) for writing with `mode` (default 0o600). Returns the descriptor. */
 export function openFileExclusiveSync(path: string, mode: number = PRIVATE_FILE_MODE): number {
 	return openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, mode);
 }
-
-/** Open `path` for appending, creating it with `mode` (default 0o600) when missing. */
 export function openAppendSync(path: string, mode: number = PRIVATE_FILE_MODE): number {
 	return openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND, mode);
 }
-
-/** Append `data` to `path` through a single opened descriptor (created with `mode` when missing). */
 export function appendFileSecureSync(path: string, data: SecureWriteData, mode: number = PRIVATE_FILE_MODE): void {
 	const fd = openAppendSync(path, mode);
 	try {
@@ -288,8 +238,6 @@ export function appendFileSecureSync(path: string, data: SecureWriteData, mode: 
 		closeSync(fd);
 	}
 }
-
-/** Async variant of {@link appendFileSecureSync}. */
 export async function appendFileSecure(
 	path: string,
 	data: SecureWriteData,
@@ -302,8 +250,6 @@ export async function appendFileSecure(
 		await handle.close();
 	}
 }
-
-/** Read a file and its metadata through one descriptor. Returns null when the file does not exist. */
 export function readFileWithStatSync(path: string): FileWithStat<Buffer> | null;
 export function readFileWithStatSync(path: string, encoding: BufferEncoding): FileWithStat<string> | null;
 export function readFileWithStatSync(
@@ -326,8 +272,6 @@ export function readFileWithStatSync(
 		closeSync(fd);
 	}
 }
-
-/** Async variant of {@link readFileWithStatSync}. */
 export async function readFileWithStat(path: string): Promise<FileWithStat<Buffer> | null>;
 export async function readFileWithStat(path: string, encoding: BufferEncoding): Promise<FileWithStat<string> | null>;
 export async function readFileWithStat(
@@ -350,16 +294,12 @@ export async function readFileWithStat(
 		await handle.close();
 	}
 }
-
-/** Read a file, returning null when it does not exist (replaces exists/stat-then-read). */
 export function readFileIfExistsSync(path: string): Buffer | null;
 export function readFileIfExistsSync(path: string, encoding: BufferEncoding): string | null;
 export function readFileIfExistsSync(path: string, encoding?: BufferEncoding): string | Buffer | null {
 	const result = encoding ? readFileWithStatSync(path, encoding) : readFileWithStatSync(path);
 	return result ? result.content : null;
 }
-
-/** Async variant of {@link readFileIfExistsSync}. */
 export async function readFileIfExists(path: string): Promise<Buffer | null>;
 export async function readFileIfExists(path: string, encoding: BufferEncoding): Promise<string | null>;
 export async function readFileIfExists(path: string, encoding?: BufferEncoding): Promise<string | Buffer | null> {

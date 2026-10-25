@@ -75,7 +75,7 @@ Stored facts and constraints under an aspect. Important fields include:
 - `aspect_id`
 - `agent_id`
 - `memory_id`
-- `kind`: `attribute` or `constraint`
+- `kind`: `attribute`, `constraint`, or `claim`
 - `content`
 - `normalized_content`
 - `group_key`
@@ -130,8 +130,14 @@ confidence >= minConfidence
 ```
 
 `related_to` edges require a non-empty reason. Migration 050 adds
-`entity_dependency_history`, an append-only audit table populated by triggers
-for dependency insert, update, and delete events.
+`entity_dependency_history`, an audit table populated by triggers for
+dependency insert, update, and delete events. Rows are never edited. The
+retention worker removes one kind of row: a trigger-written `deleted` event
+whose next event for the same dependency is a `created` event in the same
+second with identical source, target, agent, type, and reason. Such a pair
+records a rebuild that changed nothing the history stores. Every other event,
+including `updated` rows, reason changes, real deletes, and the first
+`created` or `backfill` row, is kept.
 
 ### `task_meta`
 
@@ -214,8 +220,9 @@ remember and ingest no longer author graph structure directly.
 The only retained write closure in
 `platform/daemon/src/pipeline/graph-transactions.ts` is
 `txDecrementEntityMentions`, used by the retention worker to decrement mention
-counts and delete orphaned entities (plus their dangling relations) after a
-memory purge.
+counts after a memory purge. Retention never deletes entities: an entity that
+reaches zero mentions keeps its pin, aspects, attributes, aliases,
+dependencies, relations, and epistemic assertions.
 
 ### Ontology Operation Handlers
 
@@ -368,6 +375,12 @@ Read-oriented graph endpoints live in `platform/daemon/src/routes/knowledge-rout
 | `/api/knowledge/expand` | POST | Entity expansion with related memory/session context |
 | `/api/knowledge/expand/session` | POST | Session-summary expansion |
 
+`/api/knowledge/expand` keeps graph traversal and the subsequent entity, aspect,
+attribute, dependency, and memory hydration on the database-owner boundary. A
+traversal timeout or traversal failure returns the available expansion with
+`partial: true` and a `degradation` marker; an owner failure before focal
+resolution returns HTTP 503 with `code: "knowledge_graph_unavailable"`.
+
 Ontology-control endpoints live in `platform/daemon/src/routes/ontology-routes.ts`.
 
 | Endpoint family | Purpose |
@@ -430,9 +443,33 @@ Use `--json` on either command family for automation.
 
 `getKnowledgeGraphForConstellation` in `platform/daemon/src/knowledge-graph.ts`
 builds the dashboard graph. It fetches active entities, aspects, attributes,
-dependencies, proposal overlays, and dreaming summaries within bounded limits.
-The dashboard then converts that payload into entity, aspect, attribute, memory,
-proposal, and relationship nodes.
+dependencies, epistemic assertions, proposal overlays, and dreaming summaries
+within bounded limits. Source-document entities are included when an active
+Dreaming claim cites them (same `source_id` and `source_path`); source folders,
+skills, and uncited source topology remain excluded so the bounded view does not
+become a filesystem browser.
+
+The dashboard preserves the ontology instead of flattening it into unlabeled
+points. Its semantic path is:
+
+```text
+subject -> aspect -> group -> claim slot -> claim/constraint value
+                                      \-> epistemic assertion
+claim/constraint value -> evidence origin
+```
+
+Subjects, aspects, groups, claim slots, claims, constraints, assertions, and
+evidence origins have distinct node shapes and colors. Relationship edges are
+also typed: containment, organization, value description, assertion, evidence,
+and dependency use different visual treatments. Claim/value and assertion labels
+carry confidence; claim and assertion labels carry source kind/path when present.
+Every bounded node remains hover-readable with its full content, role,
+confidence, provenance, and relationship count even when its resting label is
+suppressed to prevent dense workspaces from becoming a wall of text.
+
+The payload converts into subject, source-document, aspect, group, claim-slot,
+claim, constraint, attribute, assertion, evidence-origin, memory, proposal, and
+relationship nodes in the dashboard scene.
 
 When the request does not include `agent_id`, `/api/knowledge/constellation`
 uses the configured daemon agent ID (`SIGNET_AGENT_ID`, falling back to

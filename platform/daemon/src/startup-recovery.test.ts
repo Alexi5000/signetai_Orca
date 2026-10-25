@@ -1,11 +1,5 @@
-/**
- * Tests for startup recovery — automatic crash-loop damage cleanup.
- *
- * Proves: dead jobs purged, redundant staging rows cleaned, genuinely new
- * staging rows preserved, orphaned passes swept, clean workspace untouched.
- */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DreamingConfig } from "@signet/core";
@@ -15,11 +9,12 @@ import { createDbOwnerClient } from "./db-owner-client";
 import { startDreamingWorker } from "./pipeline/dreaming-worker";
 import { getStartupRecoveryCompletion, runStartupRecovery, runStartupRecoveryAsync } from "./startup-recovery";
 
-const dbFiles = ["memories.db", "memories.db-shm", "memories.db-wal"];
 let agentsDir = "";
 
 function resetDbFiles(): void {
-	for (const file of dbFiles) rmSync(join(agentsDir, "memory", file), { force: true });
+	for (const file of readdirSync(join(agentsDir, "memory"))) {
+		if (file.startsWith("memories.db")) rmSync(join(agentsDir, "memory", file), { force: true });
+	}
 }
 
 function seedTables(db: WriteDb): void {
@@ -100,8 +95,8 @@ describe("runStartupRecovery", () => {
 		getDbAccessor().withWriteTx(seedTables);
 	});
 
-	afterEach(() => {
-		closeDbAccessor();
+	afterEach(async () => {
+		await closeDbAccessor();
 		rmSync(agentsDir, { recursive: true, force: true });
 	});
 
@@ -119,7 +114,7 @@ describe("runStartupRecovery", () => {
 		const report = await runStartupRecoveryAsync(getDbAccessor());
 
 		expect(report.deadJobsPurged).toBe(2);
-		expect(countRows("memory_jobs")).toBe(2); // dead-recent + pending-1
+		expect(countRows("memory_jobs")).toBe(2);
 	});
 
 	it("routes startup cleanup through the DB owner without blocking the caller", async () => {
@@ -258,17 +253,15 @@ describe("runStartupRecovery", () => {
 
 	it("deletes redundant staging rows but keeps genuinely new ones", async () => {
 		getDbAccessor().withWriteTx((db) => {
-			// Row promoted to embeddings AND still in staging (redundant)
 			insertEmbedding(db, "emb-1", "hash-A", "embeddings");
 			insertEmbedding(db, "stage-1", "hash-A", "embeddings_staging");
-			// Row only in staging (genuinely new — keep)
 			insertEmbedding(db, "stage-2", "hash-B", "embeddings_staging");
 		});
 
 		const report = await runStartupRecoveryAsync(getDbAccessor());
 
 		expect(report.stagingRowsCleaned).toBe(1);
-		expect(countRows("embeddings_staging")).toBe(1); // only the new row remains
+		expect(countRows("embeddings_staging")).toBe(1);
 	});
 
 	it("sweeps orphaned dreaming passes left by a crash", async () => {
@@ -349,7 +342,6 @@ describe("runStartupRecovery", () => {
 	});
 
 	it("is idempotent — a clean workspace cleans nothing", async () => {
-		// Run recovery on a fresh workspace with no damage.
 		const report1 = await runStartupRecoveryAsync(getDbAccessor());
 		expect(report1.deadJobsPurged).toBe(0);
 		expect(report1.documentLeasesRecovered).toBe(0);
@@ -357,8 +349,6 @@ describe("runStartupRecovery", () => {
 		expect(report1.orphanedPassesSwept).toBe(0);
 		expect(report1.databaseIntegrity.phase).toBe("pending");
 		expect(report1.databaseIntegrity.quickCheck.messages).toEqual(["not checked"]);
-
-		// Run again — still nothing.
 		const report2 = await runStartupRecoveryAsync(getDbAccessor());
 		expect(report2.deadJobsPurged).toBe(0);
 		expect(report2.stagingRowsCleaned).toBe(0);

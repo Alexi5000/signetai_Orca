@@ -2,12 +2,6 @@ import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-/**
- * Stage 1 isolates process environment and filesystem roots only. Provider
- * fixtures, generated artifacts, shared database state, and parallel-suite
- * coordination remain later hermetic-runner stages.
- */
 export const CLEARED_ENV_KEYS = [
 	"SIGNET_PATH",
 	"SIGNET_WORKSPACE",
@@ -61,6 +55,8 @@ export const CLEARED_ENV_KEYS = [
 
 type HermeticEnvironment = NodeJS.ProcessEnv;
 
+export const HERMETIC_TEST_GUARD = join(import.meta.dir, "hermetic-test-guard.ts");
+
 function createHermeticRoot(): string {
 	const candidates = [tmpdir(), import.meta.dir];
 	for (const candidate of candidates) {
@@ -106,7 +102,7 @@ export function buildHermeticEnvironment(
 function run(): number {
 	const root = createHermeticRoot();
 	try {
-		const result = spawnSync(process.execPath, ["test", ...process.argv.slice(2)], {
+		const result = spawnSync(process.execPath, ["test", "--preload", HERMETIC_TEST_GUARD, ...process.argv.slice(2)], {
 			cwd: join(import.meta.dir, ".."),
 			env: buildHermeticEnvironment(process.env, root),
 			stdio: "inherit",

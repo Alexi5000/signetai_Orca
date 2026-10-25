@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { MuseCodeConnector } from "@signet/connector-muse-code";
 import { OpenClawConnector } from "@signet/connector-openclaw";
 import { getOhMyPiConfigPath } from "@signet/connector-oh-my-pi";
 import { getPiConfigPath } from "@signet/connector-pi";
@@ -191,7 +192,6 @@ async function syncSourceRepo(basePath: string, deps: Deps): Promise<number> {
 		console.log(chalk.dim(`  ${result.message}`));
 		return 0;
 	}
-	// current: already up to date, no output
 	return 0;
 }
 
@@ -245,8 +245,6 @@ async function syncHarnessHooks(basePath: string, deps: Deps): Promise<number> {
 						),
 					);
 				}
-				// Leave dual-state installs visible in doctor/status for manual cleanup.
-				// sync only self-heals legacy-only configs and should not silently remove hooks.
 			}
 
 			await deps.configureHarnessHooks(
@@ -293,6 +291,9 @@ function detectInstalledHarnesses(): string[] {
 	}
 	if (existsSync(getPiConfigPath())) {
 		found.push("pi");
+	}
+	if (new MuseCodeConnector().isInstalled()) {
+		found.push("muse-code");
 	}
 
 	return found;

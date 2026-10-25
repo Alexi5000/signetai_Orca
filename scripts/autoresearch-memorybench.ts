@@ -176,7 +176,6 @@ function record(runId: string, note: string): void {
 	const report = readReport(runId);
 	const m = metrics(report);
 	mkdirSync(dirname(resultsTsv), { recursive: true });
-	// Create the header only when the file is new (O_EXCL), then append via one descriptor.
 	writeFileExclusiveSync(
 		resultsTsv,
 		"timestamp\trun_id\taccuracy\tcorrect\ttotal\thit_at_k\tf1\tmrr\tndcg\tsearch_ms\tcontext_tokens\tnote\n",

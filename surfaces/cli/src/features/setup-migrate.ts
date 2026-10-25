@@ -1,18 +1,21 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { writeFileAtomicSync, writeFileExclusiveSync } from "@signet/core";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { confirm } from "@inquirer/prompts";
 import {
 	Database as CoreDatabase,
 	type IdentityMode,
 	type ImportResult,
 	type SkillsResult,
+	createFreshWorkspaceV2,
 	disableGraphiqState,
 	ensureUnifiedSchema,
 	formatYaml,
+	hasExistingWorkspaceState,
 	importMemoryLogs,
 	resolvePrimaryPackageManager,
+	resolveWorkspaceLayout,
 	runMigrations,
 	unifySkills,
 } from "@signet/core";
@@ -20,8 +23,10 @@ import { readNetworkMode } from "@signet/core";
 import chalk from "chalk";
 import ora from "ora";
 import { daemonAccessLines } from "../lib/network.js";
+import { createDaemonClient } from "../lib/daemon.js";
 import type { SetupDetection } from "../lib/setup-detection.js";
-import { openUrlWithFallback } from "../lib/open-url.js";
+import { openDashboardWithDesktopFallback, openUrlWithFallback } from "../lib/open-url.js";
+import { isDesktopWorkspacePath } from "../lib/workspace.js";
 import Database from "../sqlite.js";
 import { installGraphiqPlugin } from "./graphiq.js";
 import {
@@ -163,6 +168,7 @@ export function detectedHarnessesForExistingSetup(
 	if (detection.harnesses.opencode) detected.push("opencode");
 	if (detection.harnesses.forge || configuredHarnessList.includes("forge")) detected.push("forge");
 	if (detection.harnesses.codex) detected.push("codex");
+	if (detection.harnesses.museCode) detected.push("muse-code");
 	if (detection.harnesses.hermesAgent) detected.push("hermes-agent");
 	if (detection.harnesses.gemini) detected.push("gemini");
 	if (detection.harnesses.ohMyPi || configuredHarnessList.includes("oh-my-pi")) detected.push("oh-my-pi");
@@ -220,22 +226,8 @@ export async function runExistingSetupWizard(
 		if (!existsSync(basePath)) {
 			mkdirSync(basePath, { recursive: true });
 		}
-		if (!existsSync(join(basePath, "memory"))) {
-			mkdirSync(join(basePath, "memory"), { recursive: true });
-		}
-		if (!existsSync(join(basePath, "memory", "scripts"))) {
-			mkdirSync(join(basePath, "memory", "scripts"), { recursive: true });
-		}
-
-		spinner.text = "Installing memory system...";
-		const scriptsSource = join(templatesDir, "memory", "scripts");
-		if (existsSync(scriptsSource)) {
-			deps.copyDirRecursive(scriptsSource, join(basePath, "memory", "scripts"));
-		}
-
-		const requirementsSource = join(templatesDir, "memory", "requirements.txt");
-		if (existsSync(requirementsSource)) {
-			copyFileSync(requirementsSource, join(basePath, "memory", "requirements.txt"));
+		if (!hasExistingWorkspaceState(basePath)) {
+			createFreshWorkspaceV2(basePath);
 		}
 
 		spinner.text = "Syncing built-in skills...";
@@ -252,9 +244,7 @@ export async function runExistingSetupWizard(
 				if (nameMatch) {
 					agentName = nameMatch[1].trim();
 				}
-			} catch {
-				// Ignore
-			}
+			} catch {}
 		}
 
 		const configuredHarnessList = readHarnesses(existingConfig.harnesses);
@@ -286,7 +276,7 @@ export async function runExistingSetupWizard(
 				source: packageManager.source,
 			},
 			memory: {
-				database: "memory/memories.db",
+				database: relative(basePath, resolveWorkspaceLayout(basePath).database),
 				session_budget: 2000,
 				decay_rate: 0.95,
 			},
@@ -375,8 +365,6 @@ export async function runExistingSetupWizard(
 				if (Object.hasOwn(config, "inference")) {
 					updatedConfig.inference = config.inference;
 				} else {
-					// Remove only a generated setup route when extraction is disabled;
-					// preserve any user-owned inference configuration.
 					applySetupInferenceRoute(updatedConfig, undefined);
 				}
 			}
@@ -416,7 +404,6 @@ export async function runExistingSetupWizard(
 		const agentsPath = join(basePath, "AGENTS.md");
 		if (identityMode === "managed") {
 			const agentsTemplate = join(templatesDir, "AGENTS.md.template");
-			// O_EXCL create-if-missing: an existing AGENTS.md is never overwritten.
 			if (existsSync(agentsTemplate)) {
 				const content = readFileSync(agentsTemplate, "utf-8").replace(/\{\{AGENT_NAME\}\}/g, agentName);
 				writeFileExclusiveSync(agentsPath, content);
@@ -452,7 +439,8 @@ export async function runExistingSetupWizard(
 		}
 
 		spinner.text = "Initializing database...";
-		const dbPath = join(basePath, "memory", "memories.db");
+		const dbPath = resolveWorkspaceLayout(basePath).database;
+		mkdirSync(dirname(dbPath), { recursive: true });
 		const db = Database(dbPath);
 		const migrationResult = ensureUnifiedSchema(db);
 		if (migrationResult.migrated) {
@@ -597,16 +585,31 @@ export async function runExistingSetupWizard(
 		console.log();
 		printSetupProtectionSummary(protection);
 		console.log();
-		if (options?.nonInteractive === true) {
-			if (options.openDashboard === true) {
-				await openUrlWithFallback(`http://127.0.0.1:${deps.DEFAULT_PORT}`);
+		const shouldOpenDashboard =
+			options?.nonInteractive === true
+				? options.openDashboard === true
+				: await withSetupPrompt(spinner, () => confirm({ message: "Open the dashboard?", default: true }));
+		if (shouldOpenDashboard) {
+			const client = createDaemonClient(deps.DEFAULT_PORT, basePath);
+			if (client.localWorkspace) {
+				const status = await client.fetchDaemonResult<{ agentsDir: string }>("/api/status");
+				if (!status.ok) {
+					throw new Error(
+						`Signet is not ready: ${status.error ?? status.reason}. Run signet doctor, then retry setup.`,
+					);
+				}
+				if (status.data.agentsDir !== basePath) {
+					throw new Error(
+						"Another workspace is running at this address. Stop it or select its workspace before continuing setup.",
+					);
+				}
 			}
-		} else {
-			const launchNow = await withSetupPrompt(spinner, () =>
-				confirm({ message: "Open the dashboard?", default: true }),
-			);
-			if (launchNow) {
-				await openUrlWithFallback(`http://127.0.0.1:${deps.DEFAULT_PORT}`);
+			const destination = options?.nonInteractive === true ? "dashboard" : "setup";
+			const url = `${client.url}${destination === "setup" ? "/#setup" : ""}`;
+			if (client.localWorkspace && isDesktopWorkspacePath(basePath)) {
+				await openDashboardWithDesktopFallback(url, destination);
+			} else {
+				await openUrlWithFallback(url);
 			}
 		}
 

@@ -10,7 +10,11 @@ export interface Config {
   openaiBaseUrl: string
   anthropicApiKey: string
   googleApiKey: string
+  zaiApiKey: string
+  zaiBaseUrl: string
 }
+
+export const ZAI_CODING_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
 
 export const config: Config = {
   supermemoryApiKey: process.env.SUPERMEMORY_API_KEY || "",
@@ -22,6 +26,8 @@ export const config: Config = {
   openaiBaseUrl: process.env.OPENAI_BASE_URL || "",
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
   googleApiKey: process.env.GOOGLE_API_KEY || "",
+  zaiApiKey: process.env.ZAI_API_KEY || "",
+  zaiBaseUrl: process.env.ZAI_BASE_URL || ZAI_CODING_BASE_URL,
 }
 
 function openRouterHeaders(baseUrl: string): Record<string, string> | undefined {
@@ -55,27 +61,14 @@ export function getProviderConfig(provider: string): { apiKey: string; baseUrl?:
     case "zep":
       return { apiKey: config.zepApiKey }
     case "filesystem":
-      return { apiKey: config.openaiApiKey } // Filesystem uses OpenAI for memory extraction
+      return { apiKey: config.openaiApiKey }
     case "rag":
-      return { apiKey: config.openaiApiKey } // RAG provider uses OpenAI for embeddings
+      return { apiKey: config.openaiApiKey }
     case "signet":
     case "signet-dreaming":
     case "signet-supermemory-parity":
       return { apiKey: config.openaiApiKey, baseUrl: config.signetBaseUrl }
     default:
       throw new Error(`Unknown provider: ${provider}`)
-  }
-}
-
-export function getJudgeConfig(judge: string): { apiKey: string; model?: string } {
-  switch (judge) {
-    case "openai":
-      return { apiKey: config.openaiApiKey }
-    case "anthropic":
-      return { apiKey: config.anthropicApiKey }
-    case "google":
-      return { apiKey: config.googleApiKey }
-    default:
-      throw new Error(`Unknown judge: ${judge}`)
   }
 }

@@ -11,7 +11,7 @@ function toEntry(provider: string, preset: PipelineModelPreset): ModelRegistryEn
 }
 
 function catalogEntries(provider: string): ModelRegistryEntry[] {
-	const presets = Object.prototype.hasOwnProperty.call(PIPELINE_MODEL_CATALOG, provider)
+	const presets = Object.hasOwn(PIPELINE_MODEL_CATALOG, provider)
 		? PIPELINE_MODEL_CATALOG[provider as keyof typeof PIPELINE_MODEL_CATALOG]
 		: [];
 	return presets.map((preset) => toEntry(provider, preset));
@@ -25,15 +25,9 @@ export function markDeprecatedVersions(entries: readonly ModelRegistryEntry[]): 
 	return entries.map((entry) => ({ ...entry }));
 }
 
-export function initModelRegistry(): void {
-	// Kept as an API-compatible no-op. Model IDs now come from the checked-in
-	// provider/harness catalog in @signet/core, not runtime synthesis or probing.
-}
+export function initModelRegistry(): void {}
 
-export async function refreshRegistry(): Promise<void> {
-	// Deliberately static. Local/provider discovery should be explicit per
-	// provider setup flow, never a background registry that invents options.
-}
+export async function refreshRegistry(): Promise<void> {}
 
 export function getAvailableModels(provider?: string, includeDeprecated = false): ModelRegistryEntry[] {
 	const models = provider ? catalogEntries(provider) : allCatalogEntries();
@@ -61,6 +55,4 @@ export function getRegistryStatus(): {
 	return { initialized: true, lastRefreshAt: 0, modelCounts };
 }
 
-export function stopModelRegistry(): void {
-	// no-op
-}
+export function stopModelRegistry(): void {}

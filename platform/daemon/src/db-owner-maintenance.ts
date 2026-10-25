@@ -1,19 +1,13 @@
-/**
- * Bounded maintenance operations executed by the database owner.
- *
- * The daemon only submits serializable SQL jobs. Each FTS chunk is a separate
- * owner transaction and advances a durable keyset checkpoint in the same
- * transaction as the index writes. If the owner dies, the last committed
- * checkpoint is the resume point and a partially applied chunk is rolled back.
- */
-
 import { randomUUID } from "node:crypto";
+import { MEMORIES_FTS_TOKENIZER } from "@signet/core";
 import {
+	DbOwnerAdmissionError,
 	DbOwnerDeadlineError,
 	DbOwnerDiedError,
 	type DbOwnerClient,
 	type DbOwnerHealth,
 	type DbOwnerJobHandle,
+	type DbOwnerSubmitOptions,
 } from "./db-owner-client";
 import { createDbOwnerClient } from "./db-owner-client";
 import type {
@@ -25,8 +19,15 @@ import type {
 	DbOwnerParameter,
 	DbOwnerRequest,
 	DbOwnerStatement,
+	DbOwnerVectorRepairInput,
+	DbOwnerVectorRepairResult,
 } from "./db-owner-protocol";
-import { DB_OWNER_MAX_RESULT_BYTES, DB_OWNER_MAX_WORK_UNITS } from "./db-owner-protocol";
+import {
+	DB_OWNER_MAX_RESULT_BYTES,
+	DB_OWNER_MAX_WORK_UNITS,
+	VECTOR_REPAIR_MAX_BATCH_DEADLINE_MS,
+	VECTOR_REPAIR_MAX_WORK_UNITS_PER_BATCH,
+} from "./db-owner-protocol";
 import { setFtsIndexIncomplete } from "./fts-index-state";
 import type { EmbeddingIndexMigrationProgress } from "./embedding-index-state";
 import type { DiagnosticsReport, ProviderTracker, QueueHealth } from "./diagnostics";
@@ -36,25 +37,17 @@ import type { DreamingSurprisalSelection } from "./pipeline/dreaming-surprisal";
 export interface DbOwnerMaintenanceOptions {
 	readonly deadlineMs?: number;
 	readonly estimatedWorkUnits?: number;
-	/** Verification maintenance is admitted while application writes are blocked. */
+	readonly signal?: AbortSignal;
 	readonly lane?: "maintenance" | "verify";
 	readonly onOwnerMetrics?: (metrics: DbOwnerMaintenanceMetrics) => void | Promise<void>;
-	/** Called when the owner worker has emitted its terminal result. */
 	readonly onOwnerJobSettled?: () => void | Promise<void>;
-	/**
-	 * Keep a deadline-abandoned synchronous job as the caller's completion fence.
-	 * Queued jobs resolve their metrics without running; dispatched jobs resolve
-	 * after the owner emits its terminal result.
-	 */
 	readonly waitForOwnerCompletionOnDeadline?: boolean;
-	/** Called when admission rejects before an owner job is created. */
 	readonly onOwnerJobAdmissionFailure?: (error: unknown) => void;
+	readonly admission?: "wait" | "reject";
 }
 
 export interface DbOwnerMaintenanceMetrics {
-	/** Time admitted in the daemon queue before the owner child started work. */
 	readonly queueAdmissionMs: number;
-	/** Execution time measured inside the owner child process. */
 	readonly ownerExecutionMs: number;
 }
 
@@ -78,7 +71,7 @@ function submitOptions(
 	};
 }
 
-async function runOwnerJob<Result>(
+export async function runOwnerJob<Result>(
 	owner: DbOwnerClient,
 	request: DbOwnerRequest,
 	operation: string,
@@ -87,8 +80,6 @@ async function runOwnerJob<Result>(
 ): Promise<Result> {
 	let handle: DbOwnerJobHandle<Result>;
 	try {
-		// Integrity checks and their durable checkpoints are the recovery path
-		// that must remain usable while application writes are fail-closed.
 		const effectiveLane = options.lane ?? (operation.startsWith("integrity.") ? "verify" : lane);
 		handle = owner.submit<Result>(request, submitOptions(operation, effectiveLane, options));
 	} catch (error) {
@@ -99,38 +90,40 @@ async function runOwnerJob<Result>(
 	const notifySettled = (): void => {
 		if (notified) return;
 		notified = true;
-		void Promise.resolve(options.onOwnerJobSettled?.()).catch(() => {
-			// Completion notification is advisory and must not alter the owner result.
-		});
+		void Promise.resolve(options.onOwnerJobSettled?.()).catch(() => {});
 	};
 	void handle.metrics?.then(notifySettled, () => {
-		// A dead owner has no worker left to wait for.
 		notifySettled();
 	});
 	void handle.result.catch((error: unknown) => {
-		// Deadline rejection abandons the client promise but not a dispatched
-		// synchronous worker; its metrics promise remains the completion fence.
 		if (!(error instanceof DbOwnerDeadlineError)) notifySettled();
 	});
-	let result: Result;
+	const onAbort = (): void => handle.cancel();
+	if (options.signal !== undefined) {
+		if (options.signal.aborted) onAbort();
+		else options.signal.addEventListener("abort", onAbort, { once: true });
+	}
 	try {
-		result = await handle.result;
-	} catch (error) {
-		if (error instanceof DbOwnerDeadlineError && options.waitForOwnerCompletionOnDeadline === true) {
-			await handle.metrics?.catch(() => {
-				// Preserve the original deadline error if owner metrics fail too.
+		let result: Result;
+		try {
+			result = await handle.result;
+		} catch (error) {
+			if (error instanceof DbOwnerDeadlineError && options.waitForOwnerCompletionOnDeadline === true) {
+				await handle.metrics?.catch(() => {});
+			}
+			throw error;
+		}
+		const metrics = await handle.metrics;
+		if (metrics !== undefined) {
+			await options.onOwnerMetrics?.({
+				queueAdmissionMs: Math.max(0, metrics.startedAt - handle.job.enqueuedAt),
+				ownerExecutionMs: Math.max(0, metrics.finishedAt - metrics.startedAt),
 			});
 		}
-		throw error;
+		return result;
+	} finally {
+		options.signal?.removeEventListener("abort", onAbort);
 	}
-	const metrics = await handle.metrics;
-	if (metrics !== undefined) {
-		await options.onOwnerMetrics?.({
-			queueAdmissionMs: Math.max(0, metrics.startedAt - handle.job.enqueuedAt),
-			ownerExecutionMs: Math.max(0, metrics.finishedAt - metrics.startedAt),
-		});
-	}
-	return result;
 }
 
 async function startOwnerWithinDeadline(owner: DbOwnerClient, deadlineAt: number, operation: string): Promise<void> {
@@ -148,8 +141,6 @@ async function startOwnerWithinDeadline(owner: DbOwnerClient, deadlineAt: number
 		if (timer !== undefined) clearTimeout(timer);
 	}
 }
-
-/** Run an idempotent maintenance request once more after an owner crash. */
 export async function runOwnerMaintenanceWithRetry<Result>(
 	owner: DbOwnerClient,
 	request: DbOwnerRequest,
@@ -163,12 +154,34 @@ export async function runOwnerMaintenanceWithRetry<Result>(
 		if (remainingMs < 1) throw new DbOwnerDeadlineError(operation);
 		return { ...options, deadlineMs: remainingMs };
 	};
+	const runAdmitted = async (): Promise<Result> => {
+		let queueFull: DbOwnerAdmissionError | null = null;
+		for (;;) {
+			if (queueFull !== null && Math.floor(deadlineAt - Date.now()) < 1) throw queueFull;
+			try {
+				return await runOwnerJob(owner, request, operation, "maintenance", attemptOptions());
+			} catch (error) {
+				if (
+					options.admission === "reject" ||
+					!(error instanceof DbOwnerAdmissionError) ||
+					error.code !== "DB_OWNER_QUEUE_FULL"
+				) {
+					throw error;
+				}
+				queueFull = error;
+				if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : error;
+				const remainingMs = deadlineAt - Date.now();
+				if (remainingMs <= 1) throw error;
+				await new Promise<void>((resolve) => setTimeout(resolve, Math.min(25, remainingMs - 1)));
+			}
+		}
+	};
 	try {
-		return await runOwnerJob(owner, request, operation, "maintenance", attemptOptions());
+		return await runAdmitted();
 	} catch (error) {
 		if (!(error instanceof DbOwnerDiedError)) throw error;
 		await startOwnerWithinDeadline(owner, deadlineAt, operation);
-		return await runOwnerJob(owner, request, operation, "maintenance", attemptOptions());
+		return await runAdmitted();
 	}
 }
 
@@ -202,8 +215,6 @@ export async function ownerQueryOne<Row extends object>(
 	);
 	return result ?? undefined;
 }
-
-/** Run a returning statement on the owner's write connection. */
 export async function ownerWriteQueryOne<Row extends object>(
 	owner: DbOwnerClient,
 	operation: string,
@@ -233,8 +244,6 @@ export async function ownerTransaction(
 		options,
 	);
 }
-
-/** Execute a bounded write batch with optional compare-and-set preconditions. */
 export async function ownerBatch(
 	owner: DbOwnerClient,
 	operation: string,
@@ -249,8 +258,6 @@ export async function ownerBatch(
 		options,
 	);
 }
-
-/** Execute one autocommit write statement through the owner. */
 export async function ownerRun(
 	owner: DbOwnerClient,
 	operation: string,
@@ -387,13 +394,9 @@ export interface FtsBackfillOptions {
 	readonly checkpointKey?: string;
 	readonly chunkSize?: number;
 	readonly deadlineMs?: number;
-	/** Stop after this many chunks. Omit to drain within the run budget. */
 	readonly maxChunks?: number;
-	/** Maximum wall-clock time for the complete backfill invocation. */
 	readonly runBudgetMs?: number;
-	/** Maximum estimated owner work units for the complete invocation. */
 	readonly maxWorkUnits?: number;
-	/** Cooperatively stop before submitting another chunk. */
 	readonly signal?: AbortSignal;
 	readonly onChunk?: (progress: FtsBackfillProgress) => void | Promise<void>;
 	readonly audit?: FtsRepairAudit;
@@ -437,6 +440,10 @@ export interface DbOwnerMaintenance {
 		configuredBaseUrl?: string,
 		options?: DbOwnerMaintenanceOptions,
 	) => Promise<EmbeddingIndexMigrationProgress | null>;
+	readonly vectorRepair: (
+		input: DbOwnerVectorRepairInput,
+		options?: DbOwnerMaintenanceOptions,
+	) => Promise<DbOwnerVectorRepairResult>;
 	readonly healthReady: (
 		options?: DbOwnerMaintenanceOptions,
 	) => Promise<{ readonly migrationsOk: boolean; readonly queueHealth: QueueHealth }>;
@@ -446,6 +453,11 @@ export interface DbOwnerMaintenance {
 	) => Promise<DiagnosticsReport>;
 	readonly health: () => DbOwnerHealth;
 	readonly close: () => Promise<void>;
+}
+
+interface RegisteredDbOwnerMaintenanceLease {
+	readonly maintenance: DbOwnerMaintenance;
+	readonly release: () => void;
 }
 
 function boundedChunkSize(chunkSize: number | undefined): number {
@@ -512,7 +524,7 @@ async function ensureFtsSchema(client: DbOwnerClient, deadlineMs: number): Promi
 			kind: "batch",
 			statements: [
 				runStatement(
-					"CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='unicode61')",
+					`CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='${MEMORIES_FTS_TOKENIZER}')`,
 				),
 				runStatement(
 					`CREATE TABLE IF NOT EXISTS ${FTS_STATE_TABLE} (
@@ -842,13 +854,122 @@ export interface CreateDbOwnerMaintenanceOptions {
 }
 
 let registeredMaintenance: DbOwnerMaintenance | null = null;
+let registeredMaintenanceClose: Promise<void> | null = null;
+let registeredMaintenanceLeases: {
+	count: number;
+	readonly idle: Promise<void>;
+	readonly resolveIdle: () => void;
+} | null = null;
 
-export function registerDbOwnerMaintenance(maintenance: DbOwnerMaintenance | null): void {
+export type DbOwnerMaintenanceState = "registered" | "closing" | "unavailable";
+
+export function registerDbOwnerMaintenance(maintenance: DbOwnerMaintenance): void {
+	if (registeredMaintenanceClose !== null) throw new Error("DB owner maintenance is closing");
+	if (registeredMaintenance !== null) {
+		throw new Error("DB owner maintenance is already registered; close it before replacement");
+	}
 	registeredMaintenance = maintenance;
 }
 
 export function getDbOwnerMaintenance(): DbOwnerMaintenance | null {
 	return registeredMaintenance;
+}
+
+export function getDbOwnerMaintenanceState(): DbOwnerMaintenanceState {
+	if (registeredMaintenanceClose !== null) return "closing";
+	return registeredMaintenance === null ? "unavailable" : "registered";
+}
+
+export function isDbOwnerMaintenanceClosing(): boolean {
+	return getDbOwnerMaintenanceState() === "closing";
+}
+
+function acquireRegisteredDbOwnerMaintenance(): RegisteredDbOwnerMaintenanceLease | null {
+	const maintenance = registeredMaintenance;
+	if (maintenance === null || registeredMaintenanceClose !== null) return null;
+	let leases = registeredMaintenanceLeases;
+	if (leases === null) {
+		let resolveIdle: (() => void) | undefined;
+		const idle = new Promise<void>((resolve) => {
+			resolveIdle = resolve;
+		});
+		leases = {
+			count: 0,
+			idle,
+			resolveIdle: () => resolveIdle?.(),
+		};
+		registeredMaintenanceLeases = leases;
+	}
+	leases.count += 1;
+	let released = false;
+	return {
+		maintenance,
+		release: () => {
+			if (released) return;
+			released = true;
+			leases.count -= 1;
+			if (leases.count !== 0) return;
+			if (registeredMaintenanceLeases === leases) registeredMaintenanceLeases = null;
+			leases.resolveIdle();
+		},
+	};
+}
+
+export async function withRegisteredDbOwnerMaintenance<Result>(
+	callback: (maintenance: DbOwnerMaintenance) => Promise<Result>,
+): Promise<Result | undefined> {
+	const lease = acquireRegisteredDbOwnerMaintenance();
+	if (lease === null) return undefined;
+	try {
+		return await callback(lease.maintenance);
+	} finally {
+		lease.release();
+	}
+}
+
+export function submitRegisteredDbOwnerJob<Result>(
+	expectedOwner: DbOwnerClient,
+	request: DbOwnerRequest,
+	options: DbOwnerSubmitOptions,
+): DbOwnerJobHandle<Result> | null {
+	const lease = acquireRegisteredDbOwnerMaintenance();
+	if (lease === null || lease.maintenance.owner !== expectedOwner) {
+		lease?.release();
+		return null;
+	}
+	try {
+		const handle = lease.maintenance.owner.submit<Result>(request, options);
+		let released = false;
+		const release = (): void => {
+			if (released) return;
+			released = true;
+			lease.release();
+		};
+		const completion = handle.metrics ?? handle.result;
+		void completion.then(release, release);
+		return handle;
+	} catch (error) {
+		lease.release();
+		throw error;
+	}
+}
+export async function closeRegisteredDbOwnerMaintenance(): Promise<void> {
+	const inFlight = registeredMaintenanceClose;
+	if (inFlight !== null) {
+		await inFlight;
+		return;
+	}
+	const maintenance = registeredMaintenance;
+	registeredMaintenance = null;
+	if (maintenance === null) return;
+	const leases = registeredMaintenanceLeases;
+	const completion = (leases?.idle ?? Promise.resolve()).then(() => maintenance.close());
+	registeredMaintenanceClose = completion;
+	try {
+		await completion;
+	} finally {
+		if (registeredMaintenanceClose === completion) registeredMaintenanceClose = null;
+	}
 }
 
 export function createDbOwnerMaintenance(options: CreateDbOwnerMaintenanceOptions): DbOwnerMaintenance {
@@ -922,6 +1043,26 @@ export function createDbOwnerMaintenance(options: CreateDbOwnerMaintenanceOption
 			"maintenance.embedding.migration-progress",
 			maintenanceOptions,
 		);
+	const vectorRepair = (
+		input: DbOwnerVectorRepairInput,
+		maintenanceOptions: DbOwnerMaintenanceOptions = {},
+	): Promise<DbOwnerVectorRepairResult> => {
+		const requestedDeadline = maintenanceOptions.deadlineMs ?? VECTOR_REPAIR_MAX_BATCH_DEADLINE_MS;
+		if (!Number.isFinite(requestedDeadline) || requestedDeadline <= 0) {
+			throw new RangeError("vector repair owner deadline must be positive");
+		}
+		const deadlineMs = Math.min(VECTOR_REPAIR_MAX_BATCH_DEADLINE_MS, Math.floor(requestedDeadline));
+		const estimatedWorkUnits = Math.min(
+			VECTOR_REPAIR_MAX_WORK_UNITS_PER_BATCH,
+			Math.max(1, Math.floor(maintenanceOptions.estimatedWorkUnits ?? input.batchSize ?? 50)),
+		);
+		return runOwnerMaintenanceWithRetry<DbOwnerVectorRepairResult>(
+			owner,
+			{ kind: "vector_repair", input },
+			`maintenance.vector-repair.${input.operation}`,
+			{ ...maintenanceOptions, lane: "maintenance", deadlineMs, estimatedWorkUnits },
+		);
+	};
 	const healthReady = (
 		maintenanceOptions?: DbOwnerMaintenanceOptions,
 	): Promise<{ readonly migrationsOk: boolean; readonly queueHealth: QueueHealth }> =>
@@ -954,7 +1095,7 @@ export function createDbOwnerMaintenance(options: CreateDbOwnerMaintenanceOption
 					runStatement("DROP TABLE IF EXISTS memories_fts"),
 					runStatement("DROP TABLE IF EXISTS memories_fts_state"),
 					runStatement(
-						`CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='unicode61')`,
+						`CREATE VIRTUAL TABLE memories_fts USING fts5(content, content='memories', content_rowid='rowid', tokenize='${MEMORIES_FTS_TOKENIZER}')`,
 					),
 					runStatement(
 						`CREATE TABLE memories_fts_state (id INTEGER PRIMARY KEY CHECK (id = 1), memory_count INTEGER NOT NULL, indexed_count INTEGER NOT NULL, updated_at TEXT NOT NULL)`,
@@ -1023,6 +1164,7 @@ export function createDbOwnerMaintenance(options: CreateDbOwnerMaintenanceOption
 		dreamingEpisodicBacklogProbe,
 		dreamingEpisodicBacklogExists,
 		embeddingMigrationProgress,
+		vectorRepair,
 		healthReady,
 		diagnostics,
 		health: () => owner.health(),

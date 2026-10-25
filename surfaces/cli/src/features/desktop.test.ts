@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
 	chmodSync,
 	closeSync,
@@ -10,6 +11,7 @@ import {
 	mkdtempSync,
 	openSync,
 	readFileSync,
+	readlinkSync,
 	readdirSync,
 	renameSync,
 	rmSync,
@@ -27,8 +29,6 @@ import {
 	installWindowsDesktopApp,
 	resolveDesktopSourceCheckout,
 } from "./desktop.js";
-
-/** Read a launcher through one no-follow descriptor; throws (ELOOP) if it is a symlink. */
 function readRegularFileNoFollow(path: string): string {
 	const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
 	try {
@@ -168,6 +168,20 @@ describe("desktop source checkout resolution", () => {
 });
 
 describe("desktop source build", () => {
+	test("old Bun blocks both build and install before source sync or dependency installation", () => {
+		const ctx = {
+			bunVersion: () => "1.3.14",
+			syncWorkspaceSourceRepo: () => {
+				throw new Error("unexpected source sync");
+			},
+			runner: () => {
+				throw new Error("unexpected dependency installation");
+			},
+		};
+		expect(() => buildDesktopFromSource({}, ctx)).toThrow("require Bun 1.4.2");
+		expect(() => installDesktopFromSource({}, ctx)).toThrow("require Bun 1.4.2");
+	});
+
 	test("syncs the managed workspace checkout before building by default", () => {
 		const root = makeCheckout();
 		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
@@ -181,7 +195,7 @@ describe("desktop source build", () => {
 					cwd: home,
 					env: { SIGNET_PATH: workspace },
 					syncWorkspaceSourceRepo: (workspaceDir, options) => {
-						expect(options).toEqual({ cloneIfMissing: true });
+						expect(options).toEqual({ cloneIfMissing: true, localChanges: "stash" });
 						calls.push(`sync ${workspaceDir}`);
 						return {
 							status: "pulled",
@@ -191,6 +205,7 @@ describe("desktop source build", () => {
 							defaultBranch: "main",
 						};
 					},
+					bunVersion: () => "1.4.2",
 					runner: (cmd, args, opts) => {
 						calls.push(`${cmd} ${args.join(" ")} @ ${opts.cwd}`);
 						return { status: 0 };
@@ -213,6 +228,7 @@ describe("desktop source build", () => {
 			const result = buildDesktopFromSource(
 				{ repo: root },
 				{
+					bunVersion: () => "1.4.2",
 					runner: (cmd, args, opts) => {
 						calls.push(`${cmd} ${args.join(" ")} @ ${opts.cwd}`);
 						return { status: 0 };
@@ -224,6 +240,68 @@ describe("desktop source build", () => {
 			expect(calls).toEqual([`bun install @ ${root}`, `bun run build:desktop @ ${root}`]);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("returns the exact source stash when desktop build parks local changes", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const stashRef = "0123456789abcdef0123456789abcdef01234567";
+		try {
+			const result = buildDesktopFromSource(
+				{},
+				{
+					cwd: home,
+					env: { SIGNET_PATH: join(home, "workspace") },
+					syncWorkspaceSourceRepo: () => ({
+						status: "pulled",
+						path: root,
+						message: `pulled latest Signet source checkout; local changes were preserved in stash ${stashRef}`,
+						branch: "main",
+						defaultBranch: "main",
+						localChanges: "stashed",
+						stashRef,
+					}),
+					bunVersion: () => "1.4.2",
+					runner: () => ({ status: 0 }),
+				},
+			);
+
+			expect(result).toMatchObject({ repo: root, localChanges: "stashed", stashRef });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps source stash recovery details when desktop build fails", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const stashRef = "0123456789abcdef0123456789abcdef01234567";
+		try {
+			expect(() =>
+				buildDesktopFromSource(
+					{},
+					{
+						cwd: home,
+						env: { SIGNET_PATH: join(home, "workspace") },
+						syncWorkspaceSourceRepo: () => ({
+							status: "pulled",
+							path: root,
+							message: "pulled latest Signet source checkout",
+							branch: "main",
+							defaultBranch: "main",
+							localChanges: "stashed",
+							stashRef,
+						}),
+						bunVersion: () => "1.4.2",
+						runner: (_cmd, args) => ({ status: args.includes("build:desktop") ? 1 : 0 }),
+					},
+				),
+			).toThrow(`Local source changes were preserved in stash ${stashRef}`);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
 		}
 	});
 });
@@ -380,7 +458,7 @@ describe("linux desktop install", () => {
 					env: { SIGNET_PATH: workspace },
 					platform: "linux",
 					syncWorkspaceSourceRepo: (workspaceDir, options) => {
-						expect(options).toEqual({ cloneIfMissing: true });
+						expect(options).toEqual({ cloneIfMissing: true, localChanges: "stash" });
 						calls.push(`sync ${workspaceDir}`);
 						return {
 							status: "pulled",
@@ -390,6 +468,7 @@ describe("linux desktop install", () => {
 							defaultBranch: "main",
 						};
 					},
+					bunVersion: () => "1.4.2",
 					runner: (cmd, args, opts) => {
 						calls.push(`${cmd} ${args.join(" ")} @ ${opts.cwd}`);
 						return { status: 0 };
@@ -419,6 +498,9 @@ describe("linux desktop install", () => {
 					home,
 					env: { SIGNET_PATH: join(home, "workspace") },
 					platform: "linux",
+					bunVersion: () => {
+						throw new Error("skip-build must not check Bun");
+					},
 					runner: () => {
 						throw new Error("runner should not be called");
 					},
@@ -440,7 +522,6 @@ function makeMacAppBundle(dir: string, arch: "x64" | "arm64", executable = "sign
 		join(app, "Contents", "Info.plist"),
 		`<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleExecutable</key><string>${executable}</string><key>CFBundleIdentifier</key><string>ai.signet.app</string></dict></plist>\n`,
 	);
-	// Mach-O 64-bit magic (MH_MAGIC_64, little-endian) followed by cputype.
 	const header = Buffer.alloc(8);
 	header.writeUInt32LE(0xfeedfacf, 0);
 	header.writeUInt32LE(arch === "arm64" ? 0x0100000c : 0x01000007, 4);
@@ -499,6 +580,47 @@ function makeWindowsAppContents(app: string, arch: "x64" | "arm64", packageName 
 }
 
 describe("mac desktop install", () => {
+	test("preserves relative framework links after the source bundle is removed", async () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		try {
+			const release = join(root, "surfaces", "desktop", "release", "mac");
+			mkdirSync(release, { recursive: true });
+			const source = makeMacAppBundle(release, process.arch === "arm64" ? "arm64" : "x64");
+			const frameworkPath = "Contents/Frameworks/Electron Framework.framework";
+			const framework = join(source, frameworkPath);
+			mkdirSync(join(framework, "Versions", "A"), { recursive: true });
+			writeFileSync(join(framework, "Versions", "A", "Electron Framework"), "framework");
+			symlinkSync("A", join(framework, "Versions", "Current"));
+			symlinkSync("Versions/Current/Electron Framework", join(framework, "Electron Framework"));
+			const installer = join(root, "installer.mjs");
+			const build = await Bun.build({
+				entrypoints: [join(import.meta.dir, "desktop.ts")],
+				target: "node",
+				external: ["better-sqlite3", "@napi-rs/keyring"],
+			});
+			expect(build.success).toBe(true);
+			writeFileSync(installer, await build.outputs[0].text());
+			execFileSync("node", [
+				"--input-type=module",
+				"-e",
+				`import { installMacDesktopApp } from ${JSON.stringify(installer)}; installMacDesktopApp(...process.argv.slice(1));`,
+				root,
+				home,
+				join(home, "workspace"),
+			]);
+			const result = { appBundle: join(home, "Applications", "Signet.app") };
+			rmSync(source, { recursive: true, force: true });
+			const installed = join(result.appBundle, frameworkPath);
+			expect(readlinkSync(join(installed, "Versions", "Current"))).toBe("A");
+			expect(readlinkSync(join(installed, "Electron Framework"))).toBe("Versions/Current/Electron Framework");
+			expect(readFileSync(join(installed, "Electron Framework"), "utf8")).toBe("framework");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
 	test("installs the newest matching .app bundle into ~/Applications", () => {
 		const root = makeCheckout();
 		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
@@ -553,7 +675,6 @@ describe("mac desktop install", () => {
 			mkdirSync(applications, { recursive: true });
 			const foreign = makeMacAppBundle(applications, process.arch === "arm64" ? "arm64" : "x64");
 			renameSync(foreign, join(applications, "Signet.app"));
-			// Rewrite its plist so it is no longer Signet-owned.
 			writeFileSync(
 				join(applications, "Signet.app", "Contents", "Info.plist"),
 				`<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.other</string></dict></plist>\n`,
@@ -607,11 +728,6 @@ describe("mac desktop install", () => {
 		try {
 			const release = join(root, "surfaces", "desktop", "release", "mac");
 			mkdirSync(release, { recursive: true });
-			// An unreadable non-executable resource makes cpSync fail mid-copy
-			// while the bundle still passes the pre-selection arch check (which
-			// only reads the Mach-O executable). The pre-fix code deleted the
-			// installed app BEFORE the copy, so this failure left the user with
-			// no installed app at all.
 			const source = makeMacAppBundle(release, process.arch === "arm64" ? "arm64" : "x64");
 			const doomed = join(source, "Contents", "Resources", "doomed.bin");
 			mkdirSync(join(source, "Contents", "Resources"), { recursive: true });
@@ -623,15 +739,11 @@ describe("mac desktop install", () => {
 			makeMacAppBundle(applications, process.arch === "arm64" ? "arm64" : "x64");
 
 			expect(() => installMacDesktopApp(root, home, join(home, "workspace"))).toThrow();
-			// The previously installed bundle survived the failed install...
 			expect(existsSync(join(applications, "Signet.app", "Contents", "Info.plist"))).toBe(true);
-			// ...and no swap debris was left behind.
 			expect(readdirSync(applications).some((name) => name.includes(".previous-"))).toBe(false);
 			expect(readdirSync(applications).some((name) => name.startsWith(".Signet.app."))).toBe(false);
 		} finally {
 			if (existsSync(sourceExecutable)) {
-				// Not strictly required (only Resources/doomed.bin was locked), but
-				// keep the tree removable regardless of platform semantics.
 				chmodSync(sourceExecutable, 0o755);
 			}
 			chmodSync(
@@ -649,14 +761,12 @@ describe("mac desktop install", () => {
 		try {
 			const release = join(root, "surfaces", "desktop", "release");
 			mkdirSync(release, { recursive: true });
-			// Two candidate layouts: an arm64 build and the host-arch build.
 			const armDir = join(release, "mac_arm64");
 			const hostDir = join(release, "mac");
 			mkdirSync(armDir, { recursive: true });
 			mkdirSync(hostDir, { recursive: true });
 			const armApp = makeMacAppBundle(armDir, "arm64");
 			const hostApp = makeMacAppBundle(hostDir, process.arch === "arm64" ? "arm64" : "x64");
-			// Make the foreign-arch artifact the newest; arch check must win.
 			utimesSync(armApp, new Date(9_000), new Date(9_000));
 			utimesSync(hostApp, new Date(2_000), new Date(2_000));
 
@@ -695,6 +805,334 @@ describe("Windows desktop install", () => {
 		}
 	});
 
+	test("removes the leftover uninstaller after app payload is gone and preserves unrelated files", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const localAppData = join(home, "Local AppData");
+		const programsDir = join(localAppData, "Programs");
+		const legacyAppDir = join(programsDir, "@signetdesktop");
+		const uninstallCalls: Array<{
+			cmd: string;
+			args: readonly string[];
+			cwd: string;
+			testEnv: string | undefined;
+			windowsVerbatimArguments: boolean | undefined;
+		}> = [];
+		const shortcutCalls: Array<{ legacyExecutableStillExists: boolean; target: string | undefined }> = [];
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			makeWindowsAppContents(legacyAppDir, hostDesktopArch());
+			const uninstaller = join(legacyAppDir, "Uninstall Signet.exe");
+			writeFileSync(uninstaller, "legacy uninstaller");
+			const shortcut = join(home, "Start Menu", "Signet.lnk");
+
+			const result = installWindowsDesktopApp(root, home, join(home, "workspace"), localAppData, {
+				platform: "win32",
+				startMenuShortcut: shortcut,
+				env: { SIGNET_TEST_UNINSTALL_ENV: "present" },
+				legacyUninstallRunner: (cmd, args, options) => {
+					uninstallCalls.push({
+						cmd,
+						args,
+						cwd: options.cwd,
+						testEnv: options.env.SIGNET_TEST_UNINSTALL_ENV,
+						windowsVerbatimArguments: options.windowsVerbatimArguments,
+					});
+					rmSync(join(legacyAppDir, "signet.exe"), { force: true });
+					rmSync(join(legacyAppDir, "resources"), { recursive: true, force: true });
+					writeFileSync(join(legacyAppDir, "user-note.txt"), "preserve user data");
+					expect(existsSync(uninstaller)).toBe(true);
+					return { status: 0 };
+				},
+				shortcutRunner: (cmd, _args, options) => {
+					shortcutCalls.push({
+						legacyExecutableStillExists: existsSync(join(legacyAppDir, "signet.exe")),
+						target: options.env.SIGNET_DESKTOP_TARGET,
+					});
+					expect(cmd).toBe("powershell.exe");
+					return { status: 0 };
+				},
+			});
+
+			expect(uninstallCalls).toHaveLength(1);
+			expect(uninstallCalls[0]).toMatchObject({
+				cmd: uninstaller,
+				args: ["/S", "/currentuser", `_?=${legacyAppDir}`],
+				cwd: legacyAppDir,
+				windowsVerbatimArguments: true,
+			});
+			expect(uninstallCalls[0]?.testEnv).toBe("present");
+			expect(result.retiredLegacyAppDir).toBe(legacyAppDir);
+			expect(readdirSync(legacyAppDir)).toEqual(["user-note.txt"]);
+			expect(readFileSync(join(legacyAppDir, "user-note.txt"), "utf8")).toBe("preserve user data");
+			expect(existsSync(legacyAppDir)).toBe(true);
+			expect(existsSync(uninstaller)).toBe(false);
+			expect(existsSync(join(legacyAppDir, "signet.exe"))).toBe(false);
+			expect(existsSync(result.executable)).toBe(true);
+			expect(shortcutCalls).toEqual([{ legacyExecutableStillExists: false, target: result.executable }]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("stops when a recognized legacy app has no uninstaller", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const localAppData = join(home, "local-app-data");
+		const legacyAppDir = join(localAppData, "Programs", "@signetdesktop");
+		let uninstallCalls = 0;
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			makeWindowsAppContents(legacyAppDir, hostDesktopArch());
+			writeFileSync(join(legacyAppDir, "Uninstall Another App.exe"), "unrelated uninstaller");
+
+			expect(() =>
+				installWindowsDesktopApp(root, home, join(home, "workspace"), localAppData, {
+					platform: "win32",
+					legacyUninstallRunner: () => {
+						uninstallCalls += 1;
+						return { status: 0 };
+					},
+				}),
+			).toThrow("has no uninstaller");
+			expect(uninstallCalls).toBe(0);
+			expect(existsSync(legacyAppDir)).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps the new app reachable when uninstalling the old app fails", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const localAppData = join(home, "local-app-data");
+		const legacyAppDir = join(localAppData, "Programs", "@signetdesktop");
+		let shortcutTarget: string | undefined;
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			makeWindowsAppContents(legacyAppDir, hostDesktopArch());
+			writeFileSync(join(legacyAppDir, "Uninstall Signet.exe"), "legacy uninstaller");
+
+			expect(() =>
+				installWindowsDesktopApp(root, home, join(home, "workspace"), localAppData, {
+					platform: "win32",
+					startMenuShortcut: join(home, "Start Menu", "Signet.lnk"),
+					legacyUninstallRunner: () => ({ status: 1 }),
+					shortcutRunner: (_cmd, _args, options) => {
+						shortcutTarget = options.env.SIGNET_DESKTOP_TARGET;
+						return { status: 0 };
+					},
+				}),
+			).toThrow(
+				`The new Signet desktop app is installed at ${join(localAppData, "Programs", "Signet Desktop", "signet.exe")}, but removal of the legacy app at ${legacyAppDir} could not be confirmed. Rerun desktop install to retry legacy cleanup.`,
+			);
+			expect(shortcutTarget).toBe(join(localAppData, "Programs", "Signet Desktop", "signet.exe"));
+			expect(existsSync(join(localAppData, "Programs", "Signet Desktop", "signet.exe"))).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("reports a legacy executable left behind after its package is removed", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const localAppData = join(home, "local-app-data");
+		const legacyAppDir = join(localAppData, "Programs", "@signetdesktop");
+		let shortcutTarget: string | undefined;
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			makeWindowsAppContents(legacyAppDir, hostDesktopArch());
+			writeFileSync(join(legacyAppDir, "Uninstall Signet.exe"), "legacy uninstaller");
+
+			expect(() =>
+				installWindowsDesktopApp(root, home, join(home, "workspace"), localAppData, {
+					platform: "win32",
+					startMenuShortcut: join(home, "Start Menu", "Signet.lnk"),
+					legacyUninstallRunner: () => {
+						rmSync(join(legacyAppDir, "resources"), { recursive: true, force: true });
+						return { status: 0 };
+					},
+					shortcutRunner: (_cmd, _args, options) => {
+						shortcutTarget = options.env.SIGNET_DESKTOP_TARGET;
+						return { status: 0 };
+					},
+				}),
+			).toThrow(`removal of the legacy app at ${legacyAppDir} could not be confirmed`);
+			expect(existsSync(join(legacyAppDir, "signet.exe"))).toBe(true);
+			expect(existsSync(join(legacyAppDir, "Uninstall Signet.exe"))).toBe(true);
+			expect(shortcutTarget).toBe(join(localAppData, "Programs", "Signet Desktop", "signet.exe"));
+			expect(existsSync(join(localAppData, "Programs", "Signet Desktop", "signet.exe"))).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("reports both failures when legacy uninstall and shortcut refresh fail", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const localAppData = join(home, "local-app-data");
+		const legacyAppDir = join(localAppData, "Programs", "@signetdesktop");
+		let failureMessage: string | undefined;
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			makeWindowsAppContents(legacyAppDir, hostDesktopArch());
+			writeFileSync(join(legacyAppDir, "Uninstall Signet.exe"), "legacy uninstaller");
+
+			try {
+				installWindowsDesktopApp(root, home, join(home, "workspace"), localAppData, {
+					platform: "win32",
+					startMenuShortcut: join(home, "Start Menu", "Signet.lnk"),
+					legacyUninstallRunner: () => ({ status: 1 }),
+					shortcutRunner: () => ({ status: 1 }),
+				});
+			} catch (error) {
+				failureMessage = error instanceof Error ? error.message : String(error);
+			}
+
+			expect(failureMessage).toContain(`legacy app at ${legacyAppDir} could not be confirmed`);
+			expect(failureMessage).toContain("Start Menu shortcut refresh also failed");
+			expect(failureMessage).toContain("powershell.exe");
+			expect(existsSync(join(legacyAppDir, "signet.exe"))).toBe(true);
+			expect(existsSync(join(localAppData, "Programs", "Signet Desktop", "signet.exe"))).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves the retry path after partial cleanup and succeeds on retry", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const localAppData = join(home, "local-app-data");
+		const legacyAppDir = join(localAppData, "Programs", "@signetdesktop");
+		const legacyExecutable = join(legacyAppDir, "signet.exe");
+		const legacyPackage = join(legacyAppDir, "resources", "app.asar");
+		const legacyUninstaller = join(legacyAppDir, "Uninstall Signet.exe");
+		let uninstallCalls = 0;
+		const shortcutTargets: Array<string | undefined> = [];
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			makeWindowsAppContents(legacyAppDir, hostDesktopArch());
+			writeFileSync(legacyUninstaller, "legacy uninstaller");
+
+			const install = () =>
+				installWindowsDesktopApp(root, home, join(home, "workspace"), localAppData, {
+					platform: "win32",
+					startMenuShortcut: join(home, "Start Menu", "Signet.lnk"),
+					legacyUninstallRunner: () => {
+						uninstallCalls += 1;
+						if (uninstallCalls === 1) rmSync(legacyExecutable);
+						if (uninstallCalls === 2) rmSync(join(legacyAppDir, "resources"), { recursive: true });
+						return { status: 0 };
+					},
+					shortcutRunner: (_cmd, _args, options) => {
+						shortcutTargets.push(options.env.SIGNET_DESKTOP_TARGET);
+						return { status: 0 };
+					},
+				});
+
+			expect(install).toThrow(`removal of the legacy app at ${legacyAppDir} could not be confirmed`);
+			expect(uninstallCalls).toBe(1);
+			expect(existsSync(legacyExecutable)).toBe(false);
+			expect(existsSync(legacyPackage)).toBe(true);
+			expect(existsSync(legacyUninstaller)).toBe(true);
+			expect(existsSync(join(localAppData, "Programs", "Signet Desktop", "signet.exe"))).toBe(true);
+
+			const result = install();
+
+			expect(uninstallCalls).toBe(2);
+			expect(result.retiredLegacyAppDir).toBe(legacyAppDir);
+			expect(existsSync(legacyPackage)).toBe(false);
+			expect(existsSync(legacyUninstaller)).toBe(false);
+			expect(existsSync(result.executable)).toBe(true);
+			expect(shortcutTargets).toEqual([result.executable, result.executable]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("does not uninstall an executable without the Signet package marker", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const localAppData = join(home, "local-app-data");
+		const legacyAppDir = join(localAppData, "Programs", "@signetdesktop");
+		let uninstallCalls = 0;
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			makeWindowsAppContents(legacyAppDir, hostDesktopArch());
+			rmSync(join(legacyAppDir, "resources"), { recursive: true, force: true });
+			writeFileSync(join(legacyAppDir, "Uninstall Signet.exe"), "unidentified uninstaller");
+
+			const result = installWindowsDesktopApp(root, home, join(home, "workspace"), localAppData, {
+				platform: "win32",
+				legacyUninstallRunner: () => {
+					uninstallCalls += 1;
+					return { status: 0 };
+				},
+			});
+
+			expect(uninstallCalls).toBe(0);
+			expect(existsSync(join(legacyAppDir, "signet.exe"))).toBe(true);
+			expect(result.retiredLegacyAppDir).toBeUndefined();
+			expect(existsSync(result.executable)).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("does not uninstall a foreign application at the legacy path", () => {
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		const localAppData = join(home, "local-app-data");
+		const legacyAppDir = join(localAppData, "Programs", "@signetdesktop");
+		let uninstallCalls = 0;
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			makeWindowsAppContents(legacyAppDir, hostDesktopArch(), "com.example.other");
+			const uninstaller = join(legacyAppDir, "Uninstall Signet.exe");
+			writeFileSync(uninstaller, "foreign uninstaller");
+
+			const result = installWindowsDesktopApp(root, home, join(home, "workspace"), localAppData, {
+				platform: "win32",
+				legacyUninstallRunner: () => {
+					uninstallCalls += 1;
+					return { status: 0 };
+				},
+			});
+
+			expect(uninstallCalls).toBe(0);
+			expect(existsSync(legacyAppDir)).toBe(true);
+			expect(readFileSync(join(legacyAppDir, "resources", "app.asar"), "utf8")).toContain("com.example.other");
+			expect(result.retiredLegacyAppDir).toBeUndefined();
+			expect(existsSync(result.executable)).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
 	test("refuses to replace a foreign application in the managed directory", () => {
 		const root = makeCheckout();
 		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
@@ -725,6 +1163,7 @@ describe("Windows desktop install", () => {
 			makeWindowsAppDirectory(release, hostDesktopArch());
 			const workspace = join(home, "workspace");
 			const localAppData = join(home, "local-app-data");
+			const shortcutCalls: Array<{ cmd: string; args: readonly string[]; env: NodeJS.ProcessEnv }> = [];
 
 			const result = installDesktopFromSource(
 				{ repo: root, skipBuild: true },
@@ -732,8 +1171,13 @@ describe("Windows desktop install", () => {
 					env: { SIGNET_PATH: workspace, LOCALAPPDATA: localAppData },
 					home,
 					platform: "win32",
+					bunVersion: () => "1.4.2",
 					runner: () => {
 						throw new Error("runner should not be called");
+					},
+					shortcutRunner: (cmd, args, opts) => {
+						shortcutCalls.push({ cmd, args, env: opts.env });
+						return { status: 0 };
 					},
 				},
 			);
@@ -741,6 +1185,50 @@ describe("Windows desktop install", () => {
 			if (!("appDir" in result)) throw new Error("expected Windows install result");
 			expect(result.workspace).toBe(workspace);
 			expect(result.appDir).toBe(join(localAppData, "Programs", "Signet Desktop"));
+			expect(result.startMenuShortcut).toBe(
+				join(home, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Signet.lnk"),
+			);
+			expect(shortcutCalls).toHaveLength(1);
+			expect(shortcutCalls[0]?.cmd).toBe("powershell.exe");
+			expect(shortcutCalls[0]?.args).toContain("-Command");
+			expect(shortcutCalls[0]?.env.SIGNET_DESKTOP_TARGET).toBe(result.executable);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	test("writes the Start Menu shortcut to the installed executable on Windows", () => {
+		if (process.platform !== "win32") return;
+		const root = makeCheckout();
+		const home = mkdtempSync(join(tmpdir(), "signet-desktop-home-"));
+		try {
+			const release = join(root, "surfaces", "desktop", "release");
+			mkdirSync(release, { recursive: true });
+			makeWindowsAppDirectory(release, hostDesktopArch());
+			const shortcut = join(home, "Start Menu", "Signet.lnk");
+			const result = installWindowsDesktopApp(root, home, join(home, "workspace"), join(home, "local-app-data"), {
+				startMenuShortcut: shortcut,
+				platform: "win32",
+			});
+
+			expect(existsSync(shortcut)).toBe(true);
+			const target = execFileSync(
+				"powershell.exe",
+				[
+					"-NoLogo",
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					"$shell = New-Object -ComObject WScript.Shell; [Console]::Write($shell.CreateShortcut($env:SIGNET_TEST_SHORTCUT).TargetPath)",
+				],
+				{
+					encoding: "utf8",
+					windowsHide: true,
+					env: { ...process.env, SIGNET_TEST_SHORTCUT: shortcut },
+				},
+			);
+			expect(target).toBe(result.executable);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(home, { recursive: true, force: true });

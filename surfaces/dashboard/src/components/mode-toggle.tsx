@@ -1,33 +1,17 @@
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
-import { Monitor, Moon, Sun } from "@/components/mingcute-icons";
+import { BrightnessRegular as Brightness } from "@mingcute/react/core-regular";
 import { Button } from "@/components/ui/button";
 import { syncDesktopTitleBarTheme } from "@/lib/desktop";
-import { cn } from "@/lib/utils";
 
 const ORDER = ["system", "light", "dark"] as const;
 type Theme = (typeof ORDER)[number];
-
-/**
- * Theme cycle button in the account row. Cycles system → light → dark, matching
- * the mockup's single-toggle behavior (which flipped dark ⇄ light; we add the
- * system default the issue mandates).
- */
 export function ModeToggle() {
 	const { theme, resolvedTheme, setTheme } = useTheme();
 	const [mounted, setMounted] = useState(false);
-	const [transitionReady, setTransitionReady] = useState(false);
 
 	useEffect(() => {
 		setMounted(true);
-		let secondFrame = 0;
-		const firstFrame = requestAnimationFrame(() => {
-			secondFrame = requestAnimationFrame(() => setTransitionReady(true));
-		});
-		return () => {
-			cancelAnimationFrame(firstFrame);
-			cancelAnimationFrame(secondFrame);
-		};
 	}, []);
 
 	useEffect(() => {
@@ -52,12 +36,11 @@ export function ModeToggle() {
 			onClick={switchTheme}
 			aria-label={`Switch theme (current: ${current})`}
 			title={`Theme: ${current} → ${next}`}
-			className="sig-header-control size-[26px] rounded-[var(--radius)]"
+			className="sig-sidebar-link sig-theme-control"
 		>
-			<span className="sig-theme-icon-stack" data-ready={transitionReady} aria-hidden="true">
-				<Sun className={cn("sig-theme-icon", visibleTheme === "light" && "is-active")} />
-				<Moon className={cn("sig-theme-icon", visibleTheme === "dark" && "is-active")} />
-				<Monitor className={cn("sig-theme-icon", visibleTheme === "system" && "is-active")} />
+			<Brightness className="size-[18px] shrink-0" aria-hidden="true" />
+			<span className="sig-sidebar-label" aria-hidden="true">
+				Theme <span className="sig-sidebar-value">{visibleTheme}</span>
 			</span>
 		</Button>
 	);

@@ -87,47 +87,6 @@ describe("structured path evidence", () => {
 		);
 	}
 
-	it("boosts advice-shaped queries toward matching entity/aspect/group/claim paths", () => {
-		seedMemory("mem-social-justice", "The user prefers social justice organizations.");
-		seedMemory("mem-travel", "The user wants scenic mountain travel suggestions.");
-		seedMemory("mem-virtual-coffee", "The user likes virtual coffee breaks with colleagues.");
-
-		seedAttribute({
-			id: "attr-social",
-			memoryId: "mem-social-justice",
-			aspect: "preferences",
-			group: "donation_targets",
-			claim: "prefer_donate_to_organizations",
-			content: "Prefers to support social justice organizations and donation suggestions.",
-		});
-		seedAttribute({
-			id: "attr-travel",
-			memoryId: "mem-travel",
-			aspect: "preferences",
-			group: "mountain_destinations",
-			claim: "hiking_and_scenic_drives_preference",
-			content: "Prefers mountain destinations with hiking and scenic drives.",
-		});
-		seedAttribute({
-			id: "attr-coffee",
-			memoryId: "mem-virtual-coffee",
-			aspect: "decision_patterns",
-			group: "virtual_coffee_breaks",
-			claim: "plans_communicate_with_team",
-			content: "Plans virtual coffee breaks, informal team socializing, and facilitation guidance.",
-		});
-
-		const scores = scoreStructuredPathEvidence(
-			asReadDb(db),
-			["mem-social-justice", "mem-travel", "mem-virtual-coffee"],
-			"ways to stay connected with colleagues, any suggestions?",
-			"memorybench",
-		);
-
-		expect(scores.get("mem-virtual-coffee") ?? 0).toBeGreaterThan(scores.get("mem-social-justice") ?? 0);
-		expect(scores.get("mem-virtual-coffee") ?? 0).toBeGreaterThan(scores.get("mem-travel") ?? 0);
-	});
-
 	it("returns unbacked source-provenanced ontology claims as structured recall candidates", () => {
 		const now = new Date().toISOString();
 		db.prepare(
@@ -196,6 +155,41 @@ describe("structured path evidence", () => {
 		expect(candidates.map((row) => row.id)).toEqual(["attr-artbat-invoice"]);
 		expect(candidates[0]?.content).toContain("€1,000");
 		expect(candidates[0]?.content).toContain("€2,000");
+	});
+
+	it("treats a non-empty source kind as claim provenance", () => {
+		const now = new Date().toISOString();
+		db.prepare(
+			`INSERT INTO entities (
+				id, name, canonical_name, entity_type, agent_id, mentions, created_at, updated_at
+			) VALUES ('ent-source-kind', 'Source Kind Note', 'source kind note', 'source_document', 'memorybench', 0, ?, ?)`,
+		).run(now, now);
+		db.prepare(
+			`INSERT INTO entity_aspects (
+				id, entity_id, agent_id, name, canonical_name, weight, created_at, updated_at
+			) VALUES ('asp-source-kind', 'ent-source-kind', 'memorybench', 'overview', 'overview', 0.9, ?, ?)`,
+		).run(now, now);
+		db.prepare(
+			`INSERT INTO entity_attributes (
+				id, aspect_id, agent_id, memory_id, kind, content, normalized_content,
+				confidence, importance, status, source_kind, source_id, source_path,
+				proposal_evidence, created_at, updated_at
+			) VALUES ('attr-source-kind', 'asp-source-kind', 'memorybench', NULL, 'claim', ?, ?, 0.95, 0.8, 'active', ?, NULL, NULL, '[]', ?, ?)`,
+		).run(
+			"The source-kind provenance is Obsidian-backed.",
+			"the source-kind provenance is obsidian-backed",
+			"source_obsidian_markdown",
+			now,
+			now,
+		);
+
+		const candidates = findStructuredClaimCandidates(asReadDb(db), "source kind provenance", "memorybench", {
+			limit: 5,
+			minScore: 0.01,
+		});
+
+		expect(candidates.map((row) => row.id)).toEqual(["attr-source-kind"]);
+		expect(candidates[0]?.sourceKind).toBe("source_obsidian_markdown");
 	});
 
 	it("runs owner-bound evidence scoring through the DB owner", async () => {

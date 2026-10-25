@@ -80,12 +80,6 @@ const CONNECTION_FAILURE_INTERVAL_MS = 5 * 60 * 1_000;
 const recentConnectionFailures = new Map<SourceClass, number>();
 const readinessClaimedInProcess = new Set<string>();
 const pendingSourceLifecycleWrites = new Set<Promise<void>>();
-
-/**
- * Track an intentional fire-and-forget lifecycle write. The async DB accessor
- * already bounds its write queue; this registry gives daemon shutdown a
- * bounded set of writes to drain before the database is closed.
- */
 export function trackSourceLifecycleWrite(operation: Promise<void>): Promise<void> {
 	let tracked: Promise<void>;
 	tracked = operation.then(
@@ -141,6 +135,7 @@ export function sourceClassForKind(kind: string): SourceClass {
 		case "repository":
 			return "repository";
 		case "obsidian":
+		case "notion":
 		case "note_vault":
 			return "note_vault";
 		case "browser":
@@ -463,6 +458,7 @@ function recallClass(result: SourceRecallTelemetryResult): SourceClass | null {
 	const sourceId = result.source_id ?? "";
 	if (source === "source_obsidian" || sourceId.startsWith("obsidian:")) return "note_vault";
 	if (sourceId.startsWith("github:")) return "repository";
+	if (sourceId.startsWith("notion:")) return "note_vault";
 	if (sourceId.startsWith("discord:") || sourceId.startsWith("discord-cache:")) return "transcript";
 	if (source === "native_memory") return "transcript";
 	return null;
@@ -498,8 +494,6 @@ export async function recordFirstSourceRecall(
 	}
 	for (const [sourceClass, ids] of byClass) await claimFirstSourceRecall(agentId, sourceClass, ids);
 }
-
-/** Record a rate-limited checkpoint for a long-lived source stream. */
 export async function recordSourceFreshness(source: SignetSourceEntry, agentId: string): Promise<void> {
 	if (sourceModeFor(source) !== "recurring") return;
 	const now = new Date();
@@ -552,8 +546,6 @@ export async function recordSourceFreshness(source: SignetSourceEntry, agentId: 
 		mode: "recurring",
 	});
 }
-
-/** Claim readiness once a recurring source has produced its first item. */
 export async function recordSourceReadiness(source: SignetSourceEntry, agentId: string): Promise<void> {
 	const processKey = `${agentId}:${sourceKey(sourceIdentity(source))}`;
 	if (readinessClaimedInProcess.has(processKey)) return;

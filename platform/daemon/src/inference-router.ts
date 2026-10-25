@@ -1,6 +1,8 @@
+import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
+import type { PiAgentRetryPolicy, PiAgentTool } from "./pipeline/pi-agent-protocol";
 import { randomUUID } from "node:crypto";
 import { isAbsolute, join, normalize, resolve } from "node:path";
-import type { AgentSessionEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type {
 	AcpxModelSelection,
 	LlmGenerateResult,
@@ -48,7 +50,7 @@ import {
 	SemaphoreTimeoutError,
 } from "./pipeline/provider";
 import { getSecret } from "./secrets";
-import { type PipelineCauseFamily, normalizePipelineCause } from "./pipeline-operation";
+import { type PipelineCauseFamily, normalizePipelineCause, pipelineErrorStatus } from "./pipeline-operation";
 
 const SNAPSHOT_TTL_MS = 15_000;
 const OBSERVED_RATE_LIMIT_TTL_MS = 60_000;
@@ -104,12 +106,19 @@ export interface InferenceExecutionResult {
 	readonly decision: RouteDecision;
 	readonly attempts: readonly InferenceExecutionAttempt[];
 }
+export interface AgentModelSelection {
+	readonly targetRef: string;
+	readonly model: string;
+}
+export interface AgentModelOption extends AgentModelSelection {
+	readonly name: string;
+	readonly provider: string;
+	readonly account: string;
+}
 
-/** Successful bounded-agent run using one router-selected target. */
 export interface InferenceAgentExecutionResult {
 	readonly decision: RouteDecision;
 	readonly attempts: readonly InferenceExecutionAttempt[];
-	/** Privacy-safe metadata for the target that actually completed the run. */
 	readonly attribution: InferenceExecutionAttribution | null;
 }
 
@@ -161,12 +170,6 @@ export class PiAgentSessionTimeoutError extends Error {
 		this.cleanup = cleanup;
 	}
 }
-
-/**
- * Race a Pi agent prompt against its deadline. A timeout returns immediately,
- * but carries the cancellation-settlement promise so the caller can retain its
- * concurrency permit until the upstream work has actually stopped.
- */
 export async function promptPiAgentSession(
 	session: PiAgentSession,
 	prompt: string,
@@ -235,7 +238,6 @@ export interface InferenceStatusSummary {
 		readonly interactive?: string;
 		readonly memoryExtraction?: string;
 		readonly aggregateRecall?: string;
-		readonly widgetGeneration?: string;
 		readonly repair?: string;
 	};
 	readonly accounts: Readonly<Record<string, InferenceAccountSummary>>;
@@ -295,8 +297,6 @@ function inferenceConfigPaths(agentsDir: string): readonly string[] {
 function resolveForComparison(path: string): string {
 	return normalize(isAbsolute(path) ? path : resolve(path));
 }
-
-/** True only for the root config files read by this router. */
 export function isInferenceRouterConfigPath(agentsDir: string, path: string): boolean {
 	const changedPath = resolveForComparison(path);
 	return inferenceConfigPaths(agentsDir).some((candidate) => resolveForComparison(candidate) === changedPath);
@@ -392,7 +392,6 @@ function buildPromptFromMessages(messages: ReadonlyArray<{ readonly role: string
 export class InferenceRouter {
 	private configCache: RouterResult<LoadedRoutingConfig> | null = null;
 	private configLoad: Promise<RouterResult<LoadedRoutingConfig>> | null = null;
-	// Coalesce explicit refreshes without letting one join a non-refresh load.
 	private configLoadForced = false;
 	private configGeneration = 0;
 	private snapshotCache: SnapshotCacheEntry | null = null;
@@ -418,16 +417,10 @@ export class InferenceRouter {
 	private nextBackgroundExecutionId = 1;
 
 	constructor(private readonly agentsDir: string) {}
-
-	/**
-	 * Eagerly load + validate the routing config once at daemon boot so broken
-	 * references are surfaced in the log before any route is attempted (#1005).
-	 * Never throws: a missing/invalid config is reported via the structured log.
-	 */
 	async validateConfigReferences(): Promise<void> {
 		try {
 			const loaded = await this.loadConfig();
-			if (!loaded.ok) return; // loadConfig already logged the structured error.
+			if (!loaded.ok) return;
 		} catch (error) {
 			logger.error("inference", "Routing config boot validation failed", error as Error);
 		}
@@ -519,12 +512,6 @@ export class InferenceRouter {
 		const execution = this.activeBackgroundExecutions.get(id);
 		if (execution) execution.kind = "pi";
 	}
-
-	/**
-	 * Drop the cached routing config after the daemon watcher observes a config
-	 * change. Concurrent callers that already started loading may finish with
-	 * the old snapshot, but the next caller starts a fresh load.
-	 */
 	invalidateConfig(): void {
 		this.configGeneration += 1;
 		this.configCache = null;
@@ -566,8 +553,6 @@ export class InferenceRouter {
 		let signature = "no-config";
 		for (const candidate of inferenceConfigPaths(this.agentsDir)) {
 			try {
-				// Open once and fstat the descriptor so the signature describes
-				// exactly the bytes that were parsed.
 				const file = await readFileWithStat(candidate, "utf-8");
 				if (file === null) continue;
 				path = candidate;
@@ -689,9 +674,12 @@ export class InferenceRouter {
 	private classifyObservedFailure(
 		message: string,
 		hasAccount: boolean,
+		status: number | undefined,
 	): { readonly state: RoutingRuntimeState; readonly ttlMs: number; readonly scope: "target" | "account" } | null {
 		const lower = message.toLowerCase();
 		if (
+			status === 429 ||
+			status === 402 ||
 			lower.includes("http 429") ||
 			lower.includes("rate limit") ||
 			lower.includes("rate-limit") ||
@@ -719,6 +707,8 @@ export class InferenceRouter {
 			};
 		}
 		if (
+			status === 401 ||
+			status === 403 ||
 			lower.includes("http 401") ||
 			lower.includes("http 403") ||
 			lower.includes("unauthorized") ||
@@ -757,12 +747,17 @@ export class InferenceRouter {
 		return null;
 	}
 
-	private observeExecutionFailure(loaded: LoadedRoutingConfig, targetRef: string, error: string): void {
+	private observeExecutionFailure(
+		loaded: LoadedRoutingConfig,
+		targetRef: string,
+		message: string,
+		error: unknown,
+	): void {
 		const parsed = parseRoutingTargetRef(targetRef);
 		if (!parsed.ok) return;
 		const target = loaded.config.targets[parsed.value.targetId];
 		if (!target) return;
-		const classified = this.classifyObservedFailure(error, Boolean(target.account));
+		const classified = this.classifyObservedFailure(message, Boolean(target.account), pipelineErrorStatus(error));
 		if (!classified) return;
 		const expiresAt = Date.now() + classified.ttlMs;
 		if (classified.scope === "account" && target.account) {
@@ -787,13 +782,6 @@ export class InferenceRouter {
 				return Boolean(config.workloads?.memoryExtraction ?? config.workloads?.default ?? config.defaultPolicy);
 			case "session_synthesis":
 				return Boolean(config.workloads?.memoryExtraction ?? config.workloads?.default ?? config.defaultPolicy);
-			case "widget_generation":
-				return Boolean(
-					config.workloads?.widgetGeneration ??
-						config.workloads?.memoryExtraction ??
-						config.workloads?.default ??
-						config.defaultPolicy,
-				);
 			case "repair":
 				return Boolean(
 					config.workloads?.repair ??
@@ -834,12 +822,13 @@ export class InferenceRouter {
 		modelId: string,
 		acpxHooks?: AcpxHooksMode,
 		acpxExtraArgs?: readonly string[],
+		transient = false,
 	): Promise<StreamCapableLlmProvider> {
 		const cacheKey = `${loaded.signature}:${targetId}/${modelId}:${acpxHooks ?? "configured-hooks"}`;
 		const target = loaded.config.targets[targetId];
 		const account = target?.account ? loaded.config.accounts[target.account] : undefined;
 		const oauthBacked = isOAuthBackedAccount(account);
-		if (!oauthBacked && !acpxExtraArgs) {
+		if (!oauthBacked && !acpxExtraArgs && !transient) {
 			const cached = this.providerCache.get(cacheKey);
 			if (cached) return cached;
 		}
@@ -856,7 +845,7 @@ export class InferenceRouter {
 			});
 		})();
 
-		if (!oauthBacked && !acpxExtraArgs) this.providerCache.set(cacheKey, build);
+		if (!oauthBacked && !acpxExtraArgs && !transient) this.providerCache.set(cacheKey, build);
 		return build;
 	}
 
@@ -900,20 +889,19 @@ export class InferenceRouter {
 				unavailableReason: `account ${target.account} not found`,
 			};
 		}
-		if (needsCredential) {
-			const credential = await this.resolveCredential(account);
-			if (!credential) {
-				return {
-					available: false,
-					health: "blocked",
-					circuitOpen: false,
-					accountState: target.kind === "subscription_session" ? "expired" : "missing",
-					unavailableReason: `missing credential${target.account ? ` for ${target.account}` : ""}`,
-				};
-			}
-		}
-
 		try {
+			if (needsCredential) {
+				const credential = await this.resolveCredential(account);
+				if (!credential) {
+					return {
+						available: false,
+						health: "blocked",
+						circuitOpen: false,
+						accountState: target.kind === "subscription_session" ? "expired" : "missing",
+						unavailableReason: `missing credential${target.account ? ` for ${target.account}` : ""}`,
+					};
+				}
+			}
 			const provider = await this.createProvider(loaded, parsed.value.targetId, parsed.value.modelId);
 			const available = await provider.available();
 			return {
@@ -928,7 +916,7 @@ export class InferenceRouter {
 				available: false,
 				health: "blocked",
 				circuitOpen: false,
-				accountState: target.kind === "subscription_session" ? "expired" : needsCredential ? "missing" : "unknown",
+				accountState: "unknown",
 				unavailableReason: formatExecutionError(error),
 			};
 		}
@@ -1030,23 +1018,71 @@ export class InferenceRouter {
 			this.finishBackgroundExecution(background?.id);
 		}
 	}
+	async agentModels(agentId: string): Promise<RouterResult<readonly AgentModelOption[]>> {
+		const loaded = await this.loadConfig(false);
+		if (!loaded.ok) return loaded;
+		const targetRefs = allTargetRefs(loaded.value.config);
+		const runtimeSnapshot: RoutingRuntimeSnapshot = {
+			targets: Object.fromEntries(
+				targetRefs.map((targetRef) => [
+					targetRef,
+					{ available: true, health: "healthy", circuitOpen: false, accountState: "ready" },
+				]),
+			),
+		};
+		const selectableTargetRefs = new Set(
+			targetRefs.filter((targetRef) => {
+				const decision = resolveRoutingDecision(
+					loaded.value.config,
+					{ agentId, operation: "interactive", explicitTargets: [targetRef], requireTools: true },
+					runtimeSnapshot,
+				);
+				return decision.ok && decision.value.targetRef === targetRef;
+			}),
+		);
+		const models: AgentModelOption[] = [];
+		const connections = new Set<string>();
+		for (const [targetId, target] of Object.entries(loaded.value.config.targets)) {
+			if (target.executor === "acpx" || !target.account) continue;
+			const slot = Object.entries(target.models).find(
+				([modelId, model]) => model.toolUse !== false && selectableTargetRefs.has(`${targetId}/${modelId}`),
+			);
+			if (!slot) continue;
+			const connection = `${target.account}:${target.executor}:${target.endpoint ?? ""}`;
+			if (connections.has(connection)) continue;
+			const account = loaded.value.config.accounts[target.account];
+			if (!account || !(await this.resolveCredential(account))) continue;
+			const provider = getBuiltinProviders().find((id) => id === account.providerFamily);
+			if (!provider) continue;
+			connections.add(connection);
+			for (const model of getBuiltinModels(provider).filter((candidate) => candidate.input.includes("text"))) {
+				models.push({
+					targetRef: `${targetId}/${slot[0]}`,
+					model: model.id,
+					name: model.name,
+					provider,
+					account: account.label ?? target.account,
+				});
+			}
+		}
+		return { ok: true, value: models };
+	}
 
-	/**
-	 * Run a daemon-owned bounded tool session through the same routing policy as
-	 * ordinary inference. Only Pi-backed targets can execute in-process tools;
-	 * ACPX gets its equivalent MCP binding rather than a fake text fallback.
-	 */
 	async runAgent(
 		request: RouteRequest,
 		prompt: string,
-		tools: readonly ToolDefinition[],
+		tools: readonly PiAgentTool[],
 		opts?: {
 			readonly timeoutMs?: number;
 			readonly maxTokens?: number;
 			readonly refresh?: boolean;
-			/** Synchronous observer for the in-process Pi session event stream. */
+			readonly modelSelection?: AgentModelSelection;
+			readonly persistentSessionKey?: string;
+			readonly continuationPrompt?: string;
+			readonly systemPrompt?: string;
+			readonly retry?: PiAgentRetryPolicy;
+			readonly signal?: AbortSignal;
 			readonly onEvent?: (event: AgentSessionEvent) => void;
-			/** Synchronous observer for the session's non-message context. */
 			readonly onSessionInfo?: (info: {
 				readonly sessionId?: string;
 				readonly model?: string;
@@ -1065,13 +1101,76 @@ export class InferenceRouter {
 			return { ok: false, error: { code: "execution-failed", message: "Background inference is paused." } };
 		}
 		const backgroundExecutionId = background?.id;
+		const callerSignal = opts?.signal;
+		const signal = background
+			? callerSignal
+				? AbortSignal.any([background.signal, callerSignal])
+				: background.signal
+			: callerSignal;
 		try {
-			const loaded = await this.loadConfig(opts?.refresh ?? false);
+			let loaded = await this.loadConfig(opts?.refresh ?? false);
 			if (!loaded.ok) return loaded;
-			const decision = await this.explain(request, false);
+			const selection = opts?.modelSelection;
+			if (selection) {
+				const available = await this.agentModels(request.agentId ?? defaultAgentIdForConfig(loaded.value.config));
+				if (!available.ok) return available;
+				if (
+					!available.value.some(
+						(option) => option.targetRef === selection.targetRef && option.model === selection.model,
+					)
+				) {
+					return {
+						ok: false,
+						error: {
+							code: "execution-failed",
+							message: "Selected model is not available through a connected Signet account.",
+						},
+					};
+				}
+			}
+			let decision = await this.explain(
+				selection ? { ...request, explicitTargets: [selection.targetRef] } : request,
+				false,
+			);
 			if (!decision.ok) return decision;
+			if (selection) {
+				if (decision.value.targetRef !== selection.targetRef)
+					return { ok: false, error: { code: "execution-failed", message: "Selected model route was not admitted." } };
+				const parsed = parseRoutingTargetRef(selection.targetRef);
+				if (!parsed.ok) return parsed;
+				const target = loaded.value.config.targets[parsed.value.targetId];
+				const slot = target?.models[parsed.value.modelId];
+				if (!target || !slot)
+					return { ok: false, error: { code: "execution-failed", message: "Selected model target is unavailable." } };
+				loaded = {
+					ok: true,
+					value: {
+						...loaded.value,
+						config: {
+							...loaded.value.config,
+							targets: {
+								...loaded.value.config.targets,
+								[parsed.value.targetId]: {
+									...target,
+									models: {
+										...target.models,
+										[parsed.value.modelId]: {
+											...slot,
+											model: selection.model,
+											label: selection.model,
+											contextWindow: undefined,
+										},
+									},
+								},
+							},
+						},
+					},
+				};
+				decision = { ok: true, value: { ...decision.value, fallbackTargetRefs: [] } };
+			}
 			const attempts: InferenceExecutionAttempt[] = [];
 			for (const targetRef of [decision.value.targetRef, ...decision.value.fallbackTargetRefs]) {
+				if (signal?.aborted) break;
 				const parsed = parseRoutingTargetRef(targetRef);
 				if (!parsed.ok) {
 					attempts.push({ targetRef, ok: false, durationMs: 0, error: parsed.error.message });
@@ -1093,8 +1192,10 @@ export class InferenceRouter {
 						parsed.value.modelId,
 						undefined,
 						mcpConfig ? ["--mcp-config", mcpConfig.path] : undefined,
+						Boolean(selection),
 					);
 					if (!isPiAgentSessionProvider(provider)) {
+						if (opts?.persistentSessionKey) throw new Error("Persistent dashboard chat requires a Pi agent target");
 						const generated = await provider.generate(prompt, {
 							timeoutMs: opts?.timeoutMs,
 							maxTokens: opts?.maxTokens,
@@ -1121,7 +1222,7 @@ export class InferenceRouter {
 					}
 					let release: (() => void) | undefined;
 					try {
-						release = await acquireLlmConcurrencyPermit(remainingBeforePermit, "pi-agent");
+						release = await acquireLlmConcurrencyPermit(remainingBeforePermit, "pi-agent", signal);
 					} catch (error) {
 						if (error instanceof SemaphoreTimeoutError) {
 							throw new PiAgentSessionTimeoutError(deadlineMs, Promise.resolve());
@@ -1130,7 +1231,6 @@ export class InferenceRouter {
 					}
 					let session: PiAgentSession | undefined;
 					let unsubscribeSessionEvents: (() => void) | undefined;
-					let releaseDeferred = false;
 					const remainingBeforeInitialization = deadline === undefined ? undefined : deadline - performance.now();
 					const initializationController = new AbortController();
 					let initializationTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1152,7 +1252,13 @@ export class InferenceRouter {
 						try {
 							session = await provider.createAgentSession(tools, {
 								maxTokens: opts?.maxTokens,
-								signal: initializationController.signal,
+								signal: signal
+									? AbortSignal.any([initializationController.signal, signal])
+									: initializationController.signal,
+								systemPrompt: opts?.systemPrompt,
+								persistentSessionKey: opts?.persistentSessionKey,
+								continuationPrompt: opts?.continuationPrompt,
+								...(opts?.retry ? { retry: opts.retry } : {}),
 							});
 						} catch (error) {
 							if (initializationTimedOut) {
@@ -1171,47 +1277,34 @@ export class InferenceRouter {
 									model: session.getModelName?.(),
 									systemPrompt: session.getSystemPrompt?.(),
 								});
-							} catch {
-								// Observers cannot change the provider/session result.
-							}
+							} catch {}
 						}
 						if (opts?.onEvent && session.subscribe) {
 							try {
 								unsubscribeSessionEvents = session.subscribe(opts.onEvent);
-							} catch {
-								// Event observation is optional; keep the Pi run usable when
-								// an older provider wrapper lacks the subscription seam.
-							}
+							} catch {}
 						}
-						// AgentSession owns an internal model loop, so acquire the
-						// process-wide permit before initialization and hold it until
-						// the whole session is disposed. This prevents tool-driven
-						// Pi turns from multiplying concurrency outside the canonical
-						// provider boundary, including cancellation cleanup.
 						const remainingMs = deadline === undefined ? undefined : deadline - performance.now();
 						if (remainingMs !== undefined && remainingMs <= 0) {
 							throw new PiAgentSessionTimeoutError(deadlineMs, Promise.resolve());
 						}
 						try {
-							await promptPiAgentSession(session, prompt, remainingMs);
-						} catch (error) {
-							if (error instanceof PiAgentSessionTimeoutError) {
-								releaseDeferred = true;
-								void error.cleanup.finally(() => {
-									try {
-										session?.dispose();
-									} finally {
-										release?.();
-									}
-								});
+							const cancel = () => {
+								void session?.abort();
+							};
+							signal?.addEventListener("abort", cancel, { once: true });
+							try {
+								if (signal?.aborted) throw new Error("Agent request cancelled");
+								await promptPiAgentSession(session, prompt, remainingMs);
+							} finally {
+								signal?.removeEventListener("abort", cancel);
 							}
+						} catch (error) {
+							if (error instanceof PiAgentSessionTimeoutError) await error.cleanup;
 							throw error;
 						}
 						const failure = session.getFailureMessage();
 						if (failure) throw new Error(failure);
-						// Read the session aggregate before dispose() tears the
-						// in-memory entries down. getStats is the only way to
-						// capture provider-reported tokens for the agentic loop.
 						sessionUsage = mapSessionStatsToUsage(
 							session.getStats(),
 							Date.now() - startedAt,
@@ -1225,12 +1318,10 @@ export class InferenceRouter {
 						} finally {
 							unsubscribeSessionEvents = undefined;
 						}
-						if (!releaseDeferred) {
-							try {
-								session?.dispose();
-							} finally {
-								release?.();
-							}
+						try {
+							await session?.dispose();
+						} finally {
+							release?.();
 						}
 					}
 					this.clearObservedRuntimeState(loaded.value, targetRef);
@@ -1245,7 +1336,7 @@ export class InferenceRouter {
 					};
 				} catch (error) {
 					const message = formatExecutionError(error);
-					this.observeExecutionFailure(loaded.value, targetRef, message);
+					this.observeExecutionFailure(loaded.value, targetRef, message, error);
 					attempts.push({ targetRef, ok: false, durationMs: Date.now() - startedAt, error: message });
 					if (error instanceof PiAgentSessionTimeoutError || error instanceof PiProviderDeadlineError) break;
 				} finally {
@@ -1316,9 +1407,6 @@ export class InferenceRouter {
 					maxTokens: opts?.maxTokens,
 					signal: opts?.signal,
 					sessionId,
-					// aggregate_recall is latency-sensitive (the routing engine already
-					// excludes ACPX subprocesses for it). Suppress thinking for the same
-					// reason: thinking tokens would dominate the synthesis budget.
 					reasoning: request.operation === "aggregate_recall" ? false : undefined,
 				});
 				this.clearObservedRuntimeState(loaded.value, targetRef);
@@ -1344,7 +1432,7 @@ export class InferenceRouter {
 					targetRef,
 					error: message.slice(0, 200),
 				});
-				this.observeExecutionFailure(loaded.value, targetRef, message);
+				this.observeExecutionFailure(loaded.value, targetRef, message, error);
 				attempts.push({
 					targetRef,
 					ok: false,
@@ -1434,8 +1522,6 @@ export class InferenceRouter {
 					maxTokens: opts?.maxTokens,
 					abortSignal: opts?.abortSignal,
 					sessionId,
-					// aggregate_recall is latency-sensitive: suppress thinking tokens
-					// (mirrors the execute path and the routing engine's ACPX exclusion).
 					reasoning: request.operation === "aggregate_recall" ? false : undefined,
 				});
 
@@ -1524,7 +1610,7 @@ export class InferenceRouter {
 									targetRef,
 									error: message.slice(0, 200),
 								});
-								router.observeExecutionFailure(loaded.value, targetRef, message);
+								router.observeExecutionFailure(loaded.value, targetRef, message, error);
 								failAttempt(message);
 								closeWith({
 									type: "error",
@@ -1561,7 +1647,7 @@ export class InferenceRouter {
 					targetRef,
 					error: message.slice(0, 200),
 				});
-				this.observeExecutionFailure(loaded.value, targetRef, message);
+				this.observeExecutionFailure(loaded.value, targetRef, message, error);
 				attempts.push({
 					targetRef,
 					ok: false,
@@ -1684,9 +1770,6 @@ export class InferenceRouter {
 					aggregateRecall:
 						loaded.value.config.workloads?.aggregateRecall?.policy ??
 						loaded.value.config.workloads?.aggregateRecall?.target,
-					widgetGeneration:
-						loaded.value.config.workloads?.widgetGeneration?.policy ??
-						loaded.value.config.workloads?.widgetGeneration?.target,
 					repair: loaded.value.config.workloads?.repair?.policy ?? loaded.value.config.workloads?.repair?.target,
 				},
 				accounts,

@@ -1,16 +1,7 @@
-/**
- * Session Checkpoints — write/read/prune checkpoint rows and
- * manage a debounced flush queue so writes don't block the
- * user-prompt-submit hot path.
- */
-
+import { redactCredentials } from "@signet/core";
 import type { ContinuityState, StructuralSnapshot } from "./continuity-state";
 import type { DbAccessor, ReadDb, WriteDb } from "./db-accessor";
 import { logger } from "./logger";
-
-// ============================================================================
-// Types
-// ============================================================================
 
 export type CheckpointTrigger =
 	| "periodic"
@@ -56,49 +47,15 @@ export interface WriteCheckpointParams {
 	readonly surfacedConstraintCount?: number;
 	readonly traversalMemoryCount?: number;
 }
-
-// ============================================================================
-// Redaction
-// ============================================================================
-
-// Common secret patterns — applied before storage and before API serve
-const SECRET_PATTERNS: ReadonlyArray<RegExp> = [
-	// Bearer tokens
-	/Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi,
-	// API key formats (sk-, pk-, key-, api_key=, etc.)
-	/\b(sk|pk|api[_-]?key|token|secret|password|credential)[_-]?[=:\s]+\S{8,}/gi,
-	// Base64-encoded blobs that look like credentials (32+ chars)
-	/\b[A-Za-z0-9+/]{32,}={0,2}\b/g,
-	// Environment variable references with values
-	/\$[A-Z_]{4,}=[^\s]+/g,
-	// Common key=value patterns
-	/\b(OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|NPM_TOKEN|AWS_SECRET)[=:\s]+\S+/gi,
-];
-
-export function redactSecrets(text: string): string {
-	let result = text;
-	for (const pattern of SECRET_PATTERNS) {
-		// Reset lastIndex for global regexes
-		pattern.lastIndex = 0;
-		result = result.replace(pattern, "[REDACTED]");
-	}
-	return result;
-}
-
-/** Apply redaction to a checkpoint row before serving via API. */
 export function redactCheckpointRow(row: CheckpointRow): CheckpointRow {
 	return {
 		...row,
-		digest: redactSecrets(row.digest),
+		digest: redactCredentials(row.digest),
 		recent_remembers: row.recent_remembers
-			? JSON.stringify((JSON.parse(row.recent_remembers) as string[]).map(redactSecrets))
+			? JSON.stringify((JSON.parse(row.recent_remembers) as string[]).map((text) => redactCredentials(text)))
 			: null,
 	};
 }
-
-// ============================================================================
-// Write
-// ============================================================================
 
 export async function writeCheckpointAsync(
 	db: DbAccessor,
@@ -107,7 +64,7 @@ export async function writeCheckpointAsync(
 ): Promise<void> {
 	const id = crypto.randomUUID();
 	const now = new Date().toISOString();
-	const digest = redactSecrets(params.digest);
+	const digest = redactCredentials(params.digest);
 
 	await db.withWriteTxAsync(
 		(wdb) => {
@@ -131,7 +88,9 @@ export async function writeCheckpointAsync(
 					digest,
 					params.promptCount,
 					params.memoryQueries.length > 0 ? JSON.stringify(params.memoryQueries) : null,
-					params.recentRemembers.length > 0 ? JSON.stringify(params.recentRemembers.map(redactSecrets)) : null,
+					params.recentRemembers.length > 0
+						? JSON.stringify(params.recentRemembers.map((text) => redactCredentials(text)))
+						: null,
 					params.focalEntityIds && params.focalEntityIds.length > 0 ? JSON.stringify(params.focalEntityIds) : null,
 					params.focalEntityNames && params.focalEntityNames.length > 0
 						? JSON.stringify(params.focalEntityNames)
@@ -160,7 +119,7 @@ export async function writeCheckpointAsync(
 					.run(params.sessionKey, excess);
 			}
 		},
-		{ siteToken: "session-checkpoints.ts:112" },
+		{ siteToken: "session-checkpoints.ts:69" },
 	);
 
 	logger.info("checkpoints", "Checkpoint written", {
@@ -174,7 +133,7 @@ export async function writeCheckpointAsync(
 export function writeCheckpoint(db: DbAccessor, params: WriteCheckpointParams, maxPerSession: number): void {
 	const id = crypto.randomUUID();
 	const now = new Date().toISOString();
-	const digest = redactSecrets(params.digest);
+	const digest = redactCredentials(params.digest);
 
 	// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withWriteTx migration site
 	db.withWriteTx((wdb: WriteDb) => {
@@ -198,7 +157,9 @@ export function writeCheckpoint(db: DbAccessor, params: WriteCheckpointParams, m
 				digest,
 				params.promptCount,
 				params.memoryQueries.length > 0 ? JSON.stringify(params.memoryQueries) : null,
-				params.recentRemembers.length > 0 ? JSON.stringify(params.recentRemembers.map(redactSecrets)) : null,
+				params.recentRemembers.length > 0
+					? JSON.stringify(params.recentRemembers.map((text) => redactCredentials(text)))
+					: null,
 				params.focalEntityIds && params.focalEntityIds.length > 0 ? JSON.stringify(params.focalEntityIds) : null,
 				params.focalEntityNames && params.focalEntityNames.length > 0 ? JSON.stringify(params.focalEntityNames) : null,
 				params.activeAspectIds && params.activeAspectIds.length > 0 ? JSON.stringify(params.activeAspectIds) : null,
@@ -206,8 +167,6 @@ export function writeCheckpoint(db: DbAccessor, params: WriteCheckpointParams, m
 				typeof params.traversalMemoryCount === "number" ? params.traversalMemoryCount : null,
 				now,
 			);
-
-		// Enforce per-session cap by deleting oldest beyond limit
 		const count = wdb
 			.prepare("SELECT COUNT(*) as cnt FROM session_checkpoints WHERE session_key = ?")
 			.get(params.sessionKey) as { cnt: number };
@@ -226,7 +185,7 @@ export function writeCheckpoint(db: DbAccessor, params: WriteCheckpointParams, m
 				)
 				.run(params.sessionKey, excess);
 		}
-	}, "session-checkpoints.ts:180");
+	}, "session-checkpoints.ts:139");
 
 	logger.info("checkpoints", "Checkpoint written", {
 		id,
@@ -276,15 +235,6 @@ function buildStructuralSection(snapshot?: StructuralSnapshot): string[] {
 	}
 	return lines;
 }
-
-// ============================================================================
-// Read
-// ============================================================================
-
-/**
- * Get the most recent checkpoint for a normalized project path
- * within the given time window.
- */
 export function getLatestCheckpoint(
 	db: DbAccessor,
 	projectNormalized: string | undefined,
@@ -305,10 +255,8 @@ export function getLatestCheckpoint(
 			)
 			.get(projectNormalized, cutoff) as unknown as CheckpointRow | null;
 		return row ?? undefined;
-	}, "session-checkpoints.ts:297");
+	}, "session-checkpoints.ts:247");
 }
-
-/** Get the most recent checkpoint for a specific session key. */
 export function getLatestCheckpointBySession(db: DbAccessor, sessionKey: string): CheckpointRow | undefined {
 	// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
 	return db.withReadDb((rdb: ReadDb) => {
@@ -321,10 +269,8 @@ export function getLatestCheckpointBySession(db: DbAccessor, sessionKey: string)
 			)
 			.get(sessionKey) as unknown as CheckpointRow | null;
 		return row ?? undefined;
-	}, "session-checkpoints.ts:314");
+	}, "session-checkpoints.ts:262");
 }
-
-/** Get all checkpoints for a session, newest first. */
 export function getCheckpointsBySession(db: DbAccessor, sessionKey: string): ReadonlyArray<CheckpointRow> {
 	// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
 	return db.withReadDb((rdb: ReadDb) => {
@@ -335,10 +281,8 @@ export function getCheckpointsBySession(db: DbAccessor, sessionKey: string): Rea
 				 ORDER BY created_at DESC, rowid DESC`,
 			)
 			.all(sessionKey) as unknown as CheckpointRow[];
-	}, "session-checkpoints.ts:330");
+	}, "session-checkpoints.ts:276");
 }
-
-/** Async session checkpoint projection for HTTP/background callers. */
 export async function getCheckpointsBySessionAsync(
 	db: DbAccessor,
 	sessionKey: string,
@@ -352,11 +296,9 @@ export async function getCheckpointsBySessionAsync(
 					 ORDER BY created_at DESC, rowid DESC`,
 				)
 				.all(sessionKey) as unknown as CheckpointRow[],
-		{ siteToken: "session-checkpoints.ts:346", operation: "http.checkpoints-by-session" },
+		{ siteToken: "session-checkpoints.ts:290", operation: "http.checkpoints-by-session" },
 	);
 }
-
-/** Get recent checkpoints for a project (for API). */
 export function getCheckpointsByProject(
 	db: DbAccessor,
 	projectNormalized: string,
@@ -372,17 +314,8 @@ export function getCheckpointsByProject(
 				 LIMIT ?`,
 			)
 			.all(projectNormalized, limit) as unknown as CheckpointRow[];
-	}, "session-checkpoints.ts:366");
+	}, "session-checkpoints.ts:308");
 }
-
-// ============================================================================
-// Pruning
-// ============================================================================
-
-/**
- * Delete all checkpoints older than retentionDays. Strict retention —
- * checkpoints are ephemeral session state, not forensic data.
- */
 export function pruneCheckpoints(db: DbAccessor, retentionDays: number): number {
 	const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
 
@@ -398,10 +331,8 @@ export function pruneCheckpoints(db: DbAccessor, retentionDays: number): number 
 			});
 		}
 		return deleted;
-	}, "session-checkpoints.ts:390");
+	}, "session-checkpoints.ts:323");
 }
-
-/** Async maintenance variant; checkpoint retention is bulk work, not a bounded HTTP lookup. */
 export async function pruneCheckpointsAsync(db: DbAccessor, retentionDays: number): Promise<number> {
 	const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
 	return await db.withWriteTxAsync(
@@ -411,13 +342,9 @@ export async function pruneCheckpointsAsync(db: DbAccessor, retentionDays: numbe
 			if (deleted > 0) logger.info("checkpoints", "Pruned old checkpoints", { deleted, retentionDays });
 			return deleted;
 		},
-		{ siteToken: "session-checkpoints.ts:407", operation: "maintenance.prune-checkpoints", estimatedWorkUnits: 1 },
+		{ siteToken: "session-checkpoints.ts:338", operation: "maintenance.prune-checkpoints", estimatedWorkUnits: 1 },
 	);
 }
-
-// ============================================================================
-// Digest formatting (passive channel)
-// ============================================================================
 
 export function formatPeriodicDigest(state: ContinuityState, structuralSnapshot?: StructuralSnapshot): string {
 	const elapsed = Date.now() - state.startedAt;
@@ -571,10 +498,6 @@ function formatDuration(ms: number): string {
 	return `${hours}h${remainMins > 0 ? ` ${remainMins}m` : ""}`;
 }
 
-// ============================================================================
-// Buffered flush queue
-// ============================================================================
-
 interface PendingCheckpoint {
 	readonly params: WriteCheckpointParams;
 	readonly maxPerSession: number;
@@ -585,21 +508,12 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let dbRef: DbAccessor | null = null;
 
 const FLUSH_DELAY_MS = 2500;
-
-/** Set the DB accessor used by the flush queue. Call once at daemon startup. */
 export function initCheckpointFlush(db: DbAccessor): void {
 	dbRef = db;
 }
-
-/**
- * Queue a checkpoint write. If a write is already pending for the same
- * session, merge the queries and remembers so data isn't lost when
- * two triggers fire within the flush window.
- */
 export function queueCheckpointWrite(params: WriteCheckpointParams, maxPerSession: number): void {
 	const existing = pendingWrites.get(params.sessionKey);
 	if (existing) {
-		// Merge: keep latest prompt count + digest, union queries/remembers
 		const mergedQueries = [...existing.params.memoryQueries, ...params.memoryQueries].slice(-20);
 		const mergedRemembers = [...existing.params.recentRemembers, ...params.recentRemembers].slice(-10);
 		const mergedFocalEntityIds = [...(existing.params.focalEntityIds ?? []), ...(params.focalEntityIds ?? [])].filter(
@@ -640,8 +554,6 @@ export function queueCheckpointWrite(params: WriteCheckpointParams, maxPerSessio
 		}, FLUSH_DELAY_MS);
 	}
 }
-
-/** Flush all pending checkpoint writes immediately through async DB admission. */
 export async function flushPendingCheckpoints(): Promise<void> {
 	if (flushTimer !== null) {
 		clearTimeout(flushTimer);

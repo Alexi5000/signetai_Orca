@@ -1,9 +1,3 @@
-/**
- * Regression test: dreaming pass token usage must reach the telemetry
- * pipeline (dreaming.pass) so dreaming economics show up in PostHog — the
- * local dreaming_passes table alone was invisible to analytics.
- */
-
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -24,9 +18,9 @@ const TELEMETRY_CONFIG = {
 } as const;
 
 describe("dreaming telemetry", () => {
-	beforeAll(() => {
+	beforeAll(async () => {
 		dir = createTestTempDir("signet-dream-telemetry-");
-		closeDbAccessor();
+		await closeDbAccessor();
 		rmSync(join(dir, "memory"), { recursive: true, force: true });
 		mkdirSync(join(dir, "memory"), { recursive: true });
 		initDbAccessor(join(dir, "memory", "memories.db"));

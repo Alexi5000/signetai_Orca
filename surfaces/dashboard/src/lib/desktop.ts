@@ -1,6 +1,8 @@
 export interface DesktopBridge {
 	readonly openExternal: (url: string) => Promise<void>;
 	readonly setTitleBarTheme?: (theme: "light" | "dark") => Promise<unknown>;
+	readonly pickDirectory?: (options?: { readonly title?: string }) => Promise<string | null>;
+	readonly pickFiles?: (options?: { readonly title?: string }) => Promise<readonly string[] | null>;
 }
 
 declare global {

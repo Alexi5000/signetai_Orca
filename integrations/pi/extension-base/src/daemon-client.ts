@@ -15,6 +15,7 @@ export interface DaemonClientConfig {
 	readonly actorName: string;
 	readonly runtimePath: string;
 	readonly defaultTimeout: number;
+	readonly logFailures?: boolean;
 }
 
 function readAuthToken(): string | undefined {
@@ -46,6 +47,17 @@ function isTimeoutError(err: unknown): boolean {
 	return code === "ABORT_ERR";
 }
 
+function logWarning(config: DaemonClientConfig, message: string): void {
+	if (config.logFailures === false) return;
+	console.warn(message);
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+	try {
+		await response.body?.cancel();
+	} catch {}
+}
+
 async function daemonFetchResult<T>(
 	daemonUrl: string,
 	path: string,
@@ -54,9 +66,10 @@ async function daemonFetchResult<T>(
 		readonly method?: string;
 		readonly body?: unknown;
 		readonly timeout?: number;
+		readonly parseJson?: boolean;
 	} = {},
 ): Promise<DaemonFetchResult<T>> {
-	const { method = "POST", body, timeout = config.defaultTimeout } = options;
+	const { method = "POST", body, timeout = config.defaultTimeout, parseJson = true } = options;
 
 	try {
 		const init: RequestInit = {
@@ -71,8 +84,14 @@ async function daemonFetchResult<T>(
 
 		const response = await fetch(`${daemonUrl}${path}`, init);
 		if (!response.ok) {
-			console.warn(`[${config.logPrefix}] ${method} ${path} failed: ${response.status}`);
+			await cancelResponseBody(response);
+			logWarning(config, `[${config.logPrefix}] ${method} ${path} failed: ${response.status}`);
 			return { ok: false, reason: "http", status: response.status };
+		}
+
+		if (!parseJson) {
+			await cancelResponseBody(response);
+			return { ok: true, data: undefined as T };
 		}
 
 		try {
@@ -81,27 +100,31 @@ async function daemonFetchResult<T>(
 				const data = JSON.parse(text) as T;
 				return { ok: true, data };
 			} catch {
-				console.warn(
+				logWarning(
+					config,
 					`[${config.logPrefix}] ${method} ${path} returned invalid JSON (${text.length} chars${text.length === 0 ? ", empty body" : ""})`,
 				);
 				return { ok: false, reason: "invalid-json", status: response.status };
 			}
 		} catch (e) {
-			// Body read failed — typically a timeout firing after headers arrived
+			await cancelResponseBody(response);
 			if (isTimeoutError(e)) {
-				console.warn(`[${config.logPrefix}] ${method} ${path} body read timed out after ${timeout}ms`);
+				logWarning(config, `[${config.logPrefix}] ${method} ${path} body read timed out after ${timeout}ms`);
 				return { ok: false, reason: "timeout" };
 			}
-			console.warn(`[${config.logPrefix}] ${method} ${path} body read failed:`, errorName(e) || e);
+			logWarning(
+				config,
+				`[${config.logPrefix}] ${method} ${path} body read failed: ${errorName(e) || "unknown error"}`,
+			);
 			return { ok: false, reason: "body-read" };
 		}
 	} catch (error) {
 		if (isTimeoutError(error)) {
-			console.warn(`[${config.logPrefix}] ${method} ${path} timed out after ${timeout}ms`);
+			logWarning(config, `[${config.logPrefix}] ${method} ${path} timed out after ${timeout}ms`);
 			return { ok: false, reason: "timeout" };
 		}
 
-		console.warn(`[${config.logPrefix}] ${method} ${path} error:`, error);
+		logWarning(config, `[${config.logPrefix}] ${method} ${path} error: ${errorName(error) || "request failed"}`);
 		return { ok: false, reason: "offline" };
 	}
 }
@@ -111,7 +134,11 @@ export interface DaemonClient {
 	postResult<T>(path: string, body: unknown, timeout?: number): Promise<DaemonFetchResult<T>>;
 }
 
-export function createDaemonClient(daemonUrl: string, config: DaemonClientConfig): DaemonClient {
+export interface DaemonStatusClient extends DaemonClient {
+	postStatus(path: string, body: unknown, timeout?: number): Promise<DaemonFetchResult<void>>;
+}
+
+export function createDaemonClient(daemonUrl: string, config: DaemonClientConfig): DaemonStatusClient {
 	return {
 		async post<T>(path: string, body: unknown, timeout = config.defaultTimeout): Promise<T | null> {
 			const result = await daemonFetchResult<T>(daemonUrl, path, config, {
@@ -127,6 +154,14 @@ export function createDaemonClient(daemonUrl: string, config: DaemonClientConfig
 				method: "POST",
 				body,
 				timeout,
+			});
+		},
+		postStatus(path: string, body: unknown, timeout = config.defaultTimeout): Promise<DaemonFetchResult<void>> {
+			return daemonFetchResult<void>(daemonUrl, path, config, {
+				method: "POST",
+				body,
+				timeout,
+				parseJson: false,
 			});
 		},
 	};

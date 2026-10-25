@@ -16,9 +16,10 @@ let cancelInstall: (() => void) | undefined;
 let installationClosed: Promise<void> = Promise.resolve();
 const INSTALLATION_TIMEOUT_MS = 30_000;
 
-type RecoveryAction = Exclude<HarnessAction, "connect">;
+type RecoveryAction = Exclude<HarnessAction, "connect" | "disconnect">;
 
 function actionLabel(action: HarnessAction): string {
+	if (action === "disconnect") return "Disconnect";
 	if (action === "repair") return "Repair";
 	if (action === "reinitialize") return "Reinitialize";
 	return "Installation";
@@ -36,8 +37,6 @@ export async function stopHarnessInstall(): Promise<void> {
 	cancelInstall?.();
 	await installationClosed;
 }
-
-/** One bounded adapter install at a time; completion waits for process cleanup. */
 export async function installHarness(
 	id: string,
 	signal: AbortSignal,
@@ -131,18 +130,20 @@ export async function installHarness(
 }
 
 export function registerHarnessInstallRoutes(app: Hono): void {
-	app.post("/api/harnesses/:id/connect", requirePermission("admin", authConfig), async (c) => {
-		const id = c.req.param("id");
-		if (getHarnessLoader(id) === null)
-			return c.json({ error: "Unsupported agent; use the CLI to configure this integration." }, 400);
-		if (installing) return c.json({ error: "Another agent installation is running." }, 409);
-		try {
-			await installHarness(id, c.req.raw.signal);
-			return c.json({ success: true, id });
-		} catch (error) {
-			return c.json({ error: error instanceof Error ? error.message : "Installation failed" }, 500);
-		}
-	});
+	for (const action of ["connect", "disconnect"] as const) {
+		app.post(`/api/harnesses/:id/${action}`, requirePermission("admin", authConfig), async (c) => {
+			const id = c.req.param("id");
+			if (getHarnessLoader(id) === null)
+				return c.json({ error: "Unsupported agent; use the CLI to configure this integration." }, 400);
+			if (installing) return c.json({ error: "Another agent installation is running." }, 409);
+			try {
+				const result = await installHarness(id, c.req.raw.signal, action);
+				return c.json({ success: true, id, action, message: result.message });
+			} catch (error) {
+				return c.json({ error: error instanceof Error ? error.message : "Installation failed" }, 500);
+			}
+		});
+	}
 
 	const registerRecoveryRoute = (action: RecoveryAction) => {
 		app.post(`/api/harnesses/:id/${action}`, requirePermission("admin", authConfig), async (c) => {
@@ -163,9 +164,7 @@ export function registerHarnessInstallRoutes(app: Hono): void {
 				let body: unknown = null;
 				try {
 					body = await c.req.json();
-				} catch {
-					// Missing or malformed confirmation is intentionally treated as no confirmation.
-				}
+				} catch {}
 				if (typeof body !== "object" || body === null || Array.isArray(body) || Reflect.get(body, "confirm") !== true) {
 					return c.json(
 						{

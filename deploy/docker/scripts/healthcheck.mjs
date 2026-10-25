@@ -1,6 +1,19 @@
 #!/usr/bin/env bun
 
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+function runtimeDir(root) {
+	try {
+		const layout = JSON.parse(readFileSync(`${root}/workspace-layout.json`, "utf8"));
+		if (layout?.version !== 2) return `${root}/.daemon`;
+		const custom = layout.overrides?.runtime;
+		return typeof custom === "string" ? resolve(root, custom) : `${root}/runtime`;
+	} catch {
+		return `${root}/.daemon`;
+	}
+}
 
 function base64url(input) {
 	return Buffer.from(input).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
@@ -8,7 +21,7 @@ function base64url(input) {
 
 const port = process.env.SIGNET_PORT ?? "3850";
 const root = process.env.SIGNET_PATH ?? "/data/agents";
-const secretPath = `${root}/.daemon/auth-secret`;
+const secretPath = `${runtimeDir(root)}/auth-secret`;
 const secretFile = Bun.file(secretPath);
 
 if (!(await secretFile.exists())) {
@@ -19,8 +32,6 @@ const secret = Buffer.from(await secretFile.arrayBuffer());
 if (secret.length !== 32) {
 	process.exit(1);
 }
-
-// Stateless signed token, not stored in daemon token tables.
 const now = Math.floor(Date.now() / 1000);
 const claims = {
 	sub: "docker:healthcheck",

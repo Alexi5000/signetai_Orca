@@ -35,9 +35,6 @@ function platformFromName(name: string): string | null {
 	if (
 		name === "native-manifest.json" ||
 		name.endsWith(".sha256") ||
-		// Connector-asset tarball is a component, not a binary. Skip it
-		// from the `assets` listing so the install-time platform lookup
-		// doesn't accidentally match `connectors-<version>.tar.gz`.
 		name.startsWith("signet-connectors-") ||
 		name.startsWith("signet-daemon-js-") ||
 		name === "daemon-js-manifest.json"
@@ -55,7 +52,6 @@ const assets: NativeAsset[] = readdirSync(nativeDir)
 		if (!platform) return [];
 		const path = join(nativeDir, name);
 		if (!statSync(path).isFile()) return [];
-		// Hash and size come from one descriptor so they describe the same file.
 		const file = readFileWithStatSync(path);
 		if (!file?.stat.isFile()) return [];
 		return [
@@ -77,9 +73,6 @@ function loadConnectorComponent(): ComponentEntry | null {
 	const { stat } = file;
 	const sha256 = createHash("sha256").update(file.content).digest("hex");
 	return {
-		// The wrapper resolves the manifest URL relative to the GitHub release
-		// page that hosts the binary. Keep the path consistent with how the
-		// release workflow uploads the tarball.
 		url: `signet-connectors-${version}.tar.gz`,
 		sha256,
 		size: stat.size,

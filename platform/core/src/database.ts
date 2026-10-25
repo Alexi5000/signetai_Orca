@@ -1,50 +1,31 @@
-/**
- * SQLite database wrapper for Signet
- * Runtime-detecting: uses bun:sqlite under Bun, better-sqlite3 under Node.js
- */
-
 import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { arch, platform } from "node:process";
 import { fileURLToPath } from "node:url";
 import { execFileSyncHidden } from "./child-process";
-import { MEMORY_CONTENT_SAFETY_POLICY_VERSION, scanMemoryContent } from "./memory-content-safety";
 import { isDaemonDerivedMemorySourceType } from "./memory-provenance";
 import { runMigrations } from "./migrations/index";
 import { resolveSqliteJournalConfig } from "./sqlite-journal";
 import type { Memory } from "./types";
 import type { MemoryHistory, MemoryJob } from "./types";
-
-// Compute __dirname at runtime so bun's bundler doesn't bake in a static path
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-
-// Platform-specific extension suffix
 function getExtensionSuffix(): string {
 	if (platform === "win32") return "dll";
 	if (platform === "darwin") return "dylib";
 	return "so";
 }
-
-// Get the platform-specific package name
 function getPlatformPackageName(): string {
 	const os = platform === "win32" ? "windows" : platform;
 	return `sqlite-vec-${os}-${arch === "x64" ? "x64" : arch}`;
 }
-
-// Find the sqlite-vec extension path
-// Handles bun's hoisted node_modules structure where platform packages
-// are in separate .bun directories
 let cachedNpmGlobalRoot: string | null | undefined;
 
 function findNpmGlobalRoot(): string | null {
 	if (cachedNpmGlobalRoot !== undefined) return cachedNpmGlobalRoot;
 
 	try {
-		// npm is a .cmd launcher on Windows. Calling it directly avoids routing
-		// through PowerShell, and windowsHide prevents a console window for every
-		// database/owner initialization.
 		const command = platform === "win32" ? "npm.cmd" : "npm";
 		const root = (
 			execFileSyncHidden(command, ["root", "-g"], {
@@ -54,7 +35,6 @@ function findNpmGlobalRoot(): string | null {
 		).trim();
 		cachedNpmGlobalRoot = root || null;
 	} catch {
-		// npm not available or timed out — continue with static paths
 		cachedNpmGlobalRoot = null;
 	}
 
@@ -62,14 +42,17 @@ function findNpmGlobalRoot(): string | null {
 }
 
 function findSqliteVecExtension(): string | null {
-	// Explicit override — always wins
 	const envPath = process.env.SIGNET_VEC_PATH;
 	if (envPath && existsSync(envPath)) return envPath;
 
 	const platformPkg = getPlatformPackageName();
 	const extFile = `vec0.${getExtensionSuffix()}`;
-
-	// Try npm's resolved global prefix before the static fallbacks.
+	const daemonEntrypoint = process.env.SIGNET_DAEMON_JS_PATH;
+	if (daemonEntrypoint) {
+		const daemonRoot = dirname(dirname(resolve(daemonEntrypoint)));
+		const bundledExtension = join(daemonRoot, "node_modules", platformPkg, extFile);
+		if (existsSync(bundledExtension)) return bundledExtension;
+	}
 	const npmRoot = findNpmGlobalRoot();
 	if (npmRoot) {
 		const direct = join(npmRoot, platformPkg, extFile);
@@ -77,18 +60,9 @@ function findSqliteVecExtension(): string | null {
 		const nested = join(npmRoot, "signetai", "node_modules", platformPkg, extFile);
 		if (existsSync(nested)) return nested;
 	}
-
-	// Try common locations in order
 	const searchPaths = [
-		// Native binary: process.execPath is .../node_modules/signetai/native/signet
-		// Extension is a sibling package in the same node_modules directory.
-		// Go up 3 levels from the binary to reach node_modules/, then into the
-		// platform package. This is the primary path for bun global installs.
 		join(dirname(dirname(dirname(process.execPath))), platformPkg, extFile),
-		// Native binary: extension nested inside signetai's own node_modules
-		// (without the "lib" prefix that npm uses)
 		join(dirname(dirname(process.execPath)), "node_modules", platformPkg, extFile),
-		// Bun default global install: ~/.bun/install/global/node_modules/<pkg>/vec0.so
 		join(process.env.BUN_INSTALL || join(homedir(), ".bun"), "install", "global", "node_modules", platformPkg, extFile),
 		join(
 			process.env.BUN_INSTALL || join(homedir(), ".bun"),
@@ -100,26 +74,14 @@ function findSqliteVecExtension(): string | null {
 			platformPkg,
 			extFile,
 		),
-		// Standard npm/yarn layout: __dirname is node_modules/@signet/core/dist/
 		join(__dirname, "..", "..", platformPkg, extFile),
-		// Installed package: __dirname is signetai/dist/, deps in own node_modules/
 		join(__dirname, "..", "node_modules", platformPkg, extFile),
-		// Bun's hoisted structure (multiple possible locations)
 		join(__dirname, "..", "..", "..", ".bun", `${platformPkg}@*`, "node_modules", platformPkg, extFile),
-		// When running from dist/
 		join(__dirname, "node_modules", platformPkg, extFile),
-		// Monorepo root node_modules
 		join(__dirname, "..", "..", "..", "node_modules", platformPkg, extFile),
-		// Monorepo root with bun structure
 		join(__dirname, "..", "..", "..", "node_modules", ".bun", `${platformPkg}@*`, "node_modules", platformPkg, extFile),
-		// Global npm install: derive from process.execPath
-		// e.g. /opt/homebrew/bin/node → /opt/homebrew/lib/node_modules/<pkg>/vec0.dylib
-		// e.g. /usr/bin/node → /usr/lib/node_modules/<pkg>/vec0.so
-		// Also covers nvm: ~/.nvm/versions/node/vXX/bin/node → .../lib/node_modules/
 		join(dirname(dirname(process.execPath)), "lib", "node_modules", platformPkg, extFile),
-		// Global npm install via signetai meta-package
 		join(dirname(dirname(process.execPath)), "lib", "node_modules", "signetai", "node_modules", platformPkg, extFile),
-		// Well-known npm global prefixes (when process.execPath is bun, not node)
 		...(platform !== "win32"
 			? [
 					join("/opt/homebrew/lib/node_modules", platformPkg, extFile),
@@ -130,7 +92,6 @@ function findSqliteVecExtension(): string | null {
 					join("/usr/lib/node_modules", "signetai", "node_modules", platformPkg, extFile),
 				]
 			: [
-					// Windows: npm global prefix is typically in AppData
 					join(
 						process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
 						"npm",
@@ -148,7 +109,6 @@ function findSqliteVecExtension(): string | null {
 						extFile,
 					),
 				]),
-		// nvm global paths
 		join(homedir(), ".nvm", "versions", "node", "*", "lib", "node_modules", platformPkg, extFile),
 		join(
 			homedir(),
@@ -166,7 +126,6 @@ function findSqliteVecExtension(): string | null {
 	];
 
 	for (const searchPath of searchPaths) {
-		// Handle glob-like patterns for bun's versioned directories
 		if (searchPath.includes("*")) {
 			const baseDir = dirname(searchPath.replace(/\*.*$/, ""));
 			const pattern = searchPath.split("*")[1];
@@ -186,14 +145,7 @@ function findSqliteVecExtension(): string | null {
 
 	return null;
 }
-
-/** Find the sqlite-vec native extension path, or null if unavailable. */
 export { findSqliteVecExtension };
-
-/**
- * Load sqlite-vec extension onto a database connection.
- * Returns true if the extension was loaded successfully.
- */
 export function loadSqliteVec(db: unknown): boolean {
 	const extPath = findSqliteVecExtension();
 	if (!extPath) {
@@ -209,8 +161,6 @@ export function loadSqliteVec(db: unknown): boolean {
 		return false;
 	}
 }
-
-// Common SQLite interface shared by both implementations
 interface SQLiteDatabase {
 	pragma(pragma: string): void;
 	exec(sql: string): void;
@@ -219,7 +169,7 @@ interface SQLiteDatabase {
 		get(...args: unknown[]): Record<string, unknown> | undefined;
 		all(...args: unknown[]): Record<string, unknown>[];
 	};
-	close(): void;
+	close(throwOnError?: boolean): void;
 }
 
 export class Database {
@@ -233,7 +183,6 @@ export class Database {
 	}
 
 	async init(): Promise<void> {
-		// Detect runtime and load appropriate SQLite implementation
 		const isBun = typeof (globalThis as Record<string, unknown>).Bun !== "undefined";
 
 		if (isBun) {
@@ -260,17 +209,8 @@ export class Database {
 				readonly: this.options?.readonly,
 			}) as SQLiteDatabase;
 		}
-
-		// Load sqlite-vec extension for vector search capabilities
 		loadSqliteVec(this.db);
-
-		// Enable WAL only when the filesystem supports SQLite's shared-memory
-		// and locking requirements. Darwin network filesystems such as SMB/NFS
-		// use rollback journaling instead.
 		if (!this.options?.readonly) {
-			// Set auto_vacuum = INCREMENTAL before any tables are created (#1139).
-			// Only affects fresh databases; existing databases are converted by
-			// the daemon's convertToIncrementalVacuum on startup.
 			this.getDb().exec("PRAGMA auto_vacuum = INCREMENTAL");
 			const journal = resolveSqliteJournalConfig({ directory: dirname(this.dbPath) });
 			const journalMode = `journal_mode = ${journal.journalMode}`;
@@ -278,20 +218,14 @@ export class Database {
 			else (this.getDb() as { pragma(s: string): void }).pragma(journalMode);
 			if (journal.networkFilesystem) this.getDb().exec("PRAGMA synchronous = FULL");
 		}
-
-		// Run migrations
 		runMigrations(this.getDb());
 	}
-
-	/** Safe accessor that throws if db isn't initialized. */
 	private getDb(): SQLiteDatabase {
 		if (this.db === null) {
 			throw new Error("Database not initialized — call init() first");
 		}
 		return this.db;
 	}
-
-	// -- Memory CRUD --
 
 	addMemory(memory: Omit<Memory, "id" | "createdAt" | "updatedAt" | "version">): string {
 		const id = crypto.randomUUID();
@@ -325,7 +259,6 @@ export class Database {
 				memory.manualOverride ? 1 : 0,
 				isDaemonDerivedMemorySourceType(memory.sourceType) ? null : "episodic",
 			);
-		this.recordMemoryContentSafety(id, memory.content, "default");
 
 		return id;
 	}
@@ -345,139 +278,6 @@ export class Database {
 		if (row === undefined) return null;
 		return rowToMemory(row);
 	}
-
-	updateMemory(id: string, updates: Partial<Memory>): void {
-		const sets: string[] = [];
-		const values: unknown[] = [];
-
-		const fieldMap: Record<string, string> = {
-			type: "type",
-			category: "category",
-			content: "content",
-			confidence: "confidence",
-			importance: "importance",
-			pinned: "pinned",
-			contentHash: "content_hash",
-			normalizedContent: "normalized_content",
-			extractionStatus: "extraction_status",
-			embeddingModel: "embedding_model",
-			extractionModel: "extraction_model",
-			sourceId: "source_id",
-			sourceType: "source_type",
-			sourcePath: "source_path",
-			runtimePath: "runtime_path",
-			idempotencyKey: "idempotency_key",
-			who: "who",
-		};
-
-		for (const [key, col] of Object.entries(fieldMap)) {
-			if (key in updates) {
-				sets.push(`${col} = ?`);
-				const val = updates[key as keyof Memory];
-				if (key === "pinned") {
-					values.push(val ? 1 : 0);
-				} else {
-					values.push(val ?? null);
-				}
-			}
-		}
-
-		if (updates.tags !== undefined) {
-			sets.push("tags = ?");
-			values.push(JSON.stringify(updates.tags));
-		}
-
-		if (sets.length === 0) return;
-		const owner = this.getDb().prepare("SELECT agent_id FROM memories WHERE id = ?").get(id) as
-			| { agent_id: string | null }
-			| undefined;
-
-		sets.push("updated_at = ?");
-		values.push(new Date().toISOString());
-
-		sets.push("update_count = COALESCE(update_count, 0) + 1");
-
-		values.push(id);
-
-		this.getDb()
-			.prepare(`UPDATE memories SET ${sets.join(", ")} WHERE id = ?`)
-			.run(...values);
-		if (typeof updates.content === "string") {
-			this.recordMemoryContentSafety(id, updates.content, owner?.agent_id?.trim() || "default");
-		}
-	}
-
-	private recordMemoryContentSafety(id: string, content: string, agentId: string): void {
-		const db = this.getDb();
-		const table = db
-			.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-			.get("memory_content_safety");
-		if (table == null) return;
-		const assessment = scanMemoryContent(content);
-		db.prepare(
-			`INSERT INTO memory_content_safety
-			 (agent_id, source_kind, source_id, status, context_eligible, reasons_json, policy_version, scanned_at)
-			 VALUES (?, 'memory', ?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(agent_id, source_kind, source_id) DO UPDATE SET
-			   status = excluded.status,
-			   context_eligible = excluded.context_eligible,
-			   reasons_json = excluded.reasons_json,
-			   policy_version = excluded.policy_version,
-			   scanned_at = excluded.scanned_at`,
-		).run(
-			agentId,
-			id,
-			assessment.status,
-			assessment.contextEligible ? 1 : 0,
-			JSON.stringify(assessment.reasons),
-			MEMORY_CONTENT_SAFETY_POLICY_VERSION,
-			new Date().toISOString(),
-		);
-	}
-
-	softDeleteMemory(id: string, deletedBy: string, reason?: string): void {
-		const now = new Date().toISOString();
-
-		// Grab old content for history
-		const existing = this.getMemoryById(id);
-		if (existing === null) return;
-
-		this.getDb()
-			.prepare(
-				`UPDATE memories
-				 SET is_deleted = 1, deleted_at = ?, updated_at = ?
-				 WHERE id = ?`,
-			)
-			.run(now, now, id);
-
-		this.addHistoryEvent({
-			memoryId: id,
-			event: "deleted",
-			oldContent: existing.content,
-			changedBy: deletedBy,
-			reason,
-		});
-	}
-
-	recoverMemory(id: string, recoveredBy: string): void {
-		const now = new Date().toISOString();
-
-		this.getDb()
-			.prepare(
-				`UPDATE memories
-				 SET is_deleted = 0, deleted_at = NULL, updated_at = ?
-				 WHERE id = ?`,
-			)
-			.run(now, id);
-
-		this.addHistoryEvent({
-			memoryId: id,
-			event: "recovered",
-			changedBy: recoveredBy,
-		});
-	}
-
-	// -- History --
 
 	addHistoryEvent(event: Omit<MemoryHistory, "id" | "createdAt">): string {
 		const id = crypto.randomUUID();
@@ -517,8 +317,6 @@ export class Database {
 		return rows.map(rowToHistory);
 	}
 
-	// -- Job queue --
-
 	enqueueJob(job: Omit<MemoryJob, "id" | "createdAt" | "updatedAt" | "attempts">): string {
 		const id = crypto.randomUUID();
 		const now = new Date().toISOString();
@@ -547,8 +345,6 @@ export class Database {
 
 	leaseJob(jobType: string): MemoryJob | null {
 		const now = new Date().toISOString();
-
-		// Find the oldest pending job of this type
 		const row = this.getDb()
 			.prepare(
 				`SELECT * FROM memory_jobs
@@ -572,8 +368,6 @@ export class Database {
 				 WHERE id = ?`,
 			)
 			.run(now, now, id);
-
-		// Return the updated row
 		const updated = this.getDb().prepare("SELECT * FROM memory_jobs WHERE id = ?").get(id);
 		if (updated === undefined) return null;
 		return rowToJob(updated);
@@ -595,8 +389,6 @@ export class Database {
 
 	failJob(id: string, error: string): void {
 		const now = new Date().toISOString();
-
-		// Check if we've exceeded max_attempts
 		const row = this.getDb().prepare("SELECT attempts, max_attempts FROM memory_jobs WHERE id = ?").get(id);
 
 		const attempts = row !== undefined ? (row.attempts as number) : 0;
@@ -635,12 +427,10 @@ export class Database {
 
 	close(): void {
 		if (this.db) {
-			this.db.close();
+			this.db.close(true);
 		}
 	}
 }
-
-// -- Row mappers (module-level, no `this`) --
 
 function safeJsonParse(raw: unknown, fallback: unknown): unknown {
 	if (typeof raw !== "string" || raw.length === 0) return fallback;
@@ -670,7 +460,6 @@ function rowToMemory(row: Record<string, unknown>): Memory {
 		vectorClock: safeJsonParse(row.vector_clock, {}) as Record<string, number>,
 		version: row.version as number,
 		manualOverride: Boolean(row.manual_override),
-		// v2 optional fields
 		contentHash: row.content_hash as string | undefined,
 		normalizedContent: row.normalized_content as string | undefined,
 		isDeleted: row.is_deleted === 1,

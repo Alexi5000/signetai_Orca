@@ -1,14 +1,13 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDbOwnerMaintenance, registerDbOwnerMaintenance, type DbOwnerMaintenance } from "../db-owner-maintenance";
+import {
+	closeRegisteredDbOwnerMaintenance,
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+	type DbOwnerMaintenance,
+} from "../db-owner-maintenance";
 const owners: Array<{ owner: DbOwnerMaintenance; directory: string }> = [];
-/**
- * Issue #901 — regression tests for /api/diagnostics/queue + repair.
- *
- * Uses a file-backed SQLite DB and real database owner with migrations so the queue
- * breakdowns read against production-shaped tables.
- */
 
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -74,7 +73,10 @@ interface DbEnv {
 	app: Hono;
 }
 
-function setup(authConfig?: NonNullable<Parameters<typeof registerQueueDiagnosticsRoutes>[1]>["authConfig"]): DbEnv {
+async function setup(
+	authConfig?: NonNullable<Parameters<typeof registerQueueDiagnosticsRoutes>[1]>["authConfig"],
+): Promise<DbEnv> {
+	await closeRegisteredDbOwnerMaintenance();
 	const directory = mkdtempSync(join(tmpdir(), "queue-owner-test-"));
 	const dbPath = join(directory, "memory.db");
 	const db = new Database(dbPath);
@@ -93,8 +95,8 @@ function setup(authConfig?: NonNullable<Parameters<typeof registerQueueDiagnosti
 
 describe("/api/diagnostics/queue", () => {
 	let env: DbEnv;
-	beforeEach(() => {
-		env = setup();
+	beforeEach(async () => {
+		env = await setup();
 	});
 	afterEach(async () => {
 		env.db.close();
@@ -102,11 +104,11 @@ describe("/api/diagnostics/queue", () => {
 			await item.owner.close();
 			rmSync(item.directory, { recursive: true, force: true });
 		}
-		registerDbOwnerMaintenance(null);
+		await closeRegisteredDbOwnerMaintenance();
 	});
 
 	it("requires admin permission in team mode", async () => {
-		const guarded = setup({ mode: "team" } as NonNullable<
+		const guarded = await setup({ mode: "team" } as NonNullable<
 			Parameters<typeof registerQueueDiagnosticsRoutes>[1]
 		>["authConfig"]);
 		try {
@@ -175,8 +177,8 @@ describe("/api/diagnostics/queue", () => {
 
 describe("POST /api/diagnostics/queue/repair", () => {
 	let env: DbEnv;
-	beforeEach(() => {
-		env = setup();
+	beforeEach(async () => {
+		env = await setup();
 	});
 	afterEach(async () => {
 		env.db.close();
@@ -184,7 +186,7 @@ describe("POST /api/diagnostics/queue/repair", () => {
 			await item.owner.close();
 			rmSync(item.directory, { recursive: true, force: true });
 		}
-		registerDbOwnerMaintenance(null);
+		await closeRegisteredDbOwnerMaintenance();
 	});
 
 	it("rejects retired summary repair tables with an actionable status", async () => {
@@ -211,11 +213,6 @@ describe("POST /api/diagnostics/queue/repair", () => {
 
 describe("repair action integration via the new dispatch path", () => {
 	it("returns a structured result when a repair action throws (no unstructured 500)", async () => {
-		// Simulate a degraded runtime: the write transaction throws (e.g. a
-		// missing migrations table, a closed DbAccessor, or a transient SQLite
-		// error). The handler must return the documented RepairResult instead
-		// of propagating an unhandled exception. Mirrors the GET sibling and
-		// the Rust parity handler.
 		const directory = mkdtempSync(join(tmpdir(), "queue-owner-test-"));
 		const dbPath = join(directory, "memory.db");
 		const db = new Database(dbPath);
@@ -226,6 +223,9 @@ describe("repair action integration via the new dispatch path", () => {
 					throw new Error("simulated degraded runtime: DbAccessor is closed");
 				},
 				withWriteTx: () => {
+					throw new Error("simulated degraded runtime: DbAccessor is closed");
+				},
+				withReadDbAsync: async () => {
 					throw new Error("simulated degraded runtime: DbAccessor is closed");
 				},
 				withWriteTxAsync: async () => {

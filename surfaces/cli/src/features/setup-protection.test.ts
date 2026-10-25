@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
+import { persistWorkspaceLayout } from "@signet/core";
 import { createWorkspaceSnapshot, getSnapshotProtection, saveSnapshotProtection } from "../lib/workspace-protection.js";
 import Database from "../sqlite.js";
 import { enforceSetupProtection, refreshSnapshotProtection } from "./setup-protection.js";
@@ -14,13 +15,13 @@ const originalEnv = {
 
 afterEach(() => {
 	if (originalEnv.OPENCLAW_CONFIG_PATH === undefined) {
-		process.env.OPENCLAW_CONFIG_PATH = undefined;
+		delete process.env.OPENCLAW_CONFIG_PATH;
 	} else {
 		process.env.OPENCLAW_CONFIG_PATH = originalEnv.OPENCLAW_CONFIG_PATH;
 	}
 
 	if (originalEnv.HOME === undefined) {
-		process.env.HOME = undefined;
+		delete process.env.HOME;
 	} else {
 		process.env.HOME = originalEnv.HOME;
 	}
@@ -105,6 +106,34 @@ describe("setup protection soft gate", () => {
 				}
 			}
 			expect(getSnapshotProtection(workspace)).toBe(result.snapshotPath);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("creates and recognizes a v2 snapshot at the resolved database path", () => {
+		const { root, workspace } = setupRepo();
+		try {
+			persistWorkspaceLayout(workspace, { version: 2 });
+			rmSync(join(workspace, "memory"), { recursive: true, force: true });
+			mkdirSync(join(workspace, "data"), { recursive: true });
+			const db = Database(join(workspace, "data", "signet.db"));
+			try {
+				db.exec("CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT)");
+				db.exec("INSERT INTO marker (value) VALUES ('v2')");
+			} finally {
+				db.close();
+			}
+
+			const snapshot = createWorkspaceSnapshot(workspace, join(root, "backups"));
+			saveSnapshotProtection(workspace, snapshot.path);
+			expect(getSnapshotProtection(workspace)).toBe(snapshot.path);
+			const snapDb = Database(join(snapshot.path, "data", "signet.db"), { readonly: true });
+			try {
+				expect(snapDb.prepare("SELECT value FROM marker").get()?.value).toBe("v2");
+			} finally {
+				snapDb.close();
+			}
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -206,6 +235,23 @@ describe("setup protection soft gate", () => {
 				}),
 			).rejects.toThrow("OpenClaw workspace is linked");
 		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps two snapshots taken in the same millisecond", () => {
+		const root = mkdtempSync(join(tmpdir(), "setup-protection-"));
+		const workspace = join(root, "agents");
+		try {
+			mkdirSync(workspace, { recursive: true });
+			writeFileSync(join(workspace, "AGENTS.md"), "agents");
+			setSystemTime(new Date("2026-10-05T00:00:00.000Z"));
+			const first = createWorkspaceSnapshot(workspace, join(root, "backups"));
+			const second = createWorkspaceSnapshot(workspace, join(root, "backups"));
+			expect(second.path).not.toBe(first.path);
+			expect(readFileSync(join(second.path, "AGENTS.md"), "utf8")).toBe("agents");
+		} finally {
+			setSystemTime();
 			rmSync(root, { recursive: true, force: true });
 		}
 	});

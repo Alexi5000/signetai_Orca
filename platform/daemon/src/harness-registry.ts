@@ -8,13 +8,7 @@ import { existsSync } from "node:fs";
 
 export type HarnessConnectorConstructor = new () => BaseConnector;
 export type HarnessConnectorLoader = () => Promise<HarnessConnectorConstructor>;
-export type HarnessAction = "connect" | "repair" | "reinitialize";
-
-/**
- * The daemon's canonical external-harness registry. Install, inspection, and
- * dashboard enumeration all consume this map so a registered connector is
- * visible without another dashboard-specific list.
- */
+export type HarnessAction = "connect" | "disconnect" | "repair" | "reinitialize";
 export const HARNESS_INSTALLERS = {
 	"claude-code": () => import("@signet/connector-claude-code").then((module) => module.ClaudeCodeConnector),
 	codex: () => import("@signet/connector-codex").then((module) => module.CodexConnector),
@@ -25,6 +19,7 @@ export const HARNESS_INSTALLERS = {
 	pi: () => import("@signet/connector-pi").then((module) => module.PiConnector),
 	"oh-my-pi": () => import("@signet/connector-oh-my-pi").then((module) => module.OhMyPiConnector),
 	kimi: () => import("@signet/connector-kimi").then((module) => module.KimiConnector),
+	"muse-code": () => import("@signet/connector-muse-code").then((module) => module.MuseCodeConnector),
 	forge: () => import("@signet/connector-forge").then((module) => module.ForgeConnector),
 } satisfies Readonly<Record<string, HarnessConnectorLoader>>;
 
@@ -35,6 +30,7 @@ export interface HarnessConnectorHealth {
 }
 
 export interface HarnessConnectorStatus {
+	inspectionStatus: "complete" | "unavailable";
 	id: string;
 	displayName: string;
 	kind: "harness";
@@ -53,7 +49,7 @@ export interface HarnessConnectorStatus {
 
 export type HarnessRegistry = Readonly<Record<string, HarnessConnectorLoader>>;
 
-const HEALTH_STATUSES: readonly ConnectorHealthStatus[] = ["healthy", "degraded", "unhealthy", "needs-auth"];
+const HEALTH_STATUSES: readonly ConnectorHealthStatus[] = ["healthy", "degraded", "unhealthy", "needs-auth", "unknown"];
 
 function isHealthStatus(value: unknown): value is ConnectorHealthStatus {
 	return typeof value === "string" && HEALTH_STATUSES.some((status) => status === value);
@@ -79,7 +75,11 @@ function unavailableCapabilities(): ConnectorRecoveryCapabilities {
 
 function defaultHealth(installed: boolean, detected: boolean, checkedAt: string): HarnessConnectorHealth {
 	if (installed)
-		return { status: "degraded", message: "Integration detected; runtime health has not been verified.", checkedAt };
+		return {
+			status: "unknown",
+			message: "Signet integration files are installed. This connector does not check runtime health.",
+			checkedAt,
+		};
 	if (detected) {
 		return {
 			status: "degraded",
@@ -137,6 +137,7 @@ function unavailableStatus(
 ): HarnessConnectorStatus {
 	return {
 		id,
+		inspectionStatus: "unavailable",
 		displayName: displayNameFor(id),
 		kind: "harness",
 		description: "Harness connector",
@@ -150,7 +151,7 @@ function unavailableStatus(
 		lastSeen,
 		capabilities: unavailableCapabilities(),
 		health: {
-			status: "unhealthy",
+			status: "unknown",
 			message: `Connector plugin failed to load: ${errorMessage(error, "unknown loader error")}`,
 			checkedAt,
 		},
@@ -181,9 +182,7 @@ export async function inspectRegisteredConnector(
 	let configPath: string | null = null;
 	try {
 		configPath = connector.getConfigPath();
-	} catch {
-		// A connector may not have a usable config path until it is installed.
-	}
+	} catch {}
 
 	let detected = false;
 	try {
@@ -195,17 +194,28 @@ export async function inspectRegisteredConnector(
 	let installed = false;
 	try {
 		installed = connector.isInstalled();
-	} catch {
-		installed = false;
+	} catch (error) {
+		return {
+			...unavailableStatus(id, configured, checkedAt, error, lastSeen),
+			displayName: connector.name || displayNameFor(id),
+			icon: readIconAsset(connector),
+			health: {
+				status: "unknown",
+				message: `Installation inspection failed: ${errorMessage(error, "unknown inspection error")}`,
+				checkedAt,
+			},
+		};
 	}
 
 	let health = defaultHealth(installed, detected, checkedAt);
+	let inspectionStatus: HarnessConnectorStatus["inspectionStatus"] = "complete";
 	try {
 		const inspection = await connector.inspectHealth?.();
 		if (inspection) health = normalizeHealth(inspection, installed, detected, checkedAt);
 	} catch (error) {
+		inspectionStatus = "unavailable";
 		health = {
-			status: "unhealthy",
+			status: "unknown",
 			message: `Health inspection failed: ${errorMessage(error, "unknown inspection error")}`,
 			checkedAt,
 		};
@@ -213,6 +223,7 @@ export async function inspectRegisteredConnector(
 
 	return {
 		id,
+		inspectionStatus,
 		displayName: connector.name || displayNameFor(id),
 		kind: "harness",
 		description: "Harness connector",

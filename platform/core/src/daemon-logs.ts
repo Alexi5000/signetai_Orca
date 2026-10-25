@@ -1,3 +1,4 @@
+import { resolveWorkspaceLayout } from "./workspace-layout";
 import {
 	closeSync,
 	constants,
@@ -97,7 +98,7 @@ export function openPrivateDaemonLog(
 	assertOwned(root);
 	if (!root.isDirectory() || (process.platform !== "win32" && (root.mode & 0o022) !== 0))
 		throw new Error("Daemon workspace must not be writable by other users");
-	const daemonDir = join(workspace, ".daemon");
+	const daemonDir = resolveWorkspaceLayout(workspace).runtime;
 	privateDirectory(daemonDir);
 	const logDir = join(daemonDir, "logs");
 	privateDirectory(logDir);

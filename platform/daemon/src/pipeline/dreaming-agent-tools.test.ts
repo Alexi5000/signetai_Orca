@@ -7,7 +7,8 @@ import { createDreamingAgentTools } from "./dreaming-agent-tools";
 import { runDreamingAgentPass, getDreamingToolCalls } from "./dreaming";
 import { getDbOwnerForAccessor } from "../db-owner-runtime";
 import { ownerRun, ownerReadOne } from "../db-owner-sql";
-import { DREAMING_CAPABILITY_IDS } from "./dreaming-capabilities";
+import { DREAMING_CAPABILITY_IDS, getDreamingCapabilityManifest } from "./dreaming-capabilities";
+import { MEMORY_HEAD_MAX_TOKENS } from "../memory-head";
 
 describe("dreaming-agent-tools", () => {
 	let dir = "";
@@ -106,6 +107,7 @@ describe("dreaming-agent-tools", () => {
 		const tools = createDreamingAgentTools({
 			accessor: getDbAccessor(),
 			agentId: "owner",
+			allowedAgentIds: ["owner"],
 			actor: "owner",
 			mode: "incremental-content",
 		});
@@ -113,7 +115,198 @@ describe("dreaming-agent-tools", () => {
 		expect(tools.some((tool) => tool.name === "curate_memory_head")).toBe(false);
 	});
 
-	it("publishes through a content pass and reports a rejected stale commit honestly", async () => {
+	it("puts only read-only lookups behind codemode when the flag is on", () => {
+		const base = { accessor: getDbAccessor(), agentId: "owner", allowedAgentIds: ["owner"], actor: "owner" } as const;
+		expect(createDreamingAgentTools(base).every((tool) => tool.exposure === undefined)).toBe(true);
+		const exposure = Object.fromEntries(
+			createDreamingAgentTools({ ...base, codemode: true }).map((tool) => [tool.name, tool.exposure]),
+		);
+		for (const lookup of [
+			"search_entities",
+			"get_entity",
+			"list_aspect_claims",
+			"validate_proposal",
+			"attention_list",
+		]) {
+			expect(exposure[lookup]).toBe("codemode");
+		}
+		for (const direct of ["search_evidence", "apply_ontology_ops", "runbook_write"]) {
+			expect(exposure[direct]).toBe("model-only");
+		}
+	});
+
+	it("completes a content pass whose empty head stays empty, but not one that empties a published head", async () => {
+		insertEpisodicMemory("head-evidence", "Meeting is Tuesday.");
+		const accessor = getDbAccessor();
+		const owner = await getDbOwnerForAccessor(accessor);
+		const options = { operation: "empty-head-fixture", lane: "read" as const, deadlineMs: 10000 };
+		const cfg = {
+			tokenThreshold: 100000,
+			maxInterval: 3600000,
+			maxInputTokens: 32000,
+			maxOutputTokens: 16000,
+			timeout: 30000,
+			backfillOnFirstRun: true,
+		};
+		let passId = "";
+		const runPass = (entries: readonly Record<string, unknown>[]) =>
+			runDreamingAgentPass(
+				accessor,
+				{
+					async run(input) {
+						passId = input.passId;
+						const invoke = async (name: string, args: unknown) =>
+							readResult(await findTool(input.tools, name).execute(name, args, undefined, undefined, {} as never));
+						await invoke("memory_head_read", { agentId: "owner" });
+						expect(
+							await invoke("memory_head_commit", {
+								agentId: "owner",
+								entries,
+							}),
+						).toMatchObject({ ok: true, code: "STAGED_FOR_FINALIZATION" });
+						return { summary: "Nothing durable for MEMORY.md yet." };
+					},
+				},
+				cfg,
+				dir,
+				"owner",
+				["owner"],
+				"incremental-content",
+			);
+		const status = async () =>
+			await ownerReadOne(owner, "SELECT status FROM dreaming_passes WHERE id=?", [passId], options);
+
+		await runPass([]);
+		expect(await status()).toEqual({ status: "completed" });
+
+		await runPass([
+			{
+				entryId: "meeting",
+				text: "Meeting is Tuesday.",
+				support: [{ source_ref: "memory:head-evidence", quote: "Meeting is Tuesday." }],
+			},
+		]);
+		expect(await status()).toEqual({ status: "completed" });
+
+		await expect(runPass([])).rejects.toThrow("INVALID_HEAD");
+		expect(await status()).toEqual({ status: "failed" });
+	});
+
+	it("rejects an over-budget memory head when it is staged and lets the pass resubmit a shorter one", async () => {
+		insertEpisodicMemory("head-evidence", "Meeting is Tuesday.");
+		const accessor = getDbAccessor();
+		const owner = await getDbOwnerForAccessor(accessor);
+		const options = { operation: "head-budget-fixture", lane: "read" as const, deadlineMs: 10000 };
+		const cfg = {
+			tokenThreshold: 100000,
+			maxInterval: 3600000,
+			maxInputTokens: 32000,
+			maxOutputTokens: 16000,
+			timeout: 30000,
+			backfillOnFirstRun: true,
+		};
+		const support = [{ source_ref: "memory:head-evidence", quote: "Meeting is Tuesday." }];
+		const runPass = (retry: boolean) =>
+			runDreamingAgentPass(
+				accessor,
+				{
+					async run(input) {
+						const invoke = async (name: string, args: unknown) =>
+							readResult(await findTool(input.tools, name).execute(name, args, undefined, undefined, {} as never));
+						expect(await invoke("memory_head_read", { agentId: "owner" })).toMatchObject({
+							ok: true,
+							head: { maxTokens: MEMORY_HEAD_MAX_TOKENS, committedTokens: 0 },
+						});
+						const rejected = await invoke("memory_head_commit", {
+							agentId: "owner",
+							entries: [{ entryId: "meeting", text: "Meeting is Tuesday. ".repeat(300), support }],
+						});
+						expect(rejected).toMatchObject({ ok: false, code: "INVALID_HEAD", maxTokens: MEMORY_HEAD_MAX_TOKENS });
+						expect(rejected.tokens as number).toBeGreaterThan(MEMORY_HEAD_MAX_TOKENS);
+						if (retry)
+							expect(
+								await invoke("memory_head_commit", {
+									agentId: "owner",
+									entries: [{ entryId: "meeting", text: "Meeting is Tuesday.", support }],
+								}),
+							).toMatchObject({ ok: true, code: "STAGED_FOR_FINALIZATION" });
+						return { summary: "Kept the meeting day." };
+					},
+				},
+				cfg,
+				dir,
+				"owner",
+				["owner"],
+				"incremental-content",
+			);
+
+		await expect(runPass(false)).rejects.toThrow(`memory_head_commit was rejected (INVALID_HEAD): head is`);
+		const completed = await runPass(true);
+		expect(
+			await ownerReadOne(owner, "SELECT status FROM dreaming_passes WHERE id=?", [completed.passId], options),
+		).toEqual({ status: "completed" });
+		expect(
+			await ownerReadOne(owner, "SELECT content FROM memory_md_heads WHERE agent_id='owner'", [], options),
+		).toEqual({ content: "- Meeting is Tuesday." });
+	});
+
+	it("binds the memory-head commit to the running pass instead of asking the agent for its id", async () => {
+		const manifest = getDreamingCapabilityManifest().find((capability) => capability.id === "memory_head_commit");
+		const schema = manifest?.inputSchema as { properties?: Record<string, unknown>; required?: string[] } | undefined;
+		expect(schema?.properties).toBeDefined();
+		expect(schema?.properties).not.toHaveProperty("passId");
+		expect(schema?.required ?? []).not.toContain("passId");
+
+		insertEpisodicMemory("head-evidence", "Meeting is Tuesday.");
+		const accessor = getDbAccessor();
+		const owner = await getDbOwnerForAccessor(accessor);
+		const options = { operation: "head-binding-fixture", lane: "read" as const, deadlineMs: 10000 };
+		const cfg = {
+			tokenThreshold: 100000,
+			maxInterval: 3600000,
+			maxInputTokens: 32000,
+			maxOutputTokens: 16000,
+			timeout: 30000,
+			backfillOnFirstRun: true,
+		};
+		const runPass = (commits: readonly Record<string, unknown>[]) =>
+			runDreamingAgentPass(
+				accessor,
+				{
+					async run(input) {
+						const invoke = async (name: string, args: unknown) =>
+							readResult(await findTool(input.tools, name).execute(name, args, undefined, undefined, {} as never));
+						await invoke("memory_head_read", { agentId: "owner" });
+						for (const extra of commits)
+							await invoke("memory_head_commit", {
+								agentId: "owner",
+								entries: [],
+								...extra,
+							});
+						return { summary: "Nothing durable for MEMORY.md yet." };
+					},
+				},
+				cfg,
+				dir,
+				"owner",
+				["owner"],
+				"incremental-content",
+			);
+
+		const completed = await runPass([{}]);
+		expect(
+			await ownerReadOne(owner, "SELECT status FROM dreaming_passes WHERE id=?", [completed.passId], options),
+		).toEqual({ status: "completed" });
+		const staged = (await getDreamingToolCalls(accessor, "owner", completed.passId)).find(
+			(call) => call.toolName === "memory_head_commit",
+		);
+		expect(staged?.output).toMatchObject({ ok: true, code: "STAGED_FOR_FINALIZATION" });
+
+		await expect(runPass([{}, {}])).rejects.toThrow("memory_head_commit was rejected (MULTIPLE_COMMIT_ATTEMPTS)");
+		await expect(runPass([])).rejects.toThrow("the agent ended without calling memory_head_commit");
+	});
+
+	it("does not complete a content pass without a successful memory-head commit", async () => {
 		insertEpisodicMemory("head-evidence", "Meeting is Tuesday.");
 		const accessor = getDbAccessor();
 		const owner = await getDbOwnerForAccessor(accessor);
@@ -126,40 +319,53 @@ describe("dreaming-agent-tools", () => {
 			timeout: 30000,
 			backfillOnFirstRun: true,
 		};
-		for (const corrected of [false, true]) {
-			const result = await runDreamingAgentPass(
+		let passId = "";
+		const runPass = (behavior: "commit" | "stale" | "missing" | "fail-finalization-after-head-commit") =>
+			runDreamingAgentPass(
 				accessor,
 				{
 					async run(input) {
+						passId = input.passId;
 						const invoke = async (name: string, args: unknown) =>
 							readResult(await findTool(input.tools, name).execute(name, args, undefined, undefined, {} as never));
 						const base = await invoke("memory_head_read", { agentId: "owner" });
 						const head = base.head;
 						if (typeof head !== "object" || head === null || !("revision" in head) || !("hash" in head))
 							throw new Error("Missing head revision/hash");
-						if (corrected)
+						if (behavior === "stale")
 							await ownerRun(
 								owner,
 								"UPDATE memories SET content='Meeting is Thursday.' WHERE id='head-evidence'",
 								[],
 								options,
 							);
-						const publication = await invoke("memory_head_commit", {
-							agentId: "owner",
-							passId: input.passId,
-							baseRevision: head.revision,
-							baseHash: head.hash,
-							entries: [
-								{
-									entryId: "meeting",
-									text: "Meeting is Tuesday.",
-									support: [{ source_ref: "memory:head-evidence", quote: "Meeting is Tuesday." }],
-								},
-							],
-						});
-						expect(publication).toMatchObject(
-							corrected ? { ok: false, code: "STALE_HEAD" } : { ok: true, code: "COMMITTED" },
-						);
+						if (behavior !== "missing") {
+							const publication = await invoke("memory_head_commit", {
+								agentId: "owner",
+								entries: [
+									{
+										entryId: "meeting",
+										text:
+											behavior === "fail-finalization-after-head-commit"
+												? "Tuesday is the confirmed meeting day."
+												: "Meeting is Tuesday.",
+										support: [{ source_ref: "memory:head-evidence", quote: "Meeting is Tuesday." }],
+									},
+								],
+							});
+							expect(publication).toMatchObject({ ok: true, code: "STAGED_FOR_FINALIZATION" });
+							if (behavior === "fail-finalization-after-head-commit") {
+								await ownerRun(
+									owner,
+									`CREATE TRIGGER fail_content_pass_completion
+									 BEFORE UPDATE OF status ON dreaming_passes
+									 WHEN NEW.mode='incremental-content' AND NEW.status='completed'
+									 BEGIN SELECT RAISE(ABORT, 'injected finalization failure after head commit'); END`,
+									[],
+									options,
+								);
+							}
+						}
 						return { summary: "Reviewed meeting evidence." };
 					},
 				},
@@ -169,15 +375,71 @@ describe("dreaming-agent-tools", () => {
 				["owner"],
 				"incremental-content",
 			);
-			expect(result.summary.includes("[memory-head commit missing]")).toBe(corrected);
+		const completed = await runPass("commit");
+		const completedPassId = passId;
+		expect(completed.summary).not.toContain("[memory-head commit missing]");
+		expect(
+			await ownerReadOne(owner, "SELECT status FROM dreaming_passes WHERE id=?", [completedPassId], options),
+		).toEqual({
+			status: "completed",
+		});
+		const stableWatermark = await ownerReadOne(
+			owner,
+			"SELECT last_pass_at AS lastPassAt FROM dreaming_state WHERE agent_id='owner'",
+			[],
+			options,
+		);
+		const headBeforeLateFinalizationFailure = await ownerReadOne(
+			owner,
+			"SELECT revision, content_hash AS contentHash FROM memory_md_heads WHERE agent_id='owner' AND is_current=1",
+			[],
+			options,
+		);
+		const lateFinalizationFailure = runPass("fail-finalization-after-head-commit");
+		await expect(lateFinalizationFailure).rejects.toThrow("injected finalization failure after head commit");
+		await ownerRun(owner, "DROP TRIGGER fail_content_pass_completion", [], options);
+		const failedFinalizationPassId = passId;
+		expect(
+			await ownerReadOne(owner, "SELECT status FROM dreaming_passes WHERE id=?", [failedFinalizationPassId], options),
+		).toEqual({ status: "failed" });
+		expect(
+			await ownerReadOne(
+				owner,
+				"SELECT revision, content_hash AS contentHash FROM memory_md_heads WHERE agent_id='owner' AND is_current=1",
+				[],
+				options,
+			),
+		).toEqual(headBeforeLateFinalizationFailure);
+		expect(
+			await ownerReadOne(
+				owner,
+				"SELECT last_pass_at AS lastPassAt FROM dreaming_state WHERE agent_id='owner'",
+				[],
+				options,
+			),
+		).toEqual(stableWatermark);
+		for (const behavior of ["stale", "missing"] as const) {
+			const incomplete = runPass(behavior);
+			await expect(incomplete).rejects.toThrow("memory-head commit");
+			const failedPassId = passId;
 			expect(
-				(await getDreamingToolCalls(accessor, "owner", result.passId)).find(
+				await ownerReadOne(owner, "SELECT status FROM dreaming_passes WHERE id=?", [failedPassId], options),
+			).toEqual({
+				status: "failed",
+			});
+			expect(
+				(await getDreamingToolCalls(accessor, "owner", failedPassId)).some(
 					(call) => call.toolName === "memory_head_commit",
-				)?.output,
-			).toMatchObject({ ok: !corrected });
+				),
+			).toBe(behavior === "stale");
 			expect(
-				await ownerReadOne(owner, "SELECT status FROM dreaming_passes WHERE id=?", [result.passId], options),
-			).toEqual({ status: "completed" });
+				await ownerReadOne(
+					owner,
+					"SELECT last_pass_at AS lastPassAt FROM dreaming_state WHERE agent_id='owner'",
+					[],
+					options,
+				),
+			).toEqual(stableWatermark);
 		}
 		expect(readFileSync(join(dir, "agents/owner/MEMORY.md"), "utf8")).toContain("Meeting is Tuesday.");
 		expect(
@@ -201,7 +463,7 @@ describe("dreaming-agent-tools", () => {
 				return enqueue(fn);
 			},
 		};
-		const tools = createDreamingAgentTools({ accessor, agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({ accessor, agentId: "owner", allowedAgentIds: ["owner"], actor: "owner" });
 		const result = readResult(
 			await findTool(tools, "apply_ontology_ops").execute(
 				"call",
@@ -241,7 +503,12 @@ describe("dreaming-agent-tools", () => {
 		insertEntity("e-owner", "Owner Entity", "owner entity", "owner");
 		insertEntity("e-other", "Other Entity", "other entity", "intruder");
 
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 		const search = findTool(tools, "search_entities");
 		const res = readResult(
 			await search.execute("call", { agentId: "owner", query: "entity" }, undefined, undefined, {} as never),
@@ -255,7 +522,12 @@ describe("dreaming-agent-tools", () => {
 	it("get_entity surfaces pinned status and hydrates aspects on demand", async () => {
 		insertEntity("e-atlas", "Atlas", "atlas", "owner");
 		insertActiveAttribute("e-atlas", "a-config", "Feature is enabled by default.", "owner");
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 
 		const plain = readResult(
 			await findTool(tools, "get_entity").execute(
@@ -297,7 +569,12 @@ describe("dreaming-agent-tools", () => {
 			);
 		});
 
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 		const evidence = readResult(
 			await findTool(tools, "search_evidence").execute(
 				"call",
@@ -378,10 +655,6 @@ describe("dreaming-agent-tools", () => {
 	});
 
 	it("search_evidence scan-first ignores the time watermark and lists incomplete evidence (#1430)", async () => {
-		// Regression for #1430: a time watermark is only a newness frontier.
-		// A scan-first call must instead drain every source revision whose
-		// delivered offset is incomplete, including evidence older than the
-		// watermark. An explicit historical range stays available as well.
 		getDbAccessor().withWriteTx((db) => {
 			db.prepare("INSERT INTO dreaming_state (agent_id, last_pass_at) VALUES (?, ?)").run(
 				"owner",
@@ -398,16 +671,15 @@ describe("dreaming-agent-tools", () => {
 				).run(id, content, createdAt, createdAt);
 			}
 		});
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 
 		const listed = readResult(
-			await findTool(tools, "search_evidence").execute(
-				"call",
-				{ agentId: "owner" }, // scan-first listing: omit query and since
-				undefined,
-				undefined,
-				{} as never,
-			),
+			await findTool(tools, "search_evidence").execute("call", { agentId: "owner" }, undefined, undefined, {} as never),
 		);
 		const refs = (listed.items as Array<{ sourceRef: string }>).map((item) => item.sourceRef);
 		expect(refs).toContain("memory:mem-new");
@@ -425,6 +697,154 @@ describe("dreaming-agent-tools", () => {
 		expect((explicit.items as Array<{ sourceRef: string }>).map((item) => item.sourceRef)).toEqual(
 			expect.arrayContaining(["memory:mem-old", "memory:mem-new"]),
 		);
+	});
+
+	it("search_evidence queries search history older than the time watermark", async () => {
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare("INSERT INTO dreaming_state (agent_id, last_pass_at) VALUES (?, ?)").run(
+				"owner",
+				"2026-08-06T12:00:00.000Z",
+			);
+			db.prepare(
+				`INSERT INTO memories
+				 (id, content, source_type, memory_kind, visibility, agent_id, created_at, updated_at)
+				 VALUES ('mem-old', 'Nicholai Vogel founded Biohazard VFX.', 'manual', 'episodic', 'normal', 'owner',
+				  '2026-08-06T11:00:00.000Z', '2026-08-06T11:00:00.000Z')`,
+			).run();
+		});
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
+
+		const found = readResult(
+			await findTool(tools, "search_evidence").execute(
+				"call",
+				{ agentId: "owner", query: "Nicholai Vogel" },
+				undefined,
+				undefined,
+				{} as never,
+			),
+		);
+		expect((found.items as Array<{ sourceRef: string }>).map((item) => item.sourceRef)).toEqual(["memory:mem-old"]);
+
+		const bounded = readResult(
+			await findTool(tools, "search_evidence").execute(
+				"call",
+				{ agentId: "owner", query: "Nicholai Vogel", since: "2026-08-06T11:30:00.000Z" },
+				undefined,
+				undefined,
+				{} as never,
+			),
+		);
+		expect(bounded.items).toEqual([]);
+	});
+
+	it("search_evidence matches query terms independently and ranks fuller matches first", async () => {
+		getDbAccessor().withWriteTx((db) => {
+			for (const [id, content, createdAt] of [
+				["mem-full", "Nicholai is a director. Vogel runs Biohazard VFX.", "2026-08-06T09:00:00.000Z"],
+				["mem-partial", "Vogel is mentioned here alone.", "2026-08-06T10:00:00.000Z"],
+				["mem-miss", "Unrelated note about 100% coverage_ratio.", "2026-08-06T11:00:00.000Z"],
+				["mem-cpp", "Rewrote the parser in C++ last week.", "2026-08-06T08:00:00.000Z"],
+				["mem-long", `${"filler words ".repeat(400)}Émile met Łukasz at the École.`, "2026-08-06T07:00:00.000Z"],
+				["mem-boom", "deploy failed 💥 again", "2026-08-06T06:00:00.000Z"],
+				["mem-dotted", `${"İ".repeat(1500)} needle at end`, "2026-08-06T05:00:00.000Z"],
+				["mem-ecole-upper", "École Normale", "2026-08-06T04:00:00.000Z"],
+				["mem-ecole-lower", "école primaire", "2026-08-06T03:00:00.000Z"],
+			] as const) {
+				db.prepare(
+					`INSERT INTO memories
+					 (id, content, source_type, memory_kind, visibility, agent_id, created_at, updated_at)
+					 VALUES (?, ?, 'manual', 'episodic', 'normal', 'owner', ?, ?)`,
+				).run(id, content, createdAt, createdAt);
+			}
+		});
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
+		const search = async (query: string): Promise<string[]> =>
+			(
+				readResult(
+					await findTool(tools, "search_evidence").execute(
+						"call",
+						{ agentId: "owner", query },
+						undefined,
+						undefined,
+						{} as never,
+					),
+				).items as Array<{ sourceRef: string }>
+			).map((item) => item.sourceRef);
+
+		expect(await search("who is Nicholai Vogel?")).toEqual(["memory:mem-full", "memory:mem-partial"]);
+		expect(await search("NICHOLAI")).toEqual(["memory:mem-full"]);
+		expect(await search("100% coverage_ratio")).toEqual(["memory:mem-miss"]);
+		expect(await search("rate%note")).toEqual([]);
+		expect(await search("?!")).toEqual([]);
+		expect(await search("C++")).toEqual(["memory:mem-cpp"]);
+		expect(await search("Émile ŁUKASZ")).toEqual(["memory:mem-long"]);
+		const excerpt = readResult(
+			await findTool(tools, "search_evidence").execute(
+				"call",
+				{ agentId: "owner", query: "Émile" },
+				undefined,
+				undefined,
+				{} as never,
+			),
+		).items as Array<{ content: string }>;
+		expect(excerpt[0]?.content).toContain("Émile met");
+		expect(await search("💥")).toEqual(["memory:mem-boom"]);
+		expect((await search("École école")).sort()).toEqual([
+			"memory:mem-ecole-lower",
+			"memory:mem-ecole-upper",
+			"memory:mem-long",
+		]);
+		const dotted = readResult(
+			await findTool(tools, "search_evidence").execute(
+				"call",
+				{ agentId: "owner", query: "needle" },
+				undefined,
+				undefined,
+				{} as never,
+			),
+		).items as Array<{ sourceRef: string; content: string }>;
+		expect(dotted.find((item) => item.sourceRef === "memory:mem-dotted")?.content).toContain("needle at end");
+	});
+
+	it("search_evidence treats a blank query like an omitted one", async () => {
+		getDbAccessor().withWriteTx((db) => {
+			for (const id of ["mem-open", "mem-done"])
+				db.prepare(
+					`INSERT INTO memories
+					 (id, content, source_type, memory_kind, visibility, agent_id, created_at, updated_at)
+					 VALUES (?, 'Queued evidence.', 'manual', 'episodic', 'normal', 'owner',
+					  '2026-08-06T09:00:00.000Z', '2026-08-06T09:00:00.000Z')`,
+				).run(id);
+			db.prepare(
+				`INSERT INTO dreaming_evidence_consumption
+				 (agent_id, source_kind, source_id, source_captured_at, source_entry_id, source_revision,
+				  delivered_offset, source_length, pass_id, updated_at)
+				 VALUES ('owner', 'memory', 'mem-done', '2026-08-06T09:00:00.000Z', '', '2026-08-06T09:00:00.000Z',
+				  100, 100, 'pass-1', '2026-08-06T10:00:00.000Z')`,
+			).run();
+		});
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
+		for (const input of [{ agentId: "owner" }, { agentId: "owner", query: "" }, { agentId: "owner", query: "  " }]) {
+			const listed = readResult(
+				await findTool(tools, "search_evidence").execute("call", input, undefined, undefined, {} as never),
+			);
+			expect((listed.items as Array<{ sourceRef: string }>).map((item) => item.sourceRef)).toEqual(["memory:mem-open"]);
+		}
 	});
 
 	it("search_evidence exposes completed on transcripts and settled records", async () => {
@@ -459,7 +879,6 @@ describe("dreaming-agent-tools", () => {
 				 VALUES ('run-checkpoint', 'mid-session checkpointed states', 'pi', null, 'owner',
 				  '2026-08-07T07:00:00.000Z', '2026-08-07T07:10:00.000Z')`,
 			).run();
-			// Session ended: summary job triggered and pending.
 			db.prepare(
 				`INSERT INTO summary_jobs
 				 (id, session_key, session_id, harness, project, agent_id, transcript,
@@ -469,7 +888,6 @@ describe("dreaming-agent-tools", () => {
 				  '2026-08-07T05:20:00.000Z', '2026-08-07T05:20:00.000Z', 'pending',
 				  '2026-08-07T05:20:00.000Z')`,
 			).run();
-			// Session ended but the summary failed/timed out: still settled.
 			db.prepare(
 				`INSERT INTO summary_jobs
 				 (id, session_key, session_id, harness, project, agent_id, transcript,
@@ -479,7 +897,6 @@ describe("dreaming-agent-tools", () => {
 				  '2026-08-07T04:30:00.000Z', null, 'failed',
 				  '2026-08-07T04:30:00.000Z')`,
 			).run();
-			// Mid-session checkpoint extract: not a session-end signal.
 			db.prepare(
 				`INSERT INTO summary_jobs
 				 (id, session_key, session_id, harness, project, agent_id, transcript,
@@ -492,7 +909,12 @@ describe("dreaming-agent-tools", () => {
 		});
 		insertEpisodicMemory("mem-settled", "settled memory capture");
 
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 		const res = readResult(
 			await findTool(tools, "search_evidence").execute(
 				"call",
@@ -505,18 +927,11 @@ describe("dreaming-agent-tools", () => {
 		expect(res.ok).toBe(true);
 		const items = res.items as Array<{ sourceRef: string; completed: boolean }>;
 		const byRef = new Map(items.map((item) => [item.sourceRef, item]));
-		// A session-end job was triggered: settled, even while pending.
 		expect(byRef.get("transcript:run-done")?.completed).toBe(true);
-		// A still-running transcript is not delivered at all.
 		expect(byRef.has("transcript:run-live")).toBe(false);
-		// A failed/timed-out summary job still proves the session ended.
 		expect(byRef.get("transcript:run-failed-summary")?.completed).toBe(true);
-		// A mid-session checkpoint transcript is not delivered either.
 		expect(byRef.has("transcript:run-checkpoint")).toBe(false);
-		// Memories are settled captures by construction.
 		expect(byRef.get("memory:mem-settled")?.completed).toBe(true);
-
-		// The fragment paging path carries the same flag.
 		const fragment = readResult(
 			await findTool(tools, "search_evidence").execute(
 				"call",
@@ -530,44 +945,16 @@ describe("dreaming-agent-tools", () => {
 		expect(fragment.error).toContain("still in progress");
 	});
 
-	it("get_evidence resolves claim provenance and link provenance through one tool", async () => {
-		insertEntity("e-atlas", "Atlas", "atlas", "owner");
-		insertActiveAttribute("e-atlas", "a-config", "Feature is enabled by default.", "owner");
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
-
-		const claim = readResult(
-			await findTool(tools, "get_evidence").execute(
-				"call",
-				{
-					agentId: "owner",
-					ref: { type: "claim", entity: "Atlas", aspect: "configuration", group: "configuration", claim: "default" },
-				},
-				undefined,
-				undefined,
-				{} as never,
-			),
-		);
-		expect(claim.ok).toBe(true);
-
-		const link = readResult(
-			await findTool(tools, "get_evidence").execute(
-				"call",
-				{ agentId: "owner", ref: { type: "link", id: "missing-link" } },
-				undefined,
-				undefined,
-				{} as never,
-			),
-		);
-		// A missing link surfaces as a clean tool error, not a crash.
-		expect(link.ok).toBe(false);
-		expect(typeof link.error).toBe("string");
-	});
-
 	it("validate_proposal runs the label gate, duplicate check, and contradiction guard", async () => {
 		insertEntity("e-atlas", "Atlas", "atlas", "owner");
 		insertEntity("e-atlas-dup", "Atlas App", "atlas", "owner");
 		insertActiveAttribute("e-atlas", "a-config", "Feature is enabled by default.", "owner");
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 
 		const res = readResult(
 			await findTool(tools, "validate_proposal").execute(
@@ -593,7 +980,12 @@ describe("dreaming-agent-tools", () => {
 
 	it("attention_list returns pending and resolved hygiene records", async () => {
 		insertEntity("e-husk", "Legacy Husk", "legacy husk", "owner");
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 		await findTool(tools, "apply_ontology_ops").execute(
 			"call",
 			{
@@ -633,7 +1025,12 @@ describe("dreaming-agent-tools", () => {
 		insertEpisodicMemory("mem-approaching", "Trip is planned for tomorrow.", "owner", approachingAt);
 		insertEpisodicMemory("mem-intruder", "Other agent's expired plan.", "intruder", expiredAt);
 		insertActiveAttribute("e-trip", "a-trip", "Trip was planned for yesterday.", "owner", "plans", "mem-expired");
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 
 		const result = readResult(
 			await findTool(tools, "attention_list").execute(
@@ -660,6 +1057,7 @@ describe("dreaming-agent-tools", () => {
 		const tools = createDreamingAgentTools({
 			accessor: getDbAccessor(),
 			agentId: "owner",
+			allowedAgentIds: ["owner"],
 			actor: "owner",
 			passId: "pass-1",
 		});
@@ -687,11 +1085,10 @@ describe("dreaming-agent-tools", () => {
 		const mintedItems = minted.items as Array<{ result?: { attentionId?: string } }>;
 		const attentionId = mintedItems[0]?.result?.attentionId;
 		if (attentionId === undefined) throw new Error("flag op did not surface an attention id");
-
-		// Declining from another scope fails closed: the record is untouched.
 		const otherScope = createDreamingAgentTools({
 			accessor: getDbAccessor(),
 			agentId: "intruder",
+			allowedAgentIds: ["intruder"],
 			actor: "intruder",
 			passId: "pass-1",
 		});
@@ -722,8 +1119,6 @@ describe("dreaming-agent-tools", () => {
 			),
 		);
 		expect(stillPending.items as Array<unknown>).toHaveLength(1);
-
-		// The owning scope declines it once: resolved.
 		const declined = readResult(
 			await findTool(tools, "apply_ontology_ops").execute(
 				"call",
@@ -738,8 +1133,6 @@ describe("dreaming-agent-tools", () => {
 		);
 		expect(declined.ok).toBe(true);
 		expect((declined.items as Array<{ ok: boolean }>)[0]?.ok).toBe(true);
-
-		// A flag is one-use: a second decline of the same record is rejected.
 		const twice = readResult(
 			await findTool(tools, "apply_ontology_ops").execute(
 				"call",
@@ -776,6 +1169,7 @@ describe("dreaming-agent-tools", () => {
 		const tools = createDreamingAgentTools({
 			accessor: getDbAccessor(),
 			agentId: "owner",
+			allowedAgentIds: ["owner"],
 			actor: "owner",
 			passId: "pass-1",
 		});
@@ -809,7 +1203,12 @@ describe("dreaming-agent-tools", () => {
 
 	it("rejects a content write whose quote is not an exact substring of a stored source", async () => {
 		insertEpisodicMemory("mem-1", "Acme switched its deployment target to edge runtime in Q2.");
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 		const apply = readResult(
 			await findTool(tools, "apply_ontology_ops").execute(
 				"call",
@@ -845,6 +1244,7 @@ describe("dreaming-agent-tools", () => {
 		const tools = createDreamingAgentTools({
 			accessor: getDbAccessor(),
 			agentId: "owner",
+			allowedAgentIds: ["owner"],
 			actor: "owner",
 			onToolCall(trace) {
 				traces.push(trace);
@@ -865,7 +1265,12 @@ describe("dreaming-agent-tools", () => {
 	it("get_entity returns null result for an entity owned by another agent", async () => {
 		insertEntity("e-other", "Other Entity", "other entity", "intruder");
 
-		const tools = createDreamingAgentTools({ accessor: getDbAccessor(), agentId: "owner", actor: "owner" });
+		const tools = createDreamingAgentTools({
+			accessor: getDbAccessor(),
+			agentId: "owner",
+			allowedAgentIds: ["owner"],
+			actor: "owner",
+		});
 		const getEntity = findTool(tools, "get_entity");
 		const res = readResult(
 			await getEntity.execute("call", { agentId: "owner", entityId: "e-other" }, undefined, undefined, {} as never),

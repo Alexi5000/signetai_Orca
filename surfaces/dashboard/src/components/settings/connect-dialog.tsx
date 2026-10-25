@@ -1,14 +1,12 @@
-/**
- * Connect-provider dialog — OAuth sign-in (popup + SSE state machine) or
- * API-key paste. Visual language follows the settings modal (mcard/ctrl);
- * flows ported from the old Svelte ConnectProviderDialog.
- */
+import { ModalHeading } from "@/components/ui/modal-heading";
+import { Input } from "@/components/ui/field";
+import { Button } from "@/components/ui/button";
 import { useConnectController } from "@/components/settings/connect-controller";
 import { api } from "@/lib/api";
 import { getDesktopBridge } from "@/lib/desktop";
 import { apiKeyFormat, providerKeySecretName } from "@/lib/inference-keys";
 import { createOAuthNavigation, safeOAuthHref, type OAuthNavigation } from "@/lib/oauth-navigation";
-import { CheckCircle, Eye, EyeOff, KeyRound, Loader2, TriangleAlert, X } from "@/components/mingcute-icons";
+import { CheckCircle, Eye, EyeOff, KeyRound, Loader2, TriangleAlert } from "@/components/mingcute-icons";
 import { useEffect, useRef, useState } from "react";
 
 export interface ConnectableProvider {
@@ -40,17 +38,11 @@ export function ConnectProviderDialog({
 	provider: ConnectableProvider;
 	modelCount: number;
 	onClose: () => void;
-	/** Persist config + refresh catalog after any wiring change. */
 	onSaved: () => void | Promise<void>;
-	/** Write the subscription_session account entry into agent config. */
 	linkOAuthAccount: () => void;
-	/** Write the api account entry (kind + providerFamily + credentialRef). */
 	linkApiKeyAccount: (secretName: string) => void;
-	/** Remove the account entry entirely (disconnect path). */
 	unlinkAccount: () => void;
 }) {
-	// Desktop uses the context-isolated external-navigation bridge. Browser
-	// sessions keep the synchronous popup fallback for popup blockers.
 	const [oauthOpenError, setOAuthOpenError] = useState<string | null>(null);
 	const oauthNavigationRef = useRef<OAuthNavigation | null>(null);
 	const oauthNavigation =
@@ -77,9 +69,6 @@ export function ConnectProviderDialog({
 		},
 	});
 	const { phase } = controller;
-
-	// Auto-enter the only available path. OAuth is NEVER auto-started — the
-	// navigation must begin inside a real click gesture.
 	const [autoEntered, setAutoEntered] = useState(false);
 	useEffect(() => {
 		if (autoEntered || provider.connected) return;
@@ -88,12 +77,18 @@ export function ConnectProviderDialog({
 			setAutoEntered(true);
 		}
 	}, [autoEntered, provider, controller]);
-
-	// Close the popup once OAuth resolves (any non-running phase).
 	useEffect(() => {
 		if (phase.kind !== "oauth-running") oauthNavigation.close();
 	}, [phase.kind, oauthNavigation]);
 	useEffect(() => () => oauthNavigation.dispose(), [oauthNavigation]);
+
+	const keySaveController = useRef<AbortController | null>(null);
+	useEffect(() => () => keySaveController.current?.abort(), []);
+
+	const closeDialog = () => {
+		keySaveController.current?.abort();
+		onClose();
+	};
 
 	const [promptInput, setPromptInput] = useState("");
 	const [disconnecting, setDisconnecting] = useState(false);
@@ -108,14 +103,26 @@ export function ConnectProviderDialog({
 		controller.startOAuth();
 	};
 
-	const handleSaveKey = async () => {
-		if (phase.kind !== "key-entry") return;
+	const handleSaveKey = async (authorizeKeyring = false) => {
+		if (phase.kind !== "key-entry" && phase.kind !== "keyring-authorization") return;
 		const value = phase.key.trim();
 		if (!value) return;
+		if (keySaveController.current) return;
+		const request = new AbortController();
+		keySaveController.current = request;
 		controller.beginSaving();
 		const name = providerKeySecretName(provider.id);
-		const stored = await api.putSecret(name, value);
+		const stored = await api.putSecret(name, value, request.signal, authorizeKeyring);
+		keySaveController.current = null;
+		if (request.signal.aborted) return;
 		if (!stored.ok) {
+			if (stored.authorizationRequired) {
+				controller.requestKeyringAuthorization(
+					value,
+					stored.error ?? "Authorize macOS Keychain access to save your key.",
+				);
+				return;
+			}
 			controller.finishSaved(false, stored.error ?? "Could not save the key to the encrypted vault.");
 			return;
 		}
@@ -130,9 +137,6 @@ export function ConnectProviderDialog({
 
 	const handleDisconnect = async () => {
 		setDisconnecting(true);
-		// daemon-side first: clear OAuth creds + delete any stored API key,
-		// then remove the account entry and persist — order matters, or
-		// agent.yaml keeps a credentialRef pointing at a deleted secret.
 		await api.deleteSecret(providerKeySecretName(provider.id));
 		await controller.disconnect();
 		unlinkAccount();
@@ -151,72 +155,72 @@ export function ConnectProviderDialog({
 
 	return (
 		<div
-			className="cp-backdrop"
+			className="cs-backdrop"
 			role="presentation"
 			onClick={(e) => {
-				if (e.target === e.currentTarget) onClose();
+				if (e.target === e.currentTarget) closeDialog();
 			}}
 			onKeyDown={(e) => {
-				if (e.key === "Escape") onClose();
+				if (e.key === "Escape") closeDialog();
 			}}
 		>
-			<div className="cp-panel" role="dialog" aria-modal="true" aria-label={`Connect ${provider.name}`}>
-				<header className="cp-header">
-					<span className="cp-header-icon">
-						{phase.kind === "key-entry" || phase.kind === "saving" ? (
+			<div
+				className="cs-panel"
+				style={{ width: 420 }}
+				role="dialog"
+				aria-modal="true"
+				aria-label={`Connect ${provider.name}`}
+			>
+				<ModalHeading
+					title={provider.name}
+					description={
+						<>
+							{provider.connected ? "Connected" : provider.isOAuth ? "OAuth sign-in" : "API key"}
+							{modelCount > 0 ? ` · ${modelCount} models` : ""}
+						</>
+					}
+					icon={
+						phase.kind === "key-entry" || phase.kind === "keyring-authorization" || phase.kind === "saving" ? (
 							<KeyRound className="size-4" />
 						) : (
 							<CheckCircle className="size-4" />
-						)}
-					</span>
-					<div className="min-w-0 flex-1">
-						<div className="cp-title">{provider.name}</div>
-						<div className="cp-sub">
-							{provider.connected ? "Connected" : provider.isOAuth ? "OAuth sign-in" : "API key"}
-							{modelCount > 0 ? ` · ${modelCount} models` : ""}
-						</div>
-					</div>
-					<button type="button" className="gr-close" aria-label="Close" onClick={onClose}>
-						<X className="size-3.5" />
-					</button>
-				</header>
+						)
+					}
+					onClose={closeDialog}
+				/>
 
-				<div className="cp-body">
-					{/* connected state — status + disconnect */}
+				<div className="cs-body">
 					{provider.connected && phase.kind === "method" && (
 						<>
 							<div className="cp-status-line">
 								<span className="cp-dot cp-dot--on" />
 								Sign-in saved. Test the memory connection to verify it works.
 							</div>
-							<button
+							<Button
+								variant="destructive"
+								size="compact"
 								type="button"
-								className="cp-btn cp-btn--danger"
 								disabled={disconnecting}
 								onClick={handleDisconnect}
 							>
 								{disconnecting ? "Disconnecting…" : "Disconnect"}
-							</button>
+							</Button>
 						</>
 					)}
-
-					{/* method choice */}
 					{!provider.connected && phase.kind === "method" && (
 						<div className="flex flex-col gap-2">
 							{provider.supportsOAuth && (
-								<button type="button" className="cp-btn cp-btn--primary" onClick={handleSignIn}>
+								<Button variant="default" size="compact" type="button" onClick={handleSignIn}>
 									Sign in with {provider.name}
-								</button>
+								</Button>
 							)}
 							{provider.supportsApiKey && (
-								<button type="button" className="cp-btn" onClick={controller.enterKeyMode}>
+								<Button variant="outline" size="compact" type="button" onClick={() => controller.enterKeyMode()}>
 									Paste an API key
-								</button>
+								</Button>
 							)}
 						</div>
 					)}
-
-					{/* OAuth running */}
 					{phase.kind === "oauth-running" && (
 						<div className="flex flex-col gap-2.5">
 							<div className="cp-status-line">
@@ -247,9 +251,9 @@ export function ConnectProviderDialog({
 										{phase.prompt.message}
 									</label>
 									<div className="flex gap-1.5">
-										<input
+										<Input
 											id="cp-prompt"
-											className="ctrl ctrl--field flex-1"
+											className="flex-1"
 											placeholder={phase.prompt.placeholder ?? ""}
 											value={promptInput}
 											onChange={(e) => setPromptInput(e.target.value)}
@@ -257,9 +261,9 @@ export function ConnectProviderDialog({
 												if (e.key === "Enter") submitPrompt();
 											}}
 										/>
-										<button type="button" className="cp-btn cp-btn--primary" onClick={submitPrompt}>
+										<Button variant="default" size="compact" type="button" onClick={submitPrompt}>
 											Send
-										</button>
+										</Button>
 									</div>
 								</div>
 							)}
@@ -267,32 +271,31 @@ export function ConnectProviderDialog({
 								<div className="flex flex-col gap-1.5">
 									<span className="cp-label">{phase.prompt.message}</span>
 									{phase.prompt.options?.map((opt) => (
-										<button
+										<Button
+											variant="outline"
+											size="compact"
 											key={opt.id}
 											type="button"
-											className="cp-btn"
 											onClick={() => void controller.answerPrompt(opt.id)}
 										>
 											{opt.label}
-										</button>
+										</Button>
 									))}
 								</div>
 							)}
-							<button type="button" className="cp-btn" onClick={controller.cancelOAuth}>
+							<Button variant="outline" size="compact" type="button" onClick={controller.cancelOAuth}>
 								Cancel
-							</button>
+							</Button>
 						</div>
 					)}
-
-					{/* API-key entry */}
 					{phase.kind === "key-entry" && (
 						<div className="flex flex-col gap-2">
 							<label className="cp-label" htmlFor="cp-key">
 								API key {format ? <span className="text-muted-foreground">({format.hint})</span> : null}
 							</label>
 							<div className="flex gap-1.5">
-								<div className="ctrl ctrl--field flex-1">
-									<input
+								<div className="ui-search-field flex-1">
+									<Input
 										id="cp-key"
 										type={phase.reveal ? "text" : "password"}
 										placeholder="Paste the key…"
@@ -304,23 +307,25 @@ export function ConnectProviderDialog({
 											if (e.key === "Enter") void handleSaveKey();
 										}}
 									/>
-									<button
+									<Button
+										variant="ghost"
+										size="icon-sm"
 										type="button"
-										className="cp-eye"
 										aria-label={phase.reveal ? "Hide key" : "Show key"}
 										onClick={controller.toggleReveal}
 									>
 										{phase.reveal ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-									</button>
+									</Button>
 								</div>
-								<button
+								<Button
+									variant="default"
+									size="compact"
 									type="button"
-									className="cp-btn cp-btn--primary"
 									disabled={!phase.key.trim()}
 									onClick={() => void handleSaveKey()}
 								>
 									Connect
-								</button>
+								</Button>
 							</div>
 							{phase.validation === "unsure" && phase.key.trim() && (
 								<div className="cp-hint">
@@ -329,6 +334,24 @@ export function ConnectProviderDialog({
 								</div>
 							)}
 							<div className="cp-hint">Stored encrypted in the Signet vault. The value is never shown again.</div>
+						</div>
+					)}
+
+					{phase.kind === "keyring-authorization" && (
+						<div className="flex flex-col gap-2">
+							<div className="cp-error">
+								<TriangleAlert className="size-3.5 shrink-0" /> {phase.message}
+							</div>
+							<p className="cp-hint">
+								The next prompt is from macOS. Enter your login Keychain password and choose Always Allow so Signet can
+								use this provider in the background. One-time access cannot enable background requests.
+							</p>
+							<Button type="button" onClick={() => void handleSaveKey(true)}>
+								Authorize and save key
+							</Button>
+							<Button type="button" variant="outline" onClick={() => controller.enterKeyMode(phase.key)}>
+								Cancel
+							</Button>
 						</div>
 					)}
 
@@ -349,9 +372,9 @@ export function ConnectProviderDialog({
 							<div className="cp-error">
 								<TriangleAlert className="size-3.5 shrink-0" /> {phase.message}
 							</div>
-							<button type="button" className="cp-btn" onClick={controller.reset}>
+							<Button variant="outline" size="compact" type="button" onClick={controller.reset}>
 								Try again
-							</button>
+							</Button>
 						</div>
 					)}
 				</div>

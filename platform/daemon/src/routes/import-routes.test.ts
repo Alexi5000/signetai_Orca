@@ -8,6 +8,7 @@ import { closeDbAccessor, getDbAccessor, initDbAccessor } from "../db-accessor";
 import { IMPORT_MAX_BATCH_BYTES } from "../import-normalizer";
 import { purgeSourceArtifactStructureInTx } from "../source-artifact-graph";
 import { registerImportRoutes } from "./import-routes";
+import { ImportAdmissionConflictError, type DurableImportAdmission } from "../import-inbox";
 
 function formWithFile(file: File, duplicateMode = "skip"): FormData {
 	const form = new FormData();
@@ -21,19 +22,19 @@ describe("import routes", () => {
 	let previousPath: string | undefined;
 	let previousAgentId: string | undefined;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		dir = mkdtempSync(join(tmpdir(), "signet-import-routes-"));
 		mkdirSync(join(dir, "memory"), { recursive: true });
 		previousPath = process.env.SIGNET_PATH;
 		previousAgentId = process.env.SIGNET_AGENT_ID;
 		process.env.SIGNET_PATH = dir;
 		process.env.SIGNET_AGENT_ID = "import-test-agent";
-		closeDbAccessor();
+		await closeDbAccessor();
 		initDbAccessor(join(dir, "memory", "memories.db"));
 	});
 
-	afterEach(() => {
-		closeDbAccessor();
+	afterEach(async () => {
+		await closeDbAccessor();
 		if (previousPath === undefined) Reflect.deleteProperty(process.env, "SIGNET_PATH");
 		else process.env.SIGNET_PATH = previousPath;
 		if (previousAgentId === undefined) Reflect.deleteProperty(process.env, "SIGNET_AGENT_ID");
@@ -43,9 +44,78 @@ describe("import routes", () => {
 
 	function app(): Hono {
 		const instance = new Hono();
-		registerImportRoutes(instance);
+		registerImportRoutes(instance, {
+			durableImportAdmission: {
+				admit: async ({ fileName, bytes }) => ({
+					key: `test:${fileName}:${bytes.byteLength}`,
+					originalPath: join(dir, "retained", fileName),
+					sha256: "test",
+					size: bytes.byteLength,
+				}),
+				begin: async () => {},
+				complete: async () => {},
+			},
+		});
 		return instance;
 	}
+
+	it("admits multipart bytes before document normalization", async () => {
+		const seen: Uint8Array[] = [];
+		const admission: DurableImportAdmission = {
+			admit: async ({ bytes, fileName }) => {
+				seen.push(bytes);
+				return { key: `k:${fileName}`, originalPath: `/durable/${fileName}`, sha256: "hash", size: bytes.byteLength };
+			},
+			begin: async () => {},
+			complete: async () => {},
+		};
+		const instance = new Hono();
+		registerImportRoutes(instance, { durableImportAdmission: admission });
+		const response = await instance.request("/api/sources/import", {
+			method: "POST",
+			body: formWithFile(new File(["hello"], "note.txt", { type: "text/plain" })),
+		});
+		expect(response.status).toBe(201);
+		expect(new TextDecoder().decode(seen[0])).toBe("hello");
+	});
+
+	it("threads a bounded idempotency key with a deterministic per-file suffix", async () => {
+		const seen: string[] = [];
+		const admission: DurableImportAdmission = {
+			admit: async ({ fileName, idempotencyKey }) => {
+				seen.push(`${fileName}:${idempotencyKey}`);
+				return { key: `k:${fileName}`, originalPath: `/durable/${fileName}`, sha256: "hash", size: 1 };
+			},
+			begin: async () => {},
+			complete: async () => {},
+		};
+		const instance = new Hono();
+		registerImportRoutes(instance, { durableImportAdmission: admission });
+		const form = new FormData();
+		form.append("files", new File(["a"], "a.txt"));
+		form.append("files", new File(["b"], "b.txt"));
+		const response = await instance.request("/api/sources/import", {
+			method: "POST",
+			headers: { "Idempotency-Key": "batch-key" },
+			body: form,
+		});
+		expect(response.status).toBe(201);
+		expect(seen).toEqual(["a.txt:batch-key:a.txt", "b.txt:batch-key:b.txt"]);
+	});
+
+	it("routes JSONL uploads to the transcript importer instead of generic import", async () => {
+		const response = await app().request("/api/sources/import", {
+			method: "POST",
+			body: formWithFile(
+				new File(['{"session_id":"s","messages":[]}\\n'], "conversation.jsonl", { type: "application/x-ndjson" }),
+			),
+		});
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			error: "Transcript JSONL must be uploaded through /api/sources/imports",
+		});
+	});
 
 	it("imports a JSON file and records durable source metadata", async () => {
 		const response = await app().request("/api/sources/import", {
@@ -62,19 +132,13 @@ describe("import routes", () => {
 			files: Array<{
 				status: string;
 				sourceId?: string;
-				extraction?: { documentEntityId: string | null; aspectsCreated: number; attributesCreated: number };
+				extraction?: { documentEntityId: string | null };
 			}>;
 		};
 		expect(body.imported).toBe(1);
 		expect(body.failed).toBe(0);
 		expect(body.files[0]?.status).toBe("imported");
-		expect(body.files[0]?.extraction).toEqual({
-			documentEntityId: expect.any(String),
-			aspectsCreated: expect.any(Number),
-			attributesCreated: expect.any(Number),
-		});
-		expect(body.files[0]?.extraction?.aspectsCreated).toBeGreaterThan(0);
-		expect(body.files[0]?.extraction?.attributesCreated).toBeGreaterThan(0);
+		expect(body.files[0]?.extraction).toEqual({ documentEntityId: expect.any(String) });
 		expect(loadSourcesConfig(dir).sources[0]?.kind).toBe("import");
 		expect(loadSourcesConfig(dir).sources[0]?.providerSettings?.format).toBe("json");
 		const artifacts = getDbAccessor().withReadDb(
@@ -167,15 +231,30 @@ describe("import routes", () => {
 					fileName: "contacts.csv",
 					status: "duplicate",
 					sourceId: expect.any(String),
-					extraction: {
-						documentEntityId: expect.any(String),
-						aspectsCreated: expect.any(Number),
-						attributesCreated: expect.any(Number),
-					},
+					extraction: { documentEntityId: expect.any(String) },
 				},
 			],
 		});
 		expect(loadSourcesConfig(dir).sources).toHaveLength(1);
+	});
+
+	it("reserves a reimport source identity before source writes", async () => {
+		const content = "name,email\nAda,ada@example.com\n";
+		const first = await app().request("/api/sources/import", {
+			method: "POST",
+			body: formWithFile(new File([content], "contacts.csv", { type: "text/csv" })),
+		});
+		expect(first.status).toBe(201);
+		const reimported = await app().request("/api/sources/import", {
+			method: "POST",
+			body: formWithFile(new File([content], "contacts.csv", { type: "text/csv" }), "reimport"),
+		});
+		expect(reimported.status).toBe(201);
+		const body = (await reimported.json()) as {
+			files: Array<{ status: string; sourceId: string; duplicate: boolean }>;
+		};
+		expect(body.files[0]).toMatchObject({ status: "imported", duplicate: true, sourceId: expect.any(String) });
+		expect(loadSourcesConfig(dir).sources).toHaveLength(2);
 	});
 
 	it("retries a default-skip duplicate after a crash leaves its artifact without a completion marker across restart", async () => {
@@ -221,7 +300,7 @@ describe("import routes", () => {
 				}),
 			})}\n`,
 		);
-		closeDbAccessor();
+		await closeDbAccessor();
 		initDbAccessor(join(dir, "memory", "memories.db"));
 
 		const retry = await app().request("/api/sources/import", {
@@ -355,12 +434,43 @@ describe("import routes", () => {
 	});
 
 	it("does not convert generation-guarded cleanup failure into replacement success", () => {
-		const source = readFileSync(new URL("./import-routes.ts", import.meta.url), "utf8");
+		const source = readFileSync(new URL("../document-import-service.ts", import.meta.url), "utf8");
 		const cleanupFailure = source.indexOf("const removed = removeSourceIfGeneration(replacedSource.id");
-		const successAccounting = source.indexOf("imported += 1", cleanupFailure);
+		const successResult = source.indexOf('status: "imported"', cleanupFailure);
 		expect(cleanupFailure).toBeGreaterThanOrEqual(0);
-		expect(source.slice(cleanupFailure, successAccounting)).toContain("throw new Error");
-		expect(source.slice(cleanupFailure, successAccounting)).not.toContain("logger.warn");
+		expect(successResult).toBeGreaterThan(cleanupFailure);
+		expect(source.slice(cleanupFailure, successResult)).toContain("throw new Error");
+		expect(source.slice(cleanupFailure, successResult)).not.toContain("logger.warn");
+	});
+
+	it("maps an explicit idempotency conflict to 409 without beginning publication", async () => {
+		let began = false;
+		let completed = false;
+		const instance = new Hono();
+		registerImportRoutes(instance, {
+			durableImportAdmission: {
+				admit: async ({ idempotencyKey }) => {
+					throw new ImportAdmissionConflictError(idempotencyKey ?? "missing");
+				},
+				begin: async () => {
+					began = true;
+				},
+				complete: async () => {
+					completed = true;
+				},
+			},
+		});
+		const form = formWithFile(new File(["different"], "note.txt"));
+		const response = await instance.request("/api/sources/import", {
+			method: "POST",
+			headers: { "Idempotency-Key": "same-key" },
+			body: form,
+		});
+
+		expect(response.status).toBe(409);
+		expect(await response.json()).toEqual({ error: "Import admission key conflicts with different content" });
+		expect(began).toBe(false);
+		expect(completed).toBe(false);
 	});
 
 	it("rejects a batch that exceeds the file-count boundary", async () => {

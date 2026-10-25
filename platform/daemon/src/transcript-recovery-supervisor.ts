@@ -9,11 +9,15 @@ async function main(): Promise<void> {
 
 	const child = spawn(process.execPath, [childPath], {
 		env: process.env,
-		stdio: ["ignore", "pipe", "pipe"],
+		stdio: ["pipe", "pipe", "pipe"],
 		detached: process.platform !== "win32",
 	});
 	child.stdout?.pipe(process.stdout);
 	child.stderr?.pipe(process.stderr);
+	if (child.stdin) {
+		child.stdin.on("error", () => {});
+		process.stdin.pipe(child.stdin);
+	}
 	if (child.pid !== undefined) process.stdout.write(`${JSON.stringify({ type: "started", pid: child.pid })}\n`);
 
 	let killTimer: ReturnType<typeof setTimeout> | undefined;
@@ -26,24 +30,18 @@ async function main(): Promise<void> {
 		} catch {
 			try {
 				child.kill("SIGKILL");
-			} catch {
-				// The target may have exited between the check and escalation.
-			}
+			} catch {}
 		}
 	};
 	const forward = (signal: NodeJS.Signals): void => {
 		if (process.platform !== "win32" && child.pid !== undefined) {
 			try {
 				process.kill(-child.pid, signal);
-			} catch {
-				// The target may have exited between the check and signal.
-			}
+			} catch {}
 		}
 		try {
 			child.kill(signal);
-		} catch {
-			// The target may have exited between the check and signal.
-		}
+		} catch {}
 		if (killTimer === undefined && (signal === "SIGTERM" || signal === "SIGINT")) {
 			killTimer = setTimeout(killTarget, TRANSCRIPT_RECOVERY_CHILD_GRACE_MS);
 		}
@@ -54,7 +52,6 @@ async function main(): Promise<void> {
 		process.exit(0);
 	};
 	parentWatch = setInterval(() => {
-		// SIGKILL bypasses daemon cleanup; the supervisor owns the detached child group.
 		if (process.ppid !== parentPid) closeAndExit();
 	}, 50);
 	parentWatch.unref();

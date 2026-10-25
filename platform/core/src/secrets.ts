@@ -1,10 +1,3 @@
-/**
- * Shared secrets storage and execution primitives.
- *
- * This module is intentionally daemon-independent so the CLI can use the same
- * encrypted store when no daemon is running.
- */
-
 import { randomBytes, randomUUID } from "node:crypto";
 import {
 	chmodSync,
@@ -17,6 +10,7 @@ import {
 	readdirSync,
 	renameSync,
 	rmdirSync,
+	rmSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
@@ -25,10 +19,12 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { execSyncHidden, spawnHidden } from "./child-process";
 import { resolveDefaultBasePath } from "./constants.js";
+import { decodeSecretMasterKey } from "./secrets-key.js";
 import {
 	getSecretKeyring,
 	setSecretKeyringForTests,
 	type SecretKeyringAdapter,
+	type SecretKeyringAccessOptions,
 	type SecretKeyringResult,
 	type SecretKeyringState,
 } from "./secrets-keyring.js";
@@ -41,10 +37,6 @@ export function setSecretEventRecorder(recorder: SecretEventRecorder | null): vo
 function recordSecretEvent(event: string, data: Record<string, unknown>): void {
 	secretEventRecorder(event, data);
 }
-
-// ---------------------------------------------------------------------------
-// Storage layout
-// ---------------------------------------------------------------------------
 
 function getAgentsDir(): string {
 	return resolveDefaultBasePath();
@@ -62,12 +54,8 @@ function getMachineIdFile(): string {
 	return join(getSecretsDir(), ".machine-id");
 }
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 interface SecretEntry {
-	ciphertext: string; // base64-encoded nonce+ciphertext
+	ciphertext: string;
 	created: string;
 	updated: string;
 }
@@ -142,10 +130,6 @@ export interface SecretProviderV1 {
 	health(ctx: SecretContextV1): Promise<SecretProviderHealthV1>;
 }
 
-// ---------------------------------------------------------------------------
-// Key derivation
-// ---------------------------------------------------------------------------
-
 type MachineIdResolver = () => string | undefined;
 type MachineIdSource = "persisted" | "resolved" | "fallback";
 
@@ -153,24 +137,17 @@ interface MachineIdSelection {
 	readonly id: string;
 	readonly source: MachineIdSource;
 }
-
-/** Read a machine-specific identifier to bind the key to this host. */
 function resolveMachineId(): string | undefined {
 	const isWindows = process.platform === "win32";
 
 	if (!isWindows) {
-		// Linux: /etc/machine-id
 		const candidates = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
 		for (const p of candidates) {
 			try {
 				const id = readFileSync(p, "utf-8").trim();
 				if (id) return id;
-			} catch {
-				// try next
-			}
+			} catch {}
 		}
-
-		// macOS fallback
 		try {
 			const out = execSyncHidden("ioreg -rd1 -c IOPlatformExpertDevice | grep IOPlatformUUID | awk '{print $3}'", {
 				timeout: 2000,
@@ -179,11 +156,8 @@ function resolveMachineId(): string | undefined {
 				.trim()
 				.replace(/"/g, "");
 			if (out) return out;
-		} catch {
-			// ignore
-		}
+		} catch {}
 	} else {
-		// Windows: use MachineGuid from registry
 		try {
 			const out = execSyncHidden('reg query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid', {
 				encoding: "utf-8",
@@ -191,9 +165,7 @@ function resolveMachineId(): string | undefined {
 			});
 			const match = out.match(/MachineGuid\s+REG_SZ\s+(\S+)/);
 			if (match?.[1]) return match[1];
-		} catch {
-			// ignore
-		}
+		} catch {}
 	}
 
 	return undefined;
@@ -217,12 +189,15 @@ interface MasterKeyResolution {
 export class SecretKeyringError extends Error {
 	readonly state: SecretKeyringState;
 	readonly retryable: boolean;
+	readonly authorizationRequired: boolean;
 
-	constructor(result: SecretKeyringResult) {
+	constructor(result: SecretKeyringResult, authorizationRequired = true) {
 		super(result.message ?? `Secrets keyring is ${result.state}`);
 		this.name = "SecretKeyringError";
 		this.state = result.state;
 		this.retryable = result.state === "locked" || result.state === "unavailable";
+		this.authorizationRequired =
+			authorizationRequired && (result.state === "locked" || result.state === "permission-denied");
 	}
 }
 
@@ -255,15 +230,6 @@ function persistMachineId(machineId: string): string {
 		throw new Error(`Failed to persist secrets machine identity: ${message}`);
 	}
 }
-
-/**
- * Resolve the durable identity used by the secrets key.
- *
- * Existing stores predate the identity anchor. Do not persist a newly selected
- * identity for one of those stores until its ciphertext has been verified with
- * that identity. A transient resolver failure must not make the old key
- * unrecoverable.
- */
 function getMachineId(): string {
 	const persisted = readPersistedMachineId();
 	if (persisted) {
@@ -320,14 +286,8 @@ async function getLegacyMasterKey(): Promise<Uint8Array> {
 }
 
 function decodeKeyringValue(result: SecretKeyringResult): Uint8Array {
-	if (result.value === undefined)
-		throw new SecretKeyringError({ state: "corrupt", message: "Keyring returned no master key" });
 	try {
-		const key = Buffer.from(result.value, "base64");
-		if (key.length !== 32 || key.toString("base64") !== result.value) {
-			throw new Error("master key is not valid canonical base64");
-		}
-		return new Uint8Array(key);
+		return decodeSecretMasterKey(result.value);
 	} catch (error) {
 		throw new SecretKeyringError({ state: "corrupt", message: error instanceof Error ? error.message : String(error) });
 	}
@@ -343,9 +303,7 @@ function emitDegradedWarning(result: SecretKeyringResult): void {
 			encoding: "utf-8",
 			mode: 0o600,
 		});
-	} catch {
-		// The health response still reports degraded state if the marker cannot be written.
-	}
+	} catch {}
 }
 
 function clearDegradedWarning(): void {
@@ -355,14 +313,6 @@ function clearDegradedWarning(): void {
 		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
 	}
 }
-
-/**
- * Re-encrypt a legacy snapshot with the native keyring key.
- *
- * The caller must hold the cross-process secret-store lock for the full
- * read/decrypt/rewrite sequence. Releasing it before saveStore() would let a
- * concurrent writer update the snapshot and then be overwritten here.
- */
 async function migrateLegacyStore(store: SecretsStore, legacyKey: Uint8Array, nativeKey: Uint8Array): Promise<void> {
 	const plaintexts = new Map<string, string>();
 	for (const [name, entry] of Object.entries(store.secrets)) {
@@ -371,7 +321,7 @@ async function migrateLegacyStore(store: SecretsStore, legacyKey: Uint8Array, na
 	const migrated: SecretsStore = {
 		version: NATIVE_STORE_VERSION,
 		provider: "native-keyring",
-		secrets: {},
+		secrets: Object.create(null),
 	};
 	for (const [name, plaintext] of plaintexts) {
 		const entry = store.secrets[name];
@@ -389,9 +339,38 @@ async function migrateLegacyStore(store: SecretsStore, legacyKey: Uint8Array, na
 	clearDegradedWarning();
 }
 
-async function resolveMasterKey(store: SecretsStore): Promise<MasterKeyResolution> {
+async function resolveMasterKey(
+	store: SecretsStore,
+	options: SecretKeyringAccessOptions & {
+		readonly allowLegacyFallback?: boolean;
+		readonly onKeyringAuthorization?: () => Promise<void>;
+	} = {},
+): Promise<MasterKeyResolution> {
 	const keyring = getSecretKeyring(`${KEYRING_ACCOUNT_SCOPE}:${getAgentsDir()}`);
-	const result = await keyring.get();
+	let result = await keyring.get();
+	if (
+		keyring.platform === "darwin" &&
+		options.allowInteraction === true &&
+		(result.state === "locked" || result.state === "permission-denied")
+	) {
+		await options.onKeyringAuthorization?.();
+		if (options.signal?.aborted) throw new Error("Secret write cancelled");
+		result = await keyring.get(options);
+		if (options.signal?.aborted) throw new Error("Secret write cancelled");
+		if (result.state === "found") {
+			const authorized = result.value;
+			result = await keyring.get();
+			if (result.state === "locked" || result.state === "permission-denied")
+				throw new SecretKeyringError({
+					...result,
+					message:
+						"Keychain authorization was not saved. Retry saving your credential and choose Always Allow in the macOS Keychain prompt to enable background access. Your existing secrets have not been changed.",
+				});
+			if (result.state === "found" && result.value !== authorized)
+				throw new SecretKeyringError({ state: "corrupt", message: "Master key changed during authorization" });
+		}
+	}
+	if (options.signal?.aborted) throw new Error("Secret write cancelled");
 	if (store.version === NATIVE_STORE_VERSION || store.provider === "native-keyring") {
 		if (result.state !== "found") throw new SecretKeyringError(result);
 		return { key: decodeKeyringValue(result), provider: "native-keyring" };
@@ -411,18 +390,20 @@ async function resolveMasterKey(store: SecretsStore): Promise<MasterKeyResolutio
 			if (legacyKey) await migrateLegacyStore(store, legacyKey, nativeKey);
 			return { key: nativeKey, provider: "native-keyring" };
 		}
-		throw new SecretKeyringError(saved);
+		throw new SecretKeyringError(saved, false);
 	}
 
 	if (result.state === "locked") throw new SecretKeyringError(result);
 	if (result.state !== "unavailable" && result.state !== "unsupported") throw new SecretKeyringError(result);
 	emitDegradedWarning(result);
+	if (options.allowLegacyFallback === false && result.state !== "unsupported" && result.backend !== "absent") {
+		throw new SecretKeyringError({
+			...result,
+			message: `Native keyring is temporarily ${result.state}; refusing to write secrets with legacy machine-id encryption${result.message ? `: ${result.message}` : ""}`,
+		});
+	}
 	return { key: await getLegacyMasterKey(), provider: "legacy-obfuscated" };
 }
-
-// ---------------------------------------------------------------------------
-// Encrypt / decrypt
-// ---------------------------------------------------------------------------
 
 async function decryptWithKey(ciphertext: string, key: Uint8Array): Promise<string> {
 	const sodium = await getSodium();
@@ -465,10 +446,6 @@ async function encryptWithKey(plaintext: string, key: Uint8Array): Promise<strin
 	return sodium.to_base64(combined, sodium.base64_variants.ORIGINAL);
 }
 
-// ---------------------------------------------------------------------------
-// Store I/O
-// ---------------------------------------------------------------------------
-
 function isSecretStoreTempProcessLive(name: string): boolean {
 	const pid = name.slice(SECRET_STORE_TEMP_PREFIX.length).split("-", 1)[0];
 	if (!/^\d+$/.test(pid)) return false;
@@ -494,9 +471,7 @@ function cleanupStaleSecretStoreTemps(): void {
 		if (!name.startsWith(SECRET_STORE_TEMP_PREFIX) || isSecretStoreTempProcessLive(name)) continue;
 		try {
 			unlinkSync(join(dir, name));
-		} catch {
-			// Best effort. Another process may have finished or removed the file.
-		}
+		} catch {}
 	}
 }
 
@@ -504,7 +479,7 @@ function loadStore(): SecretsStore {
 	cleanupStaleSecretStoreTemps();
 	const file = getSecretsFile();
 	if (!existsSync(file)) {
-		return { version: 1, secrets: {} };
+		return { version: 1, secrets: Object.create(null) };
 	}
 	try {
 		return parseSecretsStore(JSON.parse(readFileSync(file, "utf-8")));
@@ -517,8 +492,6 @@ function loadStore(): SecretsStore {
 type SecretStoreWriteStage = "after-write" | "before-close";
 type SecretStoreWriteHookForTests = (stage: SecretStoreWriteStage, fd?: number) => void;
 let secretStoreWriteHookForTests: SecretStoreWriteHookForTests | null = null;
-
-/** @internal Inject a failure or process kill while testing atomic store replacement. */
 export function __setSecretStoreWriteHookForTests(hook: SecretStoreWriteHookForTests | null): void {
 	secretStoreWriteHookForTests = hook;
 }
@@ -542,15 +515,11 @@ function saveStore(store: SecretsStore): void {
 		if (fd !== null) {
 			try {
 				closeSync(fd);
-			} catch {
-				// Continue cleanup and preserve the original write error.
-			}
+			} catch {}
 		}
 		try {
 			unlinkSync(tmp);
-		} catch {
-			// Best effort cleanup. The existing store remains untouched if replacement did not happen.
-		}
+		} catch {}
 		throw error;
 	}
 }
@@ -564,8 +533,6 @@ const SECRET_STORE_LOCK_WAIT_MS = 10;
 type SecretStoreLockHookStage = "after-acquire" | "after-stale-check";
 type SecretStoreLockHookForTests = (stage: SecretStoreLockHookStage) => void;
 let secretStoreLockHookForTests: SecretStoreLockHookForTests | null = null;
-
-/** @internal Pause an acquired lock in a child-process race regression test. */
 export function __setSecretStoreLockHookForTests(hook: SecretStoreLockHookForTests | null): void {
 	secretStoreLockHookForTests = hook;
 }
@@ -630,9 +597,6 @@ function tryAcquireSecretStoreLock(owner: string): boolean {
 	let fd: number | null = null;
 	try {
 		if (existsSync(`${lockFile}.${SECRET_STORE_LOCK_STALE_CLAIM_FILE}`)) return false;
-		// Build the complete owner directory before publishing it. Renaming a
-		// populated directory onto the non-empty lock directory cannot replace a
-		// lock that another writer has acquired.
 		mkdirSync(tempDirectory, { mode: 0o700 });
 		fd = openSync(ownerFile, "wx", 0o600);
 		writeFileSync(fd, `${owner}\n`, "utf-8");
@@ -655,20 +619,14 @@ function tryAcquireSecretStoreLock(owner: string): boolean {
 		if (fd !== null) {
 			try {
 				closeSync(fd);
-			} catch {
-				// Preserve the original lock acquisition error.
-			}
+			} catch {}
 		}
 		try {
 			unlinkSync(ownerFile);
-		} catch {
-			// Best effort cleanup. The published lock owns the owner file.
-		}
+		} catch {}
 		try {
 			rmdirSync(tempDirectory);
-		} catch {
-			// Best effort cleanup. The published lock owns the directory.
-		}
+		} catch {}
 	}
 }
 
@@ -692,9 +650,7 @@ function acquireSecretStoreLockStaleClaim(): string | null {
 		if (fd !== null) {
 			try {
 				closeSync(fd);
-			} catch {
-				// Preserve the original stale-claim error.
-			}
+			} catch {}
 		}
 	}
 }
@@ -738,9 +694,7 @@ function removeStaleSecretStoreLock(observedOwner: string | null): boolean {
 	} finally {
 		try {
 			unlinkSync(claimFile);
-		} catch {
-			// The claim is removed with the stale lock directory.
-		}
+		} catch {}
 	}
 }
 
@@ -757,8 +711,9 @@ async function acquireSecretStoreLock(): Promise<SecretStoreLock> {
 				release: async () => {
 					try {
 						if (readSecretStoreLockOwner() !== owner) return;
-						unlinkSync(getSecretStoreLockOwnerFile());
-						rmdirSync(getSecretStoreLockFile());
+						const released = `${getSecretStoreLockFile()}.released-${owner}`;
+						renameSync(getSecretStoreLockFile(), released);
+						rmSync(released, { recursive: true, force: true });
 					} catch (error) {
 						if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
 					}
@@ -781,11 +736,15 @@ async function withSecretStoreLock<T>(fn: () => Promise<T> | T): Promise<T> {
 	}
 }
 
-export async function putLocalSecret(name: string, value: string): Promise<void> {
+export async function putLocalSecret(
+	name: string,
+	value: string,
+	options: SecretKeyringAccessOptions & { readonly onKeyringAuthorization?: () => Promise<void> } = {},
+): Promise<void> {
 	await withSecretStoreLock(async () => {
 		const localName = parseLocalSecretName(name);
 		const store = loadStore();
-		const resolution = await resolveMasterKey(store);
+		const resolution = await resolveMasterKey(store, { ...options, allowLegacyFallback: false });
 		if (
 			resolution.provider === "legacy-obfuscated" &&
 			existsSync(getSecretsFile()) &&
@@ -807,6 +766,7 @@ export async function putLocalSecret(name: string, value: string): Promise<void>
 			updated: now,
 		};
 
+		if (options.signal?.aborted) throw new Error("Secret write cancelled");
 		saveStore(store);
 		recordSecretEvent("secret.stored", { name: localName, providerId: resolution.provider });
 	});
@@ -815,20 +775,26 @@ export async function putLocalSecret(name: string, value: string): Promise<void>
 async function readSecretValue(store: SecretsStore, name: string, resolution: MasterKeyResolution): Promise<string> {
 	const localName = parseLocalSecretName(name);
 	const entry = store.secrets[localName];
-	if (!entry) throw new Error(`Secret '${localName}' not found`);
+	if (!Object.hasOwn(store.secrets, localName) || !entry) throw new Error(`Secret '${localName}' not found`);
 	return decryptWithKey(entry.ciphertext, resolution.key);
 }
 
-export async function getLocalSecretValue(name: string): Promise<string> {
+export async function getLocalSecretValue(
+	name: string,
+	options?: SecretKeyringAccessOptions & { readonly onKeyringAuthorization?: () => Promise<void> },
+): Promise<string> {
 	const initialStore = loadStore();
+	const localName = parseLocalSecretName(name);
 	if (initialStore.version === NATIVE_STORE_VERSION || initialStore.provider === "native-keyring") {
-		const resolution = await resolveMasterKey(initialStore);
+		if (!Object.hasOwn(initialStore.secrets, localName)) throw new Error(`Secret '${localName}' not found`);
+		const resolution = await resolveMasterKey(initialStore, options);
 		return readSecretValue(initialStore, name, resolution);
 	}
 
 	return withSecretStoreLock(async () => {
 		const store = loadStore();
-		const resolution = await resolveMasterKey(store);
+		if (!Object.hasOwn(store.secrets, localName)) throw new Error(`Secret '${localName}' not found`);
+		const resolution = await resolveMasterKey(store, options);
 		const plaintext = await readSecretValue(store, name, resolution);
 		if (resolution.provider === "legacy-obfuscated") await anchorLegacyMachineIdAfterVerification(resolution.key);
 		return plaintext;
@@ -837,7 +803,7 @@ export async function getLocalSecretValue(name: string): Promise<string> {
 
 export function hasLocalSecret(name: string): boolean {
 	const store = loadStore();
-	return parseLocalSecretName(name) in store.secrets;
+	return Object.hasOwn(store.secrets, parseLocalSecretName(name));
 }
 
 export function hasSecret(name: string): boolean {
@@ -854,7 +820,7 @@ export async function deleteLocalSecret(name: string): Promise<boolean> {
 	return withSecretStoreLock(async () => {
 		const store = loadStore();
 		const localName = parseLocalSecretName(name);
-		if (!(localName in store.secrets)) return false;
+		if (!Object.hasOwn(store.secrets, localName)) return false;
 		delete store.secrets[localName];
 		saveStore(store);
 		recordSecretEvent("secret.deleted", { name: localName });
@@ -913,6 +879,7 @@ function healthForKeyringState(result: SecretKeyringResult): SecretProviderHealt
 	const checkedAt = new Date().toISOString();
 	const message = result.message ?? `Native secrets keyring is ${result.state}`;
 	if (
+		result.state === "unchecked" ||
 		result.state === "missing" ||
 		result.state === "locked" ||
 		result.state === "unavailable" ||
@@ -926,7 +893,7 @@ function healthForKeyringState(result: SecretKeyringResult): SecretProviderHealt
 	return { status: "healthy", checkedAt };
 }
 
-export function getLocalSecretProviderHealth(): SecretProviderHealthV1 {
+export async function getLocalSecretProviderHealth(): Promise<SecretProviderHealthV1> {
 	try {
 		const store = loadStore();
 		if (existsSync(join(getSecretsDir(), DEGRADED_WARNING_FILE))) {
@@ -938,18 +905,16 @@ export function getLocalSecretProviderHealth(): SecretProviderHealthV1 {
 		}
 		if (store.version === NATIVE_STORE_VERSION || store.provider === "native-keyring") {
 			const keyring = getSecretKeyring(`${KEYRING_ACCOUNT_SCOPE}:${getAgentsDir()}`);
-			const state = keyring.getStatus?.();
-			if (state && state.state !== "found") return healthForKeyringState(state);
-			if (state) {
-				try {
-					decodeKeyringValue(state);
-				} catch (error) {
-					return {
-						status: "degraded",
-						message: `Native secrets keyring is corrupt: ${error instanceof Error ? error.message : String(error)}`,
-						checkedAt: new Date().toISOString(),
-					};
-				}
+			const state = await (keyring.getStatus?.() ?? keyring.get());
+			if (state.state !== "found") return healthForKeyringState(state);
+			if (state.value === undefined) return healthForKeyringState(state);
+			try {
+				decodeKeyringValue(state);
+			} catch (error) {
+				return healthForKeyringState({
+					state: "corrupt",
+					message: `Native secrets keyring is corrupt: ${error instanceof Error ? error.message : String(error)}`,
+				});
 			}
 		}
 		return { status: "healthy", checkedAt: new Date().toISOString() };
@@ -961,23 +926,7 @@ export function getLocalSecretProviderHealth(): SecretProviderHealthV1 {
 		};
 	}
 }
-
-// Belt-and-suspenders: reject obvious shell metacharacters even though
-// we no longer use sh -c. Catches injection attempts early with a
-// clear error message before argv parsing.
 const SHELL_META = /[;&|`$(){}[\]<>!\\]/;
-
-/**
- * Spawn a subprocess with one or more secrets injected as environment
- * variables. The agent only supplies references (env var names), never
- * the actual values.
- *
- * Uses direct argv execution (no shell) to eliminate glob/tilde/pipe
- * expansion. The command string is parsed into argv tokens.
- *
- * @param command  Command string to execute (parsed as argv, no shell)
- * @param secretRefs  Map of env var name → secret name, e.g. { OPENAI_API_KEY: "OPENAI_API_KEY" }
- */
 export async function execWithSecrets(
 	command: string,
 	secretRefs: Record<string, string>,
@@ -986,8 +935,6 @@ export async function execWithSecrets(
 	if (SHELL_META.test(command)) {
 		return { stdout: "", stderr: "command contains disallowed shell metacharacters", code: 1 };
 	}
-
-	// Parse command into argv — no shell, so no glob/tilde/pipe expansion
 	const argv = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
 	if (!argv || argv.length === 0) {
 		return { stdout: "", stderr: "empty command", code: 1 };
@@ -995,8 +942,6 @@ export async function execWithSecrets(
 	const cmd = argv.map((a) => a.replace(/^["']|["']$/g, ""));
 	const timeoutMs = normalizeSecretExecTimeoutMs(options.timeoutMs);
 	const maxOutputBytes = normalizeSecretExecMaxOutputBytes(options.maxOutputBytes);
-
-	// Resolve all secret values up front so we can redact them from output
 	const resolved: Record<string, string> = {};
 	for (const [envVar, secretName] of Object.entries(secretRefs)) {
 		resolved[envVar] = await getLocalSecretValue(secretName);
@@ -1073,9 +1018,7 @@ export async function execWithSecrets(
 			} catch {
 				try {
 					proc.kill(signal);
-				} catch {
-					// Already gone.
-				}
+				} catch {}
 			}
 		}
 
@@ -1175,10 +1118,6 @@ function normalizeSecretExecMaxOutputBytes(value: unknown): number {
 	return Math.min(DEFAULT_SECRET_EXEC_MAX_OUTPUT_BYTES, Math.max(1024, Math.trunc(value)));
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function validateName(name: string): void {
@@ -1206,7 +1145,7 @@ function parseSecretsStore(value: unknown): SecretsStore {
 	if (!isRecord(value.secrets)) {
 		throw new Error("secrets field must be an object");
 	}
-	const secrets: Record<string, SecretEntry> = {};
+	const secrets: Record<string, SecretEntry> = Object.create(null);
 	for (const [name, entry] of Object.entries(value.secrets)) {
 		validateName(name);
 		if (!isRecord(entry)) {

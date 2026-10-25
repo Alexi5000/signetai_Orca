@@ -1,17 +1,14 @@
 import { spawnHidden as spawn, type ChildProcess } from "@signet/core";
 import { createHash } from "node:crypto";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { DbAccessor, ReadDb, WriteDb } from "./db-accessor";
+import type { DbAccessor, WriteDb } from "./db-accessor";
 import { logger } from "./logger";
-import { deriveSessionToken } from "./memory-lineage";
+import { getDbOwnerForAccessor } from "./db-owner-runtime";
 import { deriveSessionEndFallbackId } from "./session-end-recovery";
-import { getStoredSessionTranscriptInfoAsync, upsertSessionTranscriptAsync } from "./session-transcripts";
-import { enqueueTranscriptCaptureJob } from "./transcript-capture-worker";
-import { canonicalTranscriptRelativePath } from "./transcript-jsonl";
-import { normalizeSessionTranscript } from "./transcript-normalization";
+import { enqueueTranscriptCaptureJob, type TranscriptCaptureJobInput } from "./transcript-capture-worker";
 
 export const TRANSCRIPT_RECOVERY_INTERVAL_MS = 5 * 60_000;
 export const TRANSCRIPT_RECOVERY_SETTLE_MS = 60_000;
@@ -20,6 +17,7 @@ export const TRANSCRIPT_RECOVERY_MAX_FILES_PER_SCAN = 50;
 export const TRANSCRIPT_RECOVERY_MAX_DISCOVERED_FILES = 50_000;
 export const TRANSCRIPT_RECOVERY_MAX_RETRY_DELAY_MS = 30 * 60_000;
 export const TRANSCRIPT_RECOVERY_STOP_GRACE_MS = 5_000;
+const CLAUDE_CODE_SUBAGENT_DIRECTORY = "subagents";
 
 interface RecoveryCandidate {
 	readonly harness: "claude-code" | "codex";
@@ -35,6 +33,25 @@ interface TranscriptMetadata {
 	readonly capturedAt: string;
 }
 
+export interface TranscriptRecoveryStore {
+	frontiers(): Promise<Map<string, string | null>>;
+	fingerprints(candidates: readonly RecoveryCandidate[]): Promise<Map<string, string>>;
+	save(candidate: RecoveryCandidate, cursor: string | null): Promise<void>;
+	clear(roots: TranscriptRecoveryRoots): Promise<void>;
+	mark(candidate: RecoveryCandidate, fingerprint: string, sessionId: string, scannedAt: string): Promise<void>;
+	receipt(path: string): Promise<{ source_size_bytes: number | null; source_mtime_ms: number | null } | undefined>;
+	enqueue(input: TranscriptCaptureJobInput): Promise<string | null>;
+}
+
+export type TranscriptRecoveryStoreRequest = {
+	[K in keyof TranscriptRecoveryStore]: {
+		readonly type: "store-request";
+		readonly id: number;
+		readonly method: K;
+		readonly args: Parameters<TranscriptRecoveryStore[K]>;
+	};
+}[keyof TranscriptRecoveryStore];
+
 export interface TranscriptRecoveryRoots {
 	readonly claudeCode: string;
 	readonly codex: string;
@@ -48,8 +65,6 @@ export interface TranscriptRecoveryScanOptions {
 	readonly maxFiles?: number;
 	readonly maxDiscoveredFiles?: number;
 	readonly signal?: AbortSignal;
-	/** Production scans run in a killable child; in-process is reserved for direct tests/helpers. */
-	readonly execution?: "child" | "in-process";
 }
 
 export interface TranscriptRecoveryScanResult {
@@ -67,10 +82,21 @@ export function parseTranscriptRecoveryResult(output: string): TranscriptRecover
 	for (const line of output.split("\n")) {
 		try {
 			const event = JSON.parse(line) as { type?: string; result?: TranscriptRecoveryScanResult };
-			if (event.type === "result" && event.result !== undefined) return event.result;
-		} catch {
-			// Logger output is not part of the child protocol.
-		}
+			if (event.type === "result" && event.result !== null && typeof event.result === "object") {
+				const counts = [
+					"discovered",
+					"examined",
+					"enqueued",
+					"deduplicated",
+					"skippedRecent",
+					"skippedOversized",
+					"skippedUnchanged",
+					"skippedInvalid",
+				] as const;
+				if (counts.every((key) => Number.isSafeInteger(event.result?.[key]) && (event.result?.[key] ?? -1) >= 0))
+					return event.result;
+			}
+		} catch {}
 	}
 	return null;
 }
@@ -80,9 +106,7 @@ function parseTranscriptRecoveryChildPid(output: string): number | null {
 		try {
 			const event = JSON.parse(line) as { type?: string; pid?: unknown };
 			if (event.type === "started" && typeof event.pid === "number" && Number.isInteger(event.pid)) return event.pid;
-		} catch {
-			// Logger output is not part of the child protocol.
-		}
+		} catch {}
 	}
 	return null;
 }
@@ -91,15 +115,13 @@ export interface TranscriptRecoveryWorkerHandle {
 	stop(): Promise<void>;
 	nudge(): void;
 	readonly running: boolean;
-	/** Active child PID, exposed for lifecycle tests and diagnostics. */
 	readonly childPid: number | null;
 }
 
 type TranscriptRecoveryWorkerOptions = TranscriptRecoveryScanOptions & {
 	readonly intervalMs?: number;
-	/** Test-only child entrypoint used to exercise the stdio/close protocol deterministically. */
+	readonly execution?: "child" | "in-process";
 	readonly childPath?: string;
-	/** Test-only supervisor entrypoint; production uses the bundled supervisor. */
 	readonly supervisorPath?: string;
 };
 
@@ -139,17 +161,18 @@ async function discoverFiles(
 			if (output.length >= maxFiles) return false;
 			const path = join(directory, entry.name);
 			if (entry.isDirectory()) {
+				if (harness === "claude-code" && entry.name === CLAUDE_CODE_SUBAGENT_DIRECTORY) continue;
 				pending.push(path);
 				continue;
 			}
-			if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+			if (!entry.name.endsWith(".jsonl")) continue;
 			if (harness === "codex" && !entry.name.startsWith("rollout-")) continue;
 			try {
-				const metadata = await stat(path);
-				output.push({ harness, rootPath: root, path, size: metadata.size, mtimeMs: metadata.mtimeMs });
-			} catch {
-				// A harness may rotate a file between directory enumeration and stat.
-			}
+				const resolvedPath = await realpath(path);
+				const metadata = await stat(resolvedPath);
+				if (!metadata.isFile()) continue;
+				output.push({ harness, rootPath: root, path: resolvedPath, size: metadata.size, mtimeMs: metadata.mtimeMs });
+			} catch {}
 		}
 	}
 	return !signal?.aborted;
@@ -184,6 +207,7 @@ function readMetadata(candidate: RecoveryCandidate, raw: string): TranscriptMeta
 				? nonEmptyString(payload?.session_id, payload?.id, parsed.session_id, parsed.sessionId)
 				: nonEmptyString(parsed.sessionId, parsed.session_id, payload?.session_id, payload?.id);
 		if (!sessionKey) continue;
+		if (candidate.harness === "claude-code" && parsed.isSidechain === true) return null;
 		const project = nonEmptyString(payload?.cwd, parsed.cwd);
 		return { sessionKey, project, capturedAt: new Date(candidate.mtimeMs).toISOString() };
 	}
@@ -199,92 +223,30 @@ function readMetadata(candidate: RecoveryCandidate, raw: string): TranscriptMeta
 	};
 }
 
-const RECOVERY_FINGERPRINT_BATCH_SIZE = 400;
+const RECOVERY_METADATA_MAX_BYTES = 256 * 1024;
 
-interface RecoveryFingerprint {
-	readonly sizeBytes: number;
-	readonly mtimeMs: number;
-	readonly hasDeadCaptureJob: boolean;
-}
-
-async function loadRecoveryFingerprints(
-	dbAccessor: DbAccessor,
-	agentId: string,
-	candidates: readonly RecoveryCandidate[],
-	signal?: AbortSignal,
-): Promise<Map<string, RecoveryFingerprint>> {
-	const fingerprints = new Map<string, RecoveryFingerprint>();
-	for (let offset = 0; offset < candidates.length; offset += RECOVERY_FINGERPRINT_BATCH_SIZE) {
-		throwIfAborted(signal);
-		const paths = candidates.slice(offset, offset + RECOVERY_FINGERPRINT_BATCH_SIZE).map((candidate) => candidate.path);
-		const placeholders = paths.map(() => "?").join(", ");
-		const rows = await dbAccessor.withReadDbAsync(
-			(db) =>
-				db
-					.prepare(
-						`SELECT f.source_path, f.size_bytes, f.mtime_ms,
-								EXISTS(
-									SELECT 1 FROM transcript_capture_jobs AS j
-									 WHERE j.agent_id = f.agent_id AND j.session_id = f.session_id AND j.status = 'dead'
-								) AS has_dead_capture_job
-						 FROM transcript_recovery_files AS f
-						 WHERE f.agent_id = ? AND f.source_path IN (${placeholders})`,
-					)
-					.all(agentId, ...paths) as Array<{
-					source_path?: unknown;
-					size_bytes?: unknown;
-					mtime_ms?: unknown;
-					has_dead_capture_job?: unknown;
-				}>,
-			{
-				siteToken: "transcript-recovery-worker.ts:221",
-				operation: "transcript-recovery.load-fingerprints",
-				signal,
-			},
-		);
-		for (const row of rows) {
-			if (typeof row.source_path !== "string" || typeof row.size_bytes !== "number" || typeof row.mtime_ms !== "number")
-				continue;
-			fingerprints.set(row.source_path, {
-				sizeBytes: row.size_bytes,
-				mtimeMs: row.mtime_ms,
-				hasDeadCaptureJob: row.has_dead_capture_job === 1 || row.has_dead_capture_job === true,
-			});
-		}
-	}
-	return fingerprints;
-}
-
-function snapshotAlreadyCaptured(
-	db: ReadDb,
-	agentId: string,
+async function readMetadataFromSource(
 	candidate: RecoveryCandidate,
-	sessionId: string,
-	transcript: string,
-): boolean {
-	const job = db
-		.prepare(
-			`SELECT id
-			 FROM transcript_capture_jobs
-			 WHERE agent_id = ? AND session_id = ? AND transcript = ?
-			   AND status <> 'dead'
-			 LIMIT 1`,
-		)
-		.get(agentId, sessionId, transcript);
-	if (job) return true;
-
-	const sessionToken = deriveSessionToken(agentId, sessionId);
-	const sourcePath = `${canonicalTranscriptRelativePath(candidate.harness)}#${sessionToken}`;
-	return Boolean(
-		db
-			.prepare(
-				`SELECT 1
-				 FROM memory_artifacts
-				 WHERE agent_id = ? AND source_path = ? AND deleted_at IS NULL
-				 LIMIT 1`,
-			)
-			.get(agentId, sourcePath),
-	);
+	signal?: AbortSignal,
+): Promise<TranscriptMetadata | null> {
+	throwIfAborted(signal);
+	if (candidate.size <= 0) return null;
+	const handle = await open(candidate.path, "r");
+	try {
+		const buffer = Buffer.alloc(Math.min(candidate.size, RECOVERY_METADATA_MAX_BYTES));
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+		throwIfAborted(signal);
+		return readMetadata(candidate, buffer.subarray(0, bytesRead).toString("utf8"));
+	} finally {
+		await handle.close().catch(() => undefined);
+	}
+}
+function sourceMetadataFingerprint(candidate: RecoveryCandidate): string {
+	return createHash("sha256")
+		.update(String(candidate.size))
+		.update("\0")
+		.update(String(Math.trunc(candidate.mtimeMs)))
+		.digest("hex");
 }
 
 function markScanned(
@@ -334,7 +296,41 @@ async function loadFrontiers(
 				.all(agentId) as Array<{ harness: string; root_path: string; cursor_path?: string | null }>;
 			return new Map(rows.map((row) => [`${row.harness}\\0${row.root_path}`, row.cursor_path ?? null]));
 		},
-		{ siteToken: "transcript-recovery-worker.ts:330", operation: "transcript-recovery.load-frontiers", signal },
+		{
+			siteToken: "db:transcript-recovery.scan.load-frontiers",
+			operation: "transcript-recovery.load-frontiers",
+			signal,
+		},
+	);
+}
+
+async function loadRecoveryFingerprints(
+	dbAccessor: DbAccessor,
+	agentId: string,
+	candidates: readonly RecoveryCandidate[],
+	signal?: AbortSignal,
+): Promise<Map<string, string>> {
+	if (candidates.length === 0) return new Map();
+	return dbAccessor.withReadDbAsync(
+		(db) => {
+			const placeholders = candidates.map(() => "?").join(", ");
+			const rows = db
+				.prepare(
+					`SELECT source_path, content_sha256
+					 FROM transcript_recovery_files
+					 WHERE agent_id = ? AND source_path IN (${placeholders})`,
+				)
+				.all(agentId, ...candidates.map((candidate) => candidate.path)) as Array<{
+				source_path: string;
+				content_sha256: string;
+			}>;
+			return new Map(rows.map((row) => [row.source_path, row.content_sha256]));
+		},
+		{
+			siteToken: "db:transcript-recovery.scan.load-fingerprints",
+			operation: "transcript-recovery.load-fingerprints",
+			signal,
+		},
 	);
 }
 
@@ -355,7 +351,7 @@ async function saveFrontier(
 					updated_at = excluded.updated_at`,
 			).run(agentId, candidate.harness, candidate.rootPath, cursorPath, new Date().toISOString());
 		},
-		{ siteToken: "transcript-recovery-worker.ts:348", operation: "transcript-recovery.save-frontier", signal },
+		{ siteToken: "db:transcript-recovery.scan.save-frontier", operation: "transcript-recovery.save-frontier", signal },
 	);
 }
 
@@ -373,7 +369,11 @@ async function clearFrontiers(
 				roots.codex,
 			);
 		},
-		{ siteToken: "transcript-recovery-worker.ts:368", operation: "transcript-recovery.clear-frontiers", signal },
+		{
+			siteToken: "db:transcript-recovery.scan.clear-frontiers",
+			operation: "transcript-recovery.clear-frontiers",
+			signal,
+		},
 	);
 }
 
@@ -381,237 +381,202 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Transcript recovery aborted");
 }
 
-function isFatalDbOwnerError(error: unknown): boolean {
-	const code = error instanceof Error && "code" in error ? (error as Error & { code?: unknown }).code : undefined;
-	return typeof code === "string" && code.startsWith("DB_OWNER_");
+function createRecoveryStore(
+	dbAccessor: DbAccessor,
+	basePath: string,
+	agentId: string,
+	signal?: AbortSignal,
+): TranscriptRecoveryStore {
+	return {
+		frontiers: () => loadFrontiers(dbAccessor, agentId, signal),
+		fingerprints: (candidates) => loadRecoveryFingerprints(dbAccessor, agentId, candidates, signal),
+		save: (candidate, cursor) => saveFrontier(dbAccessor, agentId, candidate, cursor, signal),
+		clear: (roots) => clearFrontiers(dbAccessor, agentId, roots, signal),
+		mark: (candidate, fingerprint, sessionId, scannedAt) =>
+			dbAccessor.withWriteTxAsync((db) => markScanned(db, agentId, candidate, fingerprint, sessionId, scannedAt), {
+				siteToken: "db:transcript-recovery.scan.mark-invalid",
+				operation: "transcript-recovery.mark-scanned",
+				signal,
+			}),
+		receipt: (path) =>
+			dbAccessor.withReadDbAsync(
+				(db) =>
+					db
+						.prepare(
+							"SELECT source_size_bytes, source_mtime_ms FROM transcript_capture_jobs WHERE agent_id = ? AND transcript_path = ? ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
+						)
+						.get(agentId, path) as { source_size_bytes: number | null; source_mtime_ms: number | null } | undefined,
+				{
+					siteToken: "db:transcript-recovery.scan.capture-receipt",
+					operation: "transcript-recovery.lookup-capture-receipt",
+					signal,
+				},
+			),
+		enqueue: (input) => enqueueTranscriptCaptureJob(dbAccessor, { ...input, agentId, basePath }, signal),
+	};
+}
+
+async function dispatchRecoveryStore(
+	store: TranscriptRecoveryStore,
+	request: TranscriptRecoveryStoreRequest,
+): Promise<unknown> {
+	switch (request.method) {
+		case "frontiers":
+			return Array.from(await store.frontiers());
+		case "fingerprints":
+			return Array.from(await store.fingerprints(...request.args));
+		case "save":
+			return store.save(...request.args);
+		case "clear":
+			return store.clear(...request.args);
+		case "mark":
+			return store.mark(...request.args);
+		case "receipt":
+			return store.receipt(...request.args);
+		case "enqueue":
+			return store.enqueue(...request.args);
+		default:
+			throw new Error("Unsupported transcript recovery store operation");
+	}
+}
+
+export async function executeTranscriptRecoveryStore(
+	dbAccessor: DbAccessor,
+	basePath: string,
+	agentId: string,
+	request: TranscriptRecoveryStoreRequest,
+): Promise<unknown> {
+	return dispatchRecoveryStore(createRecoveryStore(dbAccessor, basePath, agentId), request);
 }
 
 export async function runTranscriptRecoveryScan(
-	dbAccessor: DbAccessor,
+	database: DbAccessor | TranscriptRecoveryStore,
 	basePath: string,
 	agentId: string,
 	options: TranscriptRecoveryScanOptions = {},
 ): Promise<TranscriptRecoveryScanResult> {
-	void basePath;
+	const store = "frontiers" in database ? database : createRecoveryStore(database, basePath, agentId, options.signal);
 	const roots = { ...defaultRoots(), ...options.roots };
 	const nowMs = options.nowMs ?? Date.now();
 	const settleMs = options.settleMs ?? TRANSCRIPT_RECOVERY_SETTLE_MS;
 	const maxBytes = options.maxBytes ?? TRANSCRIPT_RECOVERY_MAX_BYTES;
 	const maxFiles = options.maxFiles ?? TRANSCRIPT_RECOVERY_MAX_FILES_PER_SCAN;
 	const maxDiscoveredFiles = options.maxDiscoveredFiles ?? TRANSCRIPT_RECOVERY_MAX_DISCOVERED_FILES;
-	const candidates: RecoveryCandidate[] = [];
+	const discoveredCandidates: RecoveryCandidate[] = [];
 	const claudeDiscoveryLimit = Math.max(1, Math.floor(maxDiscoveredFiles / 2));
 	const claudeDiscoveryComplete = await discoverFiles(
 		roots.claudeCode,
 		"claude-code",
 		claudeDiscoveryLimit,
-		candidates,
+		discoveredCandidates,
 		options.signal,
 	);
 	const codexDiscoveryComplete = await discoverFiles(
 		roots.codex,
 		"codex",
 		maxDiscoveredFiles,
-		candidates,
+		discoveredCandidates,
 		options.signal,
 	);
 	const discoveryComplete = claudeDiscoveryComplete && codexDiscoveryComplete;
+	const candidates = Array.from(
+		new Map(discoveredCandidates.map((candidate) => [`${candidate.harness}\0${candidate.path}`, candidate])).values(),
+	);
 	candidates.sort((a, b) => a.path.localeCompare(b.path));
-	const frontiers = await loadFrontiers(dbAccessor, agentId, options.signal);
-	const fingerprints = await loadRecoveryFingerprints(dbAccessor, agentId, candidates, options.signal);
+	const frontiers = await store.frontiers();
+	const recoveryFingerprints = new Map<string, string>();
+	for (let offset = 0; offset < candidates.length; offset += 100) {
+		for (const [path, fingerprint] of await store.fingerprints(candidates.slice(offset, offset + 100))) {
+			recoveryFingerprints.set(path, fingerprint);
+		}
+	}
 	const resumableCandidates = candidates.filter((candidate) => {
 		const cursor = frontiers.get(frontierKey(candidate));
 		if (cursor === undefined || cursor === null || candidate.path > cursor) return true;
-		const fingerprint = fingerprints.get(candidate.path);
-		return (
-			fingerprint === undefined ||
-			fingerprint.hasDeadCaptureJob ||
-			fingerprint.sizeBytes !== candidate.size ||
-			fingerprint.mtimeMs !== Math.trunc(candidate.mtimeMs)
-		);
+		return recoveryFingerprints.get(candidate.path) !== sourceMetadataFingerprint(candidate);
 	});
+	const skippedUnchanged = candidates.length - resumableCandidates.length;
 
 	let examined = 0;
 	let enqueued = 0;
 	let deduplicated = 0;
 	let skippedRecent = 0;
 	let skippedOversized = 0;
-	let skippedUnchanged = 0;
 	let skippedInvalid = 0;
 
 	for (const candidate of resumableCandidates) {
 		throwIfAborted(options.signal);
 		if (nowMs - candidate.mtimeMs < settleMs) {
 			skippedRecent++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
 		if (candidate.size > maxBytes) {
 			skippedOversized++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
-			continue;
-		}
-		const fingerprint = fingerprints.get(candidate.path);
-		if (
-			fingerprint !== undefined &&
-			!fingerprint.hasDeadCaptureJob &&
-			fingerprint.sizeBytes === candidate.size &&
-			fingerprint.mtimeMs === Math.trunc(candidate.mtimeMs)
-		) {
-			skippedUnchanged++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
 		if (examined >= maxFiles) break;
 		examined++;
 
-		let raw: string;
+		let metadata: TranscriptMetadata | null;
 		try {
-			raw = await readFile(candidate.path, { encoding: "utf8", signal: options.signal });
+			metadata = await readMetadataFromSource(candidate, options.signal);
 		} catch (error) {
 			throwIfAborted(options.signal);
-			logger.debug("transcripts", "Transcript recovery read failed", {
+			logger.debug("transcripts", "Transcript recovery metadata read failed", {
 				path: candidate.path,
 				error: error instanceof Error ? error.message : String(error),
 			});
 			skippedInvalid++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
-		const metadata = readMetadata(candidate, raw);
-		const transcript = normalizeSessionTranscript(candidate.harness, raw);
-		if (!metadata || (transcript.trim().length === 0 && raw.trim().length === 0)) {
-			const contentSha256 = createHash("sha256").update(raw).digest("hex");
+		const sourceFingerprint = sourceMetadataFingerprint(candidate);
+		if (!metadata) {
 			const skippedSessionId = `recovery-skip:${createHash("sha256")
 				.update(candidate.path)
 				.update("\0")
-				.update(contentSha256)
+				.update(sourceFingerprint)
 				.digest("hex")
 				.slice(0, 24)}`;
-			await dbAccessor.withWriteTxAsync(
-				(db) => markScanned(db, agentId, candidate, contentSha256, skippedSessionId, new Date(nowMs).toISOString()),
-				{
-					siteToken: "transcript-recovery-worker.ts:491",
-					operation: "transcript-recovery.mark-scanned",
-					signal: options.signal,
-				},
-			);
+			await store.mark(candidate, sourceFingerprint, skippedSessionId, new Date(nowMs).toISOString());
 			skippedInvalid++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
-			continue;
-		}
-		const sessionId = deriveSessionEndFallbackId(metadata.sessionKey, candidate.path, transcript);
-		const contentSha256 = createHash("sha256").update(raw).digest("hex");
-		const alreadyCaptured = await dbAccessor.withReadDbAsync(
-			(db) => snapshotAlreadyCaptured(db, agentId, candidate, sessionId, transcript),
-			{
-				siteToken: "transcript-recovery-worker.ts:505",
-				operation: "transcript-recovery.snapshot-check",
-				signal: options.signal,
-			},
-		);
-		if (alreadyCaptured) {
-			await dbAccessor.withWriteTxAsync(
-				(db) => markScanned(db, agentId, candidate, contentSha256, sessionId, new Date(nowMs).toISOString()),
-				{
-					siteToken: "transcript-recovery-worker.ts:514",
-					operation: "transcript-recovery.mark-scanned",
-					signal: options.signal,
-				},
-			);
-			deduplicated++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
 
-		const existingTranscript = await getStoredSessionTranscriptInfoAsync(
-			metadata.sessionKey,
+		const sessionId = deriveSessionEndFallbackId(metadata.sessionKey, candidate.path, "");
+		const existingCapture = await store.receipt(candidate.path);
+		const jobId = await store.enqueue({
 			agentId,
-			dbAccessor,
-			options.signal,
-		);
-		// A completed canonical row is authoritative. Recovery files are legacy
-		// snapshots and may be older or partial. A later settled snapshot is
-		// allowed through only when it strictly extends the retained content;
-		// otherwise it would clobber lossless content and regress the Dreaming
-		// watermark.
-		const completedSnapshotExtendsCanonical =
-			existingTranscript?.completedAt !== null &&
-			existingTranscript?.completedAt !== undefined &&
-			transcript.length > existingTranscript.content.length &&
-			transcript.includes(existingTranscript.content);
-		if (existingTranscript?.completedAt && !completedSnapshotExtendsCanonical && !fingerprint?.hasDeadCaptureJob) {
-			await dbAccessor.withWriteTxAsync(
-				(db) => markScanned(db, agentId, candidate, contentSha256, sessionId, new Date(nowMs).toISOString()),
-				{
-					siteToken: "transcript-recovery-worker.ts:544",
-					operation: "transcript-recovery.mark-scanned",
-					signal: options.signal,
-				},
-			);
-			deduplicated++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
-			continue;
-		}
-
-		try {
-			const retained = await upsertSessionTranscriptAsync(
-				metadata.sessionKey,
-				transcript,
-				candidate.harness,
-				metadata.project,
-				agentId,
-				metadata.capturedAt,
-				dbAccessor,
-				{ completedAt: metadata.capturedAt, preserveExistingContent: true, signal: options.signal },
-			);
-			if (!retained)
-				logger.warn("transcripts", "Recovered transcript retention or completion failed", {
-					sessionKey: metadata.sessionKey,
-				});
-		} catch (error) {
-			throwIfAborted(options.signal);
-			if (isFatalDbOwnerError(error)) throw error;
-			logger.warn("transcripts", "Recovered transcript retention failed", {
-				error: error instanceof Error ? error.message : String(error),
-				sessionKey: metadata.sessionKey,
-			});
-		}
-		const jobId = await enqueueTranscriptCaptureJob(
-			dbAccessor,
-			{
-				agentId,
-				harness: candidate.harness,
-				sessionKey: metadata.sessionKey,
-				sessionId,
-				project: metadata.project,
-				transcript,
-				rawTranscript: raw,
-				transcriptPath: candidate.path,
-				capturedAt: metadata.capturedAt,
-				endedAt: metadata.capturedAt,
-				summaryStatus: "not_requested",
-			},
-			options.signal,
-		);
+			harness: candidate.harness,
+			sessionKey: metadata.sessionKey,
+			sessionId,
+			project: metadata.project,
+			transcript: "",
+			transcriptPath: candidate.path,
+			basePath,
+			capturedAt: metadata.capturedAt,
+			endedAt: metadata.capturedAt,
+		});
 		if (!jobId) {
 			skippedInvalid++;
-			await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
+			await store.save(candidate, candidate.path);
 			continue;
 		}
-		await dbAccessor.withWriteTxAsync(
-			(db) => markScanned(db, agentId, candidate, contentSha256, sessionId, new Date(nowMs).toISOString()),
-			{
-				siteToken: "transcript-recovery-worker.ts:602",
-				operation: "transcript-recovery.mark-scanned",
-				signal: options.signal,
-			},
-		);
-		await saveFrontier(dbAccessor, agentId, candidate, candidate.path, options.signal);
-		enqueued++;
+		await store.mark(candidate, sourceFingerprint, sessionId, new Date(nowMs).toISOString());
+		await store.save(candidate, candidate.path);
+		if (
+			existingCapture &&
+			existingCapture.source_size_bytes === candidate.size &&
+			existingCapture.source_mtime_ms === Math.trunc(candidate.mtimeMs)
+		) {
+			deduplicated++;
+		} else enqueued++;
 	}
-	if (!options.signal?.aborted && discoveryComplete && examined < maxFiles) {
-		await clearFrontiers(dbAccessor, agentId, roots, options.signal);
+	if (!options.signal?.aborted && discoveryComplete && resumableCandidates.length === 0) {
+		await store.clear(roots);
 	}
 
 	return {
@@ -656,21 +621,15 @@ export function startTranscriptRecoveryWorker(
 		if (activeTargetPid !== null) {
 			try {
 				if (process.platform !== "win32") process.kill(-activeTargetPid, signal);
-			} catch {
-				// The target may have exited between the check and kill.
-			}
+			} catch {}
 			try {
 				process.kill(activeTargetPid, signal);
-			} catch {
-				// The target may have exited between the group and direct kills.
-			}
+			} catch {}
 		}
 		if (activeChild !== null) {
 			try {
 				activeChild.kill(signal);
-			} catch {
-				// The supervisor may have exited between the check and kill.
-			}
+			} catch {}
 		}
 	};
 
@@ -700,8 +659,12 @@ export function startTranscriptRecoveryWorker(
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		activeChild = child;
+
 		return await new Promise<TranscriptRecoveryScanResult>((resolve, reject) => {
 			let output = "";
+			let lineBuffer = "";
+			let pendingStore: Promise<void> | null = null;
+			let errorOutput = "";
 			let settled = false;
 			const settle = (callback: () => void): void => {
 				if (settled) return;
@@ -710,34 +673,85 @@ export function startTranscriptRecoveryWorker(
 			};
 			child.stdout?.setEncoding("utf8");
 			child.stdout?.on("data", (chunk: string) => {
-				// Buffer the complete protocol until the stdio streams close. The
-				// child may write its result and exit in the same turn; resolving from
-				// `data` or rejecting from `exit` races the final stdout delivery.
-				output += chunk;
-				activeTargetPid = parseTranscriptRecoveryChildPid(output) ?? activeTargetPid;
+				lineBuffer += chunk;
+				if (lineBuffer.length > 1_048_576) {
+					signalActiveProcesses("SIGKILL");
+					settle(() => reject(new Error("Transcript recovery output exceeds limit")));
+					return;
+				}
+				let newline: number;
+				while ((newline = lineBuffer.indexOf("\n")) >= 0) {
+					const line = lineBuffer.slice(0, newline);
+					lineBuffer = lineBuffer.slice(newline + 1);
+					let event: { type?: string };
+					try {
+						event = JSON.parse(line) as { type?: string };
+					} catch {
+						continue;
+					}
+					if (event.type !== "store-request") {
+						output = `${output}${line}\n`.slice(-65_536);
+						activeTargetPid = parseTranscriptRecoveryChildPid(output) ?? activeTargetPid;
+						continue;
+					}
+					if (pendingStore || cancellation.signal.aborted) {
+						signalActiveProcesses("SIGKILL");
+						settle(() => reject(new Error("Concurrent or cancelled recovery store request")));
+						return;
+					}
+					const request = event as TranscriptRecoveryStoreRequest;
+					pendingStore = (async () => {
+						let response: string;
+						try {
+							const owner = await getDbOwnerForAccessor(dbAccessor);
+							throwIfAborted(cancellation.signal);
+							const handle = owner.submit(
+								{ kind: "transcript_recovery_store", basePath, agentId, request },
+								{
+									operation: `transcript-recovery.${request.method}`,
+									lane: "write",
+									deadlineMs: 30_000,
+								},
+							);
+							const cancel = () => handle.cancel();
+							cancellation.signal.addEventListener("abort", cancel, { once: true });
+							let result: unknown;
+							try {
+								result = await handle.result;
+							} finally {
+								cancellation.signal.removeEventListener("abort", cancel);
+							}
+							response = JSON.stringify({ id: request.id, result });
+							if (response.length > 1_048_576) throw new Error("Transcript recovery response exceeds limit");
+						} catch (error) {
+							response = JSON.stringify({
+								id: request.id,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+						pendingStore = null;
+						if (!child.stdin?.destroyed) child.stdin?.write(`${response}\n`);
+					})();
+				}
+			});
+			child.stdin?.on("error", () => {});
+			child.stderr?.setEncoding("utf8");
+			child.stderr?.on("data", (chunk: string) => {
+				errorOutput = `${errorOutput}${chunk}`.slice(-2_000);
 			});
 			child.on("error", (error) => settle(() => reject(error)));
-			child.on("close", (code, signal) => {
+			child.on("close", async (code, signal) => {
+				await pendingStore;
 				const result = parseTranscriptRecoveryResult(output);
 				if (code === 0 && signal === null) {
-					settle(() =>
-						resolve(
-							result ?? {
-								discovered: 0,
-								examined: 0,
-								enqueued: 0,
-								deduplicated: 0,
-								skippedRecent: 0,
-								skippedOversized: 0,
-								skippedUnchanged: 0,
-								skippedInvalid: 0,
-							},
-						),
-					);
+					if (result === null)
+						settle(() => reject(new Error("Transcript recovery child omitted its completion receipt")));
+					else settle(() => resolve(result));
 					return;
 				}
 				const detail = signal === null ? `exit code ${code ?? "unknown"}` : `signal ${signal}`;
-				settle(() => reject(new Error(`Transcript recovery child exited with ${detail}`)));
+				const cause = errorOutput.trim().split("\n")[0]?.trim();
+				settle(() => reject(new Error(`Transcript recovery child exited with ${detail}${cause ? `: ${cause}` : ""}`)));
 			});
 		});
 	};

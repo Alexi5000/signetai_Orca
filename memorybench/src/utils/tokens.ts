@@ -9,34 +9,32 @@ export function countTokens(text: string, modelConfig: ModelConfig): number {
 
   if (provider === "openai") {
     return countOpenAITokens(text, modelConfig.id)
+  } else if (provider === "zai") {
+    return countOpenAITokens(text, "gpt-4o")
   } else if (provider === "anthropic") {
     return countAnthropicTokens(text)
   } else if (provider === "google") {
-    // Approximation: Google doesn't provide a client-side tokenizer.
-    // char/4 tends to undercount for JSON-heavy content (lots of short tokens
-    // like {, ", :) but is reasonable for natural language.
     return Math.ceil(text.length / 4)
   }
 
   return Math.ceil(text.length / 4)
 }
-
-// Cached encoder instances (lazy singletons) to avoid re-instantiation per call
 let _o200k: Tiktoken | null = null
 let _cl100k: Tiktoken | null = null
 
-function getEncoder(modelId: string): Tiktoken {
-  // o200k_base: GPT-4o+, GPT-4.1, GPT-5, and reasoning models (o1, o3, o4)
-  if (
+function usesO200k(modelId: string): boolean {
+  return (
     modelId.includes("gpt-4o") ||
     modelId.includes("gpt-4.1") ||
     modelId.includes("gpt-5") ||
     modelId.startsWith("o1") ||
     modelId.startsWith("o3") ||
     modelId.startsWith("o4")
-  ) {
-    return (_o200k ??= new Tiktoken(o200k_base))
-  }
+  )
+}
+
+function getEncoder(modelId: string): Tiktoken {
+  if (usesO200k(modelId)) return (_o200k ??= new Tiktoken(o200k_base))
   return (_cl100k ??= new Tiktoken(cl100k_base))
 }
 
@@ -48,4 +46,11 @@ function countOpenAITokens(text: string, modelId: string): number {
   } catch (_error) {
     return Math.ceil(text.length / 4)
   }
+}
+
+export function tokenizerFor(modelConfig: ModelConfig): string {
+  if (modelConfig.provider === "anthropic") return "anthropic"
+  if (modelConfig.provider === "google") return "chars/4"
+  if (modelConfig.provider === "zai") return "o200k_base (gpt-4o proxy)"
+  return usesO200k(modelConfig.id) ? "o200k_base" : "cl100k_base"
 }

@@ -62,6 +62,14 @@ describe("context budget helpers", () => {
 		expect(result).toBe(inject);
 	});
 
+	it("does not let multibyte text bypass the hard token budget", () => {
+		for (const text of ["界".repeat(20), "😀".repeat(20)]) {
+			const result = applyTokenBudget(text, 5);
+
+			expect(countTokens(result)).toBeLessThanOrEqual(5);
+		}
+	});
+
 	it("truncates injected context without exceeding the token budget", () => {
 		const result = applyTokenBudget("alpha beta gamma delta epsilon zeta eta theta", 5);
 

@@ -29,11 +29,12 @@ beforeEach(() => {
 	tempDir = mkdtempSync(join(tmpdir(), "signet-cross-agent-"));
 	dbPath = join(tempDir, "memory.db");
 	initDbAccessor(dbPath, { agentsDir: tempDir });
+	resetCrossAgentStateForTest();
 });
 
-afterEach(() => {
+afterEach(async () => {
 	resetCrossAgentStateForTest();
-	closeDbAccessor();
+	await closeDbAccessor();
 	rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -482,7 +483,7 @@ describe("ACP relay", () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 			if (originalAllowlist === undefined) {
-				process.env.SIGNET_ACP_ALLOWED_ORIGINS = undefined;
+				delete process.env.SIGNET_ACP_ALLOWED_ORIGINS;
 			} else {
 				process.env.SIGNET_ACP_ALLOWED_ORIGINS = originalAllowlist;
 			}

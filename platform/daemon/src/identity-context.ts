@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
-import { getAgentIdentityFiles, parseSimpleYaml } from "@signet/core";
+import { getAgentIdentityFiles, isWorkspacePrivatePath, parseSimpleYaml } from "@signet/core";
 import type { ContextIdentityConfig, ContextIdentityFileConfig } from "./hooks-config";
 import { countTokens, truncateToTokens } from "./pipeline/tokenizer";
 
@@ -76,9 +76,6 @@ export function budgetIdentityContent(
 		if (!Number.isFinite(budget.maxTokens) || budget.maxTokens <= 0) return undefined;
 		const maxTokens = Math.floor(budget.maxTokens);
 		if (countTokens(content) <= maxTokens) return content;
-		// Reserve room for the marker so the final string stays within budget.
-		// If the budget is too small to also flag truncation, cap without the marker
-		// rather than exceed the declared budget.
 		const markerTokens = countTokens(TRUNCATED_MARKER);
 		if (markerTokens >= maxTokens) return truncateToTokens(content, maxTokens);
 		return `${truncateToTokens(content, maxTokens - markerTokens)}${TRUNCATED_MARKER}`;
@@ -120,11 +117,8 @@ function isSafeResolvedIdentityPath(agentsDir: string, filePath: string): boolea
 		if (!target.toLowerCase().endsWith(".md")) return false;
 		const rel = relative(base, target);
 		if (!rel || rel.startsWith("..") || isAbsolute(rel)) return false;
-		const deniedDirs = new Set([".daemon", ".secrets", "memory"]);
-		return rel.split(/[\\/]/).every((part) => {
-			const normalized = part.toLowerCase();
-			return !normalized.startsWith(".") && !deniedDirs.has(normalized);
-		});
+		if (isWorkspacePrivatePath(rel)) return false;
+		return rel.split(/[\\/]/).every((part) => !part.toLowerCase().startsWith("."));
 	} catch {
 		return false;
 	}

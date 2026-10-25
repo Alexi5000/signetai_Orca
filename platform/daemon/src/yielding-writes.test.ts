@@ -1,13 +1,5 @@
-/**
- * Tests for the bounded write-batch drain primitive.
- *
- * Proves three properties:
- * 1. Work is processed in bounded transactions (not one giant one).
- * 2. The event loop gets to run between batches (yield).
- * 3. The drain pauses when system pressure is elevated, then resumes.
- */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ReadDb, WriteDb } from "./db-accessor";
@@ -25,7 +17,6 @@ import {
 } from "./system-pressure";
 import { drainWriteBatches } from "./yielding-writes";
 
-const dbFiles = ["memories.db", "memories.db-shm", "memories.db-wal"];
 let agentsDir = "";
 
 afterEach(() => {
@@ -34,7 +25,9 @@ afterEach(() => {
 });
 
 function resetDbFiles(): void {
-	for (const file of dbFiles) rmSync(join(agentsDir, "memory", file), { force: true });
+	for (const file of readdirSync(join(agentsDir, "memory"))) {
+		if (file.startsWith("memories.db")) rmSync(join(agentsDir, "memory", file), { force: true });
+	}
 }
 
 function setupTables(): void {
@@ -53,13 +46,12 @@ describe("drainWriteBatches", () => {
 		setupTables();
 	});
 
-	afterEach(() => {
-		closeDbAccessor();
+	afterEach(async () => {
+		await closeDbAccessor();
 		rmSync(agentsDir, { recursive: true, force: true });
 	});
 
 	it("processes all items in bounded batches and marks them done", async () => {
-		// Seed 250 items.
 		getDbAccessor().withWriteTx((db) => {
 			const stmt = db.prepare("INSERT INTO work (id, payload) VALUES (?, ?)");
 			for (let i = 0; i < 250; i++) stmt.run(i, `item-${i}`);
@@ -80,10 +72,8 @@ describe("drainWriteBatches", () => {
 		);
 
 		expect(result.processed).toBe(250);
-		expect(result.batches).toBe(5); // 250 / 50
+		expect(result.batches).toBe(5);
 		expect(result.stopped).toBe("exhausted");
-
-		// Verify all items were processed.
 		const remaining = getDbAccessor().withReadDb(
 			(db) =>
 				(db.prepare("SELECT COUNT(*) AS n FROM work WHERE id NOT IN (SELECT id FROM items)").get() as { n: number }).n,
@@ -130,8 +120,6 @@ describe("drainWriteBatches", () => {
 			const stmt = db.prepare("INSERT INTO work (id, payload) VALUES (?, ?)");
 			for (let i = 0; i < 120; i++) stmt.run(i, `item-${i}`);
 		});
-
-		// Track whether other macrotasks run during the drain.
 		let otherRan = false;
 		const timer = setInterval(() => {
 			otherRan = true;
@@ -150,8 +138,6 @@ describe("drainWriteBatches", () => {
 		);
 
 		clearInterval(timer);
-		// The interval callback should have fired at least once during the drain,
-		// proving the event loop was not blocked for the entire duration.
 		expect(otherRan).toBe(true);
 	});
 
@@ -160,12 +146,8 @@ describe("drainWriteBatches", () => {
 			const stmt = db.prepare("INSERT INTO work (id, payload) VALUES (?, ?)");
 			for (let i = 0; i < 200; i++) stmt.run(i, `item-${i}`);
 		});
-
-		// Simulate critical pressure.
 		reportEventLoopLag(600);
 		expect(getSystemPressure()).toBe("critical");
-
-		// Start the drain — it should pause on the first batch.
 		let drainDone = false;
 		drainWriteBatches(
 			getDbAccessor(),
@@ -181,18 +163,10 @@ describe("drainWriteBatches", () => {
 			.then(() => {
 				drainDone = true;
 			})
-			.catch(() => {
-				/* drain aborted by test teardown — expected */
-			});
-
-		// Give it a moment — it should be paused, not done.
+			.catch(() => {});
 		await new Promise((resolve) => setTimeout(resolve, 200));
 		expect(drainDone).toBe(false);
-
-		// Don't actually wait for the drain to complete — the test proves the
-		// pause by showing drainDone is false after 200ms while pressure is
-		// critical. The .catch() on drainPromise handles teardown.
-	}, 1000); // 1s timeout — proves it pauses, doesn't need to finish
+	}, 1000);
 
 	it("classifies elevated lag as still degraded", () => {
 		reportEventLoopLag(100);
@@ -209,7 +183,7 @@ describe("event-loop wedge telemetry", () => {
 		const { createTelemetryCollector, setActiveTelemetry } = await import("./telemetry");
 		const dir = createTestTempDir("signet-wedge-");
 		try {
-			closeDbAccessor();
+			await closeDbAccessor();
 			rmSync(join(dir, "memory"), { recursive: true, force: true });
 			mkdirSync(join(dir, "memory"), { recursive: true });
 			initDbAccessor(join(dir, "memory", "memories.db"));
@@ -226,9 +200,6 @@ describe("event-loop wedge telemetry", () => {
 				"0.0.0-test",
 			);
 			setActiveTelemetry(collector);
-			// Base the injected clock a day in the future — earlier tests in
-			// this file may already have set the wedge cooldown with real
-			// timestamps, so t0 must clear that window deterministically.
 			const t0 = Date.now() + 24 * 60 * 60 * 1000;
 			setRuntimePressureEnvelope(
 				buildRuntimePressureEnvelope({
@@ -244,7 +215,7 @@ describe("event-loop wedge telemetry", () => {
 			);
 
 			reportEventLoopLag(1500, t0);
-			reportEventLoopLag(2000, t0 + 1_000); // within cooldown: suppressed
+			reportEventLoopLag(2000, t0 + 1_000);
 			await collector.flush();
 			const events = (await collector.query()).filter((e) => e.event === "error.occurred");
 			expect(events).toHaveLength(1);
@@ -255,8 +226,6 @@ describe("event-loop wedge telemetry", () => {
 			expect(events[0]?.properties.embeddingLatencyBucket).toBe("unknown");
 			expect(events[0]?.properties.recoveryOutcome).toBe("still_degraded");
 			expect(events[0]?.properties.message).not.toContain("/Users/");
-
-			// After the cooldown elapses, a new wedge is reported.
 			reportEventLoopLag(999, t0 + 601_000);
 			await collector.flush();
 			const after = (await collector.query()).filter((e) => e.event === "error.occurred");

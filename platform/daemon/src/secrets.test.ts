@@ -46,6 +46,20 @@ function machineIdFile(): string {
 	return join(agentsDir, ".secrets", ".machine-id");
 }
 
+function headlessKeyring(): SecretKeyringAdapter {
+	return {
+		platform: "test",
+		service: "ai.signet.secrets",
+		account: "test",
+		async get(): Promise<SecretKeyringResult> {
+			return { state: "unavailable", message: "no Secret Service on this host", backend: "absent" };
+		},
+		async set(): Promise<SecretKeyringResult> {
+			return { state: "unavailable", message: "no Secret Service on this host", backend: "absent" };
+		},
+	};
+}
+
 function makeKeyring(initial: SecretKeyringResult): SecretKeyringAdapter & { setCalls: number } {
 	let stored = initial.state === "found" ? initial.value : undefined;
 	let next = initial;
@@ -64,7 +78,7 @@ function makeKeyring(initial: SecretKeyringResult): SecretKeyringAdapter & { set
 			next = { state: "found", value };
 			return next;
 		},
-		getStatus(): SecretKeyringResult {
+		async getStatus(): Promise<SecretKeyringResult> {
 			return stored === undefined ? next : { state: "found", value: stored };
 		},
 	};
@@ -76,17 +90,7 @@ describe("local secrets provider", () => {
 		agentsDir = createTestTempDir("signet-secrets-provider-");
 		process.env.SIGNET_PATH = agentsDir;
 		mkdirSync(agentsDir, { recursive: true });
-		setSecretKeyringAdapterForTests({
-			platform: "test",
-			service: "test",
-			account: "test",
-			async get() {
-				return { state: "unavailable", message: "test keyring unavailable" };
-			},
-			async set() {
-				return { state: "unavailable", message: "test keyring unavailable" };
-			},
-		});
+		setSecretKeyringAdapterForTests(makeKeyring({ state: "missing" }));
 	});
 
 	afterEach(() => {
@@ -159,6 +163,7 @@ describe("local secrets provider", () => {
 	});
 
 	test("legacy stores migrate once keyring access is restored", async () => {
+		setSecretKeyringAdapterForTests(headlessKeyring());
 		await putSecret("OPENAI_API_KEY", "legacy-secret");
 		const legacyStore = JSON.parse(readFileSync(secretsFile(), "utf-8")) as { version: number };
 		expect(legacyStore.version).toBe(1);
@@ -199,7 +204,7 @@ describe("local secrets provider", () => {
 		expect(health.message).toContain("Native secrets keyring is missing");
 	});
 
-	test("native v2 health degrades for a malformed keyring value and reads fail closed", async () => {
+	test("native v2 health is unhealthy for a malformed keyring value and reads fail closed", async () => {
 		const keyring = makeKeyring({ state: "missing" });
 		setSecretKeyringAdapterForTests(keyring);
 		await putSecret("OPENAI_API_KEY", "native-secret");
@@ -207,7 +212,7 @@ describe("local secrets provider", () => {
 		setSecretKeyringAdapterForTests(makeKeyring({ state: "found", value: "malformed-keyring-value" }));
 		const health = await localSecretProvider.health({});
 
-		expect(health.status).toBe("degraded");
+		expect(health.status).toBe("unhealthy");
 		expect(health.message).toContain("Native secrets keyring is corrupt");
 		await expect(getSecret("OPENAI_API_KEY")).rejects.toMatchObject({
 			name: "SecretKeyringError",
@@ -224,7 +229,7 @@ describe("local secrets provider", () => {
 		setSecretKeyringAdapterForTests(makeKeyring({ state: "found", value: `${"A".repeat(43)}!` }));
 		const health = await localSecretProvider.health({});
 
-		expect(health.status).toBe("degraded");
+		expect(health.status).toBe("unhealthy");
 		expect(health.message).toContain("Native secrets keyring is corrupt");
 		await expect(getSecret("OPENAI_API_KEY")).rejects.toMatchObject({
 			name: "SecretKeyringError",
@@ -262,6 +267,7 @@ describe("local secrets provider", () => {
 	});
 
 	test("storing a local secret writes the existing v1 encrypted store format", async () => {
+		setSecretKeyringAdapterForTests(headlessKeyring());
 		await putSecret("OPENAI_API_KEY", "sk-test-local");
 
 		const store = JSON.parse(readFileSync(secretsFile(), "utf-8")) as {
@@ -277,12 +283,15 @@ describe("local secrets provider", () => {
 	});
 
 	test("a kill during store replacement leaves the previous store and load removes the orphan temp", async () => {
+		setSecretKeyringAdapterForTests(headlessKeyring());
 		await putSecret("OPENAI_API_KEY", "before-kill");
 		const script = join(agentsDir, "kill-during-secrets-write.ts");
 		writeFileSync(
 			script,
 			[
-				`import { __setSecretStoreWriteHookForTests, putSecret } from ${JSON.stringify(join(import.meta.dir, "secrets.ts"))};`,
+				`import { __setSecretStoreWriteHookForTests, putSecret, setSecretKeyringAdapterForTests } from ${JSON.stringify(join(import.meta.dir, "secrets.ts"))};`,
+				'const absent = async () => ({ state: "unavailable", message: "no Secret Service on this host", backend: "absent" });',
+				'setSecretKeyringAdapterForTests({ platform: "test", service: "ai.signet.secrets", account: "test", get: absent, set: absent });',
 				'__setSecretStoreWriteHookForTests((stage) => { if (stage === "after-write") process.kill(process.pid, "SIGKILL"); });',
 				'await putSecret("OPENAI_API_KEY", "after-kill");',
 			].join("\n"),
@@ -318,6 +327,7 @@ describe("local secrets provider", () => {
 	});
 
 	test("transient machine-id failure keeps the secrets key stable across restarts", async () => {
+		setSecretKeyringAdapterForTests(headlessKeyring());
 		process.env.USER = "signet-secrets-test-user";
 		setMachineIdResolverForTests(() => undefined);
 
@@ -328,14 +338,13 @@ describe("local secrets provider", () => {
 		if (process.platform !== "win32") {
 			expect(statSync(machineIdFile()).mode & 0o777).toBe(0o600);
 		}
-
-		// Re-derive the key as a fresh process would, after the platform resolver recovers.
 		setMachineIdResolverForTests(() => "ioreg-id-after-transient-failure");
 		expect(await getSecret("OPENAI_API_KEY")).toBe("«redacted:sk-…»");
 		expect(readFileSync(machineIdFile(), "utf-8")).toBe(persistedMachineId);
 	});
 
 	test("existing v1 store stays recoverable when the machine-id resolver is unavailable during upgrade", async () => {
+		setSecretKeyringAdapterForTests(headlessKeyring());
 		process.env.USER = "signet-secrets-test-user";
 		setMachineIdResolverForTests(() => "legacy-machine-id");
 		await putSecret("OPENAI_API_KEY", "«redacted:sk-…»");
@@ -424,8 +433,8 @@ describe("local secrets provider", () => {
 		process.env.MARKER_PATH = marker;
 		process.env.CHILD_SCRIPT = child;
 		const result = await execWithSecrets(`bun ${parent}`, { OPENAI_API_KEY: "OPENAI_API_KEY" }, { timeoutMs: 200 });
-		process.env.MARKER_PATH = undefined;
-		process.env.CHILD_SCRIPT = undefined;
+		delete process.env.MARKER_PATH;
+		delete process.env.CHILD_SCRIPT;
 		await new Promise((resolve) => setTimeout(resolve, 1400));
 
 		expect(result.code).toBe(124);
@@ -524,17 +533,79 @@ describe("local secrets provider", () => {
 		expect(readFileSync(secretsFile(), "utf-8")).toBe(mismatchedStore);
 	});
 
-	test("default signet.secrets plugin degrades when the local provider is unhealthy", () => {
+	test("default signet.secrets plugin discovery does not wait for provider health", async () => {
 		mkdirSync(join(agentsDir, ".secrets"), { recursive: true });
 		writeFileSync(secretsFile(), "not-json", { mode: 0o600 });
 		resetDefaultPluginHostForTests();
 		resetSecretExecJobsForTests();
 
-		const plugin = getDefaultPluginHost().get(SIGNET_SECRETS_PLUGIN_ID);
+		const host = getDefaultPluginHost();
+		expect(host.get(SIGNET_SECRETS_PLUGIN_ID)?.state).toBe("active");
+		expect(host.get(SIGNET_SECRETS_PLUGIN_ID)?.health).toBeUndefined();
 
+		await Bun.sleep(0);
+		const plugin = host.get(SIGNET_SECRETS_PLUGIN_ID);
 		expect(plugin?.state).toBe("degraded");
 		expect(plugin?.health?.status).toBe("unhealthy");
 		expect(plugin?.stateReason).toContain("Failed to read secrets store");
+	});
+
+	test("authorized keyring recovery preserves active Bitwarden write routing", async () => {
+		const key = Buffer.alloc(32, 7).toString("base64");
+		let locked = false;
+		let consent = 0;
+		setSecretKeyringAdapterForTests({
+			platform: "darwin",
+			service: "fixture",
+			account: "fixture",
+			async get(options) {
+				if (options?.allowInteraction) {
+					consent++;
+					locked = false;
+				}
+				return locked ? { state: "locked" } : { state: "found", value: key };
+			},
+			async set() {
+				throw new Error("must not replace the master key");
+			},
+		});
+		await putSecret(BITWARDEN_SESSION_SECRET, "fixture-session");
+		await putSecret(BITWARDEN_ACTIVE_PROVIDER_SECRET, "bitwarden");
+		let writes = 0;
+		setBitwardenClientFactoryForTests(async () => ({
+			async status() {
+				return { status: "unlocked" };
+			},
+			async listFolders() {
+				return [];
+			},
+			async listItems() {
+				return [];
+			},
+			async getItem() {
+				throw new Error("not used");
+			},
+			async putSecret(name, value) {
+				expect(value).toBe("fixture-zai");
+				writes++;
+				return { id: "fixture", name, folderId: null };
+			},
+			async deleteSecret() {
+				return false;
+			},
+			async resolveSecret() {
+				throw new Error("not used");
+			},
+		}));
+		locked = true;
+		const before = readFileSync(secretsFile(), "utf8");
+		await expect(putSecret("ZAI_API_KEY", "fixture-zai")).rejects.toMatchObject({ state: "locked" });
+		expect(readFileSync(secretsFile(), "utf8")).toBe(before);
+		expect(consent).toBe(0);
+		await putSecret("ZAI_API_KEY", "fixture-zai", { allowInteraction: true });
+		expect(consent).toBe(1);
+		expect(writes).toBe(1);
+		expect(hasSecret("ZAI_API_KEY")).toBe(false);
 	});
 
 	test("active Bitwarden provider resolves bare names with the same canonical name used on write", async () => {

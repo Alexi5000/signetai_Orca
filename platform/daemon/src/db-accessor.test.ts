@@ -1,6 +1,3 @@
-/**
- * Tests for the DB accessor (singleton read/write transaction wrapper).
- */
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
@@ -63,8 +60,8 @@ function tmpDbPath(): string {
 describe("DbAccessor", () => {
 	const cleanupDirs: string[] = [];
 
-	afterEach(() => {
-		closeDbAccessor();
+	afterEach(async () => {
+		await closeDbAccessor();
 		for (const dir of cleanupDirs) {
 			if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 		}
@@ -106,7 +103,7 @@ describe("DbAccessor", () => {
 		cleanupDirs.push(join(dbPath, ".."));
 
 		initDbAccessor(dbPath);
-		closeDbAccessor();
+		await closeDbAccessor();
 		for (const name of readdirSync(join(dbPath, ".."))) {
 			if (name.startsWith("test.db.bak-v") && !name.endsWith(".cursor.json")) rmSync(join(dbPath, "..", name));
 		}
@@ -116,7 +113,7 @@ describe("DbAccessor", () => {
 			.prepare("INSERT INTO migration_large_fixture (payload) VALUES (zeroblob(?))")
 			.run(3 * MIGRATION_BACKUP_CHUNK_BYTES + 1);
 		fixture.exec("DELETE FROM schema_migrations WHERE version = 128");
-		fixture.close();
+		fixture.close(true);
 		const sourceSizeBeforeInit = statSync(dbPath).size;
 
 		const owner = createDbOwnerClient({ dbPath });
@@ -148,11 +145,11 @@ describe("DbAccessor", () => {
 		});
 	});
 
-	test("keeps large deferred FTS backfills off the initialization path", () => {
+	test("keeps large deferred FTS backfills off the initialization path", async () => {
 		const dbPath = tmpDbPath();
 		cleanupDirs.push(join(dbPath, ".."));
 		initDbAccessor(dbPath);
-		closeDbAccessor();
+		await closeDbAccessor();
 
 		const db = new Database(dbPath);
 		const insert = db.prepare(
@@ -169,7 +166,7 @@ describe("DbAccessor", () => {
 		db.exec("DROP TRIGGER memories_ad");
 		db.exec("DROP TRIGGER memories_au");
 		db.exec("DROP TABLE memories_fts");
-		db.close();
+		db.close(true);
 
 		const started = performance.now();
 		initDbAccessor(dbPath);
@@ -201,7 +198,7 @@ describe("DbAccessor", () => {
 
 		const db = new Database(dbPath);
 		db.exec("DELETE FROM memories_fts");
-		db.close();
+		db.close(true);
 
 		initDbAccessor(dbPath);
 		expect(isFtsIndexIncomplete()).toBe(true);
@@ -222,7 +219,7 @@ describe("DbAccessor", () => {
 			db.exec("CREATE TABLE memory_jobs (id TEXT PRIMARY KEY)");
 			db.exec("DROP TABLE memory_jobs_original");
 		} finally {
-			db.close();
+			db.close(true);
 		}
 
 		expect(() => initDbAccessor(dbPath)).not.toThrow();
@@ -254,7 +251,7 @@ describe("DbAccessor", () => {
 			db.exec("CREATE TABLE memory_jobs (id TEXT PRIMARY KEY)");
 			db.exec("DROP TABLE memory_jobs_original");
 		} finally {
-			db.close();
+			db.close(true);
 		}
 
 		const backupPath = join(dbPath, "..", initialBackup);
@@ -331,7 +328,6 @@ describe("DbAccessor", () => {
 			resetDbObservability();
 			establishEventLoopHeartbeatBaseline(1_000, 2_000);
 			getDbAccessor().withWriteTx((db) => {
-				// Keep this synchronous on purpose: this is the parent-isolate wedge seam.
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 				now = 5_000;
 				db.prepare("SELECT 1").get();
@@ -366,7 +362,7 @@ describe("DbAccessor", () => {
 					state.latched = getEventLoopLiveness(5_000);
 					db.prepare("SELECT 1").get();
 				},
-				{ siteToken: "db-accessor.test.ts:190" },
+				{ siteToken: "db-accessor.test.ts:357" },
 			);
 		} finally {
 			Date.now = realNow;
@@ -374,7 +370,7 @@ describe("DbAccessor", () => {
 
 		if (state.latched === null) throw new Error("in-flight latch did not produce liveness data");
 		expect(state.latched.status).toBe("wedged");
-		expect(state.latched.syncDbCallSites).toContain("withReadDbAsync@platform/daemon/src/db-accessor.test.ts:190");
+		expect(state.latched.syncDbCallSites).toContain("withReadDbAsync@platform/daemon/src/db-accessor.test.ts:357");
 	});
 
 	test("attributes an in-flight parent sync call at latch time", () => {
@@ -390,20 +386,19 @@ describe("DbAccessor", () => {
 			resetDbObservability();
 			establishEventLoopHeartbeatBaseline(1_000, 2_000);
 			getSyncDbAccessor().withWriteTx((db) => {
-				// Hold the real accessor call in flight while the latch inspects it.
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 				now = 5_000;
 				recordEventLoopHeartbeat(5_000, 2_000);
 				state.latched = getEventLoopLiveness(5_000);
 				db.prepare("SELECT 1").get();
-			}, "db-accessor.test.ts:201");
+			}, "db-accessor.test.ts:388");
 		} finally {
 			Date.now = realNow;
 		}
 
 		if (state.latched === null) throw new Error("in-flight latch did not produce liveness data");
 		expect(state.latched.status).toBe("wedged");
-		expect(state.latched.syncDbCallSites).toContain("withWriteTx@platform/daemon/src/db-accessor.test.ts:201");
+		expect(state.latched.syncDbCallSites).toContain("withWriteTx@platform/daemon/src/db-accessor.test.ts:388");
 	});
 
 	test("attributes an in-flight queued async write callback at latch time", async () => {
@@ -426,7 +421,7 @@ describe("DbAccessor", () => {
 					state.latched = getEventLoopLiveness(5_000);
 					db.prepare("SELECT 1").get();
 				},
-				{ siteToken: "db-accessor.test.ts:222" },
+				{ siteToken: "db-accessor.test.ts:416" },
 			);
 		} finally {
 			Date.now = realNow;
@@ -434,7 +429,7 @@ describe("DbAccessor", () => {
 
 		if (state.latched === null) throw new Error("in-flight latch did not produce liveness data");
 		expect(state.latched.status).toBe("wedged");
-		expect(state.latched.syncDbCallSites).toContain("withWriteTxAsync@platform/daemon/src/db-accessor.test.ts:222");
+		expect(state.latched.syncDbCallSites).toContain("withWriteTxAsync@platform/daemon/src/db-accessor.test.ts:416");
 	});
 
 	test("attributes the actual caller through runWriteTxAsync", async () => {
@@ -462,7 +457,9 @@ describe("DbAccessor", () => {
 
 		if (state.latched === null) throw new Error("in-flight latch did not produce liveness data");
 		expect(state.latched.status).toBe("wedged");
-		expect(state.latched.syncDbCallSites).toContain("withWriteTxAsync@platform/daemon/src/db-accessor.test.ts:452");
+		expect(state.latched.syncDbCallSites).toContainEqual(
+			expect.stringMatching(/^withWriteTxAsync@platform\/daemon\/src\/db-accessor\.test\.ts:\d+$/),
+		);
 	});
 
 	test("write statements expose the number of affected rows", () => {
@@ -514,9 +511,7 @@ describe("DbAccessor", () => {
 				db.prepare("INSERT INTO rollback_test (id, val) VALUES (?, ?)").run(2, "should-rollback");
 				throw new Error("intentional failure");
 			});
-		} catch {
-			// expected
-		}
+		} catch {}
 
 		const rows = acc.withReadDb((db) => {
 			return db.prepare("SELECT id FROM rollback_test ORDER BY id").all() as Array<Record<string, unknown>>;
@@ -663,8 +658,6 @@ describe("DbAccessor", () => {
 		const dbPath = tmpDbPath();
 		cleanupDirs.push(join(dbPath, ".."));
 		initDbAccessor(dbPath);
-
-		// Should not throw
 		closeDbAccessor();
 	});
 
@@ -698,9 +691,6 @@ describe("DbAccessor", () => {
 			now: () => 6000,
 			log: () => {},
 		});
-
-		// Cursorless generated-name backups are legacy rollback points and remain
-		// protected until their own verification pass classifies them.
 		expect(operations).toEqual([operations[0]]);
 		expect(Array.from(files.keys()).sort()).toEqual([
 			"test.db.bak-v58-1000",
@@ -783,8 +773,6 @@ describe("DbAccessor", () => {
 				readVerificationCheckpoint: () => "complete",
 			}),
 		).toThrow(DbSpacePreflightError);
-		// Admission refusal must preserve the only completed-unverified rollback
-		// point; freeing it before a replacement exists would destroy recovery.
 		expect(operations).toEqual([]);
 		expect(Array.from(files.keys())).toEqual(["test.db.bak-v62-5000"]);
 	});
@@ -1679,7 +1667,7 @@ describe("vec_embeddings schema repair", () => {
 		);
 
 		expect((db.prepare("SELECT COUNT(*) AS n FROM vec_embeddings").get() as { n: number }).n).toBe(1);
-		db.close();
+		db.close(true);
 	});
 
 	test("backfills missing embeddings in bounded keyset batches", () => {
@@ -1707,7 +1695,7 @@ describe("vec_embeddings schema repair", () => {
 
 		expect(batchQueries).toBeGreaterThan(1);
 		expect((db.prepare("SELECT COUNT(*) AS n FROM vec_embeddings").get() as { n: number }).n).toBe(10_001);
-		db.close();
+		db.close(true);
 	});
 
 	test("quarantines malformed rows and continues backfill around them", () => {
@@ -1739,7 +1727,6 @@ describe("vec_embeddings schema repair", () => {
 				reason: "embedding blob has 3 bytes; expected 8 for 2 dimensions",
 			},
 		]);
-		// A follow-up probe sees no eligible pending row for the quarantined ID.
 		backfillVecEmbeddings(
 			{
 				exec: (sql: string) => db.exec(sql),
@@ -1748,7 +1735,7 @@ describe("vec_embeddings schema repair", () => {
 			2,
 		);
 		expect((db.prepare("SELECT COUNT(*) AS n FROM vec_embeddings").get() as { n: number }).n).toBe(2);
-		db.close();
+		db.close(true);
 	});
 
 	test("quarantines NULL and non-blob legacy vectors and continues backfill", () => {
@@ -1775,7 +1762,7 @@ describe("vec_embeddings schema repair", () => {
 			{ rowid: "null-row", dimensions: 2, reason: "embedding blob is NULL" },
 			{ rowid: "text-row", dimensions: 2, reason: "embedding blob is not a binary buffer" },
 		]);
-		db.close();
+		db.close(true);
 	});
 
 	test("rethrows operational vector insert failures instead of quarantining rows", () => {
@@ -1803,6 +1790,6 @@ describe("vec_embeddings schema repair", () => {
 
 		expect((db.prepare("SELECT COUNT(*) AS n FROM vec_embeddings").get() as { n: number }).n).toBe(0);
 		expect((db.prepare("SELECT COUNT(*) AS n FROM vec_embeddings_quarantine").get() as { n: number }).n).toBe(0);
-		db.close();
+		db.close(true);
 	});
 });

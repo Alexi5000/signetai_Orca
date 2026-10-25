@@ -1,11 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-FROM oven/bun:1.3.11@sha256:0733e50325078969732ebe3b15ce4c4be5082f18c4ac1a0f0ca4839c2e4e42a7 AS build
+FROM oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS build
 WORKDIR /app
-
-# The daemon image does not run the Electron desktop application. Skipping
-# Electron's postinstall download keeps this daemon-only build independent of
-# the GitHub release asset network.
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 
 RUN apt-get update \
@@ -14,6 +10,7 @@ RUN apt-get update \
 
 COPY package.json bun.lock bunfig.toml tsconfig.json biome.json ./
 COPY AGENTS.md CLAUDE.md LICENSE README.md ./
+COPY patches ./patches
 COPY scripts ./scripts
 COPY skills ./skills
 COPY memorybench ./memorybench
@@ -27,10 +24,6 @@ COPY public ./public
 COPY web ./web
 
 RUN bun install --frozen-lockfile
-# @signet/sdk bundles @signet/core. Keep the core package's optional native
-# dependencies materialized for that build even when their postinstall cannot
-# produce a Node addon in this Bun-only image. The runtime uses Bun's SQLite
-# implementation, so no better-sqlite3 addon is copied into the final image.
 RUN bun install --frozen-lockfile --ignore-scripts --filter '@signet/core'
 RUN test -e platform/core/node_modules/better-sqlite3
 ARG TARGETOS=linux
@@ -49,8 +42,6 @@ RUN set -eux; \
 RUN bun run build:core
 RUN bun run build:connector-base
 RUN bun run build:opencode-plugin
-# The Docker image intentionally does not install Rust. The image uses the
-# bundled Bun native build below, so skip the optional N-API addon build.
 RUN SIGNET_SKIP_NATIVE_BUILD=1 bun run build:native
 RUN bun run build:oh-my-pi-extension
 RUN bun run build:connector-oh-my-pi
@@ -61,7 +52,7 @@ RUN bun run build:dashboard
 RUN bun run build:signetai
 RUN bun run build:native-bun
 
-FROM oven/bun:1.3.11@sha256:0733e50325078969732ebe3b15ce4c4be5082f18c4ac1a0f0ca4839c2e4e42a7 AS runtime
+FROM oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production

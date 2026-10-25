@@ -51,12 +51,12 @@ describe("pi provider catalog models", () => {
 	});
 
 	test("preserves the Codex responses API and registry metadata", () => {
-		const model = getModels("openai-codex").find((candidate) => candidate.id === "gpt-5.4");
+		const model = getModels("openai-codex").find((candidate) => candidate.id === "gpt-6-luna");
 		expect(model).toBeDefined();
 		const resolved = resolvePiModel({
 			executor: "openai-codex",
 			providerFamily: "openai-codex",
-			model: "gpt-5.4",
+			model: "gpt-6-luna",
 			piModel: model as Model<Api>,
 			apiKey: "oauth-access",
 		});
@@ -118,9 +118,7 @@ describe("pi provider catalog models", () => {
 			if (!streamWithUsage) throw new Error("expected Pi stream support");
 			const result = await streamWithUsage("non-interactive stream", { sessionId: "request-session" });
 			const reader = result.stream.getReader();
-			while (!(await reader.read()).done) {
-				// Drain the stream so the upstream request settles.
-			}
+			while (!(await reader.read()).done) {}
 
 			expect(requestHeaders).toHaveLength(3);
 			expect(requestHeaders[0]?.get("x-opencode-session")).toBeNull();
@@ -172,8 +170,8 @@ describe("pi provider catalog models", () => {
 				"done",
 			);
 
-			const unrelatedModel = getModels("openrouter")[0];
-			if (!unrelatedModel) throw new Error("expected OpenRouter catalog model");
+			const unrelatedModel = getModels("openrouter").find((candidate) => candidate.api === "openai-completions");
+			if (!unrelatedModel) throw new Error("expected an OpenAI-compatible OpenRouter catalog model");
 			const unrelatedProvider = createPiModelProvider({
 				executor: "openrouter",
 				providerFamily: "openrouter",
@@ -251,6 +249,32 @@ describe("pi provider catalog models", () => {
 		).toEqual({ requests: 3, hits: 1, misses: 1, unknown: 1, writes: 1 });
 	});
 
+	test("reports the largest single request's context as the peak", () => {
+		const stats: SessionStats = {
+			sessionFile: undefined,
+			sessionId: "session",
+			userMessages: 1,
+			assistantMessages: 3,
+			toolCalls: 2,
+			toolResults: 2,
+			totalMessages: 6,
+			tokens: { input: 9_000, output: 600, cacheRead: 150_000, cacheWrite: 4_000, total: 163_600 },
+			cost: 0,
+		};
+		const usage = (input: number, cacheRead: number, cacheWrite: number): Usage =>
+			({ input, cacheRead, cacheWrite }) as Usage;
+
+		expect(
+			mapSessionStatsToUsage(stats, 10, "provider_reported", [
+				usage(4_000, 0, 4_000),
+				usage(2_000, 60_000, 0),
+				usage(3_000, 90_000, 0),
+			]).peakContextTokens,
+		).toBe(93_000);
+		expect(mapSessionStatsToUsage(stats, 10, "provider_reported").peakContextTokens).toBeNull();
+		expect(mapUsage(usage(1_500, 20_000, 500), "provider_reported").peakContextTokens).toBe(22_000);
+	});
+
 	test("does not report request cache accounting when a provider omits cache fields", () => {
 		const mapped = mapUsage({} as Usage, "provider_reported");
 		expect(mapped).toMatchObject({
@@ -290,7 +314,7 @@ describe("pi provider catalog models", () => {
 		try {
 			expect(session.getActiveToolNames()).toEqual([]);
 		} finally {
-			session.dispose();
+			await session.dispose();
 		}
 	});
 
@@ -312,6 +336,36 @@ describe("pi provider catalog models", () => {
 		}
 	});
 
+	test.each([
+		["API key", "sk-ant-api03-test", { "x-api-key": "sk-ant-api03-test" }],
+		["OAuth token", "sk-ant-oat01-test", { authorization: "Bearer sk-ant-oat01-test" }],
+	] as const)("probes an uncataloged Anthropic model with %s auth headers", async (_kind, apiKey, expectedAuth) => {
+		const originalFetch = globalThis.fetch;
+		const requests: { url: string; headers: Record<string, string> }[] = [];
+		globalThis.fetch = mock((url: string, init?: RequestInit) => {
+			const headers = { ...(init?.headers as Record<string, string>) };
+			requests.push({ url, headers });
+			const authorized = Object.entries(expectedAuth).every(([name, value]) => headers[name] === value);
+			const versioned = headers["anthropic-version"] === "2023-06-01";
+			return Promise.resolve(new Response("{}", { status: authorized && versioned ? 200 : 400 }));
+		}) as unknown as typeof fetch;
+		try {
+			const provider = createPiModelProvider({
+				executor: "anthropic",
+				model: "claude-uncataloged-test",
+				apiKey,
+			});
+			await expect(provider.available()).resolves.toBe(true);
+			expect(requests).toHaveLength(1);
+			expect(requests[0]?.url).toBe("https://api.anthropic.com/v1/models");
+			expect(Object.keys(requests[0]?.headers ?? {}).sort()).toEqual(
+				[...Object.keys(expectedAuth), "anthropic-version"].sort(),
+			);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	test("settles a successful silent-overflow response without continuing from an assistant message", async () => {
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = mock(() =>
@@ -327,18 +381,25 @@ describe("pi provider catalog models", () => {
 			),
 		) as unknown as typeof fetch;
 
+		const workerServer = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: (request) => globalThis.fetch(request.url),
+		});
 		const provider = createPiModelProvider({
 			executor: "openai-compatible",
 			model: "silent-overflow-test",
-			baseUrl: "http://127.0.0.1:1234/v1",
+			baseUrl: `http://127.0.0.1:${workerServer.port}/v1`,
 			contextWindow: 2,
 		});
 		await expect(provider.generate("ordinary routed call")).resolves.toBe("done");
 		const session = await provider.createAgentSession([]);
 		try {
-			await expect(session.prompt("finish without tools")).resolves.toBeUndefined();
+			const result = await session.prompt("finish without tools");
+			expect(result).toBeUndefined();
 		} finally {
-			session.dispose();
+			await session.dispose();
+			workerServer.stop(true);
 			globalThis.fetch = originalFetch;
 		}
 	});

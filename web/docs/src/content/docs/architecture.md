@@ -17,11 +17,9 @@ Signet has one canonical state layer: agent-scoped SQLite rows and user-facing w
 
 ## Database owner boundary
 
-The daemon-facing database contract is an asynchronous, serializable job protocol. A job contains an operation name, lane (`read`, `write`, or `maintenance`), enqueue timestamp, absolute deadline, estimated work units, cancellation state, and a query request. The first implementation runs one killable owner process. The lane is part of the frozen interface so a future transport can route recall reads to parallel readers and writes or maintenance to one writer without changing callers.
+The daemon submits database work through a bounded asynchronous protocol to one killable owner process. The owner serially drains foreground and maintenance queues, prioritizing foreground work with a bounded burst. Read-only statements use read-only SQLite connections within the owner process; they are not handled by a separate reader process. Job deadlines bound admission and execution, but expiry does not kill the owner or roll back synchronous work already in progress. Failed or abandoned jobs are not silently replayed, and the daemon does not fall back to opening SQLite itself.
 
-The owner process is the only place that imports SQLite or runs synchronous SQL. The daemon client exposes `submit`, `awaitResult`, `cancel`, `health`, and `close`; it never exposes a database handle or callback. The parent kills the owner at a hard deadline, reports `owner_died` when the process exits unexpectedly, and starts a fresh owner for the next job. Pending jobs fail closed rather than waiting behind a dead process. Owner construction failures are reported as unavailable and do not silently fall back to main-thread SQLite.
-
-The wire messages are newline-delimited JSON: `submit(job)`, `cancel(jobId)`, and `shutdown` from the daemon, with `ready`, `result`, and `fatal` events from the owner. Results are `completed`, `cancelled`, `timed_out`, `failed`, or `owner_died`. This boundary is the migration seam for recall, writes, integrity and repair, index and embedding work, FTS maintenance, and source ingestion. The core rollout proves the seam with an owner-routed recall query; category migrations must not reintroduce synchronous SQLite in the daemon.
+See the [DB owner protocol reference](/architecture/db-owner-protocol/) for the job envelope, wire messages, cancellation behavior, and maintenance contract.
 
 ## Execution boundaries
 
@@ -34,6 +32,7 @@ Some boundaries intentionally remain separate from the ordinary helper runtime:
 - The database owner is one killable process because it owns synchronous SQLite access and must be restartable without wedging the daemon.
 - Native embedding keeps its own worker and model lifecycle because the model and WASM runtime are memory-heavy. Its idle TTL evicts the worker after inactivity; it is not part of the general helper pool.
 - Database integrity checks and repairs, and transcript recovery when enabled, retain killable process boundaries for deadline, crash, and restart containment.
+- Transcript recovery children discover and parse files but do not open SQLite. Their bounded, sequential store requests return through the supervising daemon to its existing database owner. The daemon fixes the agent and workspace scope; shutdown cancels and drains outstanding store work before closing the owner. A child exit without a completion receipt is a failed scan.
 - External provider commands remain external subprocesses. They are not internal helper fan-out.
 
 The compiled runtime materializes worker entrypoints as assets and starts them with `Worker`; it must not be invoked once per internal helper job. The daemon regression test `src/worker-process-boundary.test.ts` audits compiled-runtime launch sites and prints the remaining intentional process owners.

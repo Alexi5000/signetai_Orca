@@ -2,15 +2,15 @@ name: Marketing Security
 on:
   pull_request:
     paths:
-      - 'web/marketing/public/redesign-home-mockup.html'
-      - 'web/marketing/tests/**'
-      - '.github/workflows/marketing-security.yml'
+      - "web/marketing/public/redesign-home-mockup.html"
+      - "web/marketing/tests/**"
+      - ".github/workflows/marketing-security.yml"
   push:
     branches: [main]
     paths:
-      - 'web/marketing/public/redesign-home-mockup.html'
-      - 'web/marketing/tests/**'
-      - '.github/workflows/marketing-security.yml'
+      - "web/marketing/public/redesign-home-mockup.html"
+      - "web/marketing/tests/**"
+      - ".github/workflows/marketing-security.yml"
 permissions:
   contents: read
 jobs:
@@ -20,5 +20,5 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: '22'
+          node-version: "22"
       - run: node --test web/marketing/tests/*.test.mjs

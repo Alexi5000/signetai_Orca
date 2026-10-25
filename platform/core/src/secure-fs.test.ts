@@ -95,7 +95,6 @@ describe("writeFileAtomicSync / writeFileAtomic", () => {
 		expect(replaced?.content).toBe("new");
 		if (posix) {
 			expect(mode(path)).toBe(0o751);
-			// Replacement is a rename of a fresh file, never an in-place truncate.
 			expect(replaced?.stat.ino).not.toBe(inodeBefore);
 		}
 		await writeFileAtomic(path, "newer");
@@ -134,7 +133,6 @@ describe("writeFileAtomicSync / writeFileAtomic", () => {
 	test("cleans up its temp file when the rename fails", async () => {
 		const dir = scratch();
 		const target = join(dir, "occupied");
-		// A non-empty directory cannot be replaced by a file rename.
 		mkdirSync(target);
 		writeFileSync(join(target, "keep"), "x");
 		expect(() => writeFileAtomicSync(target, "data")).toThrow();

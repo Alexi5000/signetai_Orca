@@ -1,4 +1,3 @@
-/** Regression smoke for Dreaming finalization in compiled native binaries (#1824). */
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
@@ -6,11 +5,12 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { runMigrations } from "../platform/core/src/migrations";
+import type { DbOwnerDreamingPassFinalize } from "../platform/daemon/src/db-owner-protocol";
 
 const root = join(import.meta.dir, "..");
 const enabled = process.env.SIGNET_DB_OWNER_SMOKE === "1";
 const tempDirs: string[] = [];
-const children: ChildProcessWithoutNullStreams[] = [];
+const children = new Map<ChildProcessWithoutNullStreams, Promise<unknown>>();
 const SMOKE_TIMEOUT_MS = 30_000;
 
 function nativeSmokeBinary(): string {
@@ -51,11 +51,24 @@ async function waitForJsonEvent(
 	throw new Error(`native DB-owner event did not arrive within ${SMOKE_TIMEOUT_MS}ms: ${stderr()}`);
 }
 
-afterEach(() => {
-	for (const child of children.splice(0)) {
-		if (child.exitCode === null) child.kill("SIGKILL");
+afterEach(async () => {
+	for (const [child, closed] of children) {
+		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		await closed;
 	}
+	children.clear();
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
+}, SMOKE_TIMEOUT_MS);
+
+test("force-closes prepared SQLite handles before temporary workspace cleanup (#1932)", () => {
+	const directory = mkdtempSync(join(tmpdir(), "signet-native-dreaming-finalize-cleanup-"));
+	tempDirs.push(directory);
+	const database = new Database(join(directory, "memory.db"));
+	const prepared = database.prepare("CREATE TABLE prepared_fixture (value TEXT NOT NULL)");
+	prepared.run();
+	database.close(true);
+
+	expect(() => rmSync(directory, { recursive: true, force: true })).not.toThrow();
 });
 
 describe("compiled native Dreaming finalization", () => {
@@ -73,16 +86,14 @@ describe("compiled native Dreaming finalization", () => {
 			const dbPath = join(directory, "memory.db");
 			const database = new Database(dbPath);
 			runMigrations(database as unknown as Parameters<typeof runMigrations>[0]);
-			database
-				.prepare("INSERT INTO dreaming_passes (id, agent_id, mode, status) VALUES (?, ?, ?, ?)")
-				.run("native-dreaming-finalize-pass", "native-smoke", "incremental", "running");
-			database.close();
+			const prepared = database.prepare("INSERT INTO dreaming_passes (id, agent_id, mode, status) VALUES (?, ?, ?, ?)");
+			prepared.run("native-dreaming-finalize-pass", "native-smoke", "incremental", "running");
+			database.close(true);
 
 			const child = spawn(binary, [], {
 				env: { ...process.env, SIGNET_DB_OWNER_DB_PATH: dbPath, SIGNET_TELEMETRY_OPTOUT: "1" },
 				stdio: ["pipe", "pipe", "pipe"],
 			});
-			children.push(child);
 			let output = "";
 			let stderr = "";
 			let processError: Error | null = null;
@@ -100,6 +111,7 @@ describe("compiled native Dreaming finalization", () => {
 			const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
 				child.once("close", (code, signal) => resolve({ code, signal }));
 			});
+			children.set(child, closed);
 
 			await waitForJsonEvent(outputText, stderrText, child, processErrorText, (event) => event.type === "ready");
 
@@ -141,10 +153,10 @@ describe("compiled native Dreaming finalization", () => {
 					failed: 0,
 					summary: "native smoke",
 					rejectedEvidence: [],
-					memoryHeadResult: null,
+					memoryHeadCommitInput: null,
 					hasBacklogByScope: [],
 					nextWatermarkByScope: [],
-				},
+				} satisfies DbOwnerDreamingPassFinalize,
 			});
 			const finalized = await waitForJsonEvent(
 				outputText,

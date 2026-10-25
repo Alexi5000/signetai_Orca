@@ -1,18 +1,28 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
+import { createAuthMiddleware, createToken, generateSecret, parseAuthConfig } from "../auth";
 import { type BitwardenClient, setBitwardenClientFactoryForTests } from "../bitwarden.js";
 import { ONEPASSWORD_SERVICE_ACCOUNT_SECRET } from "../onepassword.js";
 import { queryPluginAuditEvents } from "../plugins/audit.js";
 import { SIGNET_SECRETS_PLUGIN_ID, signetSecretsManifest } from "../plugins/bundled/secrets.js";
 import { PluginHostV1 } from "../plugins/host.js";
-import { getLocalSecretValue, getSecret, putSecret, resetSecretExecJobsForTests } from "../secrets.js";
+import {
+	getLocalSecretValue,
+	getSecret,
+	putSecret,
+	resetSecretExecJobsForTests,
+	setSecretKeyringAdapterForTests,
+} from "../secrets.js";
 import { registerSecretRoutes } from "./secrets-routes.js";
 import { createTestTempDir } from "../test-temp-dir";
 
 const originalSignetPath = process.env.SIGNET_PATH;
 let agentsDir = "";
+const fixtureSecret = generateSecret();
+let adminToken = "";
 
 function makeHost(grantedCapabilities: readonly string[] = signetSecretsManifest.capabilities): PluginHostV1 {
 	const host = new PluginHostV1({
@@ -27,8 +37,19 @@ function makeHost(grantedCapabilities: readonly string[] = signetSecretsManifest
 
 function makeApp(host: PluginHostV1): Hono {
 	const app = new Hono();
+	app.use("*", createAuthMiddleware(parseAuthConfig({ mode: "team" }, agentsDir), fixtureSecret));
 	registerSecretRoutes(app, host);
 	return app;
+}
+
+function adminHeaders(headers?: HeadersInit): Headers {
+	const result = new Headers(headers);
+	result.set("Authorization", `Bearer ${adminToken}`);
+	return result;
+}
+
+function adminRequest(app: Hono, path: string, options: RequestInit = {}): Promise<Response> | Response {
+	return app.request(path, { ...options, headers: adminHeaders(options.headers) });
 }
 
 describe("secrets routes plugin capability enforcement", () => {
@@ -36,10 +57,28 @@ describe("secrets routes plugin capability enforcement", () => {
 		agentsDir = createTestTempDir("signet-secrets-routes-");
 		process.env.SIGNET_PATH = agentsDir;
 		mkdirSync(agentsDir, { recursive: true });
+		adminToken = createToken(fixtureSecret, { sub: "secrets-route-fixture", scope: {}, role: "admin" }, 60);
+		writeFileSync(join(agentsDir, "agent.yaml"), "name: fixture\n");
+		mkdirSync(join(agentsDir, "memory"), { recursive: true });
+		writeFileSync(join(agentsDir, "memory", "memories.db"), "");
+		let key: string | undefined = Buffer.alloc(32, 7).toString("base64");
+		setSecretKeyringAdapterForTests({
+			platform: "darwin",
+			service: "fixture",
+			account: "fixture",
+			async get() {
+				return key ? { state: "found", value: key } : { state: "missing" };
+			},
+			async set(value) {
+				key = value;
+				return { state: "found", value };
+			},
+		});
 	});
 
 	afterEach(() => {
 		resetSecretExecJobsForTests();
+		setSecretKeyringAdapterForTests(null);
 		if (originalSignetPath === undefined) {
 			Reflect.deleteProperty(process.env, "SIGNET_PATH");
 		} else {
@@ -50,13 +89,36 @@ describe("secrets routes plugin capability enforcement", () => {
 		}
 	});
 
+	test("unauthenticated secret writes cannot reach keyring consent", async () => {
+		let reads = 0;
+		setSecretKeyringAdapterForTests({
+			platform: "darwin",
+			service: "fixture",
+			account: "fixture",
+			async get() {
+				reads++;
+				return { state: "locked" };
+			},
+			async set() {
+				throw new Error("must not create a master key");
+			},
+		});
+		const response = await makeApp(makeHost()).request("/api/secrets/ZAI_API_KEY", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ value: "fixture-zai", authorizeKeyring: true }),
+		});
+		expect(response.status).toBe(401);
+		expect(reads).toBe(0);
+	});
+
 	test("denies routes when required plugin capabilities are not granted", async () => {
 		const app = makeApp(makeHost(["secrets:list"]));
 
-		const res = await app.request("/api/secrets/OPENAI_API_KEY", {
+		const res = await adminRequest(app, "/api/secrets/OPENAI_API_KEY", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ value: "sk-test" }),
+			body: JSON.stringify({ value: "sk-test", authorizeKeyring: true }),
 		});
 		const body = (await res.json()) as { status: string; missingCapabilities: string[] };
 
@@ -72,11 +134,162 @@ describe("secrets routes plugin capability enforcement", () => {
 		expect(audit.events[0]?.source).toBe("secrets-routes");
 	});
 
+	test("API-key recovery requires explicit consent and verifies persistent access before writing", async () => {
+		await putSecret("EXISTING", "fixture-existing");
+		const file = join(agentsDir, ".secrets", "secrets.enc");
+		const before = readFileSync(file, "utf8");
+		const calls: boolean[] = [];
+		let persistent = false;
+		let grantOnConsent = false;
+		const key = Buffer.alloc(32, 7).toString("base64");
+		setSecretKeyringAdapterForTests({
+			platform: "darwin",
+			service: "fixture",
+			account: "fixture",
+			async get(options) {
+				calls.push(options?.allowInteraction === true);
+				if (options?.allowInteraction === true && grantOnConsent) persistent = true;
+				if (options?.allowInteraction || persistent) return { state: "found", value: key };
+				return {
+					state: "locked",
+					message: "Platform failure: The user name or passphrase you entered is not correct.",
+				};
+			},
+			async set() {
+				throw new Error("must not replace the master key");
+			},
+		});
+		const app = makeApp(makeHost());
+		const post = (body: unknown) =>
+			adminRequest(app, "/api/secrets/ZAI_API_KEY", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		const locked = await post({ value: "fixture-zai" });
+		expect(locked.status).toBe(423);
+		expect(await locked.json()).toMatchObject({
+			code: "keyring-locked",
+			authorizationRequired: process.platform === "darwin",
+		});
+		expect(calls).toEqual([false]);
+		expect(readFileSync(file, "utf8")).toBe(before);
+		calls.length = 0;
+		const once = await post({ value: "fixture-zai", authorizeKeyring: true });
+		expect(once.status).toBe(423);
+		expect(calls).toEqual([false, true, false]);
+		expect(readFileSync(file, "utf8")).toBe(before);
+		calls.length = 0;
+		const invalid = await post({ value: "fixture-zai", authorizeKeyring: "yes" });
+		expect(invalid.status).toBe(400);
+		expect(calls).toEqual([]);
+		grantOnConsent = true;
+		const saved = await post({ value: "fixture-zai", authorizeKeyring: true });
+		expect(saved.status).toBe(200);
+		expect(calls).toEqual([false, true, false]);
+		expect(await getLocalSecretValue("EXISTING")).toBe("fixture-existing");
+		expect(await getLocalSecretValue("ZAI_API_KEY")).toBe("fixture-zai");
+	});
+
+	test("failed first-use key creation offers unlock guidance instead of unusable consent", async () => {
+		setSecretKeyringAdapterForTests({
+			platform: "darwin",
+			service: "fixture",
+			account: "fixture",
+			async get() {
+				return { state: "missing" };
+			},
+			async set() {
+				return { state: "locked" };
+			},
+		});
+		const res = await adminRequest(makeApp(makeHost()), "/api/secrets/ZAI_API_KEY", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ value: "fixture-zai" }),
+		});
+		expect(res.status).toBe(423);
+		expect(await res.json()).toMatchObject({ authorizationRequired: false });
+		expect(existsSync(join(agentsDir, ".secrets", "secrets.enc"))).toBe(false);
+	});
+
+	test("request cancellation reaches consent and leaves encrypted credentials untouched", async () => {
+		await putSecret("EXISTING", "fixture-existing");
+		const file = join(agentsDir, ".secrets", "secrets.enc");
+		const before = readFileSync(file, "utf8");
+		let entered: () => void = () => {};
+		const consent = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		setSecretKeyringAdapterForTests({
+			platform: "darwin",
+			service: "fixture",
+			account: "fixture",
+			async get(options) {
+				if (!options?.allowInteraction) return { state: "locked" };
+				entered();
+				await new Promise<void>((resolve) =>
+					options.signal?.addEventListener("abort", () => resolve(), { once: true }),
+				);
+				return { state: "found", value: Buffer.alloc(32, 7).toString("base64") };
+			},
+			async set() {
+				throw new Error("must not replace the master key");
+			},
+		});
+		const controller = new AbortController();
+		const settled = Promise.withResolvers<Response>();
+		let admissionTimer: ReturnType<typeof setTimeout> | undefined;
+		let settlementTimer: ReturnType<typeof setTimeout> | undefined;
+		const app = makeApp(makeHost());
+		const server = Bun.serve({
+			port: 0,
+			async fetch(request) {
+				const response = await app.fetch(request);
+				settled.resolve(response);
+				return response;
+			},
+		});
+		try {
+			const response = fetch(new URL("/api/secrets/ZAI_API_KEY", server.url), {
+				method: "POST",
+				signal: controller.signal,
+				headers: adminHeaders({ "Content-Type": "application/json" }),
+				body: JSON.stringify({ value: "fixture-zai", authorizeKeyring: true }),
+			}).catch(() => null);
+			const admission = await Promise.race([
+				consent.then(() => "consent" as const),
+				settled.promise.then((response) => response.status),
+				new Promise<"deadline">((resolve) => {
+					admissionTimer = setTimeout(() => resolve("deadline"), 1000);
+				}),
+			]);
+			clearTimeout(admissionTimer);
+			expect(admission).toBe("consent");
+			controller.abort();
+			expect(await response).toBeNull();
+			const result = await Promise.race([
+				settled.promise,
+				new Promise<null>((resolve) => {
+					settlementTimer = setTimeout(() => resolve(null), 1000);
+				}),
+			]);
+			clearTimeout(settlementTimer);
+			expect(result?.status).toBe(400);
+			expect(readFileSync(file, "utf8")).toBe(before);
+		} finally {
+			clearTimeout(admissionTimer);
+			clearTimeout(settlementTimer);
+			controller.abort();
+			await server.stop(true);
+		}
+	});
+
 	test("disabled signet.secrets blocks route access without deleting stored secrets", async () => {
 		const host = makeHost();
 		const app = makeApp(host);
 
-		const stored = await app.request("/api/secrets/OPENAI_API_KEY", {
+		const stored = await adminRequest(app, "/api/secrets/OPENAI_API_KEY", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ value: "sk-test" }),
@@ -85,13 +298,13 @@ describe("secrets routes plugin capability enforcement", () => {
 		expect(await stored.json()).toEqual({ success: true, name: "OPENAI_API_KEY" });
 
 		host.setEnabled(SIGNET_SECRETS_PLUGIN_ID, false);
-		const blocked = await app.request("/api/secrets");
+		const blocked = await adminRequest(app, "/api/secrets");
 		const blockedBody = (await blocked.json()) as { status: string };
 		expect(blocked.status).toBe(403);
 		expect(blockedBody.status).toBe("plugin-inactive");
 
 		host.setEnabled(SIGNET_SECRETS_PLUGIN_ID, true);
-		const listed = await app.request("/api/secrets");
+		const listed = await adminRequest(app, "/api/secrets");
 		const listedBody = (await listed.json()) as { secrets: string[] };
 		expect(listed.status).toBe(200);
 		expect(listedBody.secrets).toEqual(["OPENAI_API_KEY"]);
@@ -104,7 +317,7 @@ describe("secrets routes plugin capability enforcement", () => {
 		const script = join(agentsDir, "route-background.mjs");
 		writeFileSync(script, "setTimeout(() => process.stdout.write(process.env.OPENAI_API_KEY), 25);\n");
 
-		const queued = await app.request("/api/secrets/exec", {
+		const queued = await adminRequest(app, "/api/secrets/exec", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
@@ -123,7 +336,7 @@ describe("secrets routes plugin capability enforcement", () => {
 		let statusBody: { status: string; result?: { stdout: string; code: number } } | undefined;
 		for (let i = 0; i < 20 && statusBody?.status !== "completed"; i++) {
 			await new Promise((resolve) => setTimeout(resolve, 25));
-			const status = await app.request(`/api/secrets/exec/${queuedBody.id}`);
+			const status = await adminRequest(app, `/api/secrets/exec/${queuedBody.id}`);
 			expect(status.status).toBe(200);
 			statusBody = (await status.json()) as { status: string; result?: { stdout: string; code: number } };
 		}
@@ -140,7 +353,7 @@ describe("secrets routes plugin capability enforcement", () => {
 			["/api/secrets/exec", { command: {}, secrets: { OPENAI_API_KEY: "OPENAI_API_KEY" } }],
 			["/api/secrets/OPENAI_API_KEY/exec", { command: "   " }],
 		] as const) {
-			const res = await app.request(path, {
+			const res = await adminRequest(app, path, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify(body),
@@ -153,7 +366,7 @@ describe("secrets routes plugin capability enforcement", () => {
 	test("rejects empty or malformed secret exec maps", async () => {
 		const app = makeApp(makeHost());
 		for (const secrets of [{}, [], "OPENAI_API_KEY", { OPENAI_API_KEY: "" }]) {
-			const res = await app.request("/api/secrets/exec", {
+			const res = await adminRequest(app, "/api/secrets/exec", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ command: "bun --version", secrets }),
@@ -164,7 +377,7 @@ describe("secrets routes plugin capability enforcement", () => {
 
 	test("legacy single-secret exec rejects empty override maps", async () => {
 		const app = makeApp(makeHost());
-		const res = await app.request("/api/secrets/OPENAI_API_KEY/exec", {
+		const res = await adminRequest(app, "/api/secrets/OPENAI_API_KEY/exec", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ command: "bun --version", secrets: {} }),
@@ -209,14 +422,14 @@ describe("secrets routes plugin capability enforcement", () => {
 		setBitwardenClientFactoryForTests(makeClient);
 		const app = makeApp(makeHost());
 
-		const local = await app.request("/api/secrets/LOCAL_ONLY", {
+		const local = await adminRequest(app, "/api/secrets/LOCAL_ONLY", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ value: "local-value" }),
 		});
 		expect(local.status).toBe(200);
 
-		const connected = await app.request("/api/secrets/bitwarden/connect", {
+		const connected = await adminRequest(app, "/api/secrets/bitwarden/connect", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ session: "bw-session", activate: true, folderId: "folder-1" }),
@@ -229,7 +442,7 @@ describe("secrets routes plugin capability enforcement", () => {
 			activeProvider: true,
 		});
 
-		const storedInBitwarden = await app.request("/api/secrets/BW_ONLY", {
+		const storedInBitwarden = await adminRequest(app, "/api/secrets/BW_ONLY", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ value: "bw-value" }),
@@ -238,11 +451,11 @@ describe("secrets routes plugin capability enforcement", () => {
 		expect(items.get("BW_ONLY")).toBe("bw-value");
 		expect(writeFolders.get("BW_ONLY")).toBe("folder-1");
 
-		const listed = await app.request("/api/secrets");
+		const listed = await adminRequest(app, "/api/secrets");
 		expect(listed.status).toBe(200);
 		expect(await listed.json()).toMatchObject({ provider: "bitwarden", secrets: ["BW_ONLY", "LOCAL_ONLY"] });
 
-		const dryRun = await app.request("/api/secrets/bitwarden/migrate", {
+		const dryRun = await adminRequest(app, "/api/secrets/bitwarden/migrate", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ dryRun: true }),
@@ -250,7 +463,7 @@ describe("secrets routes plugin capability enforcement", () => {
 		expect(dryRun.status).toBe(200);
 		expect(await dryRun.json()).toMatchObject({ success: true, dryRun: true, migratedCount: 0, skippedCount: 1 });
 
-		const migrated = await app.request("/api/secrets/bitwarden/migrate", {
+		const migrated = await adminRequest(app, "/api/secrets/bitwarden/migrate", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ dryRun: false, overwrite: true }),
@@ -259,22 +472,22 @@ describe("secrets routes plugin capability enforcement", () => {
 		expect(await migrated.json()).toMatchObject({ success: true, dryRun: false, migratedCount: 1 });
 		expect(items.get("LOCAL_ONLY")).toBe("local-value");
 
-		const deletedMigrated = await app.request("/api/secrets/LOCAL_ONLY", { method: "DELETE" });
+		const deletedMigrated = await adminRequest(app, "/api/secrets/LOCAL_ONLY", { method: "DELETE" });
 		expect(deletedMigrated.status).toBe(200);
 		expect(items.has("LOCAL_ONLY")).toBe(false);
 		expect(await getLocalSecretValue("LOCAL_ONLY")).toBe("local-value");
 		await expect(getSecret("LOCAL_ONLY")).rejects.toThrow();
-		const listedAfterDelete = await app.request("/api/secrets");
+		const listedAfterDelete = await adminRequest(app, "/api/secrets");
 		expect(listedAfterDelete.status).toBe(200);
 		expect(await listedAfterDelete.json()).toMatchObject({ provider: "bitwarden", secrets: ["BW_ONLY"] });
 
-		const reconnected = await app.request("/api/secrets/bitwarden/connect", {
+		const reconnected = await adminRequest(app, "/api/secrets/bitwarden/connect", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ session: "bw-session-2", activate: true }),
 		});
 		expect(reconnected.status).toBe(200);
-		const storedAfterReconnect = await app.request("/api/secrets/BW_NO_FOLDER", {
+		const storedAfterReconnect = await adminRequest(app, "/api/secrets/BW_NO_FOLDER", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ value: "bw-no-folder" }),
@@ -282,11 +495,11 @@ describe("secrets routes plugin capability enforcement", () => {
 		expect(storedAfterReconnect.status).toBe(200);
 		expect(writeFolders.get("BW_NO_FOLDER")).toBeUndefined();
 
-		const foldersRes = await app.request("/api/secrets/bitwarden/folders");
+		const foldersRes = await adminRequest(app, "/api/secrets/bitwarden/folders");
 		expect(foldersRes.status).toBe(200);
 		expect(await foldersRes.json()).toEqual({ folders: [{ id: "folder-1", name: "Signet" }], count: 1 });
 
-		const disconnected = await app.request("/api/secrets/bitwarden/connect", { method: "DELETE" });
+		const disconnected = await adminRequest(app, "/api/secrets/bitwarden/connect", { method: "DELETE" });
 		expect(disconnected.status).toBe(200);
 		expect(await disconnected.json()).toMatchObject({ success: true, disconnected: true, activeProvider: false });
 	});
@@ -321,7 +534,7 @@ describe("secrets routes plugin capability enforcement", () => {
 		);
 		const app = makeApp(makeHost());
 
-		const rejected = await app.request("/api/secrets/bitwarden/connect", {
+		const rejected = await adminRequest(app, "/api/secrets/bitwarden/connect", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ session: "bad", activate: true }),
@@ -329,7 +542,7 @@ describe("secrets routes plugin capability enforcement", () => {
 		expect(rejected.status).toBe(400);
 		expect(await rejected.json()).toMatchObject({ success: false, connected: false, activeProvider: false });
 
-		const rejectedUnknown = await app.request("/api/secrets/bitwarden/connect", {
+		const rejectedUnknown = await adminRequest(app, "/api/secrets/bitwarden/connect", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ session: "unknown", activate: true }),
@@ -337,18 +550,18 @@ describe("secrets routes plugin capability enforcement", () => {
 		expect(rejectedUnknown.status).toBe(400);
 		expect(await rejectedUnknown.json()).toMatchObject({ success: false, connected: false, activeProvider: false });
 
-		const status = await app.request("/api/secrets/bitwarden/status");
+		const status = await adminRequest(app, "/api/secrets/bitwarden/status");
 		expect(status.status).toBe(200);
 		expect(await status.json()).toMatchObject({ configured: false, connected: false, activeProvider: false });
 
-		const useBitwarden = await app.request("/api/secrets/bitwarden/provider", {
+		const useBitwarden = await adminRequest(app, "/api/secrets/bitwarden/provider", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ provider: "bitwarden" }),
 		});
 		expect(useBitwarden.status).toBe(400);
 
-		const accepted = await app.request("/api/secrets/bitwarden/connect", {
+		const accepted = await adminRequest(app, "/api/secrets/bitwarden/connect", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ session: "good", activate: false }),
@@ -358,7 +571,7 @@ describe("secrets routes plugin capability enforcement", () => {
 	});
 
 	test("1Password compatibility status route does not require configured token", async () => {
-		const res = await makeApp(makeHost()).request("/api/secrets/1password/status");
+		const res = await adminRequest(makeApp(makeHost()), "/api/secrets/1password/status");
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({
 			configured: false,
@@ -370,7 +583,7 @@ describe("secrets routes plugin capability enforcement", () => {
 	test("1Password disconnect returns the resolved deletion result", async () => {
 		await putSecret(ONEPASSWORD_SERVICE_ACCOUNT_SECRET, "op-test-token");
 
-		const res = await makeApp(makeHost()).request("/api/secrets/1password/connect", { method: "DELETE" });
+		const res = await adminRequest(makeApp(makeHost()), "/api/secrets/1password/connect", { method: "DELETE" });
 
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ success: true, disconnected: true, existed: true });

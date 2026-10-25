@@ -1,0 +1,34 @@
+diff --git a/dist/cjs/wrapper/ontology.js b/dist/cjs/wrapper/ontology.js
+index 2ac3aa0d9d5f266af1f1aa9628e43c863b44392f..ce5b88e2f3ebf162f3f1fee90961e805b78f1751 100644
+--- a/dist/cjs/wrapper/ontology.js
++++ b/dist/cjs/wrapper/ontology.js
+@@ -37,10 +37,10 @@ exports.EntityTypeFieldSchema = zod_1.z.union([
+     exports.EntityTypeFloatFieldSchema,
+     exports.EntityTypeBooleanFieldSchema,
+ ]);
+-exports.EntityFields = zod_1.z.record(exports.EntityTypeFieldSchema);
++exports.EntityFields = zod_1.z.record(zod_1.z.string(), exports.EntityTypeFieldSchema);
+ exports.EntityTypeSchema = zod_1.z.object({
+     description: zod_1.z.string().default(""),
+-    fields: zod_1.z.record(exports.EntityTypeFieldSchema),
++    fields: zod_1.z.record(zod_1.z.string(), exports.EntityTypeFieldSchema),
+ });
+ const EdgeSourceTarget = zod_1.z.object({
+     source: zod_1.z.string().optional(),
+diff --git a/dist/esm/wrapper/ontology.mjs b/dist/esm/wrapper/ontology.mjs
+index a0cd8cbfbc76de11252ded29d73c2881ef6d74e1..737eeb1bcf35d754e1686370fc523bacc3f9a9e0 100644
+--- a/dist/esm/wrapper/ontology.mjs
++++ b/dist/esm/wrapper/ontology.mjs
+@@ -32,10 +32,10 @@ export const EntityTypeFieldSchema = z.union([
+     EntityTypeFloatFieldSchema,
+     EntityTypeBooleanFieldSchema,
+ ]);
+-export const EntityFields = z.record(EntityTypeFieldSchema);
++export const EntityFields = z.record(z.string(), EntityTypeFieldSchema);
+ export const EntityTypeSchema = z.object({
+     description: z.string().default(""),
+-    fields: z.record(EntityTypeFieldSchema),
++    fields: z.record(z.string(), EntityTypeFieldSchema),
+ });
+ const EdgeSourceTarget = z.object({
+     source: z.string().optional(),

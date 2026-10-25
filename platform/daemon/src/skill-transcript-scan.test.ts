@@ -6,10 +6,6 @@ import { runMigrations } from "../../core/src/migrations";
 import { closeDbAccessor, initDbAccessor } from "./db-accessor";
 import { MAX_TRANSCRIPT_SCAN_BYTES, recordSkillsFromTranscript } from "./skill-transcript-scan";
 import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
-
-// Each JSONL line: { sessionId, timestamp, cwd, message: { content: [...] } }
-// Two resolved Skill uses (toolu_AAA=web-search, toolu_BBB=tavily-cli),
-// one unresolved use (toolu_CCC=web-search, no matching tool_result).
 const FIXTURE_JSONL = [
 	JSON.stringify({
 		sessionId: "sess-scan-1",
@@ -35,7 +31,6 @@ const FIXTURE_JSONL = [
 		cwd: "/test",
 		message: { content: [{ type: "tool_result", tool_use_id: "toolu_BBB", is_error: false }] },
 	}),
-	// toolu_CCC has NO matching tool_result — must be skipped
 	JSON.stringify({
 		sessionId: "sess-scan-1",
 		timestamp: "2024-01-01T00:00:04.000Z",
@@ -61,9 +56,9 @@ describe("recordSkillsFromTranscript", () => {
 		writeFileSync(fixturePath, FIXTURE_JSONL);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		db.close();
-		closeDbAccessor();
+		await closeDbAccessor();
 		rmSync(dbPath, { force: true });
 		rmSync(fixturePath, { force: true });
 		cleanupTestTempDir(scratchDir);
@@ -186,8 +181,6 @@ describe("recordSkillsFromTranscript", () => {
 			agentId: "default",
 			origin: "scan",
 		});
-
-		// Second call with identical args — INSERT OR IGNORE must hold
 		recordSkillsFromTranscript({
 			transcriptPath: fixturePath,
 			harness: "claude-code",

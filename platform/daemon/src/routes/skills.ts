@@ -1,10 +1,3 @@
-/**
- * Skills API routes — extracted from daemon.ts
- *
- * Handles skill listing, browsing, searching, installing, and uninstalling.
- * Integrates with the procedural memory graph for skill discovery.
- */
-
 import { spawnHidden as spawn } from "@signet/core";
 import {
 	cpSync,
@@ -39,10 +32,6 @@ function getAgentsDir(): string {
 function getSkillsDir(): string {
 	return join(getAgentsDir(), "skills");
 }
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 interface SkillMeta {
 	description: string;
@@ -107,10 +96,6 @@ type SkillBrowseResult = {
 	builtin?: boolean;
 };
 
-// ---------------------------------------------------------------------------
-// Cache state (module-private)
-// ---------------------------------------------------------------------------
-
 let catalogCache: CatalogEntry[] = [];
 let catalogFetchedAt = 0;
 let clawhubCache: ClawhubItem[] = [];
@@ -135,8 +120,6 @@ export async function fetchCatalogUrl(
 }
 
 const MAX_CATALOG_RESPONSE_BYTES = 5 * 1024 * 1024;
-
-/** Read an external catalog/document response without materializing an unbounded body. */
 export async function readCatalogResponseText(res: Response, limit = MAX_CATALOG_RESPONSE_BYTES): Promise<string> {
 	const contentLength = res.headers.get("content-length");
 	if (contentLength) {
@@ -171,9 +154,21 @@ export async function readCatalogResponseJson<T>(res: Response, limit = MAX_CATA
 	return JSON.parse(await readCatalogResponseText(res, limit)) as T;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+function readBlockScalar(after: string, literal: boolean): string {
+	const lines: string[] = [];
+	for (const line of after.split("\n").slice(1)) {
+		if (line.trim() !== "" && !/^\s/.test(line)) break;
+		lines.push(line);
+	}
+	while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+	const indent = lines.find((line) => line.trim() !== "")?.match(/^\s*/)?.[0].length ?? 0;
+	const body = lines.map((line) => line.slice(indent).trimEnd());
+	if (literal) return body.join("\n");
+	return body.reduce((out, line) => {
+		if (line === "") return `${out}\n`;
+		return out === "" || out.endsWith("\n") ? out + line : `${out} ${line}`;
+	}, "");
+}
 
 export function parseSkillFrontmatter(content: string): SkillMeta {
 	const match = content.match(/^---\n([\s\S]*?)\n---/);
@@ -181,8 +176,13 @@ export function parseSkillFrontmatter(content: string): SkillMeta {
 
 	const fm = match[1];
 	const get = (key: string) => {
-		const m = fm.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-		return m ? m[1].trim().replace(/^["']|["']$/g, "") : "";
+		const m = fm.match(new RegExp(`^${key}:[ \\t]*(.*)$`, "m"));
+		if (!m) return "";
+		const value = m[1].trim();
+		const block = /^([|>])[+-]?$/.exec(value);
+		return block
+			? readBlockScalar(fm.slice((m.index ?? 0) + m[0].length), block[1] === "|")
+			: value.replace(/^["']|["']$/g, "");
 	};
 	const getList = (key: string): string[] | undefined => {
 		const raw = get(key);
@@ -355,18 +355,12 @@ async function fetchClawhubCatalog(): Promise<ClawhubItem[]> {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Signet official skills (from repo root skills/)
-// ---------------------------------------------------------------------------
-
 function getSignetSkillsSourceDir(): string | null {
 	if (process.env.SIGNET_SKILLS_SOURCE && existsSync(process.env.SIGNET_SKILLS_SOURCE)) {
 		return process.env.SIGNET_SKILLS_SOURCE;
 	}
-	// Dev: monorepo root skills/ (daemon src is platform/daemon/src/routes/)
 	const devPath = join(__dirname, "..", "..", "..", "..", "skills");
 	if (existsSync(devPath)) return devPath;
-	// Dist: skills/ next to dist/
 	const distPath = join(__dirname, "..", "..", "skills");
 	if (existsSync(distPath)) return distPath;
 	const distPath2 = join(__dirname, "..", "skills");
@@ -413,13 +407,6 @@ function listSignetOfficialSkills(): SkillBrowseResult[] {
 			}
 		});
 }
-
-// ---------------------------------------------------------------------------
-// Route mount
-// ---------------------------------------------------------------------------
-
-// Lazy dependency accessors — singletons are initialised at daemon startup
-// before any route handler runs. These callsites are safe.
 let fetchEmbeddingFn: ((text: string, cfg: EmbeddingConfig) => Promise<number[] | null>) | null = null;
 
 export function setFetchEmbedding(fn: (text: string, cfg: EmbeddingConfig) => Promise<number[] | null>): void {
@@ -782,11 +769,6 @@ async function installClawhubSkill(
 		rmSync(tempRoot, { recursive: true, force: true });
 	}
 }
-
-/**
- * After a successful skill install, reconcile the graph node through the same
- * per-skill flight used by startup, periodic, and filesystem watcher paths.
- */
 async function onSkillInstalled(skillName: string): Promise<void> {
 	const accessor = getAccessorSafe();
 	if (!accessor || !fetchEmbeddingFn) return;
@@ -809,10 +791,6 @@ async function onSkillInstalled(skillName: string): Promise<void> {
 		throw new Error(`Skill graph reconciliation failed for ${skillName}`);
 	}
 }
-
-/**
- * Before a skill is uninstalled from the filesystem, remove its graph node.
- */
 async function onSkillUninstalling(skillName: string): Promise<void> {
 	const accessor = getAccessorSafe();
 	if (!accessor) return;
@@ -829,7 +807,6 @@ async function onSkillUninstalling(skillName: string): Promise<void> {
 }
 
 export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): void {
-	// GET /api/skills - list installed skills
 	app.get("/api/skills", (c) => {
 		try {
 			const skills = listInstalledSkills();
@@ -843,8 +820,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 			});
 		}
 	});
-
-	// GET /api/skills/browse - browse all skills (signet + skills.sh + ClawHub)
 	app.get("/api/skills/browse", async (c) => {
 		const [skillsShCatalog, clawhubItems, signetSkills] = await Promise.all([
 			fetchCatalog(),
@@ -891,8 +866,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 				maintainer: s.displayName,
 			}),
 		);
-
-		// Deduplicate: prefer signet provider when a skill exists in multiple sources
 		const external = dedupeSkillBrowseResults([...skillsShResults, ...clawhubResults]).filter(
 			(s) => !signetNames.has(s.name),
 		);
@@ -901,8 +874,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 		);
 		return c.json({ results, total: results.length });
 	});
-
-	// GET /api/skills/search?q=query - search signet + skills.sh + ClawHub
 	app.get("/api/skills/search", async (c) => {
 		const query = c.req.query("q");
 		if (!query) {
@@ -912,8 +883,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 		logger.info("skills", "Searching skills", { query });
 		const installed = listInstalledSkills().map((s) => s.name);
 		const lowerQuery = query.toLowerCase();
-
-		// Search skills.sh API + filter cached ClawHub in parallel
 		const [skillsShResults, clawhubFiltered] = await Promise.all([
 			(async (): Promise<SkillBrowseResult[]> => {
 				try {
@@ -983,8 +952,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 					);
 			})(),
 		]);
-
-		// Filter signet official skills by query
 		const signetFiltered = listSignetOfficialSkills().filter(
 			(s) => s.name.toLowerCase().includes(lowerQuery) || s.description.toLowerCase().includes(lowerQuery),
 		);
@@ -997,15 +964,11 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 		);
 		return c.json({ results });
 	});
-
-	// GET /api/skills/:name - get skill details and SKILL.md content
 	app.get("/api/skills/:name", async (c) => {
 		const name = c.req.param("name");
 		if (!name || name.includes("..") || name.includes("/") || name.includes("\\")) {
 			return c.json({ error: "Invalid skill name" }, 400);
 		}
-
-		// Try local install first
 		const skillMdPath = join(getSkillsDir(), name, "SKILL.md");
 		if (existsSync(skillMdPath)) {
 			try {
@@ -1022,8 +985,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 				return c.json({ error: "Failed to read skill" }, 500);
 			}
 		}
-
-		// Try signet official skills source
 		const signetDir = getSignetSkillsSourceDir();
 		if (signetDir) {
 			const signetSkillPath = join(signetDir, name, "SKILL.md");
@@ -1042,8 +1003,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 				}
 			}
 		}
-
-		// Fallback: fetch SKILL.md from GitHub via repo tree search
 		const source = c.req.query("source");
 		const repo = source ? source.split("@")[0] : catalogCache.find((s) => s.name === name)?.source;
 
@@ -1080,8 +1039,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 
 		return c.json({ error: `Skill '${name}' not found` }, 404);
 	});
-
-	// POST /api/skills/install - install a skill
 	app.post("/api/skills/install", async (c) => {
 		let body: { name?: string; source?: string } = {};
 		try {
@@ -1094,8 +1051,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 		if (!name) {
 			return c.json({ error: "name is required" }, 400);
 		}
-
-		// Sanitize: allow alphanumeric, dash, underscore, slash (for owner/repo)
 		if (!/^[\w\-./]+$/.test(name)) {
 			return c.json({ error: "Invalid skill name" }, 400);
 		}
@@ -1155,7 +1110,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 			proc.on("close", (code) => {
 				if (code === 0) {
 					logger.info("skills", "Skill installed", { name });
-					// Fire-and-forget graph node creation
 					onSkillInstalled(name).catch((e) => {
 						logger.error("skills", "Post-install graph hook failed", e as Error);
 					});
@@ -1174,8 +1128,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 			});
 		});
 	});
-
-	// DELETE /api/skills/:name - uninstall a skill
 	app.delete("/api/skills/:name", async (c) => {
 		const name = c.req.param("name");
 		if (!name || name.includes("..") || name.includes("/") || name.includes("\\")) {
@@ -1188,7 +1140,6 @@ export function mountSkillsRoutes(app: Hono, _authMode: AuthMode = "local"): voi
 		}
 
 		try {
-			// Remove graph node before filesystem cleanup
 			await onSkillUninstalling(name);
 			rmSync(skillDir, { recursive: true, force: true });
 			logger.info("skills", "Skill removed", { name });

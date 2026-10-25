@@ -1,20 +1,27 @@
 import { stat } from "node:fs/promises";
-import { join } from "node:path";
-import { vectorSearchWithMetadata } from "@signet/core";
+import { resolveWorkspaceLayout, vectorSearchWithMetadata } from "@signet/core";
 import type { DbAccessor, ReadDb, WriteDb } from "./db-accessor";
 import { getDbAccessorPath, hasDbAccessor, resolveSqliteAgentsDir } from "./db-accessor";
 import { registerDbAccessorCloseParticipant } from "./db-accessor-lifecycle";
 import {
 	createDbOwnerClient,
 	DbOwnerAdmissionError,
+	DbOwnerDiedError,
 	type DbOwnerClient,
 	type DbOwnerClientOptions,
 	type DbOwnerJobHandle,
 	type DbOwnerSubmitOptions,
 } from "./db-owner-client";
-import { getDbOwnerMaintenance } from "./db-owner-maintenance";
+import {
+	closeRegisteredDbOwnerMaintenance,
+	getDbOwnerMaintenance,
+	isDbOwnerMaintenanceClosing,
+	submitRegisteredDbOwnerJob,
+	withRegisteredDbOwnerMaintenance,
+} from "./db-owner-maintenance";
 import { commitTranscriptImportBatchInTx, purgeTranscriptImportSourceInTx } from "./transcript-import-commit";
 import { purgeSourceOwnedRowsInTx } from "./source-purge-tx";
+import { type AgentRemovalInput, type AgentRemovalResult, removeAgentInTx } from "./agent-removal";
 import type {
 	DbOwnerJob,
 	DbOwnerParameter,
@@ -32,14 +39,10 @@ import type {
 	DbOwnerStatement,
 	DbOwnerWorkloadClass,
 } from "./db-owner-protocol";
+import { applyVectorRepairBatch } from "./vector-repair-owner";
+import { MigrationControlBoundary } from "./workspace-writer-barrier";
 
 let isolatedTestAccessor: DbAccessor | null = null;
-
-/**
- * Tests that use an isolated in-memory accessor cannot start the process
- * owner. They may explicitly register that accessor so owner-routed helpers
- * retain their old test seam without creating a production fallback.
- */
 export function registerDbOwnerIsolatedTestAccessor(accessor: DbAccessor): void {
 	if (hasDbAccessor()) return;
 	isolatedTestAccessor = accessor;
@@ -159,6 +162,11 @@ async function executeInlineOwnerRequest(accessor: DbAccessor, request: DbOwnerR
 			return results;
 		});
 	}
+	if (request.kind === "vector_repair") {
+		return await invokeAccessorAsync(accessor, "withWriteTxAsync", (db) =>
+			applyVectorRepairBatch(db as never, request.input),
+		);
+	}
 	if (request.kind === "transcript_bulk_commit") {
 		return await invokeAccessorAsync(accessor, "withWriteTxAsync", (db) => {
 			return commitTranscriptImportBatchInTx(db as never, request.input);
@@ -173,6 +181,8 @@ async function executeInlineOwnerRequest(accessor: DbAccessor, request: DbOwnerR
 				purged: purged + purgeTranscriptImportSourceInTx(db as never, input.agentId, input.sourceId),
 			};
 		});
+	if (request.kind === "agent_remove")
+		return await invokeAccessorAsync(accessor, "withWriteTxAsync", (db) => removeAgentInTx(db as never, request.input));
 	if (request.kind === "vector_search") {
 		return invokeAccessor(accessor, "withReadDb", (db) =>
 			vectorSearchWithMetadata(db as never, new Float32Array(request.payload.queryEmbedding), request.payload.options),
@@ -197,6 +207,7 @@ async function executeInlineOwnerRequest(accessor: DbAccessor, request: DbOwnerR
 		case "dreaming_episodic_backlog_exists":
 		case "dreaming_evidence_search":
 		case "dreaming_evidence_source":
+		case "dreaming_evidence_review":
 		case "memory_head":
 		case "dreaming_pass_finalize":
 		case "dreaming_review_due":
@@ -205,6 +216,7 @@ async function executeInlineOwnerRequest(accessor: DbAccessor, request: DbOwnerR
 		case "embedding_migration_progress":
 		case "health_ready":
 		case "diagnostics":
+		case "transcript_recovery_store":
 		case "queue_diagnostics":
 		case "embedding_tracker_candidates":
 		case "vector_backfill":
@@ -219,6 +231,7 @@ async function executeInlineOwnerRequest(accessor: DbAccessor, request: DbOwnerR
 }
 
 function inlineOwner(accessor: DbAccessor): DbOwnerClient {
+	const migrationControl = new MigrationControlBoundary(`inline-db-owner:${process.pid}`);
 	const submit = <Result>(request: DbOwnerRequest, options: DbOwnerSubmitOptions): DbOwnerJobHandle<Result> => {
 		const now = Date.now();
 		const job: DbOwnerJob = {
@@ -257,6 +270,7 @@ function inlineOwner(accessor: DbAccessor): DbOwnerClient {
 			lastError: null,
 		}),
 		close: async () => undefined,
+		migrationControl: () => migrationControl,
 	};
 }
 
@@ -282,7 +296,7 @@ async function dbIdentity(dbPath: string): Promise<string> {
 export async function startDbOwnerWithRole(
 	dbPath: string,
 	workerRole: "generic" | "recall",
-	options: Pick<DbOwnerClientOptions, "workerPath"> = {},
+	options: Pick<DbOwnerClientOptions, "workerPath" | "migrationControl"> = {},
 ): Promise<DbOwnerClient> {
 	const identity = await dbIdentity(dbPath);
 	const key = dbPath;
@@ -321,17 +335,13 @@ export async function startDbOwnerWithRole(
 		if (currentEntry?.owner === owner && currentEntry.startPromise === pendingStart) currentEntry.startPromise = null;
 	}
 }
-
-/** Start the shared process DB owner for one database path. */
 export async function startDbOwner(
-	dbPath = join(resolveSqliteAgentsDir(), "memory", "memories.db"),
+	dbPath = resolveWorkspaceLayout(resolveSqliteAgentsDir()).database,
 ): Promise<DbOwnerClient> {
 	return await startDbOwnerWithRole(dbPath, "generic");
 }
-
-/** Compatibility entry point; recall shares the canonical owner. */
 export async function startDbRecallOwner(
-	dbPath = join(resolveSqliteAgentsDir(), "memory", "memories.db"),
+	dbPath = resolveWorkspaceLayout(resolveSqliteAgentsDir()).database,
 ): Promise<DbOwnerClient> {
 	return await startDbOwnerWithRole(dbPath, "recall");
 }
@@ -342,25 +352,75 @@ async function getCurrentProcessOwner(): Promise<DbOwnerClient> {
 	return inlineOwner(getDbAccessor());
 }
 
-/** Resolve the process owner, or the in-process adapter used inside an owner worker. */
+function registeredOwnerError(): DbOwnerDiedError {
+	return new DbOwnerDiedError("DB owner maintenance is no longer registered");
+}
+
+function registeredOwnerProxy(owner: DbOwnerClient): DbOwnerClient {
+	const activeJobs = new Set<string>();
+	const currentOwner = (): DbOwnerClient => {
+		if (getDbOwnerMaintenance()?.owner !== owner) throw registeredOwnerError();
+		return owner;
+	};
+	return {
+		start: async (): Promise<void> => {
+			const started = await withRegisteredDbOwnerMaintenance(async (maintenance) => {
+				if (maintenance.owner !== owner) throw registeredOwnerError();
+				await maintenance.owner.start();
+			});
+			if (started === undefined) throw registeredOwnerError();
+		},
+		initialize: async (agentsDir?: string) => {
+			const initialized = await withRegisteredDbOwnerMaintenance((maintenance) => {
+				if (maintenance.owner !== owner) throw registeredOwnerError();
+				return maintenance.owner.initialize(agentsDir);
+			});
+			if (initialized === undefined) throw registeredOwnerError();
+			return initialized;
+		},
+		submit: <Result>(request: DbOwnerRequest, options: DbOwnerSubmitOptions): DbOwnerJobHandle<Result> => {
+			const handle = submitRegisteredDbOwnerJob<Result>(owner, request, options);
+			if (handle === null) throw registeredOwnerError();
+			activeJobs.add(handle.job.id);
+			const completion = handle.metrics ?? handle.result;
+			const release = (): void => {
+				activeJobs.delete(handle.job.id);
+			};
+			void completion.then(release, release);
+			return handle;
+		},
+		setWriteBlocked: (blocked: boolean): void => {
+			currentOwner().setWriteBlocked(blocked);
+		},
+		awaitResult: async <Result>(handle: DbOwnerJobHandle<Result>, timeoutMs?: number): Promise<Result> => {
+			if (!activeJobs.has(handle.job.id)) currentOwner();
+			return await owner.awaitResult(handle, timeoutMs);
+		},
+		cancel: (jobId: string): void => {
+			if (!activeJobs.has(jobId)) currentOwner();
+			owner.cancel(jobId);
+		},
+		health: (): ReturnType<DbOwnerClient["health"]> => currentOwner().health(),
+		migrationControl: () => currentOwner().migrationControl(),
+		close: async (): Promise<void> => {
+			const maintenance = getDbOwnerMaintenance();
+			if (maintenance === null || maintenance.owner !== owner) throw registeredOwnerError();
+			await closeRegisteredDbOwnerMaintenance();
+		},
+	};
+}
 export async function getDbOwner(dbPath?: string): Promise<DbOwnerClient> {
 	if (process.env.SIGNET_DB_OWNER_WORKER === "1") return await getCurrentProcessOwner();
 	const registered = getDbOwnerMaintenance()?.owner;
-	if (registered !== undefined) return registered;
+	if (registered !== undefined) return registeredOwnerProxy(registered);
+	if (isDbOwnerMaintenanceClosing()) throw registeredOwnerError();
 	if (hasDbAccessor()) return await startDbOwner(getDbAccessorPath());
 	if (isolatedTestAccessor !== null) return inlineOwner(isolatedTestAccessor);
 	return await startDbOwner(dbPath);
 }
-
-/** Recall requests use the same owner as writes and maintenance. */
 export async function getDbRecallOwner(dbPath?: string): Promise<DbOwnerClient> {
 	return getDbOwner(dbPath);
 }
-
-/**
- * Resolve the production owner, or an explicitly supplied isolated test
- * accessor without opening a second SQLite connection.
- */
 export async function getDbOwnerForAccessor(accessor: DbAccessor): Promise<DbOwnerClient> {
 	if (process.env.SIGNET_DB_OWNER_WORKER === "1") return inlineOwner(accessor);
 	if (hasDbAccessor()) return await getDbOwner(getDbAccessorPath());
@@ -374,7 +434,6 @@ export interface DbOwnerSqlOptions {
 	readonly workloadClass?: DbOwnerWorkloadClass;
 	readonly deadlineMs?: number;
 	readonly estimatedWorkUnits?: number;
-	/** Aborting abandons the queued/in-flight owner job and suppresses its result. */
 	readonly signal?: AbortSignal;
 }
 
@@ -408,9 +467,6 @@ async function submitWithAdmission<Result>(
 		try {
 			throwIfAborted();
 			const handle = owner.submit<Result>(request, submit);
-			// Cancellation may happen synchronously during bridge shutdown, before
-			// the async waiter gets its first turn. Keep the handle rejection
-			// observed while awaitResult still propagates it to the caller.
 			void handle.result.catch(() => {});
 			const onAbort = (): void => handle.cancel();
 			signal?.addEventListener("abort", onAbort, { once: true });
@@ -482,8 +538,6 @@ export async function dbOwnerIncrementalVacuum(
 		},
 	);
 }
-
-/** Execute read-modify-write statements atomically on the serialized owner. */
 export async function dbOwnerTransaction(
 	statements: readonly DbOwnerStatement[],
 	options: DbOwnerSqlOptions,
@@ -534,6 +588,18 @@ export async function dbOwnerSourcePurge(
 	return await submitWithAdmission<{ readonly purged: number }>(
 		owner,
 		{ kind: "source_purge", input },
+		{ ...options, lane: options.lane ?? "write" },
+	);
+}
+
+export async function dbOwnerAgentRemove(
+	input: AgentRemovalInput,
+	options: DbOwnerSqlOptions,
+): Promise<AgentRemovalResult> {
+	const owner = await getDbOwner();
+	return await submitWithAdmission<AgentRemovalResult>(
+		owner,
+		{ kind: "agent_remove", input },
 		{ ...options, lane: options.lane ?? "write" },
 	);
 }

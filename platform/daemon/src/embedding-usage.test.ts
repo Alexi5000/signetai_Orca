@@ -1,16 +1,14 @@
-/**
- * Regression test for issue #1181: pipeline.embedding was declared in
- * TELEMETRY_EVENTS but never emitted, so embedding token spend was
- * invisible in PostHog and the telemetry stats endpoint. The event must
- * fire at the embedding fetch boundary (recordEmbeddingUsage) with
- * tokens/provider/sourceKind.
- */
-
+import { startDbOwner } from "./db-owner-runtime";
+import {
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+	closeRegisteredDbOwnerMaintenance,
+} from "./db-owner-maintenance";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
-import { recordEmbeddingUsage } from "./embedding-usage";
+import { recordEmbeddingUsage, readEmbeddingUsageSummary } from "./embedding-usage";
 import { type TelemetryCollector, createTelemetryCollector, setActiveTelemetry } from "./telemetry";
 import { cleanupTestTempDir, createTestTempDir } from "./test-temp-dir";
 
@@ -18,7 +16,7 @@ let dir = "";
 let collector: TelemetryCollector;
 
 const TELEMETRY_CONFIG = {
-	posthogHost: "", // nothing sends; events stay local
+	posthogHost: "",
 	posthogApiKey: "",
 	flushIntervalMs: 60000,
 	flushBatchSize: 50,
@@ -26,22 +24,26 @@ const TELEMETRY_CONFIG = {
 	memorySearchQaEnabled: false,
 } as const;
 
-function resetWorkspace(): void {
-	closeDbAccessor();
+async function resetWorkspace(): Promise<void> {
+	await closeDbAccessor();
 	rmSync(join(dir, "memory"), { recursive: true, force: true });
 	mkdirSync(join(dir, "memory"), { recursive: true });
-	initDbAccessor(join(dir, "memory", "memories.db"));
+	initDbAccessor(join(dir, "memory", "memories.db"), { agentsDir: dir });
+	const owner = await startDbOwner(join(dir, "memory", "memories.db"));
+	await owner.initialize(dir);
+	registerDbOwnerMaintenance(createDbOwnerMaintenance({ owner, dbPath: join(dir, "memory", "memories.db") }));
 }
 
 describe("embedding telemetry (issue #1181)", () => {
-	beforeAll(() => {
+	beforeAll(async () => {
 		dir = createTestTempDir("signet-embed-telemetry-");
-		resetWorkspace();
+		await resetWorkspace();
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		setActiveTelemetry(undefined);
-		closeDbAccessor();
+		await closeRegisteredDbOwnerMaintenance();
+		await closeDbAccessor();
 		cleanupTestTempDir(dir);
 	});
 
@@ -63,8 +65,7 @@ describe("embedding telemetry (issue #1181)", () => {
 		expect(second?.properties.tokens).toBe(42);
 		expect(second?.properties.cost).toBe(0);
 		expect(second?.properties.sourceKind).toBe("dreaming");
-
-		// The DB accounting still lands too (shared boundary, #1154).
+		await readEmbeddingUsageSummary(getDbAccessor());
 		const row = getDbAccessor().withReadDb(
 			(db) => db.prepare("SELECT SUM(tokens) AS tokens FROM embedding_usage").get() as { tokens: number },
 		);

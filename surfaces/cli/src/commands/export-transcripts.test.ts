@@ -38,12 +38,6 @@ describe("parseTranscriptMessages", () => {
 	});
 
 	test("splits role-prefix lines containing literal carriage returns", () => {
-		// Regression: git output embeds \r separators (e.g. "Rebasing (1/1)\rDone").
-		// JS regex `.` does not match \r, so a "Tool:" line with an interior \r
-		// failed the whole prefix match and was absorbed into the previous
-		// message; the Python aggregator's splitlines() splits on \r. The parser
-		// must match splitlines() or export output drifts from the pipeline it
-		// replaces.
 		const content = "Assistant: rebase it\nTool: Rebasing (1/1)\rSuccessfully rebased\nAssistant: done";
 		expect(parseTranscriptMessages(content)).toEqual([
 			{ role: "assistant", content: "rebase it" },
@@ -64,6 +58,7 @@ test("CLI streams the daemon export with all filters through the real command tr
 	const program = new Command();
 	registerPortableCommands(program, {
 		AGENTS_DIR: directory,
+		daemonOwnsWorkspace: async () => false,
 		fetchDaemonStream: async (path) => {
 			requested = path;
 			return {

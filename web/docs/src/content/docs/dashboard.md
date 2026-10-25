@@ -12,39 +12,123 @@ signet daemon start
 signet dashboard
 ```
 
-The default URL is `http://localhost:3850`. If you set `SIGNET_PORT`, use that port instead.
+The default URL is `http://localhost:3850`. `signet dashboard` opens the daemon the CLI is configured for, resolved from `SIGNET_DAEMON_URL`, then `daemon.url` in `agent.yaml`, then `SIGNET_HOST` and `SIGNET_PORT`. It sets up or starts a daemon only when that target is local.
 
-## Current navigation
+## Signing in
 
-The dashboard uses hash routes. These routes are available in the current application:
+In `local` mode the dashboard needs no sign-in. To set up a daemon for several people, see [Teams](/teams/). When the daemon runs in `team` mode, or in `hybrid` mode and you open the dashboard from another machine, the dashboard shows a sign-in screen instead of empty panels. The screen names the mode and the daemon address, for example `Team · signet.example.com`.
 
-| Route | Surface | What it is for |
-|---|---|---|
-| `#home` | Home | Daemon and workspace overview. |
-| `#memory` | Memory | Browse and search stored memory. |
-| `#sources` | Sources | Connect supported sources, import files, inspect source health, re-index, snapshot, or remove a source. |
-| `#graph` | Graph | Inspect the knowledge graph. |
-| `#dreaming` | Dreams | Inspect Dreaming status and attention. |
-| `#secrets` | Secrets | Inspect stored secret names and manage secrets without exposing their values. |
+- **Username and password** is offered when the daemon has password login configured. See [Auth](/auth/).
+- **Use an API key instead** accepts an existing API key. The dashboard exchanges the key for a browser session and never stores the key itself.
+- **`signet dashboard`** opens the page already signed in when `SIGNET_API_KEY` (or the older `SIGNET_TOKEN`) is set. The CLI asks the daemon for a single-use code that expires after 60 seconds and opens the dashboard with it in the URL fragment. The page redeems the code and removes it from the address bar. The credential itself never appears in the URL. The CLI skips this when the daemon is in `local` mode. If the code can't be issued, the CLI says why and opens the page without it. If no daemon answers at a remote address, the CLI says so instead of starting a local one.
 
-Unknown hashes fall back to the current/default view rather than opening a legacy route.
+A browser session lasts for `auth.sessionTokenTtlSeconds`, and never longer than the credential it came from. Its claims match that credential: role, scope, and permissions are copied, never widened. Five minutes before it ends, a notice offers to sign in again; the dialog it opens can be dismissed while the session is still valid. When a session ends while you work, a sign-in dialog opens over the current page so your place and any unsaved input stay put. After too many failed sign-ins, the form counts down the wait before it accepts another attempt. The topbar shows the mode and address. Select it to see who you are signed in as, your role, when the session expires, and **Sign out of this browser**.
 
-`Agents` and `Skills` are visible as disabled “Coming soon” navigation rows in the current build. They are not finished management surfaces. The retired Overview, Ontology, Tasks, and Audit tabs are not part of this dashboard.
+The dashboard asks `GET /api/auth/whoami` which permissions the signed-in credential has. Areas that need a permission the credential lacks, such as Dreams and most Settings sections for non-admin keys, say what they require instead of failing, and the Settings list marks them **Admin**. Any other refused request reads as the missing permission or scope. When the daemon doesn't report permissions, for example an older daemon, nothing is hidden. The daemon enforces every request regardless.
 
-## Settings
+Admins manage keys under **Settings → API keys**: list keys with role, agent, last use, and expiry; create a key, which is shown once with a copy button; and revoke a key after confirming. See [Teams](/teams/#4-create-a-key-for-each-teammate).
 
-Select the gear in the lower-left account row to open the settings modal. The current modal groups controls into:
+Signing out clears the session from this browser only. Sessions are signed tokens that the daemon does not track, so revoking an API key stops new sign-ins with it but does not end dashboard sessions already started from it. Those sessions end when they expire.
 
-- Network: local daemon address and sync settings.
-- Inference: provider accounts, model routing, embedding configuration, and route checks.
-- Logs: runtime log controls.
-- Advanced: additional daemon configuration.
+## Navigation and cached data
 
-Settings are a modal, not a hash-routed dashboard tab. Treat the daemon and configuration references as the authority for operational behavior.
+Open `#setup` to walk through onboarding. Navigating to another dashboard page before reaching Ready asks you to confirm leaving setup; cancelling keeps your current step and drafts open. After Welcome, How it works explains capture, recall, and Dreaming before you make configuration choices. Identity lets you name the workspace's agent, optionally add your name, choose the same Minimal, Hermes, OpenClaw, or Custom identity preset offered by CLI setup, and edit the selected identity files. Existing contents are loaded into the editor; unselected files stay in place. You can also leave identity management to your existing tools. `MEMORY.md` remains generated by Signet. Saving this profile does not rename an agent's memory scope or create a separate agent in the registry. The Search step configures embeddings for search by meaning, with built-in local, Ollama, llama.cpp, hosted OpenAI, or keyword-only options. Saving uses the existing daemon configuration path; checking availability is separate from completion of an index rebuild. You can keep your existing search settings instead. The walkthrough ends with a summary of connected tools, background memory, search, sources, and your first saved memory.
+
+Home, Memory, Dreams, and Settings are client-rendered hash routes. Home includes
+sources and memory search; Settings has its own sections for data and files,
+connectors, network, inference, secrets, logs, advanced options, and licenses.
+Select the three dots at the bottom of the sidebar to open Settings.
+
+Dashboard reads share a session-only cache. Returning to a page shows its last
+successful result immediately. Fresh results avoid another daemon request;
+stale results refresh in the background. Simultaneous reads of the same query
+share one request, and slow polls do not start overlapping requests.
+
+The cache retains at most 48 results and 12 MiB of serialized payloads, with a
+4 MiB per-result limit. Least recently used results are evicted first, and
+inactive results expire after five minutes. These are payload bounds, not a
+measurement of JavaScript heap usage. Parameterized reads, including constellation
+snapshots, memory searches, and individual Dreaming passes, have separate keys.
+The cache is scoped to the daemon origin and authentication token, and is
+cleared when the daemon rejects a request as unauthenticated (401). A refused
+request (403) leaves other cached panels in place. Successful dashboard mutations invalidate the affected
+queries for background refresh. The cache is never
+persisted to disk. Refreshing the application starts a new cache.
+
+Visible pages poll at their existing intervals; hidden pages and windows stop
+polling. Failed background reads retain their last successful result and show
+that updates are unavailable. Read requests have a 20-second deadline. The daemon
+continues to own database access and every durable transition, including in the
+desktop application.
+
+The constellation currently refreshes a bounded snapshot. This cache does not
+introduce graph streaming or a change-feed protocol; external changes are picked
+up on the next visible-page refresh.
+
+## Memory graph
+
+The Memory view uses a 2D force graph. Entity clusters follow the ontology's
+entity → aspect → group key → claim key → stored value hierarchy. Evidence
+references and sources remain distinct from stored values; dashed links show
+attribution, and arrows show directed cross-entity dependencies.
+
+Drag the background to pan with momentum, drag a node to reposition it, and scroll to zoom. Linked nodes respond to dragging and settle after release. Focus and navigation buttons animate pan and zoom. Connection highlighting waits briefly for the pointer to settle on a node, then fades between highlights.
+The zoom buttons and **Fit graph** offer the same navigation without scrolling.
+Select a node to inspect its content and provenance. With the graph focused,
+arrow keys browse nodes, Enter selects, and Escape resets the view.
+
+**Ask Signet about your memories** starts from a compact input at the bottom of
+the graph. Sending a message opens chat in a right sidebar and moves the input
+there; the canvas resizes beside it. Closing chat returns the input to the graph
+and keeps the conversation available for the next message. Selected-node details
+open in the dashboard's standard detail dialog, independently of chat. On narrow screens, chat sits below the canvas.
+
+The chat opens a streamed conversation with the daemon's
+Pi agent. It uses existing scoped memory and ontology retrieval tools and can
+highlight retrieved entities and evidence in the graph. Retrieval highlights fade
+between batches and stay visible until the next question or **New chat**.
+The camera automatically follows retrieved nodes on every message. Dragging,
+scrolling, keyboard navigation, or the navigation buttons pause following for
+the current response; the next message resumes it.
+Hover and inspection remain independent. Evidence outside the bounded graph
+snapshot remains available in the chat sources. The model inherits the backend inference
+assignment unless an explicit `interactive` workload overrides it; the selected
+model must support tools. The composer model picker searches the Pi AI registry for
+models available through connected Signet accounts. **Signet default** keeps the
+backend assignment; choosing a model applies it to subsequent messages in this
+chat without changing your inference settings. The daemon rechecks credentials
+on every selected-model request.
+
+You can explicitly ask Signet to remember new context or ask Dreaming to review
+it. Saving records your exact message as evidence through the normal memory
+write path. Directed Dreaming records the instruction first and requests an
+existing scoped Dreaming pass. A requested pass is distinct from a completed
+pass; Dreaming remains the semantic writer. These actions retain the daemon's
+normal write and administration permissions.
+
+The agent cites evidence with Obsidian-style wikilinks such as `[[memory:exact-id]]` or
+`[[artifact:exact-source-path]]`. References must match evidence retrieved in the
+conversation; unverified references remain text. Verified inline source references
+appear as compact pills; select one to inspect its retrieved excerpt and full reference. Responses render streaming Markdown, with copy actions and expandable evidence attached to each answer. The conversation follows new responses until you scroll up; use the down arrow to return to the latest message. Enter sends a message, and Shift+Enter adds a new line.
+
+Conversation history stays in browser memory until **New chat**, leaving the graph,
+or a reload. Each conversation reuses a native Pi session in a daemon-managed worker,
+including its tool history, across turns. The worker expires after 15 minutes idle;
+closing the sidebar or stopping a response does not end the session. **New chat**
+starts a separate conversation and the previous idle session expires normally.
+Model switching preserves the Pi session. Conversations are not automatically stored
+as transcript evidence; explicit remember requests use the normal evidence path.
+**Stop response** cancels inference; evidence already saved and Dreaming already
+requested remain. Retrieval errors and unavailable models are shown explicitly.
+The reusable chat component can be mounted elsewhere without graph callbacks.
+
+The graph requests a bounded snapshot of up to 150 entities and displays at
+most 5,000 nodes, prioritizing hierarchy anchors. Open the graph key for node
+categories, counts, and gesture hints.
 
 ## Sources and imports
 
-Open `#sources` to work with source-backed recall:
+Use the Sources section on Home to work with source-backed recall:
 
 - **Connect a source** offers the dashboard’s basic Obsidian, GitHub, and Discord forms.
 - **Import files** uploads text, Markdown, JSON, HTML, CSV, and supported document formats as durable source artifacts.
@@ -77,3 +161,13 @@ bun run dev
 ```
 
 The development server serves the frontend separately from the daemon. Start a daemon as well when you need live API data.
+
+## Developing onboarding
+
+From the repository root, run:
+
+```bash
+bun run --cwd surfaces/dashboard dev:onboarding -- --port 5174
+```
+
+Open `http://127.0.0.1:5174/#setup` for the full-page onboarding flow. In the desktop app, setup sits below the native window-control area. This development-only mode shows all supported harnesses for layout review, regardless of what is installed locally. It uses demo data and simulates harness connections, configuration saves, model sign-in/testing, and remembering/recalling the first memory in browser memory. Reload to reset the walkthrough. No requests reach the daemon; unsupported preview actions report an error. Sources can be skipped; file imports are not simulated. Normal `dev` and production builds retain real daemon behavior.

@@ -4,16 +4,9 @@ import {
 	clearConfiguredWorkspacePath as clearCore,
 	getWorkspaceConfigPath as getCore,
 	normalizeWorkspacePath as normalizeCore,
-	readConfiguredWorkspacePath as readCore,
 	resolveWorkspacePath,
 	writeConfiguredWorkspacePath as writeCore,
 } from "@signet/core";
-
-// Canonical Signet workspace resolution lives in @signet/core (issue #956).
-// These thin wrappers preserve the CLI's historical default-argument shape
-// (resolving against process.env at call time) while delegating to the single
-// shared implementation, so the CLI, desktop shell, and connectors can no
-// longer drift on env-var precedence or the workspace.json schema.
 
 export type { WorkspaceSource, WorkspaceResolution };
 
@@ -25,12 +18,22 @@ export function getWorkspaceConfigPath(env: NodeJS.ProcessEnv = process.env): st
 	return getCore(env);
 }
 
-export function readConfiguredWorkspacePath(env: NodeJS.ProcessEnv = process.env): string | null {
-	return readCore(env);
-}
-
 export function resolveAgentsDir(env: NodeJS.ProcessEnv = process.env): WorkspaceResolution {
 	return resolveWorkspacePath({ env });
+}
+
+export function isDesktopWorkspacePath(
+	pathValue: string,
+	options: { readonly env?: NodeJS.ProcessEnv; readonly home?: string } = {},
+): boolean {
+	try {
+		const env = options.env ?? process.env;
+		const resolved =
+			options.home === undefined ? resolveWorkspacePath({ env }) : resolveWorkspacePath({ env, home: options.home });
+		return resolved.source !== "env" && normalizeCore(pathValue) === resolved.path;
+	} catch {
+		return false;
+	}
 }
 
 export function writeConfiguredWorkspacePath(pathValue: string, env: NodeJS.ProcessEnv = process.env): string {

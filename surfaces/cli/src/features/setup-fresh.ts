@@ -1,7 +1,7 @@
 import { createDaemonClient } from "../lib/daemon.js";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { writeFileExclusiveSync } from "@signet/core";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { OpenClawConnector } from "@signet/connector-openclaw";
 import {
 	addObsidianSource,
@@ -11,11 +11,14 @@ import {
 	formatYaml,
 	resolvePrimaryPackageManager,
 	runMigrations,
+	createFreshWorkspaceV2,
+	findExistingWorkspaceDatabase,
 } from "@signet/core";
 import chalk from "chalk";
 import ora from "ora";
 import { daemonAccessLines } from "../lib/network.js";
-import { openUrlWithFallback } from "../lib/open-url.js";
+import { openDashboardWithDesktopFallback, openUrlWithFallback } from "../lib/open-url.js";
+import { isDesktopWorkspacePath } from "../lib/workspace.js";
 import Database from "../sqlite.js";
 import { installGraphiqPlugin } from "./graphiq.js";
 import {
@@ -31,6 +34,57 @@ import { enforceSetupProtection, printSetupProtectionSummary, refreshSnapshotPro
 import { readErr, readRecord } from "./setup-shared.js";
 import { withSetupPrompt } from "./setup-terminal.js";
 import type { SetupDeps } from "./setup-types.js";
+
+function assertNoExistingWorkspaceDatabase(basePath: string): void {
+	const existingDatabase = findExistingWorkspaceDatabase(basePath);
+	if (existingDatabase) {
+		throw new Error(`Refusing to replace an existing database at ${existingDatabase}.`);
+	}
+}
+
+export async function runDashboardSetupBootstrap(
+	basePath: string,
+	options: { readonly allowUnprotectedWorkspace: boolean; readonly createLocalBackup: boolean },
+	deps: SetupDeps,
+): Promise<void> {
+	assertNoExistingWorkspaceDatabase(basePath);
+	if (options.createLocalBackup) createFreshWorkspaceV2(basePath);
+	let protection = await enforceSetupProtection({
+		basePath,
+		nonInteractive: true,
+		allowUnprotectedWorkspace: options.allowUnprotectedWorkspace,
+		createLocalBackup: options.createLocalBackup,
+	});
+	assertNoExistingWorkspaceDatabase(basePath);
+	const workspaceLayout = createFreshWorkspaceV2(basePath);
+	const gitignorePath = join(basePath, ".gitignore");
+	const gitignoreSource = join(deps.getTemplatesDir(), "gitignore.template");
+	if (!existsSync(gitignorePath) && existsSync(gitignoreSource)) copyFileSync(gitignoreSource, gitignorePath);
+	if (existsSync(workspaceLayout.database)) {
+		throw new Error(`Refusing to replace an existing database at ${workspaceLayout.database}.`);
+	}
+	mkdirSync(dirname(workspaceLayout.database), { recursive: true });
+	writeSetupCorePluginRegistry(basePath, { signetSecretsEnabled: true });
+	writeFileSync(workspaceLayout.database, "", { flag: "wx", mode: 0o600 });
+	const config = {
+		version: 1,
+		schema: "signet/v1",
+		capabilities: {
+			memory: { enabled: true, autoInject: true, memoryHead: true },
+			secrets: { enabled: true },
+			identity: { mode: "off" },
+		},
+		embedding: { provider: "none" },
+		memory: {
+			database: relative(basePath, workspaceLayout.database),
+			pipelineV2: { telemetryEnabled: false },
+			dreaming: { enabled: true },
+		},
+	};
+	writeFileSync(join(basePath, "agent.yaml"), formatYaml(config));
+	if (protection.state === "snapshot") protection = refreshSnapshotProtection(basePath, protection);
+	printSetupProtectionSummary(protection);
+}
 
 export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext, deps: SetupDeps): Promise<void> {
 	const spinner = ora("Setting up Signet...").start();
@@ -49,6 +103,7 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 
 		const templatesDir = deps.getTemplatesDir();
 		mkdirSync(context.basePath, { recursive: true });
+		const workspaceLayout = createFreshWorkspaceV2(context.basePath);
 
 		const gitignoreSource = join(templatesDir, "gitignore.template");
 		if (existsSync(gitignoreSource)) {
@@ -65,20 +120,9 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 			const date = new Date().toISOString().split("T")[0];
 			await deps.gitAddAndCommit(context.basePath, `${date}_pre-signet-backup`);
 		}
-
-		mkdirSync(join(context.basePath, "memory", "scripts"), { recursive: true });
 		mkdirSync(join(context.basePath, "harnesses"), { recursive: true });
 
 		spinner.text = "Installing memory system...";
-		const scriptsSource = join(templatesDir, "memory", "scripts");
-		if (existsSync(scriptsSource)) {
-			deps.copyDirRecursive(scriptsSource, join(context.basePath, "memory", "scripts"));
-		}
-
-		const requirementsSource = join(templatesDir, "memory", "requirements.txt");
-		if (existsSync(requirementsSource)) {
-			copyFileSync(requirementsSource, join(context.basePath, "memory", "requirements.txt"));
-		}
 
 		const utilScriptsSource = join(templatesDir, "scripts");
 		if (existsSync(utilScriptsSource)) {
@@ -88,6 +132,10 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 
 		spinner.text = "Installing built-in skills...";
 		deps.syncBuiltinSkills(deps.getSkillsSourceDir(), context.basePath);
+		if (plan.gitEnabled) {
+			const { initializeSkillsRepository } = await import("../lib/git.js");
+			await initializeSkillsRepository(context.basePath);
+		}
 
 		if (plan.identityMode === "managed") {
 			spinner.text = "Creating agent identity...";
@@ -127,7 +175,7 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 				source: packageManager.source,
 			},
 			memory: {
-				database: "memory/memories.db",
+				database: relative(context.basePath, workspaceLayout.database),
 				session_budget: plan.memorySessionBudget,
 				decay_rate: plan.memoryDecayRate,
 			},
@@ -173,10 +221,6 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 			plan.extractionEndpoint,
 		);
 		applySetupInferenceRoute(config, inference);
-
-		// Optional distinct provider for aggregate recall (query-time evidence
-		// synthesis). Overlaid on config.inference; the daemon merges it atop the
-		// legacy pipeline.* base, so extraction/session-synthesis are unaffected.
 		if (plan.aggregateRecallProvider) {
 			applyAggregateRecallRoute(
 				config,
@@ -201,19 +245,12 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 		if (plan.daemonUrl) {
 			config.daemon = { url: plan.daemonUrl };
 		}
-
-		// New installations share telemetry only after an explicit opt-in in settings.
 		const telemetryEnabled = false;
-		// The daemon reads telemetryEnabled from memory.pipelineV2 — writing it
-		// at the top level would be silently ignored and the opt-out would not
-		// reach the daemon.
 		const memoryCfg = (config.memory as Record<string, unknown> | undefined) ?? {};
 		const pipelineCfg = (memoryCfg.pipelineV2 as Record<string, unknown> | undefined) ?? {};
 		config.memory = { ...memoryCfg, pipelineV2: { ...pipelineCfg, telemetryEnabled } };
 
 		writeFileSync(join(context.basePath, "agent.yaml"), formatYaml(config));
-
-		// Connect configured sources (config files the daemon indexes at boot).
 		if (plan.sources && plan.sources.length > 0) {
 			for (const src of plan.sources) {
 				if (src.type === "obsidian") {
@@ -251,13 +288,12 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 			const destPath = join(context.basePath, doc.name);
 			if (existsSync(templatePath)) {
 				const content = readFileSync(templatePath, "utf-8").replace(/\{\{AGENT_NAME\}\}/g, plan.agentName);
-				// O_EXCL: never overwrite an identity file that already exists.
 				writeFileExclusiveSync(destPath, content);
 			}
 		}
 
 		spinner.text = "Initializing database...";
-		const dbPath = join(context.basePath, "memory", "memories.db");
+		const dbPath = workspaceLayout.database;
 		const db = Database(dbPath);
 		try {
 			ensureUnifiedSchema(db);
@@ -277,11 +313,6 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 		);
 
 		spinner.text = "Configuring harness hooks...";
-		// Hooks are installed before the daemon starts. This is safe because
-		// connectors only write static files (extension bundles) with a
-		// well-known daemon URL (127.0.0.1:3850). The extension resolves the
-		// actual daemon address at runtime via SIGNET_DAEMON_URL, falling back
-		// to the baked default — no live daemon connection is needed here.
 		const configuredHarnesses: string[] = [];
 		const failedHarnesses: string[] = [];
 		for (const harness of plan.harnesses) {
@@ -316,8 +347,6 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 		const remoteDaemon = Boolean(plan.daemonUrl);
 		let daemonStarted: boolean;
 		if (remoteDaemon) {
-			// Remote instance: no local daemon to start; the CLI/connector clients
-			// resolve daemon.url from config at runtime.
 			daemonStarted = true;
 		} else {
 			spinner.text = "Starting daemon...";
@@ -353,7 +382,7 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 			const special = plan.specialIdentityFiles.some((entry) => entry.path === name) ? " (special session)" : "";
 			console.log(chalk.dim(`    ├── ${name.padEnd(12)}${special}`));
 		}
-		console.log(chalk.dim("    └── memory/       database & vectors"));
+		console.log(chalk.dim("    └── data/         database & durable state"));
 
 		console.log();
 		console.log(chalk.dim("  Core plugins:"));
@@ -392,7 +421,12 @@ export async function runFreshSetup(plan: SetupPlan, context: SetupApplyContext,
 		}
 
 		if (context.openDashboard) {
-			await openUrlWithFallback(`${createDaemonClient(deps.DEFAULT_PORT, context.basePath).url}/#setup`);
+			const url = `${createDaemonClient(deps.DEFAULT_PORT, context.basePath).url}/#setup`;
+			if (!remoteDaemon && isDesktopWorkspacePath(context.basePath)) {
+				await openDashboardWithDesktopFallback(url, "setup");
+			} else {
+				await openUrlWithFallback(url);
+			}
 		}
 		if (failedHarnesses.length)
 			throw new Error(

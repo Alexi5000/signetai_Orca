@@ -6,40 +6,44 @@
 	"type": "module",
 	"scripts": {
 		"dev": "vite",
+		"dev:onboarding": "vite --mode onboarding",
 		"build": "tsc --noEmit && vite build",
 		"test": "bun test",
 		"preview": "vite preview",
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@fontsource/geist": "^5.3.0",
 		"@fontsource/geist-mono": "^5.3.0",
+		"@fontsource/schibsted-grotesk": "^5.3.0",
 		"@mingcute/react": "^3.0.2",
 		"@radix-ui/react-slot": "^1.1.2",
 		"@shadcn/react": "^0.2.1",
 		"class-variance-authority": "^0.7.1",
 		"clsx": "^2.1.1",
+		"d3-force": "^3.0.0",
+		"lucide-react": "^1.49.0",
 		"next-themes": "^0.4.6",
 		"radix-ui": "^1.6.5",
 		"react": "^19.2.0",
 		"react-dom": "^19.2.0",
 		"sonner": "^2.0.7",
+		"streamdown": "^2.7.0",
 		"tailwind-merge": "^3.6.0",
-		"three": "^0.185.1",
+		"use-stick-to-bottom": "^1.1.6",
 		"yaml": "^2.9.0"
 	},
 	"devDependencies": {
 		"@signet/core": "workspace:*",
 		"@tailwindcss/vite": "^4.2.0",
+		"@types/d3-force": "^3.0.10",
 		"@types/react": "^19.2.0",
 		"@types/react-dom": "^19.2.0",
-		"@types/three": "^0.185.3",
 		"@types/yaml": "^1.9.7",
 		"@vitejs/plugin-react": "^5.2.0",
-		"happy-dom": "^20.11.1",
+		"happy-dom": "^21.0.4",
 		"tailwindcss": "^4.2.0",
 		"tw-animate-css": "^1.4.0",
 		"typescript": "^5.9.3",
-		"vite": "^7.3.6"
+		"vite": "^8.3.5"
 	}
 }

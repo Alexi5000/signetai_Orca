@@ -40,9 +40,9 @@ describe("native memory sources", () => {
 		initDbAccessor(join(dir, "memory", "memories.db"));
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		resetEmbeddingCircuitBreakers();
-		closeDbAccessor();
+		await closeDbAccessor();
 		if (prevSignetPath === undefined) {
 			Reflect.deleteProperty(process.env, "SIGNET_PATH");
 		} else {
@@ -96,11 +96,6 @@ describe("native memory sources", () => {
 	});
 
 	it("heals legacy pre-epoch captured_at rows on rescan (#1149)", async () => {
-		// Regression for #1149 (adversarial review F3): rows already stamped
-		// with the 1980 DOS-epoch sentinel stay permanently pending — no
-		// watermark can reach them, so content passes never early-exit and
-		// re-list the same stale row forever. The watcher must re-stamp them
-		// with the index time once.
 		const root = join(dir, ".codex");
 		mkdirSync(join(root, "memories", "rollout_summaries"), { recursive: true });
 		const file = join(root, "memories", "rollout_summaries", "sentinel-heal.md");
@@ -115,8 +110,6 @@ describe("native memory sources", () => {
 				file,
 			);
 		});
-
-		// Cold scan (fresh daemon): the unchanged-file path heals the row.
 		resetNativeMemoryIndexCache();
 		expect(await indexNativeMemoryFile(source, file)).toBe(false);
 
@@ -191,6 +184,91 @@ describe("native memory sources", () => {
 			lineStart: 1,
 			lineEnd: 1,
 		});
+	});
+
+	it("persists oversized item rejection, advances the checkpoint, and clears it after the file changes", async () => {
+		const root = join(dir, ".codex-rejected");
+		const summaries = join(root, "memories", "rollout_summaries");
+		const rejectedPath = join(summaries, "a-huge.md");
+		const acceptedPath = join(summaries, "b-ok.md");
+		mkdirSync(summaries, { recursive: true });
+		writeFileSync(rejectedPath, "x".repeat(4 * 1024 * 1024 + 1024));
+		writeFileSync(acceptedPath, "accepted source item");
+
+		const agentId = "agent-source-rejection";
+		const source = codexNativeMemorySource(root);
+		const sourceKey = `${agentId}:codex:${root.replace(/\\/g, "/")}`;
+		const handle = startNativeMemoryBridge([source], { agentId, pollIntervalMs: 0 });
+		try {
+			expect(await handle.syncExisting()).toBe(1);
+			expect(handle.getLastSyncResult()).toMatchObject({
+				status: "degraded",
+				scanned: 2,
+				indexed: 1,
+				rejected: 1,
+			});
+			const active = getDbAccessor().withReadDb(
+				(db) =>
+					db
+						.prepare(
+							`SELECT failure_code, fingerprint, attempt_count, resolved_at
+							 FROM source_sync_failures
+							 WHERE agent_id = ? AND source_key = ? AND item_path = ?`,
+						)
+						.get(agentId, sourceKey, rejectedPath) as {
+						failure_code: string;
+						fingerprint: string;
+						attempt_count: number;
+						resolved_at: string | null;
+					},
+			);
+			expect(active).toMatchObject({
+				failure_code: "source_item_too_large",
+				attempt_count: 1,
+				resolved_at: null,
+			});
+			const checkpoint = getDbAccessor().withReadDb(
+				(db) =>
+					db
+						.prepare(
+							"SELECT complete FROM source_sync_checkpoints WHERE agent_id = ? AND source_key = ? AND phase = 'content'",
+						)
+						.get(agentId, sourceKey) as { complete: number },
+			);
+			expect(checkpoint.complete).toBe(1);
+
+			rmSync(rejectedPath);
+			expect(await handle.syncExisting()).toBe(0);
+			expect(handle.getLastSyncResult()).toMatchObject({ status: "complete", rejected: 0 });
+			const resolvedAfterRemoval = getDbAccessor().withReadDb(
+				(db) =>
+					db
+						.prepare(
+							"SELECT resolved_at FROM source_sync_failures WHERE agent_id = ? AND source_key = ? AND item_path = ?",
+						)
+						.get(agentId, sourceKey, rejectedPath) as { resolved_at: string | null },
+			);
+			expect(resolvedAfterRemoval.resolved_at).not.toBeNull();
+
+			writeFileSync(rejectedPath, "x".repeat(4 * 1024 * 1024 + 1024));
+			expect(await handle.syncExisting()).toBe(0);
+			expect(handle.getLastSyncResult()).toMatchObject({ status: "degraded", rejected: 1 });
+
+			writeFileSync(rejectedPath, "now small enough to index");
+			expect(await handle.syncExisting()).toBe(1);
+			expect(handle.getLastSyncResult()).toMatchObject({ status: "complete", rejected: 0 });
+			const resolved = getDbAccessor().withReadDb(
+				(db) =>
+					db
+						.prepare(
+							"SELECT resolved_at FROM source_sync_failures WHERE agent_id = ? AND source_key = ? AND item_path = ?",
+						)
+						.get(agentId, sourceKey, rejectedPath) as { resolved_at: string | null },
+			);
+			expect(resolved.resolved_at).not.toBeNull();
+		} finally {
+			await handle.close();
+		}
 	});
 
 	it("indexes Codex rollout jsonl files and extracts rollout IDs", async () => {
@@ -599,7 +677,15 @@ describe("native memory sources", () => {
 		utimesSync(file, stamp, stamp);
 
 		await closeDbAccessor();
-		expect(await indexNativeMemoryFile(source, file, "agent-native")).toBe(false);
+		const unreachable = join(dir, "unreachable-workspace");
+		mkdirSync(unreachable);
+		writeFileSync(join(unreachable, "memory"), "");
+		process.env.SIGNET_PATH = unreachable;
+		try {
+			expect(await indexNativeMemoryFile(source, file, "agent-native")).toBe(false);
+		} finally {
+			process.env.SIGNET_PATH = dir;
+		}
 
 		initDbAccessor(join(dir, "memory", "memories.db"));
 		expect(await indexNativeMemoryFile(source, file, "agent-native")).toBe(true);
@@ -803,6 +889,69 @@ describe("native memory sources", () => {
 					| undefined,
 		);
 		expect(target).toEqual({ entity_type: "source_document", source_path: targetFile });
+	});
+
+	it("does not rewrite artifacts, graph edges, or dependency history for unchanged Obsidian notes", async () => {
+		const root = join(dir, "vault");
+		mkdirSync(root, { recursive: true });
+		writeFileSync(join(root, "Source.md"), "# Source\n\nLinks to [[Target]].\n");
+		writeFileSync(join(root, "Target.md"), "# Target\n\nThe target note stays unchanged.\n");
+		const source = obsidianNativeMemorySource(root, "Unchanged Vault", "obsidian:unchanged-vault");
+		const snapshot = () =>
+			getDbAccessor().withReadDb((db) => ({
+				artifacts: db
+					.prepare("SELECT source_path, updated_at FROM memory_artifacts WHERE agent_id = ? ORDER BY source_path")
+					.all("agent-native"),
+				dependencies: db
+					.prepare("SELECT id, updated_at FROM entity_dependencies WHERE agent_id = ? ORDER BY id")
+					.all("agent-native"),
+				history: db
+					.prepare("SELECT COUNT(*) AS n FROM entity_dependency_history WHERE agent_id = ?")
+					.get("agent-native"),
+			}));
+		const sync = async (): Promise<number> => {
+			const handle = startNativeMemoryBridge([source], {
+				agentId: "agent-native",
+				pollIntervalMs: 0,
+				sourceGraphEnabled: true,
+			});
+			try {
+				return await handle.syncExisting();
+			} finally {
+				await handle.close();
+			}
+		};
+
+		expect(await sync()).toBe(2);
+		const first = snapshot();
+		expect(first.dependencies.length).toBeGreaterThan(0);
+		await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+		expect(await sync()).toBe(0);
+		expect(snapshot()).toEqual(first);
+
+		writeFileSync(join(root, "Source.md"), "# Source\n\nStill links to [[Target]], with new prose.\n");
+		expect(await sync()).toBe(1);
+		expect(snapshot().artifacts).not.toEqual(first.artifacts);
+
+		const targetDocument = () =>
+			getDbAccessor().withReadDb(
+				(db) =>
+					db
+						.prepare(
+							"SELECT COUNT(*) AS n FROM entities WHERE agent_id = ? AND entity_type = 'source_document' AND source_path = ?",
+						)
+						.get("agent-native", join(root, "Target.md")) as { n: number },
+			);
+		getDbAccessor().withWriteTx((db) => {
+			db.prepare("DELETE FROM entities WHERE agent_id = ? AND entity_type = 'source_document' AND source_path = ?").run(
+				"agent-native",
+				join(root, "Target.md"),
+			);
+		});
+		expect(targetDocument()).toEqual({ n: 0 });
+		expect(await sync()).toBe(1);
+		expect(targetDocument()).toEqual({ n: 1 });
 	});
 
 	it("can defer stale source cleanup during bridge sync", async () => {
@@ -1075,7 +1224,7 @@ describe("native memory sources", () => {
 			).count,
 		}));
 		expect(before.entities).toBeGreaterThan(0);
-		expect(before.attrs).toBeGreaterThan(0);
+		expect(before.attrs).toBe(0);
 
 		await removeNativeMemoryFile(source, file, "agent-native");
 
@@ -1119,12 +1268,9 @@ describe("native memory sources", () => {
 						.get("agent-native", file) as { count: number },
 			).count,
 		).toBe(1);
-
-		// The file vanishes before the watcher reads it (ENOENT).
 		rmSync(file);
 
 		expect(await indexNativeMemoryFile(source, file, "agent-native")).toBe(false);
-		// The stale row is soft-deleted instead of being retried every scan.
 		const after = getDbAccessor().withReadDb((db) => ({
 			active: (
 				db
@@ -1143,8 +1289,6 @@ describe("native memory sources", () => {
 		}));
 		expect(after.active).toBe(0);
 		expect(after.softDeleted).toBe(1);
-
-		// Re-attempting the gone path stays a no-op.
 		expect(await indexNativeMemoryFile(source, file, "agent-native")).toBe(false);
 	});
 
@@ -1155,14 +1299,10 @@ describe("native memory sources", () => {
 		writeFileSync(file, "Codex remembered the locked-file contract.\n");
 
 		expect(await indexNativeMemoryFile(codexNativeMemorySource(root), file, "agent-native")).toBe(true);
-
-		// Make the path fail with a non-ENOENT error (parent replaced by a
-		// file -> ENOTDIR), standing in for a transiently locked file.
 		rmSync(root, { recursive: true, force: true });
 		writeFileSync(join(dir, ".codex"), "now a plain file\n");
 
 		expect(await indexNativeMemoryFile(codexNativeMemorySource(root), file, "agent-native")).toBe(false);
-		// Transient failures must NOT drop the artifact row (only ENOENT does).
 		expect(
 			getDbAccessor().withReadDb(
 				(db) =>
@@ -1173,9 +1313,6 @@ describe("native memory sources", () => {
 						.get("agent-native", file) as { count: number },
 			).count,
 		).toBe(1);
-
-		// The path is in failure cooldown: the retry is skipped, still false,
-		// and the row is untouched.
 		expect(await indexNativeMemoryFile(codexNativeMemorySource(root), file, "agent-native")).toBe(false);
 	});
 
@@ -1262,9 +1399,6 @@ describe("native memory sources", () => {
 		} finally {
 			await handle.close();
 		}
-
-		// A new bridge must honor the durable pause without rescanning, owner
-		// churn, or a legacy artifact fallback.
 		const restarted = makeHandle();
 		try {
 			expect(await restarted.syncExisting()).toBe(0);
@@ -1322,7 +1456,7 @@ describe("native memory sources", () => {
 			expect(embeddingStarted).toBe(true);
 			const manualRun = manualBridge.syncExisting();
 			await Bun.sleep(20);
-			expect(providerCalls).toBe(3); // one non-empty admission check per bridge layer plus one file embedding
+			expect(providerCalls).toBe(3);
 			expect(rejectedEmptyInputs).toBe(0);
 			expect(embeddingCalls).toBe(1);
 			releaseEmbedding();
@@ -1622,8 +1756,10 @@ describe("native memory sources", () => {
 		expect(checkpoint?.complete).toBe(0);
 
 		failSecondChunk = false;
+		await closeDbAccessor();
 		resetEmbeddingCircuitBreakers();
 		resetObsidianSourceEmbeddingBackoff();
+		initDbAccessor(join(dir, "memory", "memories.db"));
 		const callsBeforeRecovery = calls.length;
 		const recovered = makeHandle();
 		try {
@@ -2078,8 +2214,6 @@ describe("native memory sources", () => {
 			);
 			expect(indexingPath).not.toMatch(/\b(?:readFileSync|statSync|lstatSync|createHash)\b/);
 			expect(implementation).not.toContain('from "node:crypto"');
-			// This is the runtime attribution shim: warnings are inspected by
-			// category/message rather than inferred from elapsed wall-clock time.
 			expect(criticalWarnings).toEqual([]);
 		} finally {
 			logger.warn = originalWarn;
@@ -2163,8 +2297,6 @@ describe("native memory sources", () => {
 			sourceGraphEnabled: false,
 			onSourceWorkerScanStarted: () => {
 				scanStarts += 1;
-				// The first scan commits note-0. The second scan is killed from
-				// the worker-start event, before its descriptor is returned.
 				if (scanStarts === 2) first.cancel();
 			},
 			onFileIndexed: ({ filePath }) => firstIndexed.push(filePath),
@@ -2402,11 +2534,6 @@ describe("resolveEmbeddingBridgeOptions", () => {
 	});
 
 	it("omits embeddingConfig and fetchEmbedding when the embedding provider is 'none'", () => {
-		// Regression guard: source-sync callers (daemon startup, manual re-sync
-		// routes) must skip embedding wiring when embeddings are disabled, but
-		// must NOT skip it merely because a caller forgot to pass the config.
-		// This previously caused Obsidian (and other) sources to be recorded in
-		// memory_artifacts but never chunked/embedded.
 		const options = resolveEmbeddingBridgeOptions(
 			{ provider: "none", model: "", dimensions: 0, base_url: "" },
 			fetchEmbedding,

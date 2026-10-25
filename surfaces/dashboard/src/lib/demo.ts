@@ -1,24 +1,3 @@
-/**
- * Demo-mode fixtures + installer for the dashboard.
- *
- * The marketing site embeds the REAL dashboard build (not screenshots) with
- * `VITE_DEMO=1`; this module swaps the live fetchers in `./api` for
- * fixture-backed implementations so the SPA renders fully without a daemon.
- *
- * Contracts:
- * - Compile-time only. `VITE_DEMO=1` is replaced with a literal by vite, so
- *   the `installDemoApi(api)` call is dead code — and this whole module is
- *   tree-shaken — from every non-demo build (daemon + Electron included).
- *   The dashboard can never serve fixtures at runtime.
- * - Synthetic data only. Nothing here is captured from a real workspace; the
- *   embedded demo is public on the marketing site, so every name, summary,
- *   and stat below is invented (and internally consistent: the KPI cards
- *   derive from the same timeline/stats the heatmap and graph render).
- * - Mutations are honest no-ops: demo builds report success for UI calmness
- *   only where a fake accept can't mislead (pin/unpin, reindex). Real work
- *   (dream triggers, source connects) fails with a friendly error instead.
- */
-
 import type {
 	AgentsResponse,
 	DashboardIdentity,
@@ -36,30 +15,19 @@ import type {
 	MemoryTimeline,
 	OnePasswordStatus,
 	OntologyProposal,
+	SkillDetail,
 	SourcesResponse,
 	TelemetryHealth,
 	TodayReflectionResponse,
 } from "./api";
-
-// Demo builds render inside the dark-only marketing site. The dashboard's
-// ThemeProvider defaults to `system`, which would flip the embedded demo to
-// light on light-preference visitors; pin dark before React mounts
-// (next-themes reads localStorage.theme at init). Runs at module-eval time,
-// before createRoot().render(), and only in VITE_DEMO=1 builds — this module
-// is tree-shaken from every non-demo build.
 if (import.meta.env.VITE_DEMO === "1" && typeof window !== "undefined" && typeof localStorage !== "undefined") {
 	localStorage.setItem("theme", "dark");
 	document.documentElement.classList.add("dark");
-	// The embed is a fixed 1920x1080 stage scaled to the marketing frame; the
-	// app is designed to fit 1080p, but hide any residual document scrollbar
-	// so the frame never shows one. Internal view scroll areas are unaffected.
 	const demoStyle = document.createElement("style");
 	demoStyle.textContent =
 		"html, body { scrollbar-width: none; } html::-webkit-scrollbar, body::-webkit-scrollbar { display: none; }";
 	document.head.appendChild(demoStyle);
 }
-
-// ── Seeded RNG (deterministic builds; mulberry32) ──────────────────────────
 
 function mulberry32(seed: number): () => number {
 	let a = seed >>> 0;
@@ -70,8 +38,6 @@ function mulberry32(seed: number): () => number {
 		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 	};
 }
-
-// ── Home / status ───────────────────────────────────────────────────────────
 
 const DEMO_AGENT = "default";
 
@@ -118,11 +84,11 @@ const demoStats: KnowledgeStats = {
 	entityCount: 1247,
 	aspectCount: 1893,
 	attributeCount: 4201,
+	claimCount: 3857,
+	constraintCount: 214,
 	dependencyCount: 9862,
 	coveragePercent: 61.4,
 };
-
-// ── Timeline (heatmap + Memories KPI share these numbers) ──────────────────
 
 const TOTAL_MEMORIES = 2419;
 
@@ -137,7 +103,7 @@ function demoDailyBuckets(): MemoryTimeline["dailyBuckets"] {
 		const weekend = dow === 0 || dow === 6;
 		let n = Math.round(4 + rng() * 14);
 		if (weekend) n = Math.round(n * 0.35);
-		if (i % 23 === 0) n = 0; // sparse weeks keep it believable
+		if (i % 23 === 0) n = 0;
 		days.push({ date: d.toISOString().slice(0, 10), memoriesAdded: n });
 	}
 	const sum = days.reduce((acc, d) => acc + d.memoriesAdded, 0);
@@ -155,8 +121,6 @@ const demoTimeline: MemoryTimeline = {
 	],
 	dailyBuckets: demoDailyBuckets(),
 };
-
-// ── Sources ─────────────────────────────────────────────────────────────────
 
 const demoSources: SourcesResponse = {
 	version: 1,
@@ -222,11 +186,6 @@ const demoSources: SourcesResponse = {
 		},
 	],
 };
-
-// The embedded dashboard is a product tour, so its System panel should show
-// the same kinds of configured integrations as the rest of the marketing
-// page. Keep these records synthetic, compact, and tied to real bundled logo
-// assets so the connector and agent panels never fall back to 404 states.
 const demoConnectorCheckedAt = new Date(Date.now() - 8 * 60_000).toISOString();
 const demoHarnessConnectors: HarnessConnector[] = [
 	{
@@ -314,8 +273,6 @@ const demoAgents: AgentsResponse = {
 	],
 };
 
-// ── Knowledge constellation (graph view) ───────────────────────────────────
-
 const ENTITY_NAMES = [
 	"Signet",
 	"Local-first",
@@ -360,7 +317,7 @@ const ENTITY_NAMES = [
 ] as const;
 
 const ASPECT_NAMES = ["facts", "preferences", "workflow", "constraints", "rules", "learnings"] as const;
-const ATTR_KINDS = ["fact", "rule", "learning", "constraint", "semantic"] as const;
+const ATTR_KINDS = ["fact", "rule", "learning", "claim", "constraint", "semantic"] as const;
 const DEP_TYPES = ["generates", "depends_on", "references", "strengthens"] as const;
 
 function demoConstellation(): KnowledgeConstellation {
@@ -369,31 +326,41 @@ function demoConstellation(): KnowledgeConstellation {
 	let aspectN = 0;
 	const entities = ENTITY_NAMES.map((name, i) => {
 		const aspects = [];
-		const aspectCount = 2 + Math.floor(rng() * 2); // 2-3
+		const aspectCount = 2 + Math.floor(rng() * 2);
 		for (let a = 0; a < aspectCount; a++) {
 			aspectN += 1;
+			const aspectName = ASPECT_NAMES[Math.floor(rng() * ASPECT_NAMES.length)];
 			const attributes = [];
-			const attrCount = 1 + Math.floor(rng() * 2); // 1-2
+			const attrCount = 1 + Math.floor(rng() * 2);
 			for (let b = 0; b < attrCount; b++) {
 				attrN += 1;
 				const kind = ATTR_KINDS[Math.floor(rng() * ATTR_KINDS.length)];
 				attributes.push({
 					id: `demo-attr-${attrN}`,
-					content: `${name} ${kind === "constraint" ? "constrains" : kind === "rule" ? "governs" : "informs"} ${ASPECT_NAMES[Math.floor(rng() * ASPECT_NAMES.length)]} handling in the demo workspace`,
+					content: `${name} ${kind === "constraint" ? "constrains" : kind === "rule" ? "governs" : "informs"} ${aspectName} handling in the demo workspace`,
 					kind,
 					importance: Math.round((0.55 + rng() * 0.4) * 100) / 100,
+					confidence: Math.round((0.62 + rng() * 0.36) * 100) / 100,
 					version: 1,
+					memoryId: kind === "learning" ? `demo-memory-${(attrN % 8) + 1}` : null,
+					groupKey: kind === "claim" ? "ontology" : kind === "constraint" ? "guardrails" : "context",
+					claimKey: kind === "claim" ? `${aspectName}_position` : null,
+					sourceKind: kind === "claim" ? "obsidian" : null,
+					sourceId: kind === "claim" ? "demo-obsidian" : null,
+					sourcePath: kind === "claim" ? `references/demo/${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.md` : null,
+					sourceRoot: kind === "claim" ? "vault://main" : null,
 				});
 			}
 			aspects.push({
 				id: `demo-aspect-${aspectN}`,
-				name: ASPECT_NAMES[Math.floor(rng() * ASPECT_NAMES.length)],
+				name: aspectName,
 				weight: Math.round((0.6 + rng() * 0.4) * 100) / 100,
 				attributes,
 			});
 		}
 		return {
 			id: `demo-entity-${i + 1}`,
+			agentId: "demo-agent-default",
 			name,
 			entityType: i < 8 ? "concept" : i % 4 === 0 ? "tool" : "project",
 			mentions: 12 + Math.floor(rng() * 890),
@@ -414,16 +381,35 @@ function demoConstellation(): KnowledgeConstellation {
 			strength: Math.round((0.5 + rng() * 0.5) * 100) / 100,
 		});
 	}
+	const claimRefs = entities.flatMap((entity) =>
+		entity.aspects.flatMap((aspect) =>
+			aspect.attributes.filter((attribute) => attribute.kind === "claim").map((attribute) => ({ entity, attribute })),
+		),
+	);
+	const assertions = claimRefs.slice(0, 3).map(({ entity, attribute }, index) => ({
+		id: `demo-assertion-${index + 1}`,
+		subjectEntityId: entity.id,
+		claimAttributeId: attribute.id,
+		predicate: index === 0 ? "claims" : index === 1 ? "observed" : "believes",
+		content: `${entity.name} is represented by a source-backed ${attribute.claimKey ?? "ontology"} claim`,
+		confidence: 0.78 + index * 0.07,
+		speaker: index === 0 ? "Obsidian note" : "dreaming",
+		sourceKind: "obsidian",
+		sourceId: "demo-obsidian",
+		sourcePath: `references/demo/${entity.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.md`,
+		sourceRoot: "vault://main",
+		evidenceCount: index + 1,
+		assertedAt: "2026-08-07T08:00:00.000Z",
+	}));
 
 	return {
 		entities,
 		dependencies,
+		assertions,
 		proposals: [{ id: "demo-proposal-1" }],
 		metadata: { proposals: { pending: 1 } },
 	};
 }
-
-// ── Daily brief + memories ──────────────────────────────────────────────────
 
 const demoReflection: DailyReflection = {
 	id: "demo-reflection-1",
@@ -557,8 +543,6 @@ const demoEmbeddingHealth: EmbeddingHealthReport = {
 		{ name: "coverage", status: "ok" },
 	],
 };
-
-// ── Secrets, dreams, logs ───────────────────────────────────────────────────
 
 const demoSecrets: { secrets: string[]; provider: string } = {
 	secrets: [
@@ -709,20 +693,81 @@ const demoOnePassword: OnePasswordStatus = {
 	vaults: [],
 };
 
-// ── Installer ───────────────────────────────────────────────────────────────
+const demoSkills: SkillDetail[] = [
+	{
+		name: "changelog-writer",
+		description: "Draft release notes from merged pull requests. Use when preparing a release or summarizing a sprint.",
+		version: "1.2.0",
+		author: "Signet",
+		userInvocable: true,
+		argHint: "<since-tag>",
+		path: "/home/demo/.agents/skills/changelog-writer",
+		content:
+			'# Changelog Writer\n\nTurn merged pull requests into release notes people actually read.\n\n## When to use\n\n- Preparing a tagged release\n- Summarizing a sprint for the team\n\n## Steps\n\n1. List merged PRs since the last tag.\n2. Group them by `feat`, `fix`, and `perf`.\n3. Lead each group with the change a user will notice.\n\n```bash\ngh pr list --state merged --search "merged:>2026-09-01"\n```',
+	},
+	{
+		name: "meeting-notes",
+		description: "Turn a meeting transcript into decisions, owners, and follow-ups.",
+		version: "0.4.1",
+		author: "Demo Team",
+		userInvocable: false,
+		path: "/home/demo/.agents/skills/meeting-notes",
+		content:
+			"# Meeting Notes\n\nExtract what was decided, who owns it, and what happens next.\n\n## Output\n\n| Section | Contents |\n| --- | --- |\n| Decisions | One line each, with the reason |\n| Owners | Name and next action |\n| Follow-ups | Dated, linked to the source |",
+	},
+	{
+		name: "recipe-scaler",
+		description: "Scale a recipe to a new serving count and convert units.",
+		author: "Demo Team",
+		userInvocable: true,
+		argHint: "<servings>",
+		path: "/home/demo/.agents/skills/recipe-scaler",
+		content: "# Recipe Scaler\n\nScale every ingredient proportionally, then round to kitchen-friendly measures.",
+	},
+	{
+		name: "research-brief",
+		description: "Collect sources on a question and write a short, cited brief. Use for quick literature scans.",
+		version: "2.0.0",
+		author: "Signet",
+		userInvocable: false,
+		path: "/home/demo/.agents/skills/research-brief",
+		content:
+			"# Research Brief\n\nAnswer one question with a short brief that cites every claim.\n\n## Rules\n\n- Prefer primary sources.\n- Quote numbers exactly and link them.\n- Say plainly when the evidence is thin.",
+	},
+];
 
 type ApiClient = typeof import("./api").api;
-
-/** Replace live fetchers with fixture-backed implementations (VITE_DEMO=1 builds only). */
 export function installDemoApi(target: ApiClient): void {
 	target.getHealth = async () => true;
+	target.listApiKeys = async () => ({
+		data: {
+			apiKeys: [
+				{
+					id: "key_demo",
+					prefix: "d3m0a1b2",
+					name: "alice-laptop",
+					role: "agent",
+					agentId: null,
+					connector: null,
+					createdAt: "2026-09-01T12:00:00.000Z",
+					lastUsedAt: "2026-10-05T09:30:00.000Z",
+					revokedAt: null,
+					expiresAt: "2026-12-01T00:00:00.000Z",
+				},
+			],
+		},
+		error: null,
+	});
+	target.createApiKey = async () => ({ data: null, error: "Creating keys is disabled in the demo." });
+	target.revokeApiKey = async () => ({ data: null, error: "Revoking keys is disabled in the demo." });
 	target.getStatus = async () => demoStatus;
 	target.getIdentity = async () => demoIdentity;
 	target.getHarnesses = async () => ({ data: demoHarnesses, error: null });
 	target.getAgents = async () => ({ data: demoAgents, error: null });
 	target.getKnowledgeStats = async () => demoStats;
 	target.getSources = async () => demoSources;
-	target.getSkills = async () => null;
+	target.getSkills = async () => demoSkills.map(({ content: _content, ...skill }) => skill);
+	target.getSkill = async (name) => demoSkills.find((skill) => skill.name === name) ?? null;
 	target.getMemoryTimeline = async () => demoTimeline;
 	target.getKnowledgeConstellation = async () => demoConstellation();
 	target.getOntologyProposals = async () => ({ items: demoOntologyProposals, limit: 20, offset: 0 });

@@ -71,8 +71,26 @@ async function duplicateDarwinDescriptor(fd: number, flags: number): Promise<Fil
 }
 
 async function openContainedChild(parent: FileHandle, name: string, flags: number, mode?: number): Promise<FileHandle> {
-	if (process.platform !== "darwin") return open(descriptorPath(parent.fd, name), flags, mode);
-	return duplicateDarwinDescriptor(openAt(parent.fd, name, flags, mode), flags);
+	if (process.platform === "darwin") return duplicateDarwinDescriptor(openAt(parent.fd, name, flags, mode), flags);
+	const target = descriptorPath(parent.fd, name);
+	const expected = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+		if (error.code === "ENOENT" && flags & fsConstants.O_CREAT) return null;
+		throw error;
+	});
+	if (expected?.isSymbolicLink()) throw new UnsafeManagedTranscriptPathError("managed path contains a symlink");
+	if (expected?.isDirectory() && ((expected.mode & 0o444) === 0 || (expected.mode & 0o111) === 0))
+		throw Object.assign(new Error("managed directory permission denied"), { code: "EACCES" });
+	const openFlags = expected === null ? flags | fsConstants.O_EXCL : flags;
+	const handle = await open(target, openFlags, mode);
+	try {
+		const actual = await handle.stat();
+		if (expected && (actual.dev !== expected.dev || actual.ino !== expected.ino))
+			throw new UnsafeManagedTranscriptPathError("managed path changed while opening");
+		return handle;
+	} catch (error) {
+		await handle.close();
+		throw error;
+	}
 }
 
 function* readDarwinDirectory(fd: number, api: DarwinFileSystem): Generator<string> {
@@ -149,9 +167,7 @@ function containedParts(root: string, candidate: string, allowRoot = false): str
 async function closeQuietly(handle: FileHandle): Promise<void> {
 	try {
 		await handle.close();
-	} catch {
-		// Preserve the operation's original result or error.
-	}
+	} catch {}
 }
 
 async function assertFinalComponentIsNotSymlink(path: string): Promise<void> {
@@ -162,13 +178,18 @@ async function assertFinalComponentIsNotSymlink(path: string): Promise<void> {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
 }
-
-/** Open every parent directory from a held descriptor. */
 async function openContainedDirectory(root: string, parts: readonly string[]): Promise<FileHandle> {
 	requireDescriptorFilesystem();
 	let current: FileHandle;
 	try {
+		const expected = await lstat(resolve(root));
+		if (expected.isSymbolicLink()) throw new UnsafeManagedTranscriptPathError("workspace root is a symlink");
 		current = await open(resolve(root), DIRECTORY_FLAGS);
+		const actual = await current.stat();
+		if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+			await current.close();
+			throw new UnsafeManagedTranscriptPathError("workspace root changed while opening");
+		}
 	} catch (error) {
 		throw normalizePathError(error);
 	}
@@ -184,8 +205,6 @@ async function openContainedDirectory(root: string, parts: readonly string[]): P
 		throw normalizePathError(error);
 	}
 }
-
-/** Open a file through a checked, descriptor-relative parent directory. */
 export async function openContainedTranscriptFile(
 	root: string,
 	candidate: string,
@@ -206,8 +225,6 @@ export async function openContainedTranscriptFile(
 		await closeQuietly(parent);
 	}
 }
-
-/** Remove a final entry while holding its checked parent directory. */
 export async function removeContainedTranscriptPath(
 	root: string,
 	candidate: string,
@@ -237,8 +254,6 @@ export async function removeContainedTranscriptPath(
 		await closeQuietly(parent);
 	}
 }
-
-/** Migration inventory holds the directory while iterating a bounded native buffer. */
 export async function* iterateContainedTranscriptDirectory(root: string, candidate: string): AsyncGenerator<string> {
 	const directory = await openContainedDirectory(root, containedParts(root, candidate, true));
 	try {
@@ -254,8 +269,6 @@ export async function* iterateContainedTranscriptDirectory(root: string, candida
 		await closeQuietly(directory);
 	}
 }
-
-/** Resolve a ledger path only inside imports/transcripts under the workspace. */
 export function resolveManagedTranscriptPath(root: string, managedPath: string): string {
 	const rootResolved = resolve(root);
 	const candidate = resolve(rootResolved, managedPath);

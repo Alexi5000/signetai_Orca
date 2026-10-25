@@ -9,7 +9,7 @@ export function recordSkillsFromTranscript(args: {
 	readonly transcriptPath: string;
 	readonly harness: string;
 	readonly agentId: string;
-	readonly origin?: string; // default "scan"
+	readonly origin?: string;
 	readonly expectedSessionId?: string;
 }): void {
 	if (args.transcriptPath.trim().length === 0) return;
@@ -17,8 +17,6 @@ export function recordSkillsFromTranscript(args: {
 	let content: string;
 	let fd: number | undefined;
 	try {
-		// Open once (non-blocking for FIFOs) and fstat the descriptor so the
-		// size/type checks apply to the file that is actually read.
 		fd = openSync(args.transcriptPath, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0));
 		const stat = fstatSync(fd);
 		if (!stat.isFile()) {
@@ -43,10 +41,6 @@ export function recordSkillsFromTranscript(args: {
 	} finally {
 		if (fd !== undefined) closeSync(fd);
 	}
-
-	// Fire-and-forget telemetry: this must never throw (callers invoke it from
-	// setImmediate, where an uncaught throw would crash the daemon). Guard the
-	// parse + record loop so the whole function is throw-proof at the contract.
 	try {
 		const { records, skipped } = parseTranscriptSkills(content);
 		const origin = args.origin ?? "scan";

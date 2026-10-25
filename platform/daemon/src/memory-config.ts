@@ -28,26 +28,14 @@ export interface EmbeddingConfig {
 	model: string;
 	dimensions: number;
 	base_url: string;
-	/** USD per million input tokens, keyed by billing provider. */
 	costRates?: EmbeddingCostRates;
-	/** Internal retrieval formatting contract. Omitted means legacy raw text until a generation migration promotes a profile. */
 	profile?: string;
-	/** Internal marker: only the migration worker may bypass active resolution. */
 	indexGeneration?: "staging";
 	api_key?: string;
 	promptSubmitTimeoutMs?: number;
 	llamaCppMaxInputTokens?: number;
-	/** Idle lifetime of the native embedding worker before it is evicted. */
 	idleTtlMs?: number;
-	/** Opt in to loading the native model during daemon startup. */
 	preloadNative?: boolean;
-	/**
-	 * Kill-switch for the native ONNX path (#1073). When false, the daemon
-	 * never warms or routes to native even if the active embedding profile is
-	 * native — callers fall through to the llama.cpp/ollama fallback chain.
-	 * Defaults to true (native allowed). Set via config `embedding.warmNative`
-	 * or env `SIGNET_EMBEDDING_WARM_NATIVE`.
-	 */
 	warmNative?: boolean;
 }
 
@@ -61,12 +49,11 @@ export interface MemorySearchConfig {
 	temporal_prior_enabled: boolean;
 	temporal_prior_weight: number;
 	temporal_prior_half_life_days: number;
+	transcript_evidence_limit: number;
 }
 
 export { PIPELINE_FLAGS };
 export type { PipelineFlag, PipelineV2Config, DreamingConfig };
-
-/** IANA timezone of the machine the daemon runs on. Falls back to UTC on any failure. */
 export function detectLocalTimeZone(): string {
 	try {
 		return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -98,9 +85,11 @@ export const DEFAULT_DREAMING: DreamingConfig = {
 	enabled: false,
 	tokenThreshold: 100_000,
 	maxInterval: 6 * 60 * 60 * 1_000,
-	timeout: 20 * 60 * 1_000, // 20 minutes
+	timeout: 20 * 60 * 1_000,
 	maxInputTokens: 128_000,
-	maxOutputTokens: 16_000,
+	maxOutputTokens: null,
+	maxConcurrentPasses: 2,
+	codemode: false,
 	backfillOnFirstRun: true,
 	surprisal: DEFAULT_DREAMING_SURPRISAL,
 };
@@ -163,6 +152,7 @@ export const DEFAULT_PIPELINE_V2: ResolvedPipelineV2Config = {
 	reranker: {
 		enabled: true,
 		model: "",
+		crossEncoderModel: "mixedbread-ai/mxbai-rerank-xsmall-v1",
 		useExtractionModel: false,
 		topN: 20,
 		timeoutMs: 2000,
@@ -171,15 +161,15 @@ export const DEFAULT_PIPELINE_V2: ResolvedPipelineV2Config = {
 		enabled: true,
 		frozen: false,
 		allowUpdateDelete: true,
-		maintenanceIntervalMs: 30 * 60 * 1000, // 30 min
+		maintenanceIntervalMs: 30 * 60 * 1000,
 		maintenanceMode: "execute",
 	},
 	repair: {
-		reembedCooldownMs: 300000, // 5 min
+		reembedCooldownMs: 300000,
 		reembedHourlyBudget: 10,
-		requeueCooldownMs: 60000, // 1 min
+		requeueCooldownMs: 60000,
 		requeueHourlyBudget: 50,
-		dedupCooldownMs: 600000, // 10 min
+		dedupCooldownMs: 600000,
 		dedupHourlyBudget: 3,
 		dedupSemanticThreshold: 0.92,
 		dedupBatchSize: 100,
@@ -188,21 +178,18 @@ export const DEFAULT_PIPELINE_V2: ResolvedPipelineV2Config = {
 		workerIntervalMs: 10000,
 		chunkSize: 2000,
 		chunkOverlap: 200,
-		maxContentBytes: 10 * 1024 * 1024, // 10 MB
+		maxContentBytes: 10 * 1024 * 1024,
 	},
 	guardrails: {
 		maxContentChars: 800,
 		chunkTargetChars: 600,
 		recallTruncateChars: 500,
-		// Total character budget for the injected <signet-memory> block per
-		// prompt turn. Memories are greedily included from highest score until
-		// this limit is reached. Prevents context window overruns on long sessions.
 		contextBudgetChars: 4000,
 	},
 	continuity: {
 		enabled: true,
 		promptInterval: 10,
-		timeIntervalMs: 900_000, // 15 min
+		timeIntervalMs: 900_000,
 		maxCheckpointsPerSession: 50,
 		retentionDays: 7,
 		recoveryBudgetChars: 2000,
@@ -213,10 +200,6 @@ export const DEFAULT_PIPELINE_V2: ResolvedPipelineV2Config = {
 	},
 	telemetryEnabled: true,
 	telemetry: {
-		// PostHog cloud (US). On by default so Signet can understand how it
-		// runs in the wild; set telemetryEnabled: false to opt out. Sends
-		// only when both host and api key are configured. The project API
-		// key is a public ingest key (PostHog design); it is not a secret.
 		posthogHost: DEFAULT_TELEMETRY_POSTHOG_HOST,
 		posthogApiKey: DEFAULT_TELEMETRY_POSTHOG_API_KEY,
 		flushIntervalMs: DEFAULT_TELEMETRY_FLUSH_INTERVAL_MS,
@@ -282,6 +265,7 @@ export const DEFAULT_PIPELINE_V2: ResolvedPipelineV2Config = {
 export const DEFAULT_OLLAMA_BASE_URL = `http://${LOOPBACK_HOST}:11434`;
 export const DEFAULT_LLAMACPP_BASE_URL = `http://${LOOPBACK_HOST}:8080`;
 export const DEFAULT_LLAMACPP_MAX_INPUT_TOKENS = 1400;
+export const NATIVE_EMBEDDING_MAX_INPUT_TOKENS = 2048;
 export const MIN_LLAMACPP_MAX_INPUT_TOKENS = 128;
 export const MAX_LLAMACPP_MAX_INPUT_TOKENS = 131072;
 export const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -304,7 +288,6 @@ class MemoryConfigValidationError extends Error {}
 
 function clampPositive(raw: unknown, min: number, max: number, fallback: number): number {
 	if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
-	// Bounds are inclusive; a few config fields intentionally use 0 as a disable sentinel.
 	return Math.max(min, Math.min(max, raw));
 }
 
@@ -357,13 +340,12 @@ const runtimeSchema = z.object({
 			temporal_prior_enabled: z.boolean().default(true),
 			temporal_prior_weight: fraction.default(0.15),
 			temporal_prior_half_life_days: z.number().min(1).max(365).default(14),
+			transcript_evidence_limit: z.number().int().min(0).max(5).default(2),
 		})
 		.prefault({}),
 	memory: z.record(z.string(), z.unknown()).optional(),
 	network: z.object({ mode: z.enum(NETWORK_MODES).default("localhost") }).prefault({}),
 });
-
-/** Read and normalize the selected runtime document, before legacy pipeline migrations. */
 export function readRuntimeConfig(agentsDir: string): {
 	readonly path: string | undefined;
 	readonly yaml: Record<string, unknown>;
@@ -381,7 +363,6 @@ export function readRuntimeConfig(agentsDir: string): {
 		if (!result.success) throw new Error(`${result.error.issues[0]?.path.join(".")} is invalid`);
 		const { embedding, search, network } = result.data;
 		const provider = embedding.provider === "local" ? "native" : (embedding.provider ?? "native");
-		// Preserve the established provider and alpha gates for otherwise valid legacy input.
 		const active = embedding.provider !== undefined && provider !== "none";
 		const endpoint = embedding.base_url ?? embedding.endpoint;
 		const endpoints = {
@@ -485,8 +466,6 @@ function resolveMaxLlmConcurrency(rawValue: unknown, defaultValue: number): numb
 	}
 	return clampPositive(candidate, 1, 16, defaultValue);
 }
-
-/** Parse a boolean env override ("1"/"true"/"yes" vs "0"/"false"/"no"). */
 function envBool(name: string): boolean | undefined {
 	const value = process.env[name];
 	if (value === undefined) return undefined;
@@ -514,12 +493,6 @@ function parseClaudeCodeConfig(raw: unknown, fallback: PipelineV2Config["claudeC
 		cooldownMs,
 	};
 }
-
-/**
- * Load pipeline config from YAML, supporting both nested and flat key formats.
- * Flat extraction keys (dashboard-written) take precedence over nested keys.
- * Provider and model are paired — if flat provider wins, flat model wins too.
- */
 export function loadPipelineConfig(yaml: Record<string, unknown>): ResolvedPipelineV2Config {
 	const mem = yaml.memory as Record<string, unknown> | undefined;
 	const raw = mem?.pipelineV2 as Record<string, unknown> | undefined;
@@ -528,9 +501,7 @@ export function loadPipelineConfig(yaml: Record<string, unknown>): ResolvedPipel
 			"memory.synthesis is retired; MEMORY.md synthesis follows the canonical inference workload instead.",
 		);
 	}
-	if (!raw) return { ...DEFAULT_PIPELINE_V2 };
-
-	// Read nested sub-objects (may be undefined for old flat configs)
+	if (!raw) return structuredClone(DEFAULT_PIPELINE_V2);
 	const extractionRaw = raw.extraction as Record<string, unknown> | undefined;
 	const workerRaw = raw.worker as Record<string, unknown> | undefined;
 	const claudeCodeRaw = raw.claudeCode as Record<string, unknown> | undefined;
@@ -553,8 +524,6 @@ export function loadPipelineConfig(yaml: Record<string, unknown>): ResolvedPipel
 	const modelRegistryRaw = raw.modelRegistry as Record<string, unknown> | undefined;
 	const hintsRaw = raw.hints as Record<string, unknown> | undefined;
 	const reflectionsRaw = raw.reflections as Record<string, unknown> | undefined;
-
-	// Helper: resolve with flat-fallback (non-extraction fields still nested-first)
 	const d = DEFAULT_PIPELINE_V2;
 
 	function resolveBool(nested: unknown, flat: unknown, fallback: boolean): boolean {
@@ -562,10 +531,6 @@ export function loadPipelineConfig(yaml: Record<string, unknown>): ResolvedPipel
 		if (typeof flat === "boolean") return flat;
 		return fallback;
 	}
-
-	// Provider and model selection belongs to inference.workloads. Keep the
-	// legacy keys as a loud error instead of allowing a stale config to select a
-	// local fallback with an unrelated model (#1266, #1267).
 	const legacyRoutingKeys = [
 		["memory.pipelineV2.extractionProvider", raw.extractionProvider],
 		["memory.pipelineV2.extractionModel", raw.extractionModel],
@@ -625,8 +590,6 @@ export function loadPipelineConfig(yaml: Record<string, unknown>): ResolvedPipel
 		300000,
 		d.extraction.timeout,
 	);
-
-	// Normalize aspect weights: clamp independently, then enforce min <= max
 	const maxAW = clampFraction(feedbackRaw?.maxAspectWeight, d.feedback.maxAspectWeight);
 	const minAW = clampFraction(feedbackRaw?.minAspectWeight, d.feedback.minAspectWeight);
 	const validatedMinAW = minAW > maxAW ? maxAW : minAW;
@@ -649,7 +612,6 @@ export function loadPipelineConfig(yaml: Record<string, unknown>): ResolvedPipel
 
 		extraction: {
 			strength: (() => {
-				// Flat keys win when set (dashboard writes these); nested is fallback
 				const candidate = raw.extractionStrength ?? extractionRaw?.strength;
 				return isExtractionStrength(candidate) ? candidate : d.extraction.strength;
 			})(),
@@ -741,6 +703,10 @@ export function loadPipelineConfig(yaml: Record<string, unknown>): ResolvedPipel
 					: typeof raw.rerankerModel === "string"
 						? (raw.rerankerModel as string)
 						: d.reranker.model,
+			crossEncoderModel:
+				typeof rerankerRaw?.crossEncoderModel === "string"
+					? rerankerRaw.crossEncoderModel.trim()
+					: d.reranker.crossEncoderModel,
 			useExtractionModel: resolveBool(
 				rerankerRaw?.useExtractionModel,
 				raw.rerankerUseExtractionModel,
@@ -1012,7 +978,14 @@ export function loadDreamingConfig(yaml: Record<string, unknown>): DreamingConfi
 		maxInterval: clampWarn("maxInterval", raw.maxInterval, 5 * 60 * 1_000, 7 * 24 * 60 * 60 * 1_000, dd.maxInterval),
 		timeout: clampWarn("timeout", raw.timeout, 30_000, 1_800_000, dd.timeout),
 		maxInputTokens: clampWarn("maxInputTokens", raw.maxInputTokens, 8_000, 1_000_000, dd.maxInputTokens),
-		maxOutputTokens: clampWarn("maxOutputTokens", raw.maxOutputTokens, 1_000, 128_000, dd.maxOutputTokens),
+		maxOutputTokens:
+			typeof raw.maxOutputTokens === "number" && Number.isFinite(raw.maxOutputTokens)
+				? clampWarn("maxOutputTokens", raw.maxOutputTokens, 1_000, 1_000_000, 1_000)
+				: dd.maxOutputTokens,
+		maxConcurrentPasses: Math.floor(
+			clampWarn("maxConcurrentPasses", raw.maxConcurrentPasses, 1, 16, dd.maxConcurrentPasses),
+		),
+		codemode: typeof raw.codemode === "boolean" ? raw.codemode : dd.codemode,
 		backfillOnFirstRun: typeof raw.backfillOnFirstRun === "boolean" ? raw.backfillOnFirstRun : dd.backfillOnFirstRun,
 		surprisal: {
 			enabled: typeof surprisal?.enabled === "boolean" ? surprisal.enabled : defaultSurprisal.enabled,
@@ -1043,8 +1016,6 @@ export function loadDreamingConfig(yaml: Record<string, unknown>): DreamingConfi
 		},
 	};
 }
-
-/** Write-path graph caps from the traversal config, with defaults. */
 export function graphWriteCaps(cfg: ResolvedMemoryConfig): {
 	readonly maxAspectsPerEntity: number;
 	readonly maxAttributesPerAspect: number;

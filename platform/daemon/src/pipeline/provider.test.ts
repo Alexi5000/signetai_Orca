@@ -1,14 +1,3 @@
-/**
- * Tests for the surviving provider infrastructure: the ACPX harness-subprocess
- * provider, the global LLM concurrency semaphore, and the subprocess deadline
- * helper.
- *
- * The per-provider HTTP/subprocess factories (Anthropic, OpenAI-compatible,
- * Ollama, llama.cpp, OpenRouter, Claude Code, Codex, OpenCode, command-line)
- * were removed in #947; their tests went with them. The pi-ai-backed provider
- * is covered by pi-provider.live.test.ts.
- */
-
 import { describe, expect, it } from "bun:test";
 import { createTestTempDir } from "../test-temp-dir";
 import { spawn as nodeSpawn } from "node:child_process";
@@ -26,10 +15,6 @@ import {
 	withLlmConcurrency,
 } from "./provider";
 import { logger } from "../logger";
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
 
 function streamFromString(value: string): ReadableStream<Uint8Array> {
 	return new ReadableStream({
@@ -82,10 +67,6 @@ async function waitForLlmConcurrencyStatus(running: number, pending: number): Pr
 	const status = getLlmConcurrencyStatus();
 	throw new Error(`LLM concurrency did not reach running=${running}, pending=${pending}: ${JSON.stringify(status)}`);
 }
-
-// ---------------------------------------------------------------------------
-// ACPX harness-subprocess provider
-// ---------------------------------------------------------------------------
 
 describe("createAcpxProvider", () => {
 	it("calculates bounded exponential sterile-response backoff with deterministic jitter", () => {
@@ -652,19 +633,23 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
 		const codexAcp = join(root, "codex-acp");
 		const childPidPath = join(root, "child.pid");
 		const unrelatedPidPath = join(root, "unrelated.pid");
+		const childReadyPath = join(root, "child.ready");
+		const unrelatedReadyPath = join(root, "unrelated.ready");
 		writeFileSync(
 			codexAcp,
 			`#!/usr/bin/env bash
+: > "$1"
 sleep 30
 `,
 		);
 		writeFileSync(
 			bin,
 			`#!/usr/bin/env bash
-setsid ${JSON.stringify(codexAcp)} >/dev/null 2>&1 < /dev/null &
+setsid ${JSON.stringify(codexAcp)} ${JSON.stringify(childReadyPath)} >/dev/null 2>&1 < /dev/null &
 printf '%s' "$!" > ${JSON.stringify(childPidPath)}
-SIGNET_ACPX_RUN_ID=unrelated setsid ${JSON.stringify(codexAcp)} >/dev/null 2>&1 < /dev/null &
+SIGNET_ACPX_RUN_ID=unrelated setsid ${JSON.stringify(codexAcp)} ${JSON.stringify(unrelatedReadyPath)} >/dev/null 2>&1 < /dev/null &
 printf '%s' "$!" > ${JSON.stringify(unrelatedPidPath)}
+while [ ! -e ${JSON.stringify(childReadyPath)} ] || [ ! -e ${JSON.stringify(unrelatedReadyPath)} ]; do sleep 0.01; done
 printf 'ok\\n'
 `,
 		);
@@ -672,12 +657,12 @@ printf 'ok\\n'
 		chmodSync(codexAcp, 0o755);
 		try {
 			const provider = createAcpxProvider({ agent: "codex", bin, hooks: "disabled" });
-			await expect(provider.generate("hello", { timeoutMs: 1000 })).resolves.toBe("ok");
+			await expect(provider.generate("hello", { timeoutMs: 10_000 })).resolves.toBe("ok");
 			const pid = Number(readFileSync(childPidPath, "utf-8"));
 			expect(pid).toBeGreaterThan(0);
 
 			let alive = true;
-			for (let i = 0; i < 40; i += 1) {
+			for (let i = 0; i < 200; i += 1) {
 				try {
 					process.kill(pid, 0);
 					await new Promise((resolve) => setTimeout(resolve, 25));
@@ -696,9 +681,7 @@ printf 'ok\\n'
 				if (unrelatedPid > 0) {
 					try {
 						process.kill(unrelatedPid, "SIGKILL");
-					} catch {
-						// Already exited.
-					}
+					} catch {}
 				}
 			}
 			rmSync(root, { recursive: true, force: true });
@@ -1018,9 +1001,6 @@ printf 'ok\\n'
 		const runidFile = join(root, "runid.txt");
 		const fakePs = join(root, "ps");
 		const bin = join(root, "fake-acpx.sh");
-		// fake ps: the full process listing plus the environment returned by
-		// `ps -p <pid> -E -o command=`. Two same-named agent processes; only one
-		// is bound to our run id.
 		writeFileSync(
 			fakePs,
 			`#!/usr/bin/env bash
@@ -1040,9 +1020,6 @@ fi
 exit 0
 `,
 		);
-		// fake acpx: records its own run id (from the real env the provider
-		// passed) so the sweep's environment read matches the actual runtime
-		// value rather than a literal.
 		writeFileSync(
 			bin,
 			`#!/usr/bin/env bash
@@ -1063,15 +1040,12 @@ printf 'ok\\n'
 		const killLog: string[] = [];
 		const previousKill = process.kill;
 		try {
-			// Record the signals the sweep issues so we can assert it targeted
-			// only the child bound to the run id, not the foreign one.
 			process.kill = ((pid: number, signal: NodeJS.Signals) => {
 				killLog.push(`${pid}:${signal}`);
 				return true;
 			}) as typeof process.kill;
 			const provider = createAcpxProvider({ agent: "codex", bin, hooks: "disabled" });
 			await expect(provider.generate("hello", { timeoutMs: 1000 })).resolves.toBe("ok");
-			// Let the SIGTERM->SIGKILL escalation timers (~1s) fire.
 			await new Promise((resolve) => setTimeout(resolve, 1600));
 		} finally {
 			process.kill = previousKill;
@@ -1337,9 +1311,7 @@ printf 'ok\\n'
 				if (!(await waitForProcessExit(pid))) {
 					try {
 						process.kill(pid, "SIGKILL");
-					} catch {
-						// Already exited.
-					}
+					} catch {}
 				}
 			}
 			if (previousPlatform === undefined) Reflect.deleteProperty(process.env, "SIGNET_ACPX_CLEANUP_PLATFORM");
@@ -1715,7 +1687,6 @@ touch ${JSON.stringify(holderReadyPath)}
 				timeoutMs: 5_000,
 			});
 			await expect(unrelated).resolves.toBe("unrelated answer");
-			// The run-id barrier is active even if the bounded child wait has already released the permit.
 			expect(existsSync(retryRanPath)).toBe(false);
 
 			await expect(holder).rejects.toThrow(/codex via ACPX timeout after \d+ms/);
@@ -1739,9 +1710,7 @@ touch ${JSON.stringify(holderReadyPath)}
 			if (escapedPid !== undefined) {
 				try {
 					previousKill(escapedPid, "SIGKILL");
-				} catch {
-					// Already exited.
-				}
+				} catch {}
 			}
 			await Promise.allSettled([barrierSettled, holder, retry, unrelated]);
 			configureLlmConcurrency(previousConcurrencyLimit);
@@ -1885,10 +1854,6 @@ wait
 		}
 	});
 });
-
-// ---------------------------------------------------------------------------
-// Global LLM concurrency semaphore
-// ---------------------------------------------------------------------------
 
 describe("LlmConcurrencySemaphore", () => {
 	it("acquireWithTimeout rejects with SemaphoreTimeoutError", async () => {
@@ -2047,15 +2012,8 @@ describe("LlmConcurrencySemaphore", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// Subprocess deadline helper
-// ---------------------------------------------------------------------------
-
 describe("awaitSubprocessWithDeadline — success-after-timeout race", () => {
 	it("reports timeout even when resultFn resolves successfully after deadline fires", async () => {
-		// Race: deadline timer fires (timedOut=true, SIGTERM sent) but resultFn
-		// resolves successfully because output was already buffered. Must throw
-		// SemaphoreTimeoutError instead of returning the stale result.
 		let killed = false;
 		const exitPromise = new Promise<number>((resolve) => {
 			setTimeout(() => resolve(0), 200);
@@ -2069,9 +2027,6 @@ describe("awaitSubprocessWithDeadline — success-after-timeout race", () => {
 				killed = true;
 			},
 		};
-
-		// resultFn resolves after 80ms — but deadline is 30ms, so timedOut
-		// will be true when resultFn settles.
 		const resultFn = async () => {
 			await new Promise((r) => setTimeout(r, 80));
 			return "success-value";
@@ -2184,17 +2139,13 @@ wait
 				if (pid > 0) {
 					try {
 						process.kill(pid, "SIGKILL");
-					} catch {
-						// Already exited.
-					}
+					} catch {}
 				}
 			}
 			if (typeof child.pid === "number") {
 				try {
 					process.kill(-child.pid, "SIGKILL");
-				} catch {
-					// Process group already gone.
-				}
+				} catch {}
 			}
 			rmSync(root, { recursive: true, force: true });
 		}

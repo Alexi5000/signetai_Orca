@@ -9,20 +9,20 @@ import { createDaemonClient } from "./daemon-client.js";
 import {
 	type LifecycleDeps,
 	PI_LIFECYCLE_CONFIG,
+	beginPromptSubmit,
 	currentSessionRef,
 	endCurrentSession,
 	endPreviousSession,
 	ensureSessionContext,
 	refreshSessionStart,
 	requestNotifications,
-	requestRecallForPrompt,
+	settlePromptSubmit,
 } from "./lifecycle.js";
 import { type PiSessionState, createSessionState } from "./session-state.js";
 import {
 	DAEMON_URL_DEFAULT,
 	HARNESS,
 	type PiBeforeAgentStartEvent,
-	type PiBeforeAgentStartResult,
 	type PiContextEvent,
 	type PiContextEventResult,
 	type PiExtensionApi,
@@ -37,12 +37,7 @@ import {
 	WRITE_TIMEOUT,
 } from "./types.js";
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
 interface PiExtensionConfig {
-	/** Whether Signet is enabled. Defaults to true if env var/file not set. */
 	enabled: boolean;
 }
 
@@ -66,21 +61,14 @@ function loadConfigFile(): PiExtensionConfigFile | null {
 
 export function loadConfig(): PiExtensionConfig {
 	const fileConfig = loadConfigFile();
-
-	// Env vars override file config
 	const envEnabled = readRuntimeEnv("SIGNET_ENABLED");
 	const fileEnabled = fileConfig?.enabled;
-	// Priority: env var > file > default (true)
 	const enabled = envEnabled !== undefined ? envEnabled !== "false" : fileEnabled !== undefined ? fileEnabled : true;
 
 	return { enabled };
 }
 
 const cfg = loadConfig();
-
-// ============================================================================
-// State
-// ============================================================================
 
 interface SignetState {
 	lastRecall: string | null;
@@ -91,10 +79,6 @@ const state: SignetState = {
 	lastRecall: null,
 	memoryCount: 0,
 };
-
-// ============================================================================
-// Daemon Health Check
-// ============================================================================
 
 function readAuthToken(): string | undefined {
 	return readTrimmedRuntimeEnv("SIGNET_API_KEY") ?? readTrimmedRuntimeEnv("SIGNET_TOKEN");
@@ -118,9 +102,42 @@ async function checkDaemonHealth(daemonUrl: string): Promise<boolean> {
 	}
 }
 
-// ============================================================================
-// Memory Operations
-// ============================================================================
+function daemonFailure(
+	operation: string,
+	result: { readonly ok: false; readonly reason: string; readonly status?: number },
+): Error {
+	const detail = result.reason === "http" && result.status !== undefined ? `HTTP ${result.status}` : result.reason;
+	return new Error(`${operation} failed: ${detail}`);
+}
+
+function postDaemon<T>(daemonUrl: string, path: string, body: unknown, timeout: number, operation: string): Promise<T>;
+function postDaemon(
+	daemonUrl: string,
+	path: string,
+	body: unknown,
+	timeout: number,
+	operation: string,
+	mode: "status",
+): Promise<void>;
+async function postDaemon<T>(
+	daemonUrl: string,
+	path: string,
+	body: unknown,
+	timeout: number,
+	operation: string,
+	mode: "json" | "status" = "json",
+): Promise<T | undefined> {
+	const client = createDaemonClient(daemonUrl);
+	if (mode === "status") {
+		const result = await client.postStatus(path, body, timeout);
+		if (!result.ok) throw daemonFailure(operation, result);
+		return;
+	}
+
+	const result = await client.postResult<T>(path, body, timeout);
+	if (!result.ok) throw daemonFailure(operation, result);
+	return result.data;
+}
 
 export async function recallMemories(
 	daemonUrl: string,
@@ -136,24 +153,16 @@ export async function recallMemories(
 		saveAggregate?: boolean;
 	} = {},
 ): Promise<RecallPayload> {
-	const response = await fetch(`${daemonUrl}/api/memory/recall`, {
-		method: "POST",
-		headers: daemonHeaders({ "Content-Type": "application/json" }),
-		body: JSON.stringify(
-			buildRecallRequestBody(query, {
-				...options,
-				recallSurface: "tool_call",
-			}),
-		),
-		signal: AbortSignal.timeout(options.aggregate ? Math.max(READ_TIMEOUT * 6, 30_000) : READ_TIMEOUT),
-	});
-
-	if (!response.ok) {
-		const error = await response.text();
-		throw new Error(`Recall failed: ${error}`);
-	}
-
-	return (await response.json()) as RecallPayload;
+	return postDaemon<RecallPayload>(
+		daemonUrl,
+		"/api/memory/recall",
+		buildRecallRequestBody(query, {
+			...options,
+			recallSurface: "tool_call",
+		}),
+		options.aggregate ? Math.max(READ_TIMEOUT * 6, 30_000) : READ_TIMEOUT,
+		"Recall",
+	);
 }
 export async function rememberContent(
 	daemonUrl: string,
@@ -167,27 +176,22 @@ export async function rememberContent(
 ): Promise<void> {
 	const { critical = false, tags = [], agentId, reviewAfter } = options;
 
-	const response = await fetch(`${daemonUrl}/api/hooks/remember`, {
-		method: "POST",
-		headers: daemonHeaders({ "Content-Type": "application/json" }),
-		body: JSON.stringify(
-			buildRememberRequestBody(content, {
-				harness: HARNESS,
-				pinned: critical,
-				tags,
-				agentId,
-				reviewAfter,
-				source: "pi-extension",
-				runtimePath: RUNTIME_PATH,
-			}),
-		),
-		signal: AbortSignal.timeout(WRITE_TIMEOUT),
-	});
-
-	if (!response.ok) {
-		const error = await response.text();
-		throw new Error(`Remember failed: ${error}`);
-	}
+	await postDaemon(
+		daemonUrl,
+		"/api/hooks/remember",
+		buildRememberRequestBody(content, {
+			harness: HARNESS,
+			pinned: critical,
+			tags,
+			agentId,
+			reviewAfter,
+			source: "pi-extension",
+			runtimePath: RUNTIME_PATH,
+		}),
+		WRITE_TIMEOUT,
+		"Remember",
+		"status",
+	);
 }
 export async function searchSourceArtifacts(
 	daemonUrl: string,
@@ -202,10 +206,10 @@ export async function searchSourceArtifacts(
 ): Promise<RecallPayload> {
 	const { limit, agentId, sessionKey, includeRecalled, project } = options;
 
-	const response = await fetch(`${daemonUrl}/api/memory/recall`, {
-		method: "POST",
-		headers: daemonHeaders({ "Content-Type": "application/json" }),
-		body: JSON.stringify({
+	return postDaemon<RecallPayload>(
+		daemonUrl,
+		"/api/memory/recall",
+		{
 			...buildRecallRequestBody(query, {
 				limit,
 				agentId,
@@ -215,16 +219,10 @@ export async function searchSourceArtifacts(
 				recallSurface: "tool_call",
 			}),
 			sourceOnly: true,
-		}),
-		signal: AbortSignal.timeout(READ_TIMEOUT),
-	});
-
-	if (!response.ok) {
-		const error = await response.text();
-		throw new Error(`Source search failed: ${error}`);
-	}
-
-	return (await response.json()) as RecallPayload;
+		},
+		READ_TIMEOUT,
+		"Source search",
+	);
 }
 
 export async function searchSessions(
@@ -238,36 +236,26 @@ export async function searchSessions(
 		limit?: number;
 	} = {},
 ): Promise<unknown> {
-	const response = await fetch(`${daemonUrl}/api/sessions/search`, {
-		method: "POST",
-		headers: daemonHeaders({ "Content-Type": "application/json" }),
-		body: JSON.stringify({
+	return postDaemon<unknown>(
+		daemonUrl,
+		"/api/sessions/search",
+		{
 			query,
 			sessionKey: options.sessionKey,
 			currentSessionKey: options.currentSessionKey,
 			agentId: options.agentId,
 			project: options.project,
 			limit: options.limit,
-		}),
-		signal: AbortSignal.timeout(READ_TIMEOUT),
-	});
-
-	if (!response.ok) {
-		const error = await response.text();
-		throw new Error(`Session search failed: ${error}`);
-	}
-
-	return await response.json();
+		},
+		READ_TIMEOUT,
+		"Session search",
+	);
 }
 
 function updateStatus(ctx: PiExtensionContext): void {
 	const status = state.lastRecall ? `signet:${state.memoryCount} memories` : "signet:ready";
 	ctx.ui.setStatus("signet", ctx.ui.theme.fg("accent", status));
 }
-
-// ============================================================================
-// Lifecycle Handlers
-// ============================================================================
 
 function registerSessionLifecycleHandlers(pi: PiExtensionApi, deps: LifecycleDeps, daemonUrl: string): void {
 	pi.on("session_start", async (_event, ctx) => {
@@ -282,28 +270,6 @@ function registerSessionLifecycleHandlers(pi: PiExtensionApi, deps: LifecycleDep
 
 		await refreshSessionStart(deps, ctx);
 	});
-
-	// Session switches/forks are split across the before- and post-events so the
-	// same handlers work under both current pi and pi-mono (the older monorepo
-	// fork, v0.66.x). See https://github.com/Signet-AI/signetai/issues/887.
-	//
-	// - `endPreviousSession` runs on the BEFORE-events. Both variants emit these
-	//   while the previous session is still the active one (its file is on disk and
-	//   most up to date), the most reliable point to capture its transcript.
-	// - `refreshSessionStart` runs on the POST-events, which only current pi
-	//   emits; pi-mono establishes the new-session context via `session_start`
-	//   (reason fork/new/resume) instead, so exactly one path refreshes.
-	//
-	// endPreviousSession is deliberately on ONLY the before-events (not also the
-	// post-events): current pi emits the before-event only once an extension
-	// registers a handler for it (hasHandlers guard), so registering here activates
-	// it under current pi too, and the not-loaded branch of endPreviousSession is
-	// not idempotent — wiring it to both events would double-call it for the same
-	// switch/fork. (The separate, pre-existing pending-queue re-POST behavior of
-	// endPreviousSession is unchanged by this split.) The before-event is awaited
-	// by pi, so the end POST runs as part of the pre-switch step; like session_start
-	// it is a bounded local-daemon call. Reason is normalized to the post-event
-	// names so the daemon records the same value per variant.
 	pi.on("session_before_switch", async () => {
 		await endPreviousSession(deps, {}, "session_switch");
 	});
@@ -325,23 +291,17 @@ function registerSessionLifecycleHandlers(pi: PiExtensionApi, deps: LifecycleDep
 }
 
 function registerPromptHandlers(pi: PiExtensionApi, deps: LifecycleDeps): void {
-	pi.on("input", async (event: PiInputEvent, ctx) => {
-		const session = currentSessionRef(ctx);
-		deps.state.clearPendingRecall(session.sessionId);
-		deps.state.clearPendingClock(session.sessionId);
-		await requestRecallForPrompt(deps, ctx, event.text);
+	pi.on("input", (event: PiInputEvent, ctx) => {
+		beginPromptSubmit(deps, ctx, event.text);
 	});
 
-	pi.on(
-		"before_agent_start",
-		async (event: PiBeforeAgentStartEvent, ctx): Promise<PiBeforeAgentStartResult | undefined> => {
-			await ensureSessionContext(deps, ctx);
-			const session = currentSessionRef(ctx);
-			if (!session.sessionId) return;
-			if (deps.state.hasPendingRecall(session.sessionId)) return;
-			await requestRecallForPrompt(deps, ctx, event.prompt);
-		},
-	);
+	pi.on("before_agent_start", async (event: PiBeforeAgentStartEvent, ctx): Promise<undefined> => {
+		if (!deps.state.hasPendingPromptSubmit(currentSessionRef(ctx).sessionId)) {
+			beginPromptSubmit(deps, ctx, event.prompt);
+		}
+		await settlePromptSubmit(deps, ctx);
+		await ensureSessionContext(deps, ctx);
+	});
 }
 
 interface PiDeps extends LifecycleDeps {
@@ -350,6 +310,7 @@ interface PiDeps extends LifecycleDeps {
 
 function registerContextHandlers(pi: PiExtensionApi, deps: PiDeps): void {
 	pi.on("context", async (event: PiContextEvent, ctx): Promise<PiContextEventResult | undefined> => {
+		await settlePromptSubmit(deps, ctx);
 		const session = currentSessionRef(ctx);
 		if (!deps.state.hasPendingRecall(session.sessionId)) {
 			await requestNotifications(deps, ctx, "context");
@@ -379,7 +340,6 @@ function registerCompactionHandlers(pi: PiExtensionApi, deps: LifecycleDeps): vo
 			},
 			READ_TIMEOUT,
 		);
-		// Pi handles compaction itself; we fire the hook for our own side effects only.
 		return undefined;
 	});
 
@@ -428,12 +388,7 @@ export function parseRememberArgs(raw: string): RememberArgs {
 	return { content, critical, tags };
 }
 
-// ============================================================================
-// Commands and Tools
-// ============================================================================
-
 function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId: string | undefined): void {
-	// /recall command
 	pi.registerCommand("recall", {
 		description: "Search SignetAI memories",
 		handler: async (args, ctx) => {
@@ -470,8 +425,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 			}
 		},
 	});
-
-	// /remember command
 	pi.registerCommand("remember", {
 		description: "Save a memory to SignetAI",
 		handler: async (args, ctx) => {
@@ -485,8 +438,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 				ctx.ui.notify("Signet daemon not running. Run: signet daemon start", "error");
 				return;
 			}
-
-			// Parse critical prefix and tags
 			const { content, critical, tags } = parseRememberArgs(args);
 
 			try {
@@ -499,8 +450,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 			}
 		},
 	});
-
-	// /signet-status command
 	pi.registerCommand("signet-status", {
 		description: "Check SignetAI daemon status",
 		handler: async (_args, ctx) => {
@@ -511,8 +460,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 				const parts = [`Signet daemon is running on ${daemonUrl}`];
 				if (sessionId) parts.push(`Session: ${sessionId}`);
 				ctx.ui.notify(parts.join("\n"), "success");
-
-				// Try to get memory count
 				try {
 					const response = await fetch(`${daemonUrl}/api/memory/stats`, {
 						signal: AbortSignal.timeout(READ_TIMEOUT),
@@ -521,9 +468,7 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 						const stats = (await response.json()) as Record<string, unknown>;
 						ctx.ui.notify(`Memory stats: ${JSON.stringify(stats)}`, "info");
 					}
-				} catch {
-					// Stats endpoint may not exist in all versions
-				}
+				} catch {}
 			} else {
 				ctx.ui.notify(
 					"Signet daemon not responding.\nInstall: curl -fsSL https://signetai.sh/install.sh | bash && signet setup\nStart: signet daemon start",
@@ -532,8 +477,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 			}
 		},
 	});
-
-	// signet_recall tool
 	pi.registerTool({
 		name: "signet_recall",
 		label: "Signet Recall",
@@ -618,8 +561,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 					aggregateBudget,
 				});
 				const parsed = parseRecallPayload(recall);
-
-				// Handle aggregate response: single synthesized result + metadata
 				if (isAggregate && recall.aggregate) {
 					const aggregateRows = recall.results ?? parsed.rows;
 					if (aggregateRows.length === 0) {
@@ -652,8 +593,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 						},
 					};
 				}
-
-				// Standard (non-aggregate) response
 				if (parsed.rows.length === 0) {
 					return {
 						content: [{ type: "text", text: "No relevant memories found for this query." }],
@@ -679,8 +618,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 			}
 		},
 	});
-
-	// signet_source_search tool
 	pi.registerTool({
 		name: "signet_source_search",
 		label: "Signet Source Search",
@@ -758,8 +695,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 			}
 		},
 	});
-
-	// signet_session_search tool
 	pi.registerTool({
 		name: "signet_session_search",
 		label: "Signet Session Search",
@@ -835,8 +770,6 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 			}
 		},
 	});
-
-	// signet_remember tool
 	pi.registerTool({
 		name: "signet_remember",
 		label: "Signet Remember",
@@ -897,20 +830,13 @@ function registerCommandsAndTools(pi: PiExtensionApi, daemonUrl: string, agentId
 	});
 }
 
-// ============================================================================
-// Main Extension
-// ============================================================================
-
 const SignetPiExtension: PiExtensionFactory = (pi): void => {
-	// Early return if globally disabled - nothing gets registered
 	if (!cfg.enabled) {
 		return;
 	}
 
 	const daemonUrl = readTrimmedRuntimeEnv("SIGNET_DAEMON_URL") ?? DAEMON_URL_DEFAULT;
 	const agentId = readTrimmedRuntimeEnv("SIGNET_AGENT_ID");
-
-	// Bypass mode: skip automatic hooks but keep commands and tools
 	if (readRuntimeEnv("SIGNET_BYPASS") !== "1") {
 		const deps: PiDeps = {
 			agentId,

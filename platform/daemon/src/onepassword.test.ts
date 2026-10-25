@@ -1,7 +1,8 @@
-import { describe, expect, it, mock } from "bun:test";
-
-// Exercise the adapter against the raw SDK v0.3 response shapes rather than
-// an already-normalized OnePasswordClient supplied through clientFactory.
+import { afterAll, describe, expect, it, mock } from "bun:test";
+const realOnePasswordSdk = { ...(await import("@1password/sdk")) };
+afterAll(() => {
+	mock.module("@1password/sdk", () => realOnePasswordSdk);
+});
 mock.module("@1password/sdk", () => ({
 	createClient: async () => ({
 		secrets: { resolve: async () => "resolved-secret" },

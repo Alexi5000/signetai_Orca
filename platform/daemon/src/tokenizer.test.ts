@@ -1,22 +1,27 @@
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "bun:test";
 import {
 	countTokens,
 	estimateTokens,
 	resetTokenizerStats,
+	resolveTokenizerWasmPath,
 	tokenizerStats,
+	tokenizerWasmPath,
 	truncateToTokens,
 } from "./pipeline/tokenizer";
 
 describe("tokenizer", () => {
+	it("resolves the WASM file used by the Bun loader", () => {
+		expect(existsSync(tokenizerWasmPath)).toBe(true);
+	});
+
 	it("estimates tokens from characters without encoding", () => {
 		expect(estimateTokens("")).toBe(0);
 		expect(estimateTokens("hello world")).toBe(Math.ceil("hello world".length / 4));
 	});
 
 	it("estimates never exceed the exact BPE count for plain prose", () => {
-		// chars/4 is the standard heuristic; for ASCII prose the exact BPE count
-		// is typically at or below the estimate, so budgeting on the estimate is
-		// safe (never under-reserves for the common case).
 		const text = "the quick brown fox jumps over the lazy dog and keeps running";
 		expect(countTokens(text)).toBeLessThanOrEqual(estimateTokens(text));
 	});
@@ -32,7 +37,35 @@ describe("tokenizer", () => {
 		const truncated = truncateToTokens("Résumé 東京 🚀 carries multilingual evidence", 7);
 
 		expect(countTokens(truncated)).toBeLessThanOrEqual(7);
-		expect(truncated).not.toContain("�");
+		expect(truncated).not.toContain("\uFFFD");
 		expect(truncateToTokens("🚀x", 1)).toBe("");
+	});
+});
+
+describe("resolveTokenizerWasmPath", () => {
+	it("resolves Bun file-loader relative paths against the importing module", () => {
+		const emitted = "./tokenizer-fixture.wasm";
+		const tokenizerModuleUrl = new URL("./pipeline/tokenizer.ts", import.meta.url);
+		expect(resolveTokenizerWasmPath(emitted)).toBe(fileURLToPath(new URL(emitted, tokenizerModuleUrl)));
+	});
+
+	it("keeps Windows drive-letter paths emitted by the Bun loader verbatim", () => {
+		const emitted = "D:\\a\\signetai\\signetai\\node_modules\\tiktoken\\tiktoken_bg.wasm";
+		expect(resolveTokenizerWasmPath(emitted)).toBe(emitted);
+	});
+
+	it("keeps Windows drive-letter paths with forward slashes verbatim", () => {
+		const emitted = "D:/a/signetai/signetai/node_modules/tiktoken/tiktoken_bg.wasm";
+		expect(resolveTokenizerWasmPath(emitted)).toBe(emitted);
+	});
+
+	it("keeps Windows UNC paths emitted by the Bun loader verbatim", () => {
+		const emitted = "\\\\runner\\node-modules\\tiktoken_bg.wasm";
+		expect(resolveTokenizerWasmPath(emitted)).toBe(emitted);
+	});
+
+	it("converts file URLs emitted by the Bun loader to platform paths", () => {
+		const emitted = "file:///opt/assets/tiktoken_bg.wasm";
+		expect(resolveTokenizerWasmPath(emitted)).toBe(fileURLToPath(new URL(emitted)));
 	});
 });

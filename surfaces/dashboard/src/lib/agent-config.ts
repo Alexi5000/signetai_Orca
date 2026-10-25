@@ -1,17 +1,6 @@
-/**
- * Agent config store — React equivalent of the old Svelte dashboard's
- * settings store (`st`). Loads agent.yaml via GET /api/config, exposes path
- * accessors used by the settings screens (inference accounts/targets, git
- * sync toggles), tracks dirtiness, and persists via POST /api/config.
- *
- * Writes are explicit: mutate with the aSet/aDel helpers, then save(). Callers that
- * change provider wiring must save BEFORE reloading catalogs, because the
- * daemon re-reads agent.yaml from disk (mirrors the Svelte save→invalidate
- * ordering).
- */
 import { parse, stringify } from "yaml";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "@/lib/api";
+import { type ApiReadResult, api, getJSONResult } from "@/lib/api";
 
 type YamlObject = Record<string, unknown>;
 
@@ -22,6 +11,33 @@ function getPath(obj: YamlObject, path: readonly string[]): unknown {
 		cur = (cur as YamlObject)[key];
 	}
 	return cur;
+}
+
+export function pv2MaintenanceMode(agent: Record<string, unknown>): string | undefined {
+	const value = getPath(agent, ["memory", "pipelineV2", "autonomous", "maintenanceMode"]);
+	return typeof value === "string" ? value : undefined;
+}
+
+export function pv2ToggleValue(
+	agent: Record<string, unknown>,
+	nested: readonly string[],
+	flat: readonly string[],
+	fallback: boolean,
+): boolean {
+	const nestedValue = getPath(agent, nested);
+	if (typeof nestedValue === "boolean") return nestedValue;
+	const flatValue = getPath(agent, flat);
+	if (typeof flatValue === "boolean") return flatValue;
+	return fallback;
+}
+export function pv2ToggleWriteForm(
+	agent: Record<string, unknown>,
+	nested: readonly string[],
+	flat: readonly string[],
+): "nested" | "flat" {
+	if (typeof getPath(agent, nested) === "boolean") return "nested";
+	if (typeof getPath(agent, flat) === "boolean") return "flat";
+	return "nested";
 }
 
 function setPath(obj: YamlObject, path: readonly string[], value: unknown): void {
@@ -51,28 +67,42 @@ function delPath(obj: YamlObject, path: readonly string[]): void {
 	if (path.length > 0) del(obj, 0);
 }
 
-export function isDreamingEnabled(agent: Record<string, unknown>): boolean {
-	const memory = agent.memory;
-	if (memory === null || typeof memory !== "object" || Array.isArray(memory)) return false;
-	const pipeline = (memory as Record<string, unknown>).pipelineV2;
-	if (pipeline === null || typeof pipeline !== "object" || Array.isArray(pipeline)) return true;
-	const gates = pipeline as Record<string, unknown>;
-	return gates.paused !== true && gates.mutationsFrozen !== true;
+export function dreamingBlockedBy(agent: Record<string, unknown>): "disabled" | "paused" | "frozen" | null {
+	if (getPath(agent, ["memory", "pipelineV2", "enabled"]) === false) return "disabled";
+	if (getPath(agent, ["memory", "pipelineV2", "paused"]) === true) return "paused";
+	if (getPath(agent, ["memory", "pipelineV2", "mutationsFrozen"]) === true) return "frozen";
+	return null;
+}
+
+export interface PipelinePauseResult {
+	readonly success: boolean;
+	readonly paused: boolean;
+	readonly mode: string;
+}
+
+export async function setPipelinePaused(
+	store: Pick<AgentConfigStore, "aSetBool">,
+	paused: boolean,
+	signal?: AbortSignal,
+): Promise<ApiReadResult<PipelinePauseResult>> {
+	const result = await getJSONResult<PipelinePauseResult>(`/api/pipeline/${paused ? "pause" : "resume"}`, {
+		method: "POST",
+		signal,
+	});
+	if (result.data?.success) store.aSetBool(["memory", "pipelineV2", "paused"], result.data.paused);
+	return result;
 }
 
 export interface AgentConfigStore {
 	ready: boolean;
 	dirty: boolean;
-	/** Raw parsed agent.yaml (read-only for views). */
 	agent: YamlObject;
-	aStr: (path: readonly string[]) => string;
-	aBool: (path: readonly string[]) => boolean;
+	aStr: (path: readonly string[], fallback?: string) => string;
+	aBool: (path: readonly string[], fallback?: boolean) => boolean;
 	aSetStr: (path: readonly string[], value: string) => void;
 	aSetBool: (path: readonly string[], value: boolean) => void;
 	aSetNum: (path: readonly string[], value: number) => void;
-	/** Delete a key and prune now-empty parents (keeps YAML canonical). */
 	aDel: (path: readonly string[]) => void;
-	/** Apply one synchronous mutation to the current draft. */
 	aUpdate: (fn: (draft: Record<string, unknown>) => void) => void;
 	save: () => Promise<boolean>;
 	reload: () => Promise<void>;
@@ -91,7 +121,6 @@ export function useAgentConfig(): AgentConfigStore {
 	const [error, setError] = useState<string | null>(null);
 	const saveRef = useRef<Promise<boolean> | null>(null);
 	const revision = useRef(0);
-	// Mutations accumulate in a ref between renders; state mirrors for repaint.
 	const agentRef = useRef<YamlObject>({});
 	agentRef.current = agent;
 
@@ -124,34 +153,29 @@ export function useAgentConfig(): AgentConfigStore {
 		const draft: YamlObject = structuredClone(agentRef.current);
 		fn(draft);
 		revision.current++;
-		// Write through to the ref synchronously: save() serializes
-		// agentRef.current, and React state (agentRef.current = agent on
-		// render) does not commit before the next paint. Without this, a
-		// mutation followed by an immediate save in the same tick (disconnect,
-		// target rewire) serializes the pre-mutation config and the change is
-		// silently lost on disk — the provider stays connected forever.
 		agentRef.current = draft;
 		setAgent(draft);
 		setDirty(true);
 	}, []);
 
 	const aStr = useCallback(
-		(path: readonly string[]) => {
+		(path: readonly string[], fallback = "") => {
 			const v = getPath(agent, path);
-			return v == null ? "" : String(v);
+			return v == null ? fallback : String(v);
 		},
 		[agent],
 	);
 
 	const aBool = useCallback(
-		(path: readonly string[]) => {
+		(path: readonly string[], fallback = false) => {
 			const v = getPath(agent, path);
 			if (typeof v === "boolean") return v;
 			if (typeof v === "string") {
 				const s = v.trim().toLocaleLowerCase();
 				if (s === "true") return true;
+				if (s === "false") return false;
 			}
-			return false;
+			return fallback;
 		},
 		[agent],
 	);
@@ -179,7 +203,6 @@ export function useAgentConfig(): AgentConfigStore {
 		if (saveRef.current) return saveRef.current;
 		if (!fileName) return Promise.resolve(false);
 		setSaving(true);
-		// One write in flight; edits made during it replace the pending snapshot.
 		saveRef.current = (async () => {
 			const deadline = Date.now() + 30_000;
 			while (Date.now() < deadline) {

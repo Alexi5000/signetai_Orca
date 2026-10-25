@@ -7,15 +7,13 @@ export type MemoryHeadWriteResult =
 	| { readonly ok: false; readonly error: string; readonly code?: "busy" | "invalid" | "unavailable" };
 
 export type MemoryHeadRequest =
-	| { readonly action: "read"; readonly agentId: string }
+	| { readonly action: "read"; readonly agentId: string; readonly passId?: string }
 	| { readonly action: "inspect"; readonly agentId: string; readonly content: string }
 	| {
 			readonly action: "commit";
 			readonly input: {
 				readonly agentId: string;
 				readonly passId: string;
-				readonly baseRevision: number;
-				readonly baseHash: string;
 				readonly entries: readonly {
 					readonly entryId: string;
 					readonly text: string;
@@ -31,8 +29,6 @@ export async function requestMemoryHead<Result>(request: MemoryHeadRequest): Pro
 		{ operation: `memory-head.${request.action}`, lane: "write", deadlineMs: 5000, estimatedWorkUnits: 1000 },
 	).result;
 }
-
-/** Unversioned callers cannot prove which evidence produced their text. */
 export function writeMemoryHead(
 	_content: string,
 	_opts?: { readonly agentId?: string; readonly owner?: string },
@@ -52,11 +48,14 @@ export type MemoryHeadResult = {
 	readonly hash?: string;
 	readonly changedIds?: readonly string[];
 };
-export function readCuratedMemoryHead(agentId: string): Promise<Record<string, unknown>> {
-	return requestMemoryHead({ action: "read", agentId });
+export type MemoryHeadCommitInput = Extract<MemoryHeadRequest, { action: "commit" }>["input"];
+export interface MemoryHeadCommitter {
+	read(agentId: string): Promise<Record<string, unknown>>;
+	commit(input: MemoryHeadCommitInput): Promise<MemoryHeadResult>;
 }
-export function commitCuratedMemoryHead(
-	input: Extract<MemoryHeadRequest, { action: "commit" }>["input"],
-): Promise<MemoryHeadResult> {
+export function readCuratedMemoryHead(agentId: string, passId?: string): Promise<Record<string, unknown>> {
+	return requestMemoryHead(passId === undefined ? { action: "read", agentId } : { action: "read", agentId, passId });
+}
+export function commitCuratedMemoryHead(input: MemoryHeadCommitInput): Promise<MemoryHeadResult> {
 	return requestMemoryHead({ action: "commit", input });
 }

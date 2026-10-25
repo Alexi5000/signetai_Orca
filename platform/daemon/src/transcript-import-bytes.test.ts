@@ -1,6 +1,6 @@
 import { constants, mkdtempSync } from "node:fs";
 import { openContainedTranscriptFile, resolveManagedTranscriptPath } from "./transcript-import-safe-fs";
-import { loadSourcesConfig } from "@signet/core";
+import { addImportedSource, loadSourcesConfig } from "@signet/core";
 import { afterEach, beforeEach, expect, test, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
@@ -11,7 +11,11 @@ import { up as ledger } from "../../core/src/migrations/146-source-transcript-im
 import { up as controls } from "../../core/src/migrations/149-transcript-import-state-machine";
 import { up as bytesMigration } from "../../core/src/migrations/151-transcript-import-bytes";
 import { createDbOwnerClient, type DbOwnerClient } from "./db-owner-client";
-import { createDbOwnerMaintenance, registerDbOwnerMaintenance } from "./db-owner-maintenance";
+import {
+	closeRegisteredDbOwnerMaintenance,
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+} from "./db-owner-maintenance";
 import { dbOwnerQuery, dbOwnerTransaction, dbOwnerTranscriptBulkCommit } from "./db-owner-runtime";
 import { prepareTranscriptRetry, createJob, createOwnerTranscriptImportStore } from "./transcript-import-store";
 import { startTranscriptImportWorker } from "./transcript-import-worker";
@@ -31,6 +35,7 @@ import { migrateTranscriptImports } from "./transcript-import-migration";
 import { buildCompletedTranscriptCommit, canonicalTranscriptLine } from "./transcript-import-commit";
 import { Hono } from "hono";
 import { registerTranscriptImportRoutes } from "./routes/transcript-import-routes";
+import { beginSourceDeletion } from "./source-deletion-lock";
 
 let oldPath: string | undefined, oldAgent: string | undefined;
 let root: string;
@@ -68,13 +73,13 @@ beforeEach(async () => {
 	await owner.start();
 	registerDbOwnerMaintenance(createDbOwnerMaintenance({ dbPath: path, owner }));
 	await createJob({ jobId: scope.jobId, agentId: scope.agentId, files: [{ id: scope.fileId, name: "test.jsonl" }] });
-});
+}, 20_000);
 afterEach(async () => {
 	if (oldPath === undefined) delete process.env.SIGNET_PATH;
 	else process.env.SIGNET_PATH = oldPath;
 	if (oldAgent === undefined) delete process.env.SIGNET_AGENT_ID;
 	else process.env.SIGNET_AGENT_ID = oldAgent;
-	registerDbOwnerMaintenance(null);
+	await closeRegisteredDbOwnerMaintenance();
 	await owner?.close();
 	for (let attempt = 0; ; attempt++) {
 		try {
@@ -85,7 +90,7 @@ afterEach(async () => {
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 	}
-});
+}, 20_000);
 
 test("owner persists chunks across restart, rejects cross-agent access and seals exact bytes", async () => {
 	expect(await dbOwnerQuery({ sql: "PRAGMA synchronous", result: "get", readonly: false }, options)).toEqual({
@@ -98,6 +103,7 @@ test("owner persists chunks across restart, rejects cross-agent access and seals
 	expect(
 		await failure(appendTranscriptChunk({ ...scope, agentId: "b" }, first.length, last, checksum(last))),
 	).toContain("not found");
+	await closeRegisteredDbOwnerMaintenance();
 	await owner.close();
 	owner = createDbOwnerClient({ dbPath: join(root, "test.db") });
 	await owner.start();
@@ -157,7 +163,6 @@ test("sealing batches chunk reads across the owner boundary while preserving exa
 	try {
 		const sealed = await sealTranscriptUpload(scope);
 		expect(sealed.content_hash).toBe(expected.digest("hex"));
-		// Bounded batch reads, two metadata reads, one sealing transaction.
 		expect(calls.mock.calls.length).toBe(Math.ceil((bytes.length * count) / TRANSCRIPT_READ_BYTES) + 3);
 	} finally {
 		calls.mockRestore();
@@ -541,7 +546,6 @@ test("export preserves array messages, filters scope and streams records larger 
 		{ role: "tool", content: `  exact\n${"x".repeat(1100 * 1024)}` },
 		{ role: "unknown", content: "" },
 	];
-	// Fill the row in bounded owner writes, as live transcript capture does.
 	await dbOwnerTransaction(
 		[
 			{
@@ -652,6 +656,47 @@ test.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 	},
 	20_000,
 );
+
+test("replacement cannot register a Source while its deletion lease is active", async () => {
+	const content = Buffer.from('{"sessionKey":"replacement-race"}\n');
+	const existing = addImportedSource(
+		{ fileName: "existing.jsonl", contentHash: checksum(content), format: "jsonl", agentId: "a" },
+		root,
+	);
+	if (!existing.ok) throw new Error(`Could not seed existing Source: ${existing.error}`);
+	const releaseDeletion = beginSourceDeletion(existing.source.id);
+	expect(releaseDeletion).toBeDefined();
+	if (releaseDeletion === undefined) throw new Error("Could not acquire the Source deletion lease");
+
+	try {
+		await createJob({
+			jobId: "replace-job",
+			agentId: "a",
+			duplicateMode: "replace",
+			files: [{ id: "replace-file", name: "replacement.jsonl" }],
+		});
+		const url = "/api/sources/imports/replace-job/files/replace-file";
+		const uploaded = await http().request(url, {
+			method: "PATCH",
+			headers: {
+				"upload-length": String(content.length),
+				"upload-offset": "0",
+				"upload-generation": "0",
+				"upload-checksum": checksum(content),
+			},
+			body: content,
+		});
+		expect(uploaded.status).toBe(200);
+
+		const finalized = await http().request(`${url}/finalize`, { method: "POST" });
+		expect(finalized.status).toBe(409);
+		expect(loadSourcesConfig(root).sources.find((source) => source.id === existing.source.id)?.generation).toBe(
+			existing.source.generation,
+		);
+	} finally {
+		releaseDeletion();
+	}
+}, 20_000);
 
 test("cancellation reconciles a Source registered before a failed ledger update", async () => {
 	const content = Buffer.from("retained evidence\n");

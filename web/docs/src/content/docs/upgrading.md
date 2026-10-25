@@ -59,6 +59,18 @@ curl -fsS http://127.0.0.1:3850/api/diagnostics
 
 Then test the feature you depend on: a bounded recall, a provider route, or a remote connector authentication check. A green version command does not prove the daemon's workspace, migration, inference route, or connector are healthy.
 
+## Workspace layout upgrade
+
+The first time a v2-aware daemon starts on a v1 workspace, it upgrades the
+layout in place under the same workspace root before it opens the database. Do
+not copy, move, or delete workspace directories by hand. If the upgrade cannot
+proceed safely, the daemon leaves the workspace on v1, starts normally, and
+reports the reason in `signet status` (`workspaceLayout.upgrade`); fix the cause
+and restart to retry. A workspace whose daemon is still running under an older
+release is upgraded after that daemon stops. After the upgrade, do not run an
+older release that predates layout support against the workspace. See
+[Workspace v2](/workspace-v2/) for the paths that move.
+
 ## Rollback and incident handling
 
 If a release fails after a verified backup, stop the daemon, preserve logs and the workspace, and follow the deployment mechanism's rollback procedure. Restore private state only from a known-good backup. File deletion is not a migration strategy.

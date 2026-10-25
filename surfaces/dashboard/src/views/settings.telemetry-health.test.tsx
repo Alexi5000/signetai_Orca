@@ -1,10 +1,13 @@
-/** Regression coverage for #1392: persisted telemetry drops must be visible as local data loss. */
+import { beforeEach as beforeDashboardFixture } from "bun:test";
+import { dashboardQueryCache } from "@/lib/query-cache";
+beforeDashboardFixture(() => dashboardQueryCache.clear(false, false));
+
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { TelemetryHealthResponse } from "@/lib/api";
 import { Window } from "happy-dom";
 import { act } from "react";
 import { type Root, createRoot } from "react-dom/client";
-import { TelemetryHealthPanel, formatTelemetryCount } from "./settings";
+import { TelemetryHealthPanel, formatTelemetryCount } from "@/components/settings/logs";
 
 function health(overrides: Partial<Extract<TelemetryHealthResponse, { enabled: true }>> = {}): TelemetryHealthResponse {
 	return {

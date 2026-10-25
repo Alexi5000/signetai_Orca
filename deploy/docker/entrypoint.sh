@@ -12,19 +12,26 @@ auth:
 YAML
 	printf '%s\n' "[docker] wrote default auth.mode=team to $cfg"
 fi
-
-# A fresh Docker volume is initialized by this entrypoint. Seed an empty,
-# valid SQLite container so the daemon preflight can distinguish it from an
-# established workspace whose database disappeared.
-db="$root/memory/memories.db"
-if [ ! -f "$db" ]; then
-	mkdir -p "$(dirname "$db")"
-	bun -e 'import { Database } from "bun:sqlite"; const db = new Database(process.argv[1]); db.close();' "$db"
-	printf '%s\n' "[docker] initialized workspace database at $db"
+layout="$root/workspace-layout.json"
+if [ -f "$root/.workspace-layout-upgrade.json" ]; then
+	printf '%s\n' "[docker] workspace layout upgrade record present; the daemon finishes or reports it"
+else
+	if [ ! -f "$layout" ] && { [ -f "$root/data/signet.db" ] || { [ ! -e "$root/memory" ] && [ ! -e "$root/.daemon" ]; }; }; then
+		printf '{\n  "version": 2\n}\n' > "$layout"
+		printf '%s\n' "[docker] created workspace layout v2 at $layout"
+	fi
+	if grep -Eq '"version"[[:space:]]*:[[:space:]]*2' "$layout" 2>/dev/null; then
+		db="$root/data/signet.db"
+	else
+		db="$root/memory/memories.db"
+	fi
+	if [ ! -f "$db" ] && ! grep -q '"database"' "$layout" 2>/dev/null; then
+		mkdir -p "$(dirname "$db")"
+		bun -e 'import { Database } from "bun:sqlite"; const db = new Database(process.argv[1]); db.close();' "$db"
+		printf '%s\n' "[docker] initialized workspace database at $db"
+	fi
 fi
 
-
-# seed default workspace scripts/skills for fresh volumes
 tpl="/app/dist/signetai/templates"
 
 if [ -d "$tpl/scripts" ] && [ ! -d "$root/scripts" ]; then

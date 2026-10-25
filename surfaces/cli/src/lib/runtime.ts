@@ -2,14 +2,15 @@ import {
 	spawnHidden as spawn,
 	spawnSyncHidden as spawnSync,
 	type SpawnSyncReturns,
+	resolveWorkspaceLayout,
 	openPrivateDaemonLog,
 	appendPrivateDaemonLog,
 } from "@signet/core";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, connect } from "node:net";
 import { homedir } from "node:os";
-import { basename, delimiter, dirname, join, normalize } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import chalk from "chalk";
 import {
@@ -23,11 +24,13 @@ import {
 	resolveDaemonRuntime,
 	resolveLaunchdExecutable,
 	resolveSignetDaemonUrl,
+	WORKSPACE_ENV_KEYS,
 	type DaemonRuntime,
+	type SchemaType,
 } from "@signet/core";
 import { formatInspectorEndpoint, parseInspectorEndpoint } from "./inspector-proxy.js";
 import { resolveDaemonNetwork } from "./network.js";
-import { resolveAgentsDir } from "./workspace.js";
+import { normalizeWorkspacePath, resolveAgentsDir } from "./workspace.js";
 
 export const AGENTS_DIR = resolveAgentsDir().path;
 export const DEFAULT_PORT = 3850;
@@ -75,14 +78,7 @@ export interface DaemonHealthProbe {
 	readonly listenerPresent: boolean;
 	readonly processPid: number | null;
 	readonly stalePid: number | null;
-	/** Present only when /health/ready reported not_ready; absent when readiness is unknown (older daemon). */
 	readonly readinessReasons?: readonly string[];
-	/**
-	 * The daemon's own last-exit record (`.daemon/lifecycle.json`), when one
-	 * exists. A record stuck at "starting"/"running" while no daemon process
-	 * is alive means the death was not recorded — an external kill or hard
-	 * crash (issue #1148).
-	 */
 	readonly lastExit?: DaemonLastExit | null;
 }
 
@@ -93,16 +89,15 @@ export interface DaemonLastExit {
 	readonly startedAt: string;
 	readonly runtime?: DaemonRuntime;
 	readonly systemdUnit?: string;
+	readonly startAttemptId?: string;
 	readonly exitedAt?: string;
 	readonly exitCode?: number;
 	readonly reason?: string;
 	readonly error?: string;
 }
-
-/** Tolerant read of the daemon lifecycle record; null when absent or corrupt. */
 export function readDaemonLifecycleRecord(agentsDir: string): DaemonLastExit | null {
 	try {
-		const raw = readFileSync(join(agentsDir, ".daemon", "lifecycle.json"), "utf-8");
+		const raw = readFileSync(join(resolveWorkspaceLayout(agentsDir).runtime, "lifecycle.json"), "utf-8");
 		const parsed = JSON.parse(raw) as Partial<DaemonLastExit>;
 		if (typeof parsed.state !== "string" || typeof parsed.pid !== "number") return null;
 		const { runtime: rawRuntime, ...record } = parsed;
@@ -133,6 +128,7 @@ export interface DaemonResourceUsage {
 
 interface DaemonInstance {
 	readonly baseUrl: string;
+	readonly workspacePath: string | null;
 	readonly pid: number | null;
 	readonly uptime: number | null;
 	readonly version: string | null;
@@ -158,42 +154,67 @@ interface DaemonInstance {
 		readonly blockedReason: string | null;
 		readonly hasWorkloadState: boolean;
 	} | null;
+	readonly dreaming: {
+		readonly enabled: boolean;
+		readonly workerRunning: boolean;
+		readonly blockedBy: DreamingBlockedBy | null;
+	} | null;
+	readonly workspaceStats: WorkspaceStatusSummaryFromStatus | null;
+	readonly workspaceLayoutUpgrade: string | null;
 	readonly transcripts: {
 		readonly pending: number;
 		readonly failed: number;
 		readonly dead: number;
 	} | null;
-	/** Daemon composite health from `/api/status` (score + status). */
 	readonly health: {
 		readonly score: number | null;
 		readonly status: string | null;
 	} | null;
-	/** Pipeline queue counts from `/api/status` (memory plus legacy summary compatibility). */
 	readonly queue: {
 		readonly memory: QueueCountsFromStatus | null;
 		readonly summary: QueueCountsFromStatus | null;
 	} | null;
-	/** Latest periodic Dreaming scheduler decision reported by `/api/status`. */
 	readonly scheduler: DreamingSchedulerStatusFromStatus | null;
 	readonly probe: DaemonHealthProbe;
 	readonly openclaw: DaemonOpenClawHealthSummary | null;
 }
 
+type DreamingBlockedBy = "disabled" | "paused" | "frozen" | "no_provider";
+
 interface DreamingSchedulerStatusFromStatus {
-	readonly status: "idle" | "deferred";
-	readonly reason: "queue_pressure" | "system_pressure" | null;
+	readonly status: "idle" | "deferred" | "blocked";
+	readonly reason: "queue_pressure" | "system_pressure" | "inference_unavailable" | null;
 	readonly checkedAt: string | null;
 }
 
 interface QueueCountsFromStatus {
-	readonly pending: number;
-	readonly leased: number;
-	readonly completed: number;
-	readonly failed: number;
-	readonly dead: number;
-	readonly oldestAgeSec: number;
-	readonly oldestDeadAgeSec: number;
+	readonly pending: number | null;
+	readonly leased: number | null;
+	readonly completed: number | null;
+	readonly failed: number | null;
+	readonly dead: number | null;
+	readonly oldestAgeSec: number | null;
+	readonly oldestDeadAgeSec: number | null;
 	readonly lastError: string | null;
+	readonly completeness: "exact" | "truncated" | "unknown";
+}
+
+interface WorkspaceStatusSummaryFromStatus {
+	readonly agentId: string;
+	readonly memoryCount: number;
+	readonly capturedSessionCount: number | null;
+	readonly schema: SchemaType;
+	readonly needsMigration: boolean;
+	readonly ontology: {
+		readonly entityCount: number;
+		readonly aspectCount: number;
+		readonly attributeCount: number;
+		readonly claimCount: number;
+		readonly constraintCount: number;
+		readonly dependencyCount: number;
+		readonly unassignedMemoryCount: number;
+		readonly coveragePercent: number;
+	};
 }
 
 interface DaemonProbeDeps {
@@ -230,7 +251,7 @@ function currentNativeExecutablePath(execPath: string = process.execPath): strin
 }
 
 function pidFile(agentsDir: string): string {
-	return join(agentsDir, ".daemon", "pid");
+	return join(resolveWorkspaceLayout(agentsDir).runtime, "pid");
 }
 
 export function resolveDaemonPaths(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -248,8 +269,6 @@ export function resolveDaemonPaths(env: NodeJS.ProcessEnv = process.env): string
 		.filter((path): path is string => path !== null)
 		.filter((path, index, items) => items.indexOf(path) === index);
 }
-
-/** Resolve the daemon executable that the current CLI would launch. */
 export function resolveDaemonPath(env: NodeJS.ProcessEnv = process.env): string | null {
 	return resolveDaemonPaths(env).find((path) => existsSync(path)) ?? null;
 }
@@ -295,9 +314,7 @@ function findBundleDirectory(bundleDir: string, name: string): string | null {
 		const candidate = join(root, name);
 		try {
 			if (statSync(candidate).isDirectory()) return candidate;
-		} catch {
-			// Try the next bundle root.
-		}
+		} catch {}
 	}
 	return null;
 }
@@ -348,12 +365,6 @@ export function resolveDaemonJsWasmPath(daemonPath: string): string | null {
 	}
 	return null;
 }
-
-/**
- * Check the on-disk production Bun daemon layout before spawning it. A daemon
- * JS entrypoint without its worker siblings or runtime assets is not a valid
- * profiling target, so callers must not fall back to TypeScript source.
- */
 export function inspectDaemonJsBundle(daemonPath: string): DaemonJsBundleInspection {
 	const missing: string[] = [];
 	const bundleDir = dirname(daemonPath);
@@ -406,8 +417,6 @@ export function describeBunJsDaemonUnavailable(env: NodeJS.ProcessEnv = process.
 	if (existing) return `Bun JavaScript daemon bundle is incomplete: missing ${existing.missing.join(", ")}.`;
 	return "Bun JavaScript daemon bundle not found. Build @signet/daemon before selecting --runtime=bun-js.";
 }
-
-/** Resolve only an executable for the selected daemon runtime. */
 export function resolveDaemonPathForRuntime(
 	runtime: DaemonRuntime,
 	env: NodeJS.ProcessEnv = process.env,
@@ -454,12 +463,6 @@ async function isDaemonHealthyAt(baseUrl: string): Promise<boolean> {
 		return false;
 	}
 }
-
-/**
- * Cheap liveness check: hits /health/live which never touches the DB.
- * Used during startup polling so a daemon running migrations or recovery
- * (where /health may be slow or unavailable) is still detected as alive.
- */
 async function isDaemonAliveAt(baseUrl: string): Promise<boolean> {
 	try {
 		const response = await fetch(`${baseUrl}/health/live`, {
@@ -472,8 +475,6 @@ async function isDaemonAliveAt(baseUrl: string): Promise<boolean> {
 }
 
 let daemonLivenessFlight: Promise<boolean> | null = null;
-
-/** Coalesce all liveness callers so startup cannot duplicate /health/live probes. */
 function probeDaemonLiveness(): Promise<boolean> {
 	if (daemonLivenessFlight !== null) return daemonLivenessFlight;
 
@@ -493,9 +494,6 @@ interface DaemonReadiness {
 	readonly ready: boolean;
 	readonly reasons: string[];
 }
-
-// Readiness is null when /health/ready is unreachable (e.g. an older daemon
-// without the route); callers must treat null as unknown, never as not-ready.
 async function fetchDaemonReadiness(baseUrl: string): Promise<DaemonReadiness | null> {
 	try {
 		const response = await fetch(`${baseUrl}/health/ready`, {
@@ -538,10 +536,10 @@ function reachableDaemonProbe(
 	};
 }
 
-async function fetchJsonOrNull<T>(baseUrl: string, path: string): Promise<T | null> {
+async function fetchJsonOrNull<T>(baseUrl: string, path: string, timeoutMs = 1200): Promise<T | null> {
 	try {
 		const response = await fetch(`${baseUrl}${path}`, {
-			signal: AbortSignal.timeout(1200),
+			signal: AbortSignal.timeout(timeoutMs),
 		});
 		if (!response.ok) return null;
 		return (await response.json()) as T;
@@ -603,7 +601,7 @@ function readPidArtifact(agentsDir: string): { pid: number | null; stale: boolea
 async function buildUnreachableDaemonProbe(agentsDir: string): Promise<DaemonHealthProbe> {
 	const artifact = readPidArtifact(agentsDir);
 	const managedPid = readManagedDaemonPid(agentsDir);
-	const processPid = managedPid ?? findMarkedDaemonProcessPids()[0] ?? null;
+	const processPid = managedPid ?? findMarkedDaemonProcessPids(agentsDir)[0] ?? null;
 	const url = resolveDaemonProbeUrls(agentsDir)[0] ?? `http://127.0.0.1:${DEFAULT_PORT}`;
 	const parsedUrl = new URL(url);
 	const listenerPort = parsedUrl.port
@@ -662,14 +660,6 @@ async function buildUnreachableDaemonProbe(agentsDir: string): Promise<DaemonHea
 }
 
 let reachableDaemonUrlsFlight: Promise<string[]> | null = null;
-
-/**
- * Probe daemon listeners at most once while a result is in flight. Several CLI
- * startup/status paths ask the same question concurrently. Without this
- * single-flight boundary, each caller starts another pair of health requests
- * and the resulting probe storm can keep the CLI's event loop busy while the
- * daemon is starting.
- */
 export function getReachableDaemonUrls(): Promise<string[]> {
 	if (reachableDaemonUrlsFlight !== null) return reachableDaemonUrlsFlight;
 
@@ -687,11 +677,20 @@ export function getReachableDaemonUrls(): Promise<string[]> {
 	return flight;
 }
 
+function workspaceLayoutUpgradeReason(
+	upgrade: { state?: unknown; reason?: unknown } | null | undefined,
+): string | null {
+	if (!upgrade) return null;
+	if (upgrade.state === "blocked" && typeof upgrade.reason === "string") return upgrade.reason;
+	return upgrade.state === "unreadable" ? "the upgrade record could not be read" : null;
+}
+
 async function getDaemonInstances(): Promise<DaemonInstance[]> {
 	const urls = await getReachableDaemonUrls();
 	return Promise.all(
 		urls.map(async (baseUrl): Promise<DaemonInstance> => {
 			try {
+				const workspaceStatsPromise = fetchJsonOrNull<unknown>(baseUrl, "/api/status/workspace", 2500);
 				const response = await fetch(`${baseUrl}/api/status`, {
 					signal: AbortSignal.timeout(1200),
 				});
@@ -704,6 +703,9 @@ async function getDaemonInstances(): Promise<DaemonInstance[]> {
 						host?: string;
 						bindHost?: string;
 						networkMode?: string;
+						agentsDir?: string;
+						workspaceLayout?: { upgrade?: { state?: unknown; reason?: unknown } | null };
+						dreaming?: { enabled?: boolean; workerRunning?: boolean; blockedBy?: unknown };
 						health?: {
 							score?: number;
 							status?: string;
@@ -745,8 +747,13 @@ async function getDaemonInstances(): Promise<DaemonInstance[]> {
 					const transcripts = data.transcripts?.capture;
 					const resources = data.resources;
 					const runtime = parseDaemonRuntime(data.runtime);
-					const openclawReport = await fetchJsonOrNull<unknown>(baseUrl, "/api/diagnostics/openclaw");
-					const readiness = await fetchDaemonReadiness(baseUrl);
+					const [openclawReport, readiness, workspaceStatsRaw] = await Promise.all([
+						fetchJsonOrNull<unknown>(baseUrl, "/api/diagnostics/openclaw"),
+						fetchDaemonReadiness(baseUrl),
+						workspaceStatsPromise,
+					]);
+					const workspaceStats = normalizeWorkspaceStatusSummaryFromStatus(workspaceStatsRaw);
+					const dreaming = normalizeDreamingStatusFromStatus(data.dreaming);
 					const healthRaw = data.health;
 					const pipelineRaw = data.pipeline;
 					const queueRaw =
@@ -776,6 +783,8 @@ async function getDaemonInstances(): Promise<DaemonInstance[]> {
 					const scheduler = normalizeDreamingSchedulerFromStatus(dreamingRaw);
 					return {
 						baseUrl,
+						workspacePath: typeof data.agentsDir === "string" ? data.agentsDir : null,
+						workspaceLayoutUpgrade: workspaceLayoutUpgradeReason(data.workspaceLayout?.upgrade),
 						pid: data.pid ?? null,
 						uptime: data.uptime ?? null,
 						version: data.version ?? null,
@@ -826,16 +835,17 @@ async function getDaemonInstances(): Promise<DaemonInstance[]> {
 						health,
 						queue,
 						scheduler,
+						dreaming,
+						workspaceStats,
 						probe: reachableDaemonProbe(baseUrl, data.pid ?? null, readiness),
 						openclaw: summarizeOpenClawHealth(openclawReport),
 					};
 				}
-			} catch {
-				// Fall back to health-only instance metadata.
-			}
+			} catch {}
 
 			return {
 				baseUrl,
+				workspacePath: null,
 				pid: null,
 				uptime: null,
 				version: null,
@@ -849,6 +859,9 @@ async function getDaemonInstances(): Promise<DaemonInstance[]> {
 				health: null,
 				queue: null,
 				scheduler: null,
+				dreaming: null,
+				workspaceStats: null,
+				workspaceLayoutUpgrade: null,
 				probe: reachableDaemonProbe(
 					baseUrl,
 					null,
@@ -878,23 +891,140 @@ function matchesDaemon(cmd: string, paths: readonly string[]): boolean {
 	return daemonMarks(paths).some((path) => normalizedCmd.includes(normalizeCmd(path)));
 }
 
+function isStatusRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function normalizeQueueCountsFromStatus(value: unknown): QueueCountsFromStatus | null {
-	if (typeof value !== "object" || value === null) return null;
-	const record = value as Record<string, unknown>;
-	const toNumber = (key: string): number => {
-		const raw = record[key];
-		return typeof raw === "number" && Number.isFinite(raw) ? raw : 0;
+	if (!isStatusRecord(value)) return null;
+	const lastError = typeof value.lastError === "string" && value.lastError.trim().length > 0 ? value.lastError : null;
+	const unknownCounts: QueueCountsFromStatus = {
+		pending: null,
+		leased: null,
+		completed: null,
+		failed: null,
+		dead: null,
+		oldestAgeSec: null,
+		oldestDeadAgeSec: null,
+		lastError,
+		completeness: "unknown",
 	};
-	const lastErrorRaw = record.lastError;
+	if (value.completeness !== "exact" && value.completeness !== "truncated") return unknownCounts;
+	const readCount = (key: string): number | null => {
+		const raw = value[key];
+		return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : null;
+	};
+	const readAge = (key: string): number | null => {
+		const raw = value[key];
+		return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : null;
+	};
+	const pending = readCount("pending");
+	const leased = readCount("leased");
+	const completed = readCount("completed");
+	const failed = readCount("failed");
+	const dead = readCount("dead");
+	const oldestAgeSec = readAge("oldestAgeSec");
+	const oldestDeadAgeSec = readAge("oldestDeadAgeSec");
+	if (
+		pending === null ||
+		leased === null ||
+		completed === null ||
+		failed === null ||
+		dead === null ||
+		oldestAgeSec === null ||
+		oldestDeadAgeSec === null
+	) {
+		return unknownCounts;
+	}
 	return {
-		pending: toNumber("pending"),
-		leased: toNumber("leased"),
-		completed: toNumber("completed"),
-		failed: toNumber("failed"),
-		dead: toNumber("dead"),
-		oldestAgeSec: toNumber("oldestAgeSec"),
-		oldestDeadAgeSec: toNumber("oldestDeadAgeSec"),
-		lastError: typeof lastErrorRaw === "string" && lastErrorRaw.trim().length > 0 ? lastErrorRaw : null,
+		pending,
+		leased,
+		completed,
+		failed,
+		dead,
+		oldestAgeSec,
+		oldestDeadAgeSec,
+		lastError,
+		completeness: value.completeness,
+	};
+}
+
+function normalizeWorkspaceStatusSummaryFromStatus(value: unknown): WorkspaceStatusSummaryFromStatus | null {
+	if (!isStatusRecord(value)) return null;
+	const agentId = value.agentId;
+	const schema = value.schema;
+	const needsMigration = value.needsMigration;
+	const rawOntology = value.ontology;
+	if (typeof agentId !== "string" || agentId.trim().length === 0) return null;
+	if (schema !== "python" && schema !== "cli-v1" && schema !== "core" && schema !== "unknown") return null;
+	if (typeof needsMigration !== "boolean") return null;
+	if (!isStatusRecord(rawOntology)) return null;
+	const readCount = (key: string): number | null => {
+		const count = rawOntology[key];
+		return typeof count === "number" && Number.isSafeInteger(count) && count >= 0 ? count : null;
+	};
+	const entityCount = readCount("entityCount");
+	const aspectCount = readCount("aspectCount");
+	const attributeCount = readCount("attributeCount");
+	const claimCount = readCount("claimCount");
+	const constraintCount = readCount("constraintCount");
+	const dependencyCount = readCount("dependencyCount");
+	const unassignedMemoryCount = readCount("unassignedMemoryCount");
+	const coveragePercent = rawOntology.coveragePercent;
+	const memoryCount = value.memoryCount;
+	const capturedSessionCount = value.capturedSessionCount;
+	if (
+		entityCount === null ||
+		aspectCount === null ||
+		attributeCount === null ||
+		claimCount === null ||
+		constraintCount === null ||
+		dependencyCount === null ||
+		unassignedMemoryCount === null ||
+		typeof coveragePercent !== "number" ||
+		!Number.isFinite(coveragePercent) ||
+		coveragePercent < 0 ||
+		coveragePercent > 100 ||
+		typeof memoryCount !== "number" ||
+		!Number.isSafeInteger(memoryCount) ||
+		memoryCount < 0 ||
+		(capturedSessionCount !== null &&
+			(typeof capturedSessionCount !== "number" ||
+				!Number.isSafeInteger(capturedSessionCount) ||
+				capturedSessionCount < 0))
+	) {
+		return null;
+	}
+	return {
+		agentId,
+		memoryCount,
+		capturedSessionCount,
+		schema,
+		needsMigration,
+		ontology: {
+			entityCount,
+			aspectCount,
+			attributeCount,
+			claimCount,
+			constraintCount,
+			dependencyCount,
+			unassignedMemoryCount,
+			coveragePercent,
+		},
+	};
+}
+
+function normalizeDreamingStatusFromStatus(value: unknown): DaemonInstance["dreaming"] {
+	if (!isStatusRecord(value)) return null;
+	if (typeof value.enabled !== "boolean" || typeof value.workerRunning !== "boolean") return null;
+	const blockedBy = value.blockedBy;
+	return {
+		enabled: value.enabled,
+		workerRunning: value.workerRunning,
+		blockedBy:
+			blockedBy === "disabled" || blockedBy === "paused" || blockedBy === "frozen" || blockedBy === "no_provider"
+				? blockedBy
+				: null,
 	};
 }
 
@@ -902,12 +1032,13 @@ function normalizeDreamingSchedulerFromStatus(value: unknown): DreamingScheduler
 	if (typeof value !== "object" || value === null) return null;
 	const record = value as Record<string, unknown>;
 	const status = record.status;
-	if (status !== "idle" && status !== "deferred") return null;
+	if (status !== "idle" && status !== "deferred" && status !== "blocked") return null;
 	const reason = record.reason;
 	const checkedAt = record.checkedAt;
 	return {
 		status,
-		reason: reason === "queue_pressure" || reason === "system_pressure" ? reason : null,
+		reason:
+			reason === "queue_pressure" || reason === "system_pressure" || reason === "inference_unavailable" ? reason : null,
 		checkedAt: typeof checkedAt === "string" && checkedAt.trim().length > 0 ? checkedAt : null,
 	};
 }
@@ -919,9 +1050,7 @@ function readCmd(pid: number): string | null {
 			const value = raw.replaceAll("\u0000", " ").trim();
 			return value.length > 0 ? value : null;
 		}
-	} catch {
-		// Fall through.
-	}
+	} catch {}
 
 	if (process.platform === "win32") {
 		const script = `$process = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($process) { $process.CommandLine }`;
@@ -932,9 +1061,7 @@ function readCmd(pid: number): string | null {
 					timeout: 3000,
 				});
 				if (proc.status === 0 && proc.stdout.trim()) return proc.stdout.trim();
-			} catch {
-				// Try the next available PowerShell command.
-			}
+			} catch {}
 		}
 	}
 
@@ -959,15 +1086,37 @@ function readDaemonEntrypoint(pid: number): boolean | null {
 	}
 }
 
-function findMarkedDaemonProcessPids(): number[] {
+function daemonWorkspaceFromEnvironment(value: string): string | null {
+	const env: Record<string, string> = {};
+	for (const entry of value.split("\u0000")) {
+		const index = entry.indexOf("=");
+		if (index > 0) env[entry.slice(0, index)] = entry.slice(index + 1);
+	}
+	const raw = WORKSPACE_ENV_KEYS.map((key) => env[key]?.trim() ?? "").find((entry) => entry.length > 0);
+	if (raw === undefined || !(isAbsolute(raw) || raw === "~" || raw.startsWith("~/"))) return null;
+	const resolution = resolveAgentsDir(env);
+	return resolution.source === "env" ? resolution.path : null;
+}
+
+function readDaemonWorkspace(pid: number): string | null {
+	if (process.platform !== "linux") return null;
+	try {
+		return daemonWorkspaceFromEnvironment(readFileSync(`/proc/${pid}/environ`, "utf-8"));
+	} catch {
+		return null;
+	}
+}
+
+function findMarkedDaemonProcessPids(agentsDir: string): number[] {
 	if (process.platform !== "linux") return [];
+	const workspace = normalizeWorkspacePath(agentsDir);
 	try {
 		return readdirSync("/proc", { withFileTypes: true })
 			.flatMap((entry) => {
 				if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) return [];
 				const pid = Number.parseInt(entry.name, 10);
 				if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return [];
-				return readDaemonEntrypoint(pid) === true ? [pid] : [];
+				return readDaemonEntrypoint(pid) === true && readDaemonWorkspace(pid) === workspace ? [pid] : [];
 			})
 			.filter((pid, index, items) => items.indexOf(pid) === index);
 	} catch {
@@ -1000,9 +1149,6 @@ function readProcessGroupId(pid: number): number | null {
 
 function readOwnedProcessGroupId(pid: number): number | null {
 	const groupId = readProcessGroupId(pid);
-	// Detached daemon spawns are process-group leaders. Never signal a group
-	// unless the pid still owns that group, or a reused pid could kill unrelated
-	// processes in the caller's group.
 	return groupId === pid ? groupId : null;
 }
 
@@ -1033,29 +1179,20 @@ async function waitForProcessGroupExit(groupId: number): Promise<boolean> {
 
 export async function stopManagedDaemonProcess(pid: number): Promise<void> {
 	if (process.platform === "win32") {
-		// Windows has no POSIX process-group equivalent. taskkill's tree mode is
-		// the bounded, OS-native way to release child-held resources (for example
-		// the DB owner or an integration worker) when the daemon is detached.
 		try {
 			const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
 				stdio: ["ignore", "ignore", "ignore"],
 				timeout: 5000,
 			});
 			if (result.status === 0 || !isAlive(pid)) return;
-		} catch {
-			// Fall through to the signal-based fallback below.
-		}
+		} catch {}
 		try {
 			process.kill(pid, "SIGTERM");
-		} catch {
-			// Process might already be dead.
-		}
+		} catch {}
 		if (!(await waitForPidExit(pid))) {
 			try {
 				process.kill(pid, "SIGKILL");
-			} catch {
-				// Process might already be dead.
-			}
+			} catch {}
 			await waitForPidExit(pid);
 		}
 		return;
@@ -1064,17 +1201,13 @@ export async function stopManagedDaemonProcess(pid: number): Promise<void> {
 	const groupId = readOwnedProcessGroupId(pid);
 	try {
 		process.kill(groupId === null ? pid : -groupId, "SIGTERM");
-	} catch {
-		// Process might already be dead.
-	}
+	} catch {}
 
 	if (groupId !== null) {
 		if (!(await waitForProcessGroupExit(groupId))) {
 			try {
 				process.kill(-groupId, "SIGKILL");
-			} catch {
-				// Process group already gone.
-			}
+			} catch {}
 			await waitForProcessGroupExit(groupId);
 		}
 		return;
@@ -1084,9 +1217,7 @@ export async function stopManagedDaemonProcess(pid: number): Promise<void> {
 	if (!leaderExited) {
 		try {
 			process.kill(pid, "SIGKILL");
-		} catch {
-			// Process might already be dead.
-		}
+		} catch {}
 	}
 }
 
@@ -1109,11 +1240,15 @@ export function readManagedDaemonPid(agentsDir: string = AGENTS_DIR, deps: Daemo
 		}
 
 		const marker = deps.readEnv ? isDaemonEntrypointEnvironment(deps.readEnv(pid) ?? "") : readDaemonEntrypoint(pid);
-		if (marker === true) return pid;
+		if (marker === true) {
+			const workspace = deps.readEnv
+				? daemonWorkspaceFromEnvironment(deps.readEnv(pid) ?? "")
+				: readDaemonWorkspace(pid);
+			if (workspace === null || workspace === normalizeWorkspacePath(agentsDir)) return pid;
+			rmSync(path, { force: true });
+			return null;
+		}
 		if (marker === false) return null;
-
-		// On platforms without a readable process environment, only reclaim a
-		// live PID whose command line still identifies a Signet daemon.
 		const cmd = (deps.readCmd ?? readCmd)(pid);
 		if (!cmd) return null;
 		const paths = deps.daemonPaths ?? daemonPaths();
@@ -1124,11 +1259,12 @@ export function readManagedDaemonPid(agentsDir: string = AGENTS_DIR, deps: Daemo
 }
 
 export async function hasDaemonProcess(agentsDir: string = AGENTS_DIR): Promise<boolean> {
-	return readManagedDaemonPid(agentsDir) !== null || findMarkedDaemonProcessPids().length > 0;
+	return readManagedDaemonPid(agentsDir) !== null || findMarkedDaemonProcessPids(agentsDir).length > 0;
 }
 
 async function readDaemonStatus(): Promise<{
 	running: boolean;
+	workspacePath: string | null;
 	pid: number | null;
 	uptime: number | null;
 	version: string | null;
@@ -1138,6 +1274,9 @@ async function readDaemonStatus(): Promise<{
 	networkMode: string | null;
 	resources: DaemonResourceUsage | null;
 	extraction: DaemonInstance["extraction"];
+	dreaming: DaemonInstance["dreaming"];
+	workspaceStats: DaemonInstance["workspaceStats"];
+	workspaceLayoutUpgrade: DaemonInstance["workspaceLayoutUpgrade"];
 	transcripts: DaemonInstance["transcripts"];
 	health: DaemonInstance["health"];
 	queue: DaemonInstance["queue"];
@@ -1148,9 +1287,13 @@ async function readDaemonStatus(): Promise<{
 	const instances = await getDaemonInstances();
 	if (instances.length > 0) {
 		const preferred = instances.find((instance) => typeof instance.uptime === "number") ?? instances[0];
-		const fallbackPid = typeof preferred.pid === "number" ? null : (findMarkedDaemonProcessPids()[0] ?? null);
+		const fallbackPid =
+			typeof preferred.pid === "number"
+				? null
+				: (findMarkedDaemonProcessPids(preferred.workspacePath ?? AGENTS_DIR)[0] ?? null);
 		return {
 			running: true,
+			workspacePath: preferred.workspacePath,
 			pid: preferred.pid ?? fallbackPid,
 			uptime: preferred.uptime,
 			version: preferred.version,
@@ -1160,6 +1303,9 @@ async function readDaemonStatus(): Promise<{
 			networkMode: preferred.networkMode,
 			resources: preferred.resources,
 			extraction: preferred.extraction,
+			dreaming: preferred.dreaming,
+			workspaceStats: preferred.workspaceStats,
+			workspaceLayoutUpgrade: preferred.workspaceLayoutUpgrade,
 			transcripts: preferred.transcripts,
 			health: preferred.health,
 			queue: preferred.queue,
@@ -1175,6 +1321,7 @@ async function readDaemonStatus(): Promise<{
 	const probe = await buildUnreachableDaemonProbe(AGENTS_DIR);
 	return {
 		running: false,
+		workspacePath: null,
 		pid: probe.processPid,
 		uptime: null,
 		version: null,
@@ -1184,6 +1331,9 @@ async function readDaemonStatus(): Promise<{
 		networkMode: null,
 		resources: null,
 		extraction: null,
+		dreaming: null,
+		workspaceStats: null,
+		workspaceLayoutUpgrade: null,
 		transcripts: null,
 		health: null,
 		queue: null,
@@ -1194,8 +1344,6 @@ async function readDaemonStatus(): Promise<{
 }
 
 let daemonStatusFlight: Promise<Awaited<ReturnType<typeof readDaemonStatus>>> | null = null;
-
-/** Coalesce concurrent status requests so startup cannot amplify daemon probes. */
 export function getDaemonStatus(): Promise<Awaited<ReturnType<typeof readDaemonStatus>>> {
 	if (daemonStatusFlight !== null) return daemonStatusFlight;
 
@@ -1217,12 +1365,9 @@ export interface DaemonStartArgsInput {
 	readonly bind: string;
 	readonly startupLogPath: string;
 	readonly unitName?: string;
-	// The parent CLI forwards this only when it is not already a Bun process.
-	// A Bun parent has already bound BUN_INSPECT before this code runs.
+	readonly startAttemptId?: string;
 	readonly bunInspect?: string;
-	/** Forward Bun runtime options through service-manager boundaries. */
 	readonly bunOptions?: string;
-	/** Source environment for the allowlisted telemetry variables below. */
 	readonly telemetryEnv?: NodeJS.ProcessEnv;
 }
 
@@ -1231,13 +1376,6 @@ export type SystemdDaemonStartArgsInput = DaemonStartArgsInput;
 export interface LaunchdDaemonPlistInput extends DaemonStartArgsInput {
 	readonly label?: string;
 }
-
-/**
- * Resolve the inspector setting for the daemon child. Bun binds BUN_INSPECT
- * before the CLI reaches this function, so forwarding the same setting to the
- * child creates an EADDRINUSE failure. A Node parent does not bind it and must
- * continue forwarding the setting to the Bun daemon child.
- */
 export function resolveDaemonChildInspector(
 	env: NodeJS.ProcessEnv = process.env,
 	runtimeIsBun: boolean = typeof process.versions.bun === "string",
@@ -1290,7 +1428,6 @@ export async function resolveDaemonInspectorForwarding(
 		const targetInspector = formatInspectorEndpoint({ host: "127.0.0.1", port: targetPort, path: "/" }, "/json");
 		return { childInspector: targetInspector, proxy: { publicInspector, targetInspector } };
 	} catch {
-		// Preserve the handshake fix when an invalid inspector setting cannot be proxied.
 		return { childInspector: undefined };
 	}
 }
@@ -1308,6 +1445,26 @@ function resolveTelemetryEnvironment(env: NodeJS.ProcessEnv): Partial<Record<Tel
 	const resolved: Partial<Record<TelemetryEnvironmentKey, string>> = {};
 	for (const key of TELEMETRY_ENVIRONMENT_KEYS) {
 		const value = env[key];
+		if (value) resolved[key] = value;
+	}
+	return resolved;
+}
+
+const LOCATION_ENVIRONMENT_KEYS = [
+	"HOME",
+	"XDG_CONFIG_HOME",
+	"CODEX_HOME",
+	"HERMES_HOME",
+	"KIMI_SHARE_DIR",
+	"KIMI_CODE_HOME",
+] as const;
+
+type LocationEnvironmentKey = (typeof LOCATION_ENVIRONMENT_KEYS)[number];
+
+function resolveLocationEnvironment(env: NodeJS.ProcessEnv): Partial<Record<LocationEnvironmentKey, string>> {
+	const resolved: Partial<Record<LocationEnvironmentKey, string>> = {};
+	for (const key of LOCATION_ENVIRONMENT_KEYS) {
+		const value = env[key]?.trim();
 		if (value) resolved[key] = value;
 	}
 	return resolved;
@@ -1334,9 +1491,11 @@ export function buildSystemdDaemonStartArgs(input: SystemdDaemonStartArgsInput):
 		...(nodePath ? [`--setenv=NODE_PATH=${appendNodePath(nodePath, sourceEnvironment.NODE_PATH)}`] : []),
 		...(wasmPath ? [`--setenv=SIGNET_TIKTOKEN_WASM_PATH=${wasmPath}`] : []),
 		"--setenv=SIGNET_DAEMON_ENTRYPOINT=1",
+		...(input.startAttemptId ? [`--setenv=SIGNET_DAEMON_START_ATTEMPT_ID=${input.startAttemptId}`] : []),
 		`--setenv=BUN_INSPECT=${input.bunInspect ?? ""}`,
 		`--setenv=BUN_OPTIONS=${input.bunOptions ?? ""}`,
 		...Object.entries(resolveTelemetryEnvironment(sourceEnvironment)).map(([key, value]) => `--setenv=${key}=${value}`),
+		...Object.entries(resolveLocationEnvironment(sourceEnvironment)).map(([key, value]) => `--setenv=${key}=${value}`),
 		...(input.unitName ? [`--setenv=SIGNET_DAEMON_UNIT=${input.unitName}`] : []),
 		...resolveDaemonLaunchCommand(input.daemonPath, sourceEnvironment, runtime),
 	];
@@ -1362,6 +1521,52 @@ const daemonStartDiagnosticsDeps: DaemonStartDiagnosticsDeps = {
 	spawnSync,
 };
 
+type DaemonStartFailureKind = "process-exited" | "deadline";
+
+interface DaemonStartProcessExit {
+	readonly code: number | null;
+	readonly signal: NodeJS.Signals | null;
+}
+
+interface DaemonStartLifecycleProbe {
+	readonly read: () => DaemonLastExit | null;
+	readonly startAttemptId: string;
+	readonly attemptStartedAt: number;
+	readonly systemdUnitName?: string;
+}
+
+function isDaemonLifecycleFromStartAttempt(
+	record: DaemonLastExit | null,
+	startAttemptId: string,
+	attemptStartedAt: number,
+	systemdUnitName?: string,
+): record is DaemonLastExit {
+	if (record === null) return false;
+	const recordStartedAt = Date.parse(record.startedAt);
+	if (!Number.isFinite(recordStartedAt) || recordStartedAt < attemptStartedAt) return false;
+	if (record.startAttemptId !== undefined) return record.startAttemptId === startAttemptId;
+	return systemdUnitName !== undefined && record.systemdUnit === systemdUnitName;
+}
+
+function isTerminalDaemonLifecycleFromStartAttempt(
+	record: DaemonLastExit | null,
+	startAttemptId: string,
+	attemptStartedAt: number,
+	systemdUnitName?: string,
+): boolean {
+	if (!isDaemonLifecycleFromStartAttempt(record, startAttemptId, attemptStartedAt, systemdUnitName)) return false;
+	return record.state === "clean" || record.state === "error";
+}
+
+function formatDaemonLifecycleDiagnostic(record: DaemonLastExit): string {
+	const fields = [`state=${record.state}`, `pid=${record.pid}`, `startedAt=${record.startedAt}`];
+	if (record.exitCode !== undefined) fields.push(`exitCode=${record.exitCode}`);
+	if (record.reason) fields.push(`reason=${record.reason.replace(/\s+/g, "_")}`);
+	if (record.exitedAt) fields.push(`exitedAt=${record.exitedAt}`);
+	if (record.error) fields.push(`error=${JSON.stringify(record.error.replace(/\s+/g, " ").slice(0, 500))}`);
+	return `Daemon lifecycle: ${fields.join(" ")}`;
+}
+
 function tailNonEmptyLines(value: string, max: number): string[] {
 	return value
 		.split("\n")
@@ -1375,18 +1580,35 @@ export function readDaemonStartFailureDiagnostics(
 		readonly startupLogPath: string;
 		readonly platform?: NodeJS.Platform;
 		readonly systemdUnitName?: string;
+		readonly failureKind?: DaemonStartFailureKind;
+		readonly startupDeadlineMs?: number;
+		readonly processExit?: DaemonStartProcessExit | null;
+		readonly lifecycleRecord?: DaemonLastExit | null;
 	},
 	deps: DaemonStartDiagnosticsDeps = daemonStartDiagnosticsDeps,
 ): string[] {
+	const diagnostics: string[] = [];
+	if (input.failureKind === "process-exited") diagnostics.push("Daemon process exited before becoming live.");
+	if (input.failureKind === "deadline") {
+		const seconds = Math.ceil((input.startupDeadlineMs ?? 60_000) / 1000);
+		diagnostics.push(`Daemon did not become live before the ${seconds}-second startup deadline.`);
+	}
+	if (input.processExit) {
+		const exitDetails: string[] = [];
+		if (input.processExit.code !== null) exitDetails.push(`code=${input.processExit.code}`);
+		if (input.processExit.signal !== null) exitDetails.push(`signal=${input.processExit.signal}`);
+		if (exitDetails.length > 0) diagnostics.push(`Process exit: ${exitDetails.join(" ")}`);
+	}
+	if (input.lifecycleRecord) diagnostics.push(formatDaemonLifecycleDiagnostic(input.lifecycleRecord));
+
 	if (deps.existsSync(input.startupLogPath)) {
 		try {
 			const startupLines = tailNonEmptyLines(deps.readFileSync(input.startupLogPath, "utf-8"), 20);
 			if (startupLines.length > 0) {
-				return ["Daemon failed to start. stderr output:", ...startupLines];
+				const heading = input.failureKind ? "Daemon startup stderr:" : "Daemon failed to start. stderr output:";
+				return [...diagnostics, heading, ...startupLines];
 			}
-		} catch {
-			// Continue to service-manager diagnostics.
-		}
+		} catch {}
 	}
 
 	if ((input.platform ?? process.platform) === "linux" && input.systemdUnitName) {
@@ -1408,14 +1630,17 @@ export function readDaemonStartFailureDiagnostics(
 		const journal = result.stdout ?? "";
 		const journalLines = tailNonEmptyLines(journal, 20);
 		if (journalLines.length > 0) {
-			return [`Daemon failed to start. journalctl for ${input.systemdUnitName}:`, ...journalLines];
+			return [...diagnostics, `Daemon failed to start. journalctl for ${input.systemdUnitName}:`, ...journalLines];
 		}
 	}
 
-	return [
-		"Daemon failed to start, and no startup diagnostics were captured.",
-		`Startup log checked: ${input.startupLogPath}`,
-	];
+	const missingDiagnostics = input.failureKind
+		? ["No startup diagnostics were captured.", `Startup log checked: ${input.startupLogPath}`]
+		: [
+				"Daemon failed to start, and no startup diagnostics were captured.",
+				`Startup log checked: ${input.startupLogPath}`,
+			];
+	return [...diagnostics, ...missingDiagnostics];
 }
 
 function findExecutableOnPath(name: string, pathValue: string | undefined = process.env.PATH): string | null {
@@ -1510,8 +1735,6 @@ export function macOSLaunchAgentAttributionNotice(
 	const signer = runtimeName === "Bun" ? "Bun's signer (for example, Jarred Sumner)" : `${runtimeName}'s signer`;
 	return `macOS may show a Login Items / Background Activity notification naming ${signer} instead of Signet. This is expected when Signet is started from a source checkout or JavaScript daemon path. The public curl, npm, and Bun installers use the compiled Signet binary instead.`;
 }
-
-/** Base name retained for compatibility with the pre-workspace launchd job. */
 export const LAUNCHD_DAEMON_LABEL = "ai.signet.daemon";
 
 function currentLaunchdDomain(): string {
@@ -1530,6 +1753,16 @@ export function launchdDaemonLegacyPlistPath(home: string = homedir()): string {
 
 export function launchdDaemonPlistPath(agentsDir: string, home: string = homedir()): string {
 	return join(home, "Library", "LaunchAgents", `${launchdDaemonLabel(agentsDir)}.plist`);
+}
+
+export function daemonStartupLogPath(
+	agentsDir: string,
+	platform: NodeJS.Platform = process.platform,
+	home: string = homedir(),
+): string {
+	if (platform === "darwin")
+		return join(home, "Library", "Logs", "Signet", `${launchdDaemonLabel(agentsDir)}.startup.log`);
+	return join(resolveWorkspaceLayout(agentsDir).runtime, "logs", "startup.log");
 }
 
 interface LaunchdDaemonLoadDeps {
@@ -1585,12 +1818,6 @@ function readLaunchdWorkspace(plist: string): string | null {
 	const match = plist.match(/<key>SIGNET_PATH<\/key>\s*<string>([\s\S]*?)<\/string>/);
 	return match?.[1] ? decodePlistValue(match[1]) : null;
 }
-
-/**
- * Decide how to handle the pre-#1479 global launchd plist before creating a
- * per-workspace job. A legacy job for another workspace is preserved so the
- * second workspace does not silently stop the first one.
- */
 export function resolveLaunchdDaemonMigration(
 	agentsDir: string,
 	home: string = homedir(),
@@ -1604,9 +1831,7 @@ export function resolveLaunchdDaemonMigration(
 	let legacyWorkspace: string | null = null;
 	try {
 		legacyWorkspace = readLaunchdWorkspace(deps.readFileSync(legacyPlistPath, "utf-8"));
-	} catch {
-		// Treat an unreadable plist as an obsolete job that must be replaced.
-	}
+	} catch {}
 
 	if (legacyWorkspace !== null && normalize(legacyWorkspace) !== normalize(agentsDir)) {
 		return {
@@ -1640,6 +1865,7 @@ export function buildLaunchdDaemonPlist(input: LaunchdDaemonPlistInput): string 
 	const runtime = input.runtime ?? resolveDaemonRuntime(undefined, sourceEnvironment);
 	const nodePath = runtime === "bun-js" ? resolveDaemonJsNodePath(input.daemonPath) : null;
 	const wasmPath = runtime === "bun-js" ? resolveDaemonJsWasmPath(input.daemonPath) : null;
+	const connectorAssetsDir = runtime === "bun-js" ? findBundleDirectory(dirname(input.daemonPath), "connectors") : null;
 	const environment = buildLaunchdEnvironment({
 		environment: sourceEnvironment,
 		values: {
@@ -1648,11 +1874,14 @@ export function buildLaunchdDaemonPlist(input: LaunchdDaemonPlistInput): string 
 			SIGNET_BIND: input.bind,
 			SIGNET_PATH: input.agentsDir,
 			SIGNET_DAEMON_ENTRYPOINT: "1",
+			...(input.startAttemptId ? { SIGNET_DAEMON_START_ATTEMPT_ID: input.startAttemptId } : {}),
 			SIGNET_DAEMON_RUNTIME: runtime,
 			...(nodePath ? { NODE_PATH: appendNodePath(nodePath, sourceEnvironment.NODE_PATH) } : {}),
 			...(wasmPath ? { SIGNET_TIKTOKEN_WASM_PATH: wasmPath } : {}),
+			...(connectorAssetsDir ? { SIGNET_CONNECTOR_ASSETS_DIR: connectorAssetsDir } : {}),
 			SIGNET_DAEMON_SERVICE: "launchd",
 			...resolveTelemetryEnvironment(sourceEnvironment),
+			...resolveLocationEnvironment(sourceEnvironment),
 			BUN_INSPECT: input.bunInspect ?? "",
 			...(sourceEnvironment.SIGNET_DIR ? { SIGNET_DIR: sourceEnvironment.SIGNET_DIR } : {}),
 			...(sourceEnvironment.SIGNET_DASHBOARD_DIR
@@ -1677,8 +1906,6 @@ export function buildLaunchdDaemonStartArgs(plistPath: string): string[] {
 export function buildLaunchdDaemonStopArgs(label: string = LAUNCHD_DAEMON_LABEL): string[] {
 	return ["bootout", `${currentLaunchdDomain()}/${label}`];
 }
-
-/** Minimal structural shape of the `launchctl print` probe so tests can stub it. */
 type LaunchctlProbeSpawnSync = (
 	command: string,
 	args: readonly string[],
@@ -1686,12 +1913,6 @@ type LaunchctlProbeSpawnSync = (
 ) => {
 	readonly status: number | null;
 };
-
-/**
- * Whether launchd currently has the per-workspace Signet daemon job loaded.
- * Under KeepAlive the job respawns the daemon on exit, so `stop`/`start` must
- * coordinate with it. The object overload keeps existing probe callers stable.
- */
 export function isLaunchdDaemonLoaded(
 	agentsDirOrDeps: string | LaunchdDaemonLoadDeps = AGENTS_DIR,
 	maybeDeps: LaunchdDaemonLoadDeps = {},
@@ -1732,10 +1953,22 @@ export async function waitForDaemonLiveness(
 	shouldStop: () => boolean = () => false,
 	pause: (ms: number) => Promise<void> = sleep,
 	now: () => number = Date.now,
+	lifecycle?: DaemonStartLifecycleProbe,
 ): Promise<boolean> {
 	while (now() < deadline) {
 		await pause(250);
 		if (shouldStop()) return false;
+		if (
+			lifecycle &&
+			isTerminalDaemonLifecycleFromStartAttempt(
+				lifecycle.read(),
+				lifecycle.startAttemptId,
+				lifecycle.attemptStartedAt,
+				lifecycle.systemdUnitName,
+			)
+		) {
+			return false;
+		}
 		if (await isDaemonRunning()) return true;
 	}
 	return false;
@@ -1787,7 +2020,7 @@ export async function startDaemon(
 	const net = resolveDaemonNetwork(agentsDir, process.env);
 	const inspectorForwarding = await resolveDaemonInspectorForwarding();
 
-	const daemonDir = join(agentsDir, ".daemon");
+	const daemonDir = resolveWorkspaceLayout(agentsDir).runtime;
 	const logDir = join(daemonDir, "logs");
 
 	const attributionNotice = macOSLaunchAgentAttributionNotice(daemonPath);
@@ -1795,12 +2028,11 @@ export async function startDaemon(
 		console.warn(chalk.yellow(`  Note: ${attributionNotice}`));
 	}
 
-	const startupLogPath = join(logDir, "startup.log");
-	// Transient unit name derived from the starting CLI's pid; used for the
-	// systemd-run unit and, via --setenv SIGNET_DAEMON_UNIT, recorded in the
-	// daemon lifecycle record so post-mortems can query the unit's journald
-	// exit status (issue #1148).
+	const startupLogPath = daemonStartupLogPath(agentsDir);
+	mkdirSync(dirname(startupLogPath), { recursive: true });
 	const systemdUnitName = `signet-daemon-${process.pid}`;
+	const attemptStartedAt = Date.now();
+	const startAttemptId = randomUUID();
 	let stderrFd: number | null = null;
 	let stderrTarget: "ignore" | number = "ignore";
 	try {
@@ -1823,21 +2055,11 @@ export async function startDaemon(
 		...(nodePath ? { NODE_PATH: appendNodePath(nodePath, process.env.NODE_PATH) } : {}),
 		...(tokenizerWasmPath ? { SIGNET_TIKTOKEN_WASM_PATH: tokenizerWasmPath } : {}),
 		SIGNET_DAEMON_ENTRYPOINT: "1",
+		SIGNET_DAEMON_START_ATTEMPT_ID: startAttemptId,
 		BUN_INSPECT: inspectorForwarding.childInspector,
-		// SIGNET_DAEMON_UNIT is deliberately NOT set here: it is only meaningful
-		// when systemd-run actually creates the transient unit (the --setenv in
-		// buildSystemdDaemonStartArgs). On the launchd/detached-spawn fallback
-		// paths the daemon must not record a unit name that does not exist, or
-		// the doctor journalctl pointer would be fabricated.
 	};
-
-	// `detached: true` only creates a new process group; it does not escape the
-	// caller's service manager ownership. If `signet daemon start` is run from a
-	// short-lived Linux systemd unit or macOS launchd job, that owner can reap the
-	// daemon when the caller exits. Prefer the platform service manager first so
-	// the daemon is owned independently, then fall back to detached spawn on
-	// platforms or environments where that is unavailable.
 	let procExited = false;
+	let processExit: DaemonStartProcessExit | null = null;
 	let startedByServiceManager = false;
 	if (process.platform === "linux") {
 		const systemdArgs = buildSystemdDaemonStartArgs({
@@ -1849,6 +2071,7 @@ export async function startDaemon(
 			bind: net.bind,
 			startupLogPath,
 			unitName: systemdUnitName,
+			startAttemptId,
 			bunInspect: inspectorForwarding.childInspector,
 			bunOptions: process.env.BUN_OPTIONS,
 			telemetryEnv: process.env,
@@ -1865,9 +2088,7 @@ export async function startDaemon(
 					agentsDir,
 					`[systemd-run fallback] status=${result.status ?? "null"} error=${result.error?.message ?? ""}\n`,
 				);
-			} catch {
-				// Best effort.
-			}
+			} catch {}
 		}
 	} else if (process.platform === "darwin") {
 		const migration = resolveLaunchdDaemonMigration(agentsDir);
@@ -1911,15 +2132,11 @@ export async function startDaemon(
 				host: net.host,
 				bind: net.bind,
 				startupLogPath,
+				startAttemptId,
 				bunInspect: inspectorForwarding.childInspector,
 				telemetryEnv: process.env,
 			}),
 		);
-		// Boot out any loaded job before (re)bootstrap. When no job is loaded
-		// (fresh start, or a restart that already booted it out), launchctl
-		// exits 3 with "Boot-out failed: 3: No such process" — launchd handoff
-		// noise, not a start failure. Skip the bootout in that case so the
-		// message never pollutes the startup log (#1074).
 		let bootout: SpawnSyncReturns<Buffer> | null = null;
 		if (isLaunchdDaemonLoaded(agentsDir)) {
 			bootout = spawnSync("launchctl", buildLaunchdDaemonStopArgs(launchdDaemonLabel(agentsDir)), {
@@ -1949,9 +2166,7 @@ export async function startDaemon(
 						`[launchd fallback] bootoutStatus=${bootout ? (bootout.status ?? "null") : "skipped"} bootstrapStatus=${bootstrap.status ?? "null"} kickstartStatus=${kickstart.status ?? "null"} bootoutError=${bootout?.error?.message ?? ""} bootstrapError=${bootstrap.error?.message ?? ""} kickstartError=${kickstart.error?.message ?? ""}
 `,
 					);
-				} catch {
-					// Best effort.
-				}
+				} catch {}
 			}
 		}
 	}
@@ -1967,24 +2182,17 @@ export async function startDaemon(
 		proc.on("error", (err) => {
 			try {
 				appendPrivateDaemonLog(agentsDir, `[spawn error] ${err.message}\n`);
-			} catch {
-				// Best effort.
-			}
+			} catch {}
 		});
-
-		// Track process exit so the poll loop can short-circuit on fast failures
-		// (port conflict, missing binary, bad config) rather than waiting the
-		// full deadline.
-		proc.on("exit", () => {
+		proc.on("exit", (code, signal) => {
 			procExited = true;
+			processExit = { code, signal };
 		});
 
 		if (typeof proc.pid === "number") {
 			try {
 				writeFileSync(pidFile(agentsDir), `${proc.pid}\n`);
-			} catch {
-				// Best effort.
-			}
+			} catch {}
 		}
 
 		proc.unref();
@@ -1993,21 +2201,44 @@ export async function startDaemon(
 	if (stderrFd !== null) {
 		closeSync(stderrFd);
 	}
-
-	// Use wall-clock deadline instead of iteration count so the budget
-	// is always sufficient regardless of how long each health probe takes.
-	// A large/legacy workspace may need 30-40s for migrations + startup
-	// recovery before the HTTP server binds. 60s covers the worst case
-	// while still failing fast on a genuinely broken daemon.
-	// If the spawned process exits early (fast failure), break immediately.
-	const deadline = Date.now() + 60_000;
-	const ready = await waitForDaemonLiveness(deadline, () => procExited);
+	const startupDeadlineMs = 60_000;
+	const deadline = Date.now() + startupDeadlineMs;
+	const lifecycleProbe: DaemonStartLifecycleProbe | undefined = startedByServiceManager
+		? {
+				read: () => readDaemonLifecycleRecord(agentsDir),
+				startAttemptId,
+				attemptStartedAt,
+				...(process.platform === "linux" ? { systemdUnitName } : {}),
+			}
+		: undefined;
+	const ready = await waitForDaemonLiveness(deadline, () => procExited, sleep, Date.now, lifecycleProbe);
 	if (ready) return true;
 
 	try {
+		const latestLifecycleRecord = readDaemonLifecycleRecord(agentsDir);
+		const lifecycleRecord = isDaemonLifecycleFromStartAttempt(
+			latestLifecycleRecord,
+			startAttemptId,
+			attemptStartedAt,
+			process.platform === "linux" ? systemdUnitName : undefined,
+		)
+			? latestLifecycleRecord
+			: null;
+		const processExitedDuringStart =
+			procExited ||
+			isTerminalDaemonLifecycleFromStartAttempt(
+				latestLifecycleRecord,
+				startAttemptId,
+				attemptStartedAt,
+				process.platform === "linux" ? systemdUnitName : undefined,
+			);
 		const diagnostics = readDaemonStartFailureDiagnostics({
-			startupLogPath,
+			startupLogPath: existsSync(startupLogPath) ? startupLogPath : daemonStartupLogPath(agentsDir),
 			systemdUnitName: process.platform === "linux" ? systemdUnitName : undefined,
+			failureKind: processExitedDuringStart ? "process-exited" : "deadline",
+			startupDeadlineMs,
+			processExit,
+			lifecycleRecord,
 		});
 		if (diagnostics.length > 0) {
 			console.error(chalk.red(`\n${diagnostics[0]}`));
@@ -2015,14 +2246,12 @@ export async function startDaemon(
 				console.error(chalk.dim(line));
 			}
 		}
-	} catch {
-		// Best effort.
-	}
+	} catch {}
 
 	return false;
 }
 
-export async function stopDaemon(agentsDir: string = AGENTS_DIR, preferredPid?: number): Promise<boolean> {
+export async function stopDaemon(agentsDir: string = AGENTS_DIR): Promise<boolean> {
 	if (process.platform === "darwin") {
 		const migration = resolveLaunchdDaemonMigration(agentsDir);
 		if (migration.action === "migrate") {
@@ -2039,20 +2268,19 @@ export async function stopDaemon(agentsDir: string = AGENTS_DIR, preferredPid?: 
 	}
 
 	const pids = new Set<number>();
-	if (preferredPid !== undefined && readManagedDaemonProcess(preferredPid)) {
-		pids.add(preferredPid);
-	}
 	const managed = readManagedDaemonPid(agentsDir);
 	if (managed !== null) {
 		pids.add(managed);
 	}
 
+	const workspace = normalizeWorkspacePath(agentsDir);
 	for (const instance of await getDaemonInstances()) {
+		if (instance.workspacePath === null || normalizeWorkspacePath(instance.workspacePath) !== workspace) continue;
 		if (typeof instance.pid === "number" && readManagedDaemonProcess(instance.pid)) {
 			pids.add(instance.pid);
 		}
 	}
-	for (const pid of findMarkedDaemonProcessPids()) {
+	for (const pid of findMarkedDaemonProcessPids(agentsDir)) {
 		pids.add(pid);
 	}
 
@@ -2062,12 +2290,17 @@ export async function stopDaemon(agentsDir: string = AGENTS_DIR, preferredPid?: 
 	if (existsSync(path)) {
 		try {
 			rmSync(path, { force: true });
-		} catch {
-			// Ignore.
-		}
+		} catch {}
 	}
 
-	return !(await isDaemonRunning());
+	if (!(await isDaemonRunning())) return true;
+	const remaining = await getDaemonInstances();
+	return (
+		remaining.length > 0 &&
+		remaining.every(
+			(instance) => instance.workspacePath !== null && normalizeWorkspacePath(instance.workspacePath) !== workspace,
+		)
+	);
 }
 
 export function formatUptime(seconds: number): string {

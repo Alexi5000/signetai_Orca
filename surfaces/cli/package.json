@@ -1,6 +1,6 @@
 {
 	"name": "@signet/cli",
-	"version": "0.226.1",
+	"version": "0.237.17",
 	"description": "CLI for Signet - portable AI agent identity",
 	"type": "module",
 	"bin": "./dist/cli.js",
@@ -15,8 +15,8 @@
 	],
 	"scripts": {
 		"build": "bun run build:cli",
-		"build:workspace-deps": "cd ../.. && bun run build:core && bun run build:connector-base && bun run build:opencode-plugin && bun run build:oh-my-pi-extension && bun run build:connector-oh-my-pi && bun run build:pi-extension && bun run build:connector-pi && bun run --filter '@signet/connector-claude-code' --filter '@signet/connector-codex' --filter '@signet/connector-forge' --filter '@signet/connector-gemini' --filter '@signet/connector-hermes-agent' --filter '@signet/connector-kimi' --filter '@signet/connector-opencode' --filter '@signet/connector-openclaw' build",
-		"build:cli": "bun build ./src/cli.ts --outdir ./dist --target node --external better-sqlite3",
+		"build:workspace-deps": "cd ../.. && bun run build:core && bun run build:connector-base && bun run build:opencode-plugin && bun run build:oh-my-pi-extension && bun run build:connector-oh-my-pi && bun run build:pi-extension && bun run build:connector-pi && bun run --filter '@signet/connector-claude-code' --filter '@signet/connector-codex' --filter '@signet/connector-forge' --filter '@signet/connector-gemini' --filter '@signet/connector-hermes-agent' --filter '@signet/connector-kimi' --filter '@signet/connector-muse-code' --filter '@signet/connector-opencode' --filter '@signet/connector-openclaw' build",
+		"build:cli": "bun build ./src/cli.ts --outdir ./dist --target node --external better-sqlite3 --external @napi-rs/keyring",
 		"build:dashboard": "cd ../dashboard && bun install && bun run build",
 		"dev": "bun --watch src/dev-cli.ts",
 		"dev:dashboard": "cd ../dashboard && bun run dev",
@@ -43,7 +43,7 @@
 	"homepage": "https://signetai.sh",
 	"dependencies": {
 		"@signet/core": "workspace:*",
-		"@earendil-works/pi-ai": "0.84.4",
+		"@earendil-works/pi-ai": "0.99.1",
 		"@earendil-works/pi-tui": "0.84.4",
 		"@signet/connector-claude-code": "workspace:*",
 		"@signet/connector-codex": "workspace:*",
@@ -51,6 +51,7 @@
 		"@signet/connector-gemini": "workspace:*",
 		"@signet/connector-hermes-agent": "workspace:*",
 		"@signet/connector-kimi": "workspace:*",
+		"@signet/connector-muse-code": "workspace:*",
 		"@signet/connector-opencode": "workspace:*",
 		"@signet/connector-openclaw": "workspace:*",
 		"@signet/connector-oh-my-pi": "workspace:*",

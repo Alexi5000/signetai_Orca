@@ -138,7 +138,7 @@ number of chunk links on the document.
 
 Sources connect read-only external knowledge bases to Signet recall without
 turning them into ordinary saved memories. Supported source kinds are
-`obsidian`, `discord`, `github`, and `import`.
+`obsidian`, `discord`, `github`, `notion`, `web`, and `import`.
 
 ### GET /api/sources
 
@@ -189,8 +189,8 @@ agent.
 ```
 
 For `import` sources, `health.importExtraction` is present when the daemon has
-the durable extraction outcome. It reports the source-document entity id plus
-the aspects and attributes created by the import pipeline. This is distinct
+the durable import outcome. It reports the source-document entity id. Imports
+do not create aspects or claims; Dreaming files those later. This is distinct
 from `health.semantic`, which remains the current source-attributed graph
 diagnostic and can include later Dreaming-derived work.
 
@@ -383,19 +383,16 @@ one Dreaming job per conversation.
       "format": "json",
       "duplicate": false,
       "extraction": {
-        "documentEntityId": "entity-abc123",
-        "aspectsCreated": 2,
-        "attributesCreated": 3
+        "documentEntityId": "entity-abc123"
       }
     }
   ]
 }
 ```
 
-For an imported result, `extraction` reports the graph rows created by the
-source-artifact extraction transaction. A duplicate result also includes the
-current persisted extraction counts when the existing source has a linked
-document entity. Failed results omit `extraction` and retain their structured
+For an imported result, `extraction` reports the source-document entity the
+import linked. A duplicate result also includes the persisted outcome when the
+existing source has a linked document entity. Failed results omit `extraction` and retain their structured
 error. Older daemons may omit this object; clients should show an unavailable
 state rather than infer zero counts.
 
@@ -613,12 +610,54 @@ discussions, selected Markdown docs, comments, and partial-failure artifacts.
 Partial GitHub failures cause the shared source job to report failure while
 preserving source-owned rows that were indexed successfully.
 
+### POST /api/sources/notion
+
+Add or update a Notion source and queue a shared source index job. The source
+indexes every page shared with the Notion internal integration whose token
+`tokenRef` resolves to. Raw Notion tokens are rejected; pass a Signet secret
+name or external secret reference instead. The source ID is derived from
+`tokenRef`, so posting the same `tokenRef` again updates the existing source
+and preserves omitted settings.
+
+**Request body**
+
+```json
+{
+  "tokenRef": "NOTION_TOKEN",
+  "name": "Team Notion",
+  "maxPages": 500
+}
+```
+
+`tokenRef` is required. `maxPages` is an integer from 1 to 10000 (default
+500); pages are enumerated most recently edited first. Malformed bodies and
+wrongly typed fields return `400` without changing source config.
+
+**Response**
+
+```json
+{
+  "source": { "id": "notion:abc123", "kind": "notion" },
+  "created": true,
+  "indexed": 0,
+  "queued": true,
+  "job": { "status": "queued", "sourceId": "notion:abc123" }
+}
+```
+
+The sync path writes one `source_notion_page` artifact per shared page, with
+database-entry properties rendered above the page Markdown, and
+`source_notion_failure` artifacts for failed page fetches, pages with blocks
+that could not be retrieved, and unconfirmed removals. Blocks the API cannot
+render become `[Unsupported Notion block: <type>]` placeholders. Pages whose edit minute has not changed since a completed
+fetch are not refetched, and pages no longer shared are removed after a complete
+enumeration once Notion confirms they are gone.
+
 ### DELETE /api/sources/:sourceId
 
 Remove a source config and purge Signet-owned source artifacts, graph rows,
-and source chunk embeddings. Source files are not modified.
-
-**Response**
+and source chunk embeddings. Source files are not modified. The response is
+`200` when the config and source-owned data are removed:
 
 ```json
 {
@@ -626,6 +665,32 @@ and source chunk embeddings. Source files are not modified.
   "purged": 150
 }
 ```
+
+Deletion is resumable. If an owner or provider cleanup step fails after the
+deletion tombstone is recorded, the source remains configured but is omitted
+from `GET /api/sources`, and the route returns `202` with `pending: true`:
+
+```json
+{
+  "source": { "id": "obsidian:abc123" },
+  "purged": 0,
+  "pending": true
+}
+```
+
+If a canceled source-index run is still finishing, a completed deletion returns
+`cleanupPending: true` while the finalizer completes in the background. A source
+mutation targeting that same source, including snapshot import or reconnect, is
+rejected with `409` until the active deletion phase ends; unrelated sources can
+continue to mutate. A reconnected source generation is not purged by the old
+canceled run.
+
+Retry the same `DELETE` request after the failed dependency is available, or
+restart the daemon to run deferred tombstone cleanup. If the source config has
+already been removed and only the tombstone file cannot be updated, deletion
+still returns `200` with `cleanupPending: true`; the daemon retries that marker
+after restart. A `500` is reserved for failures before the deletion tombstone
+can be recorded.
 
 ### GET /api/sources/:sourceId/health
 

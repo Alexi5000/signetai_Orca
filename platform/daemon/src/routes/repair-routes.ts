@@ -9,6 +9,7 @@ import { loadMemoryConfig } from "../memory-config.js";
 import { clusterEntities } from "../pipeline/community-detection.js";
 import { DEFAULT_RETENTION, runRetentionSweepOnce } from "../pipeline/retention-worker.js";
 import { resolveScopedAgent } from "../request-scope";
+import { openBoundedSse } from "../sse-stream.js";
 import {
 	type RepairContext,
 	type RepairResult,
@@ -23,6 +24,7 @@ import {
 	pruneChunkGroupEntities,
 	pruneGenericEntities,
 	pruneSingletonExtractedEntities,
+	type GenericEntityCursor,
 	rebuildDerivedIndexes,
 	reembedMissingMemories,
 	reembedModelMigration,
@@ -41,16 +43,52 @@ function resolveRepairContext(c: Context): RepairContext {
 	return { reason, actor, actorType, requestId };
 }
 
-function repairHttpStatus(result: RepairResult): 200 | 429 | 500 {
+function repairHttpStatus(result: RepairResult): 200 | 400 | 429 | 500 {
 	if (result.success) return 200;
+	if (result.details?.status === "running") return 200;
+	if (result.details?.invalidInput === true) return 400;
 	if (
-		/cooldown active|hourly budget exhausted|denied by policy gate|autonomous\.|agents cannot trigger repairs|already in progress/i.test(
+		/cooldown active|hourly budget exhausted|retry backoff|denied by policy gate|autonomous\.|agents cannot trigger repairs|already in progress|owner (?:admission|job).*?(?:deadline|queue)|global vector reconciliation|cancelled|time budget|byte budget/i.test(
 			result.message,
 		)
 	) {
 		return 429;
 	}
 	return 500;
+}
+
+type VectorRepairOptions = {
+	batchSize?: number;
+	maxVectorBytes?: number;
+	maxBatches?: number;
+	runBudgetMs?: number;
+	signal?: AbortSignal;
+};
+
+function readPositiveNumber(body: Readonly<Record<string, unknown>>, key: string): number | undefined {
+	const value = body[key];
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function vectorRepairOptions(
+	body: Readonly<Record<string, unknown>>,
+	signal: AbortSignal | undefined,
+): VectorRepairOptions {
+	const options: VectorRepairOptions = {};
+	for (const key of ["batchSize", "maxVectorBytes", "maxBatches", "runBudgetMs"] as const) {
+		const value = readPositiveNumber(body, key);
+		if (value !== undefined) options[key] = value;
+	}
+	if (signal !== undefined) options.signal = signal;
+	return options;
+}
+
+function rejectGlobalVectorRepair(body: Readonly<Record<string, unknown>>): Response | null {
+	if (body.allAgents !== true && readString(body, "scope") !== "all") return null;
+	return Response.json(
+		{ error: "global vector reconciliation is not exposed; provide one resolved agentId" },
+		{ status: 403 },
+	);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -70,11 +108,15 @@ export function registerRepairRoutes(
 	deps: {
 		readonly authConfig?: AuthConfig;
 		readonly getDbAccessor?: () => DbAccessor;
+		readonly loadMemoryConfig?: typeof loadMemoryConfig;
+		readonly resolveExecutable?: typeof which;
+		readonly spawnCommand?: typeof spawnHidden;
 	} = {},
 ): void {
 	const effectiveAuthConfig = deps.authConfig ?? authConfig;
-
-	// Permission guards
+	const resolveMemoryConfig = deps.loadMemoryConfig ?? loadMemoryConfig;
+	const resolveExecutable = deps.resolveExecutable ?? which;
+	const spawnCommand = deps.spawnCommand ?? spawnHidden;
 	app.use("/api/repair/*", async (c, next) => {
 		return requirePermission("admin", effectiveAuthConfig)(c, next);
 	});
@@ -103,9 +145,7 @@ export function registerRepairRoutes(
 		try {
 			const body = await c.req.json();
 			repair = body?.repair === true;
-		} catch {
-			// no body or invalid JSON — default repair=false
-		}
+		} catch {}
 		const result = await checkFtsConsistency(getDbAccessor(), cfg.pipelineV2, ctx, repairLimiter, repair);
 		return c.json(result, result.success ? 200 : 429);
 	});
@@ -114,7 +154,6 @@ export function registerRepairRoutes(
 		const details = await runRetentionSweepOnce(getDbAccessor(), DEFAULT_RETENTION);
 		const affected =
 			details.graphLinksPurged +
-			details.entitiesOrphaned +
 			details.embeddingsPurged +
 			details.tombstonesPurged +
 			details.historyPurged +
@@ -146,18 +185,26 @@ export function registerRepairRoutes(
 		const cfg = loadMemoryConfig(AGENTS_DIR);
 		const accessor = deps.getDbAccessor?.() ?? getDbAccessor();
 		const ctx = resolveRepairContext(c);
-		let batchSize = 50;
+		let batchSize = 20;
 		let dryRun = false;
 		let fullSweep = false;
+		let operationId: string | undefined;
+		let invalidBatchSize = false;
 
 		let body: Record<string, unknown> = {};
 		try {
 			body = asRecord(await c.req.json());
-			if (typeof body.batchSize === "number") batchSize = body.batchSize;
 			if (typeof body.dryRun === "boolean") dryRun = body.dryRun;
 			if (typeof body.fullSweep === "boolean") fullSweep = body.fullSweep;
-		} catch {
-			// no body or invalid JSON — use defaults
+			operationId = readString(body, "operationId") ?? readString(body, "operation_id");
+		} catch {}
+		const options = vectorRepairOptions(body, c.req.raw.signal);
+		if ("batchSize" in body) {
+			if (options.batchSize === undefined || !Number.isInteger(options.batchSize)) {
+				invalidBatchSize = true;
+			} else {
+				batchSize = options.batchSize;
+			}
 		}
 		const scoped = resolveScopedAgent(
 			c.get("auth")?.claims ?? null,
@@ -170,6 +217,7 @@ export function registerRepairRoutes(
 			resolveDaemonAgentId(),
 		);
 		if (scoped.error) return c.json({ error: scoped.error }, 403);
+		if (invalidBatchSize) return c.json({ error: "batchSize must be a positive integer" }, 400);
 
 		const result = await reembedMissingMemories(
 			accessor,
@@ -182,7 +230,9 @@ export function registerRepairRoutes(
 			batchSize,
 			dryRun,
 			fullSweep,
-			fullSweep && ctx.actorType === "operator" ? 0 : undefined,
+			operationId ?? c.req.query("operationId") ?? c.req.query("operation_id") ?? undefined,
+			undefined,
+			options,
 		);
 
 		return c.json(result, repairHttpStatus(result));
@@ -218,16 +268,66 @@ export function registerRepairRoutes(
 	});
 
 	app.post("/api/repair/resync-vec", async (c) => {
-		const cfg = loadMemoryConfig(AGENTS_DIR);
+		const cfg = resolveMemoryConfig(AGENTS_DIR);
+		const body = asRecord(await c.req.json().catch(() => ({})));
 		const ctx = resolveRepairContext(c);
-		const result = await resyncVectorIndex(getDbAccessor(), cfg.pipelineV2, ctx, repairLimiter);
+		const globalRejection = rejectGlobalVectorRepair(body);
+		if (globalRejection !== null) return globalRejection;
+		const scoped = resolveScopedAgent(
+			c.get("auth")?.claims ?? null,
+			effectiveAuthConfig.mode,
+			readString(body, "agentId") ??
+				readString(body, "agent_id") ??
+				c.req.query("agentId") ??
+				c.req.query("agent_id") ??
+				c.req.header("x-signet-agent-id"),
+			resolveDaemonAgentId(),
+		);
+		if (scoped.error) return c.json({ error: scoped.error }, 403);
+		const result = await resyncVectorIndex(
+			deps.getDbAccessor?.() ?? getDbAccessor(),
+			cfg.pipelineV2,
+			ctx,
+			repairLimiter,
+			scoped.agentId,
+			vectorRepairOptions(body, c.req.raw.signal),
+		);
 		return c.json(result, repairHttpStatus(result));
 	});
 
 	app.post("/api/repair/clean-orphans", async (c) => {
-		const cfg = loadMemoryConfig(AGENTS_DIR);
+		const cfg = resolveMemoryConfig(AGENTS_DIR);
+		const body = asRecord(await c.req.json().catch(() => ({})));
 		const ctx = resolveRepairContext(c);
-		const result = await cleanOrphanedEmbeddings(getDbAccessor(), cfg.pipelineV2, ctx, repairLimiter);
+		const globalRejection = rejectGlobalVectorRepair(body);
+		if (globalRejection !== null) return globalRejection;
+		const scoped = resolveScopedAgent(
+			c.get("auth")?.claims ?? null,
+			effectiveAuthConfig.mode,
+			readString(body, "agentId") ??
+				readString(body, "agent_id") ??
+				c.req.query("agentId") ??
+				c.req.query("agent_id") ??
+				c.req.header("x-signet-agent-id"),
+			resolveDaemonAgentId(),
+		);
+		if (scoped.error) return c.json({ error: scoped.error }, 403);
+		const options = vectorRepairOptions(body, c.req.raw.signal);
+		const result = await cleanOrphanedEmbeddings(
+			deps.getDbAccessor?.() ?? getDbAccessor(),
+			cfg.pipelineV2,
+			ctx,
+			repairLimiter,
+			options.batchSize ?? Number.MAX_SAFE_INTEGER,
+			scoped.agentId,
+			{
+				maxVectorBytes: options.maxVectorBytes,
+				maxBatches: options.maxBatches,
+				runBudgetMs: options.runBudgetMs,
+				signal: options.signal,
+				throwOnFailure: false,
+			},
+		);
 		return c.json(result, repairHttpStatus(result));
 	});
 
@@ -251,9 +351,7 @@ export function registerRepairRoutes(
 			if (typeof body?.dryRun === "boolean") options.dryRun = body.dryRun;
 			if (typeof body?.semanticThreshold === "number") options.semanticThreshold = body.semanticThreshold;
 			if (typeof body?.semanticEnabled === "boolean") options.semanticEnabled = body.semanticEnabled;
-		} catch {
-			// no body or invalid JSON — use defaults
-		}
+		} catch {}
 		const result = await deduplicateMemories(getDbAccessor(), cfg.pipelineV2, ctx, repairLimiter, options);
 		return c.json(result, repairHttpStatus(result));
 	});
@@ -277,9 +375,7 @@ export function registerRepairRoutes(
 			const body = await c.req.json();
 			if (typeof body?.batchSize === "number") batchSize = body.batchSize;
 			if (typeof body?.dryRun === "boolean") dryRun = body.dryRun;
-		} catch {
-			// no body or invalid JSON — use defaults
-		}
+		} catch {}
 		const result = await pruneChunkGroupEntities(getDbAccessor(), cfg.pipelineV2, ctx, repairLimiter, {
 			batchSize,
 			dryRun,
@@ -298,9 +394,7 @@ export function registerRepairRoutes(
 			if (typeof body?.batchSize === "number") batchSize = body.batchSize;
 			if (typeof body?.dryRun === "boolean") dryRun = body.dryRun;
 			if (typeof body?.maxMentions === "number") maxMentions = body.maxMentions;
-		} catch {
-			// no body or invalid JSON — use defaults
-		}
+		} catch {}
 		const result = await pruneSingletonExtractedEntities(getDbAccessor(), cfg.pipelineV2, ctx, repairLimiter, {
 			batchSize,
 			dryRun,
@@ -313,15 +407,19 @@ export function registerRepairRoutes(
 		const cfg = loadMemoryConfig(AGENTS_DIR);
 		const ctx = resolveRepairContext(c);
 		let batchSize = 100;
+		let candidateLimit: number | undefined;
+		let inspectionLimit: number | undefined;
+		let cursor: GenericEntityCursor | undefined;
 		let dryRun = true;
 		let body: Record<string, unknown> = {};
 		try {
 			body = asRecord(await c.req.json());
 			if (typeof body?.batchSize === "number") batchSize = body.batchSize;
+			if (typeof body?.candidateLimit === "number") candidateLimit = body.candidateLimit;
+			if (typeof body?.inspectionLimit === "number") inspectionLimit = body.inspectionLimit;
+			if (body.cursor !== undefined) cursor = body.cursor as GenericEntityCursor;
 			if (typeof body?.dryRun === "boolean") dryRun = body.dryRun;
-		} catch {
-			// no body or invalid JSON — use defaults
-		}
+		} catch {}
 		const scoped = resolveScopedAgent(
 			c.get("auth")?.claims ?? null,
 			effectiveAuthConfig.mode,
@@ -333,10 +431,15 @@ export function registerRepairRoutes(
 			resolveDaemonAgentId(),
 		);
 		if (scoped.error) return c.json({ error: scoped.error }, 403);
-		const result = await pruneGenericEntities(getDbAccessor(), cfg.pipelineV2, ctx, repairLimiter, {
+		const accessor = deps.getDbAccessor?.() ?? getDbAccessor();
+		const result = await pruneGenericEntities(accessor, cfg.pipelineV2, ctx, repairLimiter, {
 			batchSize,
+			candidateLimit,
+			inspectionLimit,
 			dryRun,
 			agentId: scoped.agentId,
+			cursor,
+			signal: c.req.raw.signal,
 		});
 		return c.json(result, repairHttpStatus(result));
 	});
@@ -412,9 +515,7 @@ export function registerRepairRoutes(
 				batchSize = Math.min(Math.floor(body.batchSize), 500);
 			}
 			if (typeof body.dryRun === "boolean") dryRun = body.dryRun;
-		} catch {
-			// defaults
-		}
+		} catch {}
 		const scoped = resolveScopedAgent(
 			c.get("auth")?.claims ?? null,
 			effectiveAuthConfig.mode,
@@ -560,9 +661,7 @@ export function registerRepairRoutes(
 		try {
 			const body = await c.req.json();
 			if (typeof body?.batchSize === "number") batchSize = Math.min(body.batchSize, 200);
-		} catch {
-			// defaults
-		}
+		} catch {}
 
 		const accessor = getDbAccessor();
 		// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
@@ -723,22 +822,20 @@ export function registerRepairRoutes(
 		}
 
 		const [bin, args] = cmd;
-		const resolved = which(bin);
+		const resolved = resolveExecutable(bin);
 		if (!resolved) {
 			return c.json({ error: `Binary not found: ${bin}` }, 500);
 		}
 
 		const { CLAUDECODE: _cc, SIGNET_NO_HOOKS: _, ...baseEnv } = process.env;
-		const encoder = new TextEncoder();
-
 		if (key === "daemon-stop" || key === "daemon-restart") {
 			const action = key === "daemon-stop" ? "stop" : "restart";
-			const lifecycle = new ReadableStream({
-				start(controller) {
+			const lifecycle = openBoundedSse({
+				requestSignal: c.req.raw.signal,
+				onStart(producer) {
+					if (producer.signal.aborted) return;
 					const write = (event: unknown): void => {
-						try {
-							controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-						} catch {}
+						producer.write(event);
 					};
 
 					write({ type: "started", key, command: `signet daemon ${action}` });
@@ -747,9 +844,7 @@ export function registerRepairRoutes(
 						write({ type: "stdout", data: "Dashboard will lose connection.\n" });
 					}
 					write({ type: "exit", code: 0 });
-					try {
-						controller.close();
-					} catch {}
+					producer.close();
 
 					setTimeout(async () => {
 						if (key === "daemon-restart") {
@@ -767,87 +862,146 @@ export function registerRepairRoutes(
 				},
 			});
 
-			return new Response(lifecycle, {
-				headers: {
-					"content-type": "text/event-stream",
-					"cache-control": "no-cache",
-					connection: "keep-alive",
-				},
-			});
+			return lifecycle.response;
 		}
 
-		const stream = new ReadableStream({
-			async start(controller) {
-				const write = (event: unknown) => {
-					try {
-						controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-					} catch {}
-				};
-
-				write({ type: "started", key, command: `${bin} ${args.join(" ")}` });
-
-				const child = spawnHidden(resolved, args as string[], {
+		const stream = openBoundedSse({
+			requestSignal: c.req.raw.signal,
+			highWaterMarkBytes: 512 * 1024,
+			maxFrameBytes: 256 * 1024,
+			onStart(producer) {
+				if (producer.signal.aborted) return;
+				const child = spawnCommand(resolved, args as string[], {
 					stdio: "pipe",
 					env: { ...baseEnv, SIGNET_NO_HOOKS: "1", FORCE_COLOR: "0" } as NodeJS.ProcessEnv,
 				});
+				let killTimer: ReturnType<typeof setTimeout> | undefined;
+				let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+				let childFinished = false;
+				let outputPaused = false;
+				let flushingOutput = false;
+				let terminalEvent:
+					| { readonly type: "exit"; readonly code: number }
+					| { readonly type: "error"; readonly message: string }
+					| undefined;
+				const outputFrameChars = 32 * 1024;
+				const outputPauseBytes = 128 * 1024;
+				const outputResumeBytes = 64 * 1024;
+				const pendingOutput: { readonly type: "stdout" | "stderr"; readonly data: string; offset: number }[] = [];
 
-				child.stdout?.on("data", (chunk: Buffer) => {
-					try {
-						write({ type: "stdout", data: chunk.toString("utf-8") });
-					} catch {
-						clearTimeout(killTimer);
-						try {
-							child.kill("SIGTERM");
-						} catch {}
-					}
-				});
-
-				child.stderr?.on("data", (chunk: Buffer) => {
-					try {
-						write({ type: "stderr", data: chunk.toString("utf-8") });
-					} catch {
-						clearTimeout(killTimer);
-						try {
-							child.kill("SIGTERM");
-						} catch {}
-					}
-				});
-
-				const killTimer = setTimeout(() => {
+				const clearTimers = (): void => {
+					if (killTimer) clearTimeout(killTimer);
+					if (forceKillTimer) clearTimeout(forceKillTimer);
+					killTimer = undefined;
+					forceKillTimer = undefined;
+				};
+				const terminateChild = (): void => {
+					if (killTimer) clearTimeout(killTimer);
+					killTimer = undefined;
+					child.stdout?.pause();
+					child.stderr?.pause();
+					if (childFinished || child.pid === undefined || child.exitCode !== null || child.killed) return;
 					try {
 						child.kill("SIGTERM");
 					} catch {}
-					setTimeout(() => {
+					forceKillTimer = setTimeout(() => {
+						if (childFinished || child.exitCode !== null) return;
 						try {
-							child.kill();
+							child.kill("SIGKILL");
 						} catch {}
 					}, 5_000);
+					forceKillTimer.unref?.();
+				};
+				producer.addDisposer(terminateChild);
+				producer.addDisposer(clearTimers);
+
+				const pauseOutput = (): void => {
+					if (outputPaused || producer.isClosed) return;
+					outputPaused = true;
+					child.stdout?.pause();
+					child.stderr?.pause();
+				};
+				const finishOutput = (): void => {
+					if (
+						!childFinished ||
+						pendingOutput.length > 0 ||
+						outputPaused ||
+						terminalEvent === undefined ||
+						producer.isClosed
+					)
+						return;
+					producer.write(terminalEvent);
+					producer.close();
+				};
+				const resumeOutput = (): void => {
+					if (outputPaused || pendingOutput.length > 0 || producer.isClosed) return;
+					child.stdout?.resume();
+					child.stderr?.resume();
+				};
+				const flushOutput = (): void => {
+					if (flushingOutput || outputPaused || producer.isClosed) return;
+					flushingOutput = true;
+					try {
+						while (pendingOutput.length > 0 && !outputPaused && !producer.isClosed) {
+							const next = pendingOutput[0];
+							if (!next) break;
+							if (next.offset >= next.data.length) {
+								pendingOutput.shift();
+								continue;
+							}
+							let end = Math.min(next.offset + outputFrameChars, next.data.length);
+							if (end < next.data.length) {
+								const before = next.data.charCodeAt(end - 1);
+								const after = next.data.charCodeAt(end);
+								if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end -= 1;
+							}
+							const status = producer.write({ type: next.type, data: next.data.slice(next.offset, end) });
+							if (status === "closed" || status === "overflow") break;
+							next.offset = end;
+							if (next.offset >= next.data.length) pendingOutput.shift();
+							if (producer.queuedBytes >= outputPauseBytes) pauseOutput();
+						}
+					} finally {
+						flushingOutput = false;
+					}
+					finishOutput();
+					resumeOutput();
+				};
+				producer.addDrainListener((queuedBytes) => {
+					if (outputPaused && queuedBytes <= outputResumeBytes && !producer.isClosed) {
+						outputPaused = false;
+						flushOutput();
+					}
+				});
+
+				const writeOutput = (type: "stdout" | "stderr", chunk: Buffer): void => {
+					if (producer.isClosed) return;
+					pendingOutput.push({ type, data: chunk.toString("utf-8"), offset: 0 });
+					flushOutput();
+				};
+
+				child.stdout?.on("data", (chunk: Buffer) => writeOutput("stdout", chunk));
+				child.stderr?.on("data", (chunk: Buffer) => writeOutput("stderr", chunk));
+				producer.write({ type: "started", key, command: `${bin} ${args.join(" ")}` });
+
+				killTimer = setTimeout(() => {
+					terminateChild();
 				}, 60_000);
+				killTimer.unref?.();
 
-				child.on("close", (code) => {
-					clearTimeout(killTimer);
-					write({ type: "exit", code: code ?? 1 });
-					try {
-						controller.close();
-					} catch {}
-				});
+				const finishChild = (event: NonNullable<typeof terminalEvent>): void => {
+					if (childFinished) return;
+					childFinished = true;
+					terminalEvent = event;
+					clearTimers();
+					flushOutput();
+				};
 
-				child.on("error", (err) => {
-					clearTimeout(killTimer);
-					write({ type: "error", message: err.message });
-					try {
-						controller.close();
-					} catch {}
-				});
+				child.on("close", (code) => finishChild({ type: "exit", code: code ?? 1 }));
+				child.on("error", (error) => finishChild({ type: "error", message: error.message }));
 			},
 		});
 
-		return new Response(stream, {
-			headers: {
-				"content-type": "text/event-stream",
-				"cache-control": "no-cache",
-				connection: "keep-alive",
-			},
-		});
+		return stream.response;
 	});
 }

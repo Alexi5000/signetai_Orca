@@ -475,7 +475,6 @@ specs:
     success_criteria: []
     decision: null
 
-
   - id: signet-roadmap-spec
     status: planning
     path: docs/specs/planning/signet-roadmap-spec.md
@@ -753,7 +752,6 @@ specs:
       - "A bounded deterministic evaluation covers a claim followed by its negation, source removal, and agent isolation"
     decision: null
 
-
   - id: ssm-foundation-evaluation
     status: planning
     path: docs/specs/planning/ssm-foundation-evaluation.md
@@ -840,7 +838,6 @@ specs:
       - "Shadow and ablation runs show measurable gains before default-path adoption"
     decision: null
 
-
   - id: distributed-harness-orchestration
     status: planning
     path: docs/specs/planning/distributed-harness-orchestration.md
@@ -855,7 +852,6 @@ specs:
       - "Architecture supports multiple remote harnesses, multiple agents, and multiple memory backends under one control plane"
     decision: null
 
-
   - id: signet-native-harness
     status: planning
     path: docs/specs/planning/signet-native-harness.md
@@ -869,7 +865,6 @@ specs:
       - "Signet ships a first-party harness for controlled benchmarking and production workflows while preserving existing harness support"
     decision: null
 
-
   - id: remember-recall-skill-parity
     status: planning
     path: docs/specs/planning/remember-recall-skill-parity.md
@@ -881,9 +876,6 @@ specs:
     success_criteria:
       - "/remember and /recall skills align with current memory architecture and schema"
     decision: null
-
-
-
 
   - id: deep-memory-search
     status: planning
@@ -898,35 +890,19 @@ specs:
       - "Optional deep memory search path uses multi-agent LLM retrieval only when primary retrieval confidence is low"
     decision: null
 
-
-  - id: mcp-cli-bridge-and-usage-analytics
-    status: approved
-    path: docs/specs/approved/mcp-cli-bridge-and-usage-analytics.md
-    hard_depends_on:
-      - signet-runtime
-    soft_depends_on: []
-    blocks: []
-    informed_by: []
-    success_criteria:
-      - "Installed MCP servers are invokable through Signet CLI with dashboard usage tracking"
-    decision: null
-
   - id: overview-usage-analytics
     status: approved
     path: docs/specs/approved/overview-usage-analytics.md
     hard_depends_on:
-      - mcp-cli-bridge-and-usage-analytics
       - procedural-memory-plan
     soft_depends_on: []
     blocks: []
     informed_by:
       - docs/research/technical/RESEARCH-OVERVIEW-USAGE-ANALYTICS.md
-      - docs/specs/approved/mcp-cli-bridge-and-usage-analytics.md
       - docs/specs/approved/procedural-memory-plan.md
     success_criteria:
-      - "The home overview card reflects real most-used MCP servers and skills instead of catalog popularity"
+      - "The home overview card reflects real most-used skills instead of catalog popularity"
     decision: null
-
 
   - id: git-marketplace-monorepo
     status: planning
@@ -937,7 +913,7 @@ specs:
     blocks: []
     informed_by: []
     success_criteria:
-      - "GitHub-authenticated pull-request workflow supports publishing and reviewing skills and MCP servers"
+      - "GitHub-authenticated pull-request workflow supports publishing and reviewing skills with JSON review artifacts"
     decision: null
 
   - id: marketplace-official-skills
@@ -955,7 +931,6 @@ specs:
       - "Featured official skills do not render as duplicate cards again in the same initial catalog viewport"
     decision: null
 
-
   - id: adaptive-skill-lifecycle
     status: planning
     path: docs/specs/planning/adaptive-skill-lifecycle.md
@@ -969,7 +944,6 @@ specs:
       - "Skills are continuously maintained and performance-scored from invocation outcomes"
     decision: null
 
-
   - id: cryptographic-identity-roadmap
     status: planning
     path: docs/specs/planning/cryptographic-identity-roadmap.md
@@ -981,7 +955,6 @@ specs:
     success_criteria:
       - "Identity model progresses toward cryptographic verification for agents and signed artifacts"
     decision: null
-
 
   - id: connector-py-agent
     status: planning
@@ -1019,7 +992,6 @@ specs:
       - "Oh My Pi connector installs a managed runtime extension and forwards Signet lifecycle hooks without adding Oh My Pi-only dependencies for other users"
     decision: null
 
-
   - id: plugin-api-ecosystem
     status: planning
     path: docs/specs/planning/plugin-api-ecosystem.md
@@ -1037,7 +1009,6 @@ specs:
       - "Secret providers can register modular backends such as local, 1Password, Bitwarden, Vault, cloud secret managers, and environment resolvers"
       - "Plugin manifests are marketplace-ready without requiring full marketplace install support in the first implementation"
     decision: null
-
 
   - id: plugin-sdk-core-v1
     status: complete
@@ -1060,7 +1031,6 @@ specs:
       - "The V1 manifest and registry store marketplace-ready metadata and future Rust sidecar compatibility fields without implementing marketplace install or Rust sidecar execution"
     decision: null
 
-
   - id: constellation-unified-viewer
     status: planning
     path: docs/specs/planning/constellation-unified-viewer.md
@@ -1072,7 +1042,6 @@ specs:
     success_criteria:
       - "Realtime unified viewer replaces slow 3D renderer and visualizes new dependency types by default"
     decision: null
-
 
   - id: dashboard-information-architecture-refactor
     status: planning
@@ -1086,7 +1055,6 @@ specs:
       - "Settings become standalone page and dashboard navigation is consolidated with breadcrumb-driven interaction"
     decision: null
 
-
   - id: postinstall-behavior-migration-audit
     status: planning
     path: docs/specs/planning/postinstall-behavior-migration-audit.md
@@ -1099,7 +1067,6 @@ specs:
       - "All critical post-install behaviors are owned by CLI/daemon flows and not fragile post-install scripts"
     decision: null
 
-
   - id: ci-changed-files-selective
     status: planning
     path: docs/specs/planning/ci-changed-files-selective.md
@@ -1111,7 +1078,6 @@ specs:
     success_criteria:
       - "PR CI runs only affected package lanes plus dependency closure while nightly runs full suite"
     decision: null
-
 
   - id: ci-contract-invariants-lane
     status: planning
@@ -1126,7 +1092,6 @@ specs:
       - "Lockfile/install invariants fail fast when package manifests drift from bun.lock"
     decision: null
 
-
   - id: ci-flaky-test-quarantine
     status: planning
     path: docs/specs/planning/ci-flaky-test-quarantine.md
@@ -1138,7 +1103,6 @@ specs:
     success_criteria:
       - "Flaky tests are detected, tracked, and quarantined with threshold-based enforcement"
     decision: null
-
 
   - id: ci-pr-preview-environments
     status: planning
@@ -1152,7 +1116,6 @@ specs:
       - "Each frontend-affecting PR can publish a preview with automated smoke and screenshot checks"
     decision: null
 
-
   - id: pr-risk-tier-policy
     status: planning
     path: docs/specs/planning/pr-risk-tier-policy.md
@@ -1165,7 +1128,6 @@ specs:
       - "PRs declare risk tier and high-risk PRs require rollback/test plans"
     decision: null
 
-
   - id: api-contract-snapshots
     status: planning
     path: docs/specs/planning/api-contract-snapshots.md
@@ -1177,7 +1139,6 @@ specs:
     success_criteria:
       - "Critical API response contracts are snapshotted to detect accidental breaking changes"
     decision: null
-
 
   - id: developer-doctor-command
     status: planning
@@ -1241,7 +1202,6 @@ specs:
       - "The supported source-build path is exposed through `signet desktop build` and `signet desktop install`"
     decision: null
 
-
   - id: golden-path-docs
     status: planning
     path: docs/specs/planning/golden-path-docs.md
@@ -1253,7 +1213,6 @@ specs:
     success_criteria:
       - "Short golden-path guides exist for backend, dashboard, and connector changes"
     decision: null
-
 
   - id: code-ownership-sla
     status: planning
@@ -1267,7 +1226,6 @@ specs:
       - "CODEOWNERS and reviewer ownership map reduce review-routing latency"
     decision: null
 
-
   - id: release-train-cadence
     status: planning
     path: docs/specs/planning/release-train-cadence.md
@@ -1280,7 +1238,6 @@ specs:
       - "Predictable release windows reduce merge pressure and batch risk"
     decision: null
 
-
   - id: post-merge-canary-suite
     status: planning
     path: docs/specs/planning/post-merge-canary-suite.md
@@ -1292,7 +1249,6 @@ specs:
     success_criteria:
       - "Main branch merges trigger lightweight canary checks before broader rollout"
     decision: null
-
 
   - id: incident-guardrail-loop
     status: planning
@@ -1439,10 +1395,10 @@ specs:
     blocks: []
     informed_by: []
     success_criteria:
-      - "A versioned deterministic policy classifies hostile stored content without rewriting immutable evidence"
-      - "Remembered memories, native artifacts, source chunks, transcripts, summaries, reranking, recall, Dreaming, and MEMORY.md use one context-eligibility decision"
-      - "Blocked and tainted rows remain agent-scoped and inspectable through user-facing memory and diagnostics surfaces"
-      - "False-positive coverage protects ordinary technical prose, shell examples, security discussions, non-English text, and emoji"
+      - "One core credential detector redacts provider keys, tokens, private keys, JWTs, and secret assignments in every prompt-facing projection"
+      - "Nothing is withheld for content-safety reasons and stored evidence is never rewritten"
+      - "Checkpoint, subagent-context, and plugin-audit redaction use the same detector"
+      - "False-positive coverage keeps prose about secrets, variable names, placeholders, commit SHAs, hashes, and UUIDs unchanged"
     decision: null
   - id: cache-stable-memory-injection
     status: approved

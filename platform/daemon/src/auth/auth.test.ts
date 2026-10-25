@@ -8,13 +8,14 @@ import { generateSecret, loadOrCreateSecret, createToken, verifyToken } from "./
 import { hashPassword, verifyPasswordHash } from "./password";
 import { checkPermission, checkScope } from "./policy";
 import { AuthRateLimiter } from "./rate-limiter";
-import { createAuthMiddleware, requirePermission, requireRateLimit } from "./middleware";
+import {
+	createAuthMiddleware,
+	requirePermission,
+	requirePermissionWithRateLimit,
+	requireRateLimit,
+} from "./middleware";
 import { parseAuthConfig } from "./config";
 import type { TokenClaims, TokenRole } from "./types";
-
-// =============================================================================
-// Tokens
-// =============================================================================
 
 describe("tokens", () => {
 	const secret = generateSecret();
@@ -54,7 +55,6 @@ describe("tokens", () => {
 
 	test("expired token is rejected", async () => {
 		const token = createToken(secret, { sub: "u1", scope: {}, role: "agent" }, 1);
-		// wait for the 1-second TTL to lapse
 		await new Promise((r) => setTimeout(r, 1100));
 		const result = verifyToken(secret, token);
 		expect(result.authenticated).toBe(false);
@@ -114,8 +114,6 @@ describe("tokens", () => {
 		beforeEach(() => {
 			tmpDir = mkdtempSync(join(tmpdir(), "signet-auth-test-"));
 		});
-
-		// cleanup is best-effort; test dirs are small and tmpdir is ephemeral
 		test("creates file when missing and returns a buffer", () => {
 			const path = join(tmpDir, "sub", "secret");
 			const buf = loadOrCreateSecret(path);
@@ -150,10 +148,6 @@ console.log(createHash("sha256").update(loadOrCreateSecret(process.argv[1])).dig
 	});
 });
 
-// =============================================================================
-// Password login hashes
-// =============================================================================
-
 describe("password hashes", () => {
 	test("hashPassword creates a verifiable pbkdf2 hash", () => {
 		const hash = hashPassword("correct horse battery staple", 10_000);
@@ -167,10 +161,6 @@ describe("password hashes", () => {
 		expect(verifyPasswordHash("password", "pbkdf2-sha256$1$salt$hash")).toBe(false);
 	});
 });
-
-// =============================================================================
-// Policy
-// =============================================================================
 
 function makeClaims(role: TokenRole, scope = {}): TokenClaims {
 	const now = Math.floor(Date.now() / 1000);
@@ -262,10 +252,8 @@ describe("policy - checkPermission", () => {
 	});
 
 	test("hybrid mode with claims delegates same logic as team", () => {
-		// readonly should be denied 'remember' in hybrid, same as team
 		const d = checkPermission(makeClaims("readonly"), "remember", "hybrid");
 		expect(d.allowed).toBe(false);
-		// admin should be allowed everything
 		const a = checkPermission(makeClaims("admin"), "admin", "hybrid");
 		expect(a.allowed).toBe(true);
 	});
@@ -309,8 +297,6 @@ describe("policy - checkScope", () => {
 	test("empty scope on non-admin token is allowed with deprecation warning", () => {
 		const claims = makeClaims("agent", {});
 		const d = checkScope(claims, { project: "anything" }, "team");
-		// Currently allowed for backwards compatibility — will be denied
-		// in a future release after operators rotate tokens.
 		expect(d.allowed).toBe(true);
 	});
 
@@ -333,16 +319,11 @@ describe("policy - checkScope", () => {
 	});
 
 	test("scope check passes when target has no matching dimension", () => {
-		// token scoped to project-a, target has no project field
 		const claims = makeClaims("agent", { project: "proj-a" });
 		const d = checkScope(claims, {}, "team");
 		expect(d.allowed).toBe(true);
 	});
 });
-
-// =============================================================================
-// Rate Limiter
-// =============================================================================
 
 describe("AuthRateLimiter", () => {
 	let limiter: AuthRateLimiter;
@@ -410,19 +391,13 @@ describe("AuthRateLimiter", () => {
 		const shortLimiter = new AuthRateLimiter(50, 2);
 		shortLimiter.record("k");
 		shortLimiter.record("k");
-		// exhausted
 		expect(shortLimiter.check("k").allowed).toBe(false);
-		// wait for window to expire
 		await new Promise((r) => setTimeout(r, 80));
 		const result = shortLimiter.check("k");
 		expect(result.allowed).toBe(true);
 		expect(result.remaining).toBe(2);
 	});
 });
-
-// =============================================================================
-// Middleware integration tests
-// =============================================================================
 
 const testLoginConfig = {
 	password: { username: "admin", passwordHash: null },
@@ -489,8 +464,6 @@ describe("middleware - createAuthMiddleware", () => {
 		app.get("/", (c) => c.text("dashboard"));
 		app.get("/assets/app.js", (c) => c.text("asset"));
 		app.get("/api/auth/methods", (c) => c.json({ ok: true }));
-		// /api/mode is the unauthenticated environment probe the dashboard
-		// uses to detect a real daemon before any token exchange (issue #1001).
 		app.get("/api/mode", (c) => c.json({ mode: "team", requiresAuth: true }));
 		expect((await app.request(new Request("http://localhost/"))).status).toBe(200);
 		expect((await app.request(new Request("http://localhost/assets/app.js"))).status).toBe(200);
@@ -533,8 +506,6 @@ describe("middleware - createAuthMiddleware", () => {
 
 	test("hybrid mode: Host header alone does not bypass auth (fail closed)", async () => {
 		const app = makeTestApp(createAuthMiddleware(hybridConfig, secret));
-		// Host header is spoofable — isLocalhost must fail closed when
-		// TCP socket info is unavailable
 		const res = await app.request(
 			new Request("http://localhost/test", {
 				headers: { host: "localhost:3850" },
@@ -641,9 +612,7 @@ describe("middleware - requireRateLimit", () => {
 		const app = makeRateLimitApp(5000, 1);
 		const token = createToken(secret, { sub: "u2", scope: {}, role: "agent" }, 60);
 		const headers = bearerHeader(token);
-		// first request consumes the only slot
 		await app.request(new Request("http://localhost/test", { headers }));
-		// second should be rate limited
 		const res = await app.request(new Request("http://localhost/test", { headers }));
 		expect(res.status).toBe(429);
 		expect(res.headers.get("retry-after")).not.toBeNull();
@@ -655,18 +624,11 @@ describe("middleware - requireRateLimit", () => {
 		app.use("*", createAuthMiddleware(localConfig, null));
 		app.use("*", requireRateLimit("testOp", limiter, localConfig));
 		app.get("/test", (c) => c.json({ ok: true }));
-
-		// exhaust what would be the limit
 		await app.request(new Request("http://localhost/test"));
 		const res = await app.request(new Request("http://localhost/test"));
-		// local mode should still return 200
 		expect(res.status).toBe(200);
 	});
 });
-
-// =============================================================================
-// Config
-// =============================================================================
 
 describe("parseAuthConfig", () => {
 	const agentsDir = "/home/test/.agents";
@@ -744,22 +706,18 @@ describe("parseAuthConfig", () => {
 	});
 });
 
-// =============================================================================
-// Auth routes
-// =============================================================================
-
 describe("auth routes - password dashboard login", () => {
 	test("login is open in team mode and issues an admin session token", async () => {
 		const tmpDir = mkdtempSync(join(tmpdir(), "signet-auth-login-test-"));
 		const prevUsername = process.env.SIGNET_ADMIN_USERNAME;
 		const prevPassword = process.env.SIGNET_ADMIN_PASSWORD;
+		const state = await import("../routes/state.js");
 		try {
 			mkdirSync(join(tmpDir, ".daemon"), { recursive: true });
 			writeFileSync(join(tmpDir, "agent.yaml"), "auth:\n  mode: team\n  sessionTokenTtlSeconds: 60\n");
 			process.env.SIGNET_ADMIN_USERNAME = "owner";
 			process.env.SIGNET_ADMIN_PASSWORD = "secret-password";
 
-			const state = await import("../routes/state.js");
 			state.reloadAuthState(tmpDir);
 			if (!state.authSecret) throw new Error("expected auth secret");
 
@@ -789,21 +747,17 @@ describe("auth routes - password dashboard login", () => {
 			else process.env.SIGNET_ADMIN_USERNAME = prevUsername;
 			if (prevPassword === undefined) Reflect.deleteProperty(process.env, "SIGNET_ADMIN_PASSWORD");
 			else process.env.SIGNET_ADMIN_PASSWORD = prevPassword;
+			state.reloadAuthState(state.AGENTS_DIR);
 			rmSync(tmpDir, { recursive: true, force: true });
 		}
 	});
 });
-
-// =============================================================================
-// Security hardening
-// =============================================================================
 
 describe("security hardening", () => {
 	const secret = generateSecret();
 
 	describe("token claims validation", () => {
 		test("rejects token with non-string sub", () => {
-			// Craft a token with numeric sub by manually building payload
 			const payload = JSON.stringify({
 				sub: 12345,
 				scope: {},
@@ -905,16 +859,11 @@ describe("security hardening", () => {
 			app.get("/test", (c) => c.json({ ok: true }));
 
 			const token = createToken(secret, { sub: "u", scope: {}, role: "admin" }, 60);
-
-			// First request exhausts the limit for sub "u"
 			await app.request(
 				new Request("http://localhost/test", {
 					headers: { Authorization: `Bearer ${token}` },
 				}),
 			);
-
-			// Second request with different x-signet-actor should still be limited
-			// because rate key uses claims.sub, not the header
 			const res = await app.request(
 				new Request("http://localhost/test", {
 					headers: {
@@ -925,5 +874,35 @@ describe("security hardening", () => {
 			);
 			expect(res.status).toBe(429);
 		});
+	});
+});
+
+describe("middleware - requirePermissionWithRateLimit", () => {
+	const secret = generateSecret();
+	const appWith = (limiter: AuthRateLimiter) => {
+		const app = new Hono();
+		app.use("*", createAuthMiddleware(teamConfig, secret));
+		app.use("*", requirePermissionWithRateLimit("forget", "forget", limiter, teamConfig));
+		app.post("/forget", (c) => c.json({ ok: true }));
+		return app;
+	};
+	const call = (app: Hono, role: TokenRole) =>
+		app.request("/forget", {
+			method: "POST",
+			headers: { Authorization: `Bearer ${createToken(secret, { sub: `u-${role}`, scope: {}, role }, 60)}` },
+		});
+
+	test("returns 403 for a credential without the permission", async () => {
+		const res = await call(appWith(new AuthRateLimiter(60_000, 5)), "readonly");
+		expect(res.status).toBe(403);
+	});
+
+	test("returns 429 with Retry-After once the limit is spent", async () => {
+		const app = appWith(new AuthRateLimiter(60_000, 2));
+		expect((await call(app, "agent")).status).toBe(200);
+		expect((await call(app, "agent")).status).toBe(200);
+		const limited = await call(app, "agent");
+		expect(limited.status).toBe(429);
+		expect(limited.headers.get("Retry-After")).not.toBeNull();
 	});
 });

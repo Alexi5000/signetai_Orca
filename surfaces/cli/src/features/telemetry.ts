@@ -1,12 +1,3 @@
-/**
- * CLI-side anonymous telemetry.
- *
- * The CLI mirrors command.invoked events to the open JSONL audit log and queues
- * them in the workspace database. A best-effort, non-awaited batch flush sends
- * queued CLI events to the same PostHog project and install id as the daemon.
- * Telemetry must never change the command's result or failure behavior.
- */
-
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -14,6 +5,7 @@ import {
 	DEFAULT_TELEMETRY_FLUSH_BATCH_SIZE,
 	DEFAULT_TELEMETRY_POSTHOG_API_KEY,
 	DEFAULT_TELEMETRY_POSTHOG_HOST,
+	resolveWorkspaceLayout,
 	TELEMETRY_DEPLOYMENT_ROLES,
 	TELEMETRY_INSTALL_CHANNELS,
 	type TelemetryDeploymentRole,
@@ -99,13 +91,8 @@ export function cliTelemetryInstallChannel(
 function cliTelemetryDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
 	return env.SIGNET_TELEMETRY_OPTOUT === "1" || env.SIGNET_TELEMETRY_OPTOUT === "true";
 }
-
-/**
- * Resolve the shared open-telemetry log path, mirroring the daemon's
- * `defaultTelemetryLogPath` (issue #1026).
- */
 export function cliTelemetryLogPath(agentsDir: string): string {
-	return join(agentsDir, ".daemon", "telemetry", "events.jsonl");
+	return join(resolveWorkspaceLayout(agentsDir).runtime, "telemetry", "events.jsonl");
 }
 
 function readTelemetrySettings(agentsDir: string, env: NodeJS.ProcessEnv = process.env): CliTelemetrySettings | null {
@@ -144,12 +131,6 @@ function readTelemetrySettings(agentsDir: string, env: NodeJS.ProcessEnv = proce
 		return null;
 	}
 }
-
-/**
- * True when anonymous telemetry is active for this workspace. Telemetry is on
- * by default, so the flag is only false when agent.yaml is unavailable,
- * telemetry is explicitly disabled, or the runtime opt-out is set.
- */
 export function cliTelemetryEnabled(agentsDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
 	return readTelemetrySettings(agentsDir, env)?.enabled === true;
 }
@@ -178,7 +159,7 @@ function getOrCreateInstallId(db: ReturnType<typeof createDatabase>): string | n
 }
 
 function queueCommandEvent(agentsDir: string, event: QueuedEvent): void {
-	const dbPath = join(agentsDir, "memory", "memories.db");
+	const dbPath = resolveWorkspaceLayout(agentsDir).database;
 	if (!existsSync(dbPath)) return;
 
 	let db: ReturnType<typeof createDatabase> | null = null;
@@ -190,8 +171,6 @@ function queueCommandEvent(agentsDir: string, event: QueuedEvent): void {
 			 (id, event, timestamp, properties, sent_to_posthog, created_at, source)
 				VALUES (?, ?, ?, ?, 0, ?, 'cli')`,
 		).run(event.id, event.event, event.timestamp, JSON.stringify(event.properties), new Date().toISOString());
-		// CLI commands can continue to run while the daemon or PostHog is down.
-		// Keep the shared durable queue bounded without touching daemon-owned rows.
 		db.prepare(
 			`DELETE FROM telemetry_events
 			 WHERE source = 'cli' AND sent_to_posthog = 0 AND claim_token IS NULL
@@ -202,7 +181,6 @@ function queueCommandEvent(agentsDir: string, event: QueuedEvent): void {
 			   )`,
 		).run(MAX_CLI_PENDING_EVENTS);
 	} catch {
-		// Older workspaces may not have the telemetry migrations yet.
 	} finally {
 		db?.close();
 	}
@@ -242,9 +220,7 @@ function claimEvents(db: ReturnType<typeof createDatabase>, limit: number): Clai
 function releaseClaim(db: ReturnType<typeof createDatabase>, token: string): void {
 	try {
 		db.prepare("UPDATE telemetry_events SET claim_token = NULL, claimed_at = NULL WHERE claim_token = ?").run(token);
-	} catch {
-		// Best effort. Stale claims are recoverable on a later flush.
-	}
+	} catch {}
 }
 
 function markClaimedSent(db: ReturnType<typeof createDatabase>, token: string): void {
@@ -252,16 +228,8 @@ function markClaimedSent(db: ReturnType<typeof createDatabase>, token: string): 
 		db.prepare(
 			"UPDATE telemetry_events SET sent_to_posthog = 1, claim_token = NULL, claimed_at = NULL WHERE claim_token = ?",
 		).run(token);
-	} catch {
-		// Best effort. Stale claims are recoverable on a later flush.
-	}
+	} catch {}
 }
-
-/**
- * Append a `command.invoked` event to the audit log and durable flush queue.
- * Payload is the command name only. This function is synchronous for the
- * local write and never performs a network request.
- */
 export function recordCommandInvoked(
 	agentsDir: string,
 	commandName: string,
@@ -289,18 +257,8 @@ export function recordCommandInvoked(
 		if (settings.posthogHost.length > 0 && settings.posthogApiKey.length > 0) {
 			queueCommandEvent(agentsDir, event);
 		}
-	} catch {
-		// Never break the command on telemetry write failures.
-	}
+	} catch {}
 }
-
-/**
- * Flush queued CLI command events to PostHog. Callers should deliberately not
- * await this function from command hooks. The batch size and request timeout
- * bound the work, while a telemetry SQLite database preserves queued events
- * when the request fails. Workspaces without that database remain local-only
- * until it exists.
- */
 export async function flushCliTelemetry(
 	agentsDir: string,
 	cliVersion: string,
@@ -309,7 +267,7 @@ export async function flushCliTelemetry(
 	const settings = readTelemetrySettings(agentsDir, env);
 	if (!settings || settings.posthogHost.length === 0 || settings.posthogApiKey.length === 0) return;
 
-	const dbPath = join(agentsDir, "memory", "memories.db");
+	const dbPath = resolveWorkspaceLayout(agentsDir).database;
 	if (!existsSync(dbPath)) return;
 
 	let db: ReturnType<typeof createDatabase> | null = null;
@@ -348,7 +306,6 @@ export async function flushCliTelemetry(
 		claimToken = null;
 	} catch {
 		if (db && claimToken) releaseClaim(db, claimToken);
-		// Best effort. Unsent rows remain queued for the daemon or next CLI run.
 	} finally {
 		db?.close();
 	}

@@ -1,4 +1,3 @@
-/** Release regression guard for the compiled binary's first-install contract. */
 import { afterEach, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -97,6 +96,50 @@ afterEach(async () => {
 
 describe("compiled native first use", () => {
 	const smoke = enabled ? test : test.skip;
+
+	smoke(
+		"runs the native boundary checks and strict-verifies the macOS arm64 signature from the compiled artifact",
+		() => {
+			const binary = nativeSmokeBinary();
+			if (!existsSync(binary)) {
+				throw new Error(`native binary not found at ${binary}; build it first (bun run build:native-bun)`);
+			}
+			if (process.platform === "darwin" && process.env.SIGNET_NATIVE_PLATFORM === "darwin-arm64") {
+				run("codesign", ["--verify", "--strict", "--verbose=2", binary], process.env, 10_000);
+			}
+			smokeHome = mkdtempSync(join(tmpdir(), "signet-native-boundaries-"));
+			const env = smokeEnv(smokeHome, join(smokeHome, ".agents"));
+			const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+				packageManager: string;
+			};
+			const expectedBun = packageJson.packageManager.replace("bun@", "");
+			const runtime = parseJsonOutput(run(binary, [], { ...env, SIGNET_RUNTIME_VERSION_SMOKE: "1" }, 10_000));
+			expect(runtime).toMatchObject({ type: "runtime-version", bun: expectedBun });
+
+			const source = parseJsonOutput(run(binary, [], { ...env, SIGNET_NATIVE_SOURCE_WORKER_SMOKE: "1" }, 30_000));
+			expect(source).toMatchObject({
+				type: "native-source-worker-smoke",
+				rejected: ["source_item_too_large"],
+				complete: true,
+				failures: 30,
+				cancelled: true,
+			});
+			expect(source.continued).toEqual([expect.stringContaining("b-ok.md")]);
+			if (typeof source.fdDelta === "number") expect(source.fdDelta).toBeLessThanOrEqual(4);
+
+			const keyringEnv: NodeJS.ProcessEnv = { ...env, SIGNET_KEYRING_HELPER_SMOKE: "1" };
+			delete keyringEnv.DBUS_SESSION_BUS_ADDRESS;
+			const keyring = parseJsonOutput(run(binary, [], keyringEnv, 10_000));
+			expect(keyring.type).toBe("keyring-helper-smoke");
+			expect(keyring.elapsedMs).toBeLessThan(5_000);
+			const message = Reflect.get(keyring.result as object, "message");
+			expect(
+				Reflect.get(keyring.result as object, "state"),
+				typeof message === "string" ? message : "Native keyring smoke failed",
+			).toMatch(/^(found|missing|unavailable)$/);
+		},
+		60_000,
+	);
 
 	smoke(
 		"setup, doctor, remember, and recall work from a clean workspace",

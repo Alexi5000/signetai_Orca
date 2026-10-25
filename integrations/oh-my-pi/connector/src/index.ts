@@ -89,14 +89,10 @@ export class OhMyPiConnector extends BaseConnector {
 		const agentDir = resolveOhMyPiAgentDir();
 		const targetPath = managedExtensionFilePath(agentDir, OH_MY_PI_MANAGED_FILENAME);
 		const legacyPath = managedExtensionFilePath(agentDir, OH_MY_PI_LEGACY_MANAGED_FILENAME);
-
-		// Read once and reuse the same content for the ownership check and the
-		// change check, instead of checking the path and writing it later.
 		let previous: string | null;
 		try {
 			previous = readFileIfExistsSync(targetPath, "utf8");
 		} catch {
-			// Present but unreadable (e.g. a directory): treat as unmanaged.
 			previous = "";
 		}
 		if (previous !== null && !previous.includes(OH_MY_PI_MANAGED_MARKER)) {

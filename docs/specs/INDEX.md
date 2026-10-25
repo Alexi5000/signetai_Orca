@@ -49,7 +49,6 @@ flowchart TD
     SNH[Signet Native Harness]
     RRP[Remember/Recall Skill Parity]
     DMS[Deep Memory Search]
-    MCB[MCP CLI Bridge + Usage Analytics]
     GMM[Git Marketplace Monorepo]
     ASL[Adaptive Skill Lifecycle]
     CIR[Cryptographic Identity Roadmap]
@@ -115,7 +114,6 @@ flowchart TD
   PM --> RRP
   DP --> DMS
   SSF --> DMS
-  SR --> MCB
   PAF --> GMM
   PM --> ASL
   PAF --> ASL
@@ -698,11 +696,8 @@ Phase ordering based on hard dependencies and integration contracts.
   - extend prospective indexing with hint embeddings and semantic recall over predicted future cues
 - **Deep Memory Search** (`deep-memory-search`)
   - optional multi-agent LLM memory search path (not primary retrieval)
-- **MCP CLI Bridge and Usage Analytics** (`mcp-cli-bridge-and-usage-analytics`)
-  - expose installed MCP servers as Signet CLI commands and track usage in dashboard
-  - reference inspiration: MC Porter
 - **Overview Usage Analytics** (`overview-usage-analytics`)
-  - make the home overview card reflect real MCP server and skill usage
+  - make the home overview card reflect real skill usage
   - reuse analytics ledgers instead of catalog popularity
 - **Git Marketplace Monorepo** (`git-marketplace-monorepo`)
   - GitHub-authenticated PR workflow for skills/servers and JSON review artifacts
@@ -778,7 +773,7 @@ Legend:
 | `daemon-startup-responsiveness` | planning | `docs/specs/planning/daemon-startup-responsiveness.md` | `memory-pipeline-v2` | - | Incident-driven stub for issue #331: keep /health responsive during large-db startup recovery and recover stale managed daemon processes cleanly |
 | `runtime-upgrade-regression-hardening` | planning | `docs/specs/planning/runtime-upgrade-regression-hardening.md` | `signet-runtime` | - | Incident-driven stub for the March 29, 2026 `0.83.0` → `0.85.3` runtime regressions: hook transport wiring and dashboard publish contract hardening |
 | `explicit-recall-surface-alignment` | approved | `docs/specs/approved/explicit-recall-surface-alignment.md` | `memory-pipeline-v2`, `signet-runtime` | - | Consolidate TypeScript explicit recall around `hybridRecall()` and `/api/memory/recall`, keep prompt-submit lightweight with a conservative low-signal gate, and stop CLI/MCP/connector consumers from flattening away useful metadata |
-| `memory-content-safety` | approved | `docs/specs/approved/memory-content-safety.md` | `memory-pipeline-v2`, `explicit-recall-surface-alignment`, `native-harness-memory-bridge`, `dreaming-memory-consolidation` | - | Scan untrusted remembered content and source projections before prompt-facing recall, reranking, native fallback, Dreaming, and MEMORY.md use while preserving immutable evidence and provenance. |
+| `memory-content-safety` | approved | `docs/specs/approved/memory-content-safety.md` | `memory-pipeline-v2`, `explicit-recall-surface-alignment`, `native-harness-memory-bridge`, `dreaming-memory-consolidation` | - | Redact detected credentials in every prompt-facing projection of stored evidence (recall, Dreaming, MEMORY.md, MCP, derived LLM stages) without withholding or rewriting the evidence. |
 | `semantic-prospective-hints` | planning | `docs/specs/planning/semantic-prospective-hints.md` | `memory-pipeline-v2`, `desire-paths-epic` | - | Extend DP-6.1 prospective indexing with hint embeddings, semantic hint retrieval, incremental backfill, and degraded-mode-safe fusion into hybrid recall |
 | `transcript-surface-separation` | planning | `docs/specs/planning/transcript-surface-separation.md` | `session-continuity-protocol`, `lossless-working-memory-runtime`, `lossless-working-memory-closure`, `explicit-recall-surface-alignment` | - | Keep raw transcripts canonical but move prompt-submit and transcript fallback onto a derived retrieval surface with stronger separation between archive truth and hot recall material |
 | `openclaw-legacy-plugin-migration` | planning | `docs/specs/planning/openclaw-legacy-plugin-migration.md` | `openclaw-hardening`, `signet-runtime` | - | Incident-driven stub for issue #434: auto-migrate legacy-only OpenClaw installs to the plugin runtime path and surface the degraded state in doctor |
@@ -814,9 +809,8 @@ Legend:
 | `signet-native-harness` | planning | `docs/specs/planning/signet-native-harness.md` | `distributed-harness-orchestration`, `signet-runtime` | - | Stub: first-party harness track (Hermes-agent informed) |
 | `remember-recall-skill-parity` | planning | `docs/specs/planning/remember-recall-skill-parity.md` | `procedural-memory-plan` | - | Stub: /remember and /recall architecture/schema parity |
 | `deep-memory-search` | planning | `docs/specs/planning/deep-memory-search.md` | `desire-paths-epic`, `ssm-foundation-evaluation` | - | Stub: optional supermemory-style deep memory escalation |
-| `mcp-cli-bridge-and-usage-analytics` | approved | `docs/specs/approved/mcp-cli-bridge-and-usage-analytics.md` | `signet-runtime` | - | Phase 1: CLI bridge, invocation tracking, analytics API, dashboard panel |
-| `overview-usage-analytics` | approved | `docs/specs/approved/overview-usage-analytics.md` | `mcp-cli-bridge-and-usage-analytics`, `procedural-memory-plan` | - | Home overview card ranks most-used MCP servers and skills from real analytics instead of catalog popularity |
-| `git-marketplace-monorepo` | planning | `docs/specs/planning/git-marketplace-monorepo.md` | `predictor-agent-feedback` | - | Stub: GitHub-authenticated PR marketplace for skills and MCP servers |
+| `overview-usage-analytics` | approved | `docs/specs/approved/overview-usage-analytics.md` | `procedural-memory-plan` | - | Home overview card ranks most-used skills from real analytics instead of catalog popularity |
+| `git-marketplace-monorepo` | planning | `docs/specs/planning/git-marketplace-monorepo.md` | `predictor-agent-feedback` | - | Stub: GitHub-authenticated PR marketplace for skills and JSON review artifacts |
 | `adaptive-skill-lifecycle` | planning | `docs/specs/planning/adaptive-skill-lifecycle.md` | `procedural-memory-plan`, `predictor-agent-feedback` | - | Stub: passive continuous skill creation/maintenance loop |
 | `marketplace-official-skills` | planning | `docs/specs/planning/marketplace-official-skills.md` | `procedural-memory-plan` | - | Stub: feature Signet official skills prominently in the dashboard marketplace |
 | `cryptographic-identity-roadmap` | planning | `docs/specs/planning/cryptographic-identity-roadmap.md` | `multi-agent-support` | - | Stub: signed identity and artifact trust roadmap |

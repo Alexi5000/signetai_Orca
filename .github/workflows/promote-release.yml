@@ -33,6 +33,7 @@ jobs:
             "@signetai/connector-gemini"
             "@signetai/connector-hermes-agent"
             "@signetai/connector-kimi"
+            "@signetai/connector-muse-code"
             "@signetai/connector-oh-my-pi"
             "@signetai/connector-openclaw"
             "@signetai/connector-opencode"
@@ -43,9 +44,6 @@ jobs:
           optional_packages=(
             "@signetai/signet-memory-openclaw"
           )
-
-          # Preflight every required package and the GitHub release before
-          # changing any public dist-tag or release state.
           for package in "${required_packages[@]}"; do
             npm view "${package}@${VERSION}" version >/dev/null
           done

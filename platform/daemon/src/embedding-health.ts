@@ -1,17 +1,6 @@
-/**
- * Embedding health check — aggregates scattered embedding signals
- * into a single actionable report.
- *
- * Read-only module following the diagnostics.ts pattern.
- * All functions accept a ReadDb and return plain data structs.
- */
-
+import { activeVectorProjectionTable } from "@signet/core";
 import { type ReadDb, type VectorRuntimeStatus, getVectorRuntimeStatus } from "./db-accessor";
 import type { EmbeddingConfig } from "./memory-config";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 interface EmbeddingStatus {
 	readonly provider: "native" | "ollama" | "openai" | "llama-cpp" | "none";
@@ -43,10 +32,6 @@ export interface EmbeddingHealthReport {
 	readonly checks: readonly EmbeddingCheckResult[];
 }
 
-// ---------------------------------------------------------------------------
-// Score helpers (duplicated from diagnostics.ts — those are private)
-// ---------------------------------------------------------------------------
-
 function scoreStatus(score: number): "healthy" | "degraded" | "unhealthy" {
 	if (score >= 0.8) return "healthy";
 	if (score >= 0.5) return "degraded";
@@ -56,10 +41,6 @@ function scoreStatus(score: number): "healthy" | "degraded" | "unhealthy" {
 function clamp(n: number): number {
 	return Math.max(0, Math.min(1, n));
 }
-
-// ---------------------------------------------------------------------------
-// Individual checks
-// ---------------------------------------------------------------------------
 
 function checkProviderAvailable(providerStatus: EmbeddingStatus): EmbeddingCheckResult {
 	if (providerStatus.available) {
@@ -226,7 +207,9 @@ function checkNullVectors(db: ReadDb, runtime: VectorRuntimeStatus): EmbeddingCh
 	let count = 0;
 	try {
 		const row = db
-			.prepare("SELECT COUNT(*) AS n FROM embeddings e LEFT JOIN vec_embeddings v ON v.id = e.id WHERE v.id IS NULL")
+			.prepare(
+				`SELECT COUNT(*) AS n FROM embeddings e LEFT JOIN ${activeVectorProjectionTable(db)} v ON v.id = e.id WHERE v.id IS NULL`,
+			)
 			.get() as { n: number } | undefined;
 		count = row?.n ?? 0;
 	} catch (err) {
@@ -287,7 +270,9 @@ function checkVecTableSync(db: ReadDb, runtime: VectorRuntimeStatus): EmbeddingC
 
 	let vecCount = 0;
 	try {
-		const vecRow = db.prepare("SELECT COUNT(*) AS n FROM vec_embeddings").get() as { n: number } | undefined;
+		const vecRow = db.prepare(`SELECT COUNT(*) AS n FROM ${activeVectorProjectionTable(db)}`).get() as
+			| { n: number }
+			| undefined;
 		vecCount = vecRow?.n ?? 0;
 	} catch (err) {
 		if (!missing(err, "vec_embeddings")) {
@@ -352,10 +337,6 @@ function checkOrphanedEmbeddings(db: ReadDb): EmbeddingCheckResult {
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Scoring weights
-// ---------------------------------------------------------------------------
-
 const WEIGHTS: Record<string, number> = {
 	"provider-available": 0.3,
 	coverage: 0.25,
@@ -371,10 +352,6 @@ function checkScore(check: EmbeddingCheckResult): number {
 	if (check.status === "warn") return 0.5;
 	return 0;
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 export function buildEmbeddingHealth(
 	db: ReadDb,

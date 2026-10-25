@@ -18,6 +18,7 @@ export default defineConfig({
 			customCss: ["./src/styles/custom.css"],
 			components: {
 				Head: "./src/components/Head.astro",
+				Search: "./src/components/Search.astro",
 			},
 			lastUpdated: true,
 			editLink: {
@@ -40,7 +41,7 @@ export default defineConfig({
 					tag: "link",
 					attrs: {
 						rel: "stylesheet",
-						href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap",
+						href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap",
 					},
 				},
 			],
@@ -58,6 +59,7 @@ export default defineConfig({
 						{ label: "Your first session", slug: "getting-started/first-session" },
 						{ label: "Operate your installation", slug: "getting-started/operate" },
 						{ label: "Upgrade", slug: "upgrading" },
+						{ label: "Workspace v2", slug: "workspace-v2" },
 					],
 				},
 				{
@@ -113,6 +115,7 @@ export default defineConfig({
 								{ label: "Files and integrations", slug: "configuration/files-integrations" },
 							],
 						},
+						{ label: "Teams", slug: "teams" },
 						{ label: "Authentication", slug: "auth" },
 						{ label: "Self-hosting", slug: "self-hosting" },
 						{ label: "Remote connectors", slug: "remote-connectors" },
@@ -188,6 +191,7 @@ export default defineConfig({
 								{ label: "Overview", slug: "harnesses" },
 								{ label: "Claude Code", slug: "harnesses/claude-code" },
 								{ label: "Kimi Code", slug: "harnesses/kimi" },
+								{ label: "Muse Code", slug: "harnesses/muse-code" },
 								{ label: "Codex", slug: "harnesses/codex" },
 								{ label: "OpenCode", slug: "harnesses/opencode" },
 								{ label: "Oh My Pi", slug: "harnesses/oh-my-pi" },
@@ -213,10 +217,12 @@ export default defineConfig({
 								{ label: "Platform services", slug: "architecture/platform-services" },
 								{ label: "Data lifecycle", slug: "architecture/data-lifecycle" },
 								{ label: "Interfaces and agents", slug: "architecture/interfaces-agents" },
+								{ label: "DB owner protocol", slug: "architecture/db-owner-protocol" },
 							],
 						},
 						{ label: "Contributing", slug: "contributing" },
 						{ label: "Your first PR", slug: "first-pr" },
+						{ label: "Desktop builds", slug: "desktop-builds" },
 						{ label: "Benchmarks", slug: "benchmarking" },
 						{ label: "Roadmap", slug: "roadmap" },
 					],

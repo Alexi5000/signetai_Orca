@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,7 +33,12 @@ afterEach(() => {
 	}
 });
 
-process.env.SIGNET_TELEMETRY_OPTOUT = "1"; // keep CI/test daemons out of the PostHog project
+const previousTelemetryOptout = process.env.SIGNET_TELEMETRY_OPTOUT;
+process.env.SIGNET_TELEMETRY_OPTOUT = "1";
+afterAll(() => {
+	if (previousTelemetryOptout === undefined) delete process.env.SIGNET_TELEMETRY_OPTOUT;
+	else process.env.SIGNET_TELEMETRY_OPTOUT = previousTelemetryOptout;
+});
 
 describe("native Hermes release smoke", () => {
 	const binary = process.env.SIGNET_NATIVE_SMOKE_BINARY?.trim();
@@ -132,9 +137,6 @@ describe("native Hermes release smoke", () => {
 			const toolNames = JSON.parse(providerProbe.stdout) as string[];
 			expect(toolNames).toContain("signet_session_search");
 			expect(toolNames).not.toContain("session_search");
-
-			// The package under test intentionally needs no Signet source checkout or
-			// sibling runtime directory: its only required release payload is the binary.
 			expect(basename(binary)).toMatch(/^signet(?:-|$)/);
 		},
 		120_000,

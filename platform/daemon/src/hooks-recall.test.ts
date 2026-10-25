@@ -9,6 +9,13 @@ import {
 	createPromptSubmitAdmission,
 	preferHookRecallCause,
 } from "./routes/hooks-routes";
+import { claimRecallItemsAsync } from "./session-recall-dedupe";
+import {
+	clearSessionStartDedupe,
+	hasSessionStartDedupe,
+	markSessionStartDedupe,
+	sessionStartRecallKey,
+} from "./session-start-state";
 import { resetSessionEndTelemetry } from "./session-end-state";
 import { createTelemetryCollector, setActiveTelemetry } from "./telemetry";
 
@@ -95,9 +102,7 @@ memory:
 		closeDbAccessor?.();
 		try {
 			rmSync(dir, { recursive: true, force: true });
-		} catch {
-			// cleanup best-effort
-		}
+		} catch {}
 	});
 
 	it("returns 200 on valid recall request", async () => {
@@ -112,9 +117,6 @@ memory:
 				sessionKey: "valid-recall-fast",
 			}),
 		});
-
-		// The route should resolve without crashing (no cfg ReferenceError),
-		// even if the DB isn't fully initialized — the key contract is no 500.
 		expect(resp.status).toBe(200);
 		const body = await resp.json();
 		expect(body.error).not.toBe("Hook execution failed");
@@ -122,6 +124,51 @@ memory:
 		expect(body.memories).toEqual(body.results);
 		expect(body.count).toBe(body.results.length);
 		expect(body.message).toBe("No matching memories found.");
+	});
+
+	it("advances the session-start recall epoch after compaction", async () => {
+		const sessionKey = `compaction-recall-${crypto.randomUUID()}`;
+		const harness = "openclaw";
+		const cwd = "/tmp/project";
+		const recallSessionKey = sessionStartRecallKey({ harness, cwd, sessionKey });
+		if (recallSessionKey === null) throw new Error("expected a durable recall key");
+		markSessionStartDedupe({ harness, cwd, sessionKey, agentId: "default" });
+		expect(hasSessionStartDedupe({ harness, cwd, sessionKey, agentId: "default" })).toBeTrue();
+
+		try {
+			const first = await claimRecallItemsAsync({
+				sessionKey: recallSessionKey,
+				agentId: "default",
+				surface: "test",
+				mode: "automatic",
+				items: [{ id: "compaction-recall-memory" }],
+			});
+			expect(first.items).toHaveLength(1);
+
+			const response = await app.request("/api/hooks/compaction-complete", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"x-signet-runtime-path": "plugin",
+				},
+				body: JSON.stringify({ harness, cwd, sessionKey, summary: "compaction summary" }),
+			});
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({ success: true, contextEpoch: 1, dedupeDegraded: false });
+			expect(hasSessionStartDedupe({ harness, cwd, sessionKey, agentId: "default" })).toBeFalse();
+
+			const second = await claimRecallItemsAsync({
+				sessionKey: recallSessionKey,
+				agentId: "default",
+				surface: "test",
+				mode: "automatic",
+				items: [{ id: "compaction-recall-memory" }],
+			});
+			expect(second.items).toHaveLength(1);
+		} finally {
+			clearSessionStartDedupe({ harness, cwd, sessionKey, agentId: "default" });
+			releaseSession?.(sessionKey);
+		}
 	});
 
 	it("labels partial FTS recall separately from provider outages", async () => {
@@ -608,6 +655,38 @@ memory:
 			const row = await waitForSkillInvocation(toolUseId);
 			expect(row?.agent_id).toBe("scan-agent");
 		} finally {
+			releaseSession?.(sessionKey);
+		}
+	});
+
+	it("requires remember permission before recording a session-end assistant reply", async () => {
+		const { authConfig } = await import("./routes/state");
+		const { registerHooksRoutes } = await import("./routes/hooks-routes");
+		const { Hono } = await import("hono");
+		const routes = new Hono();
+		registerHooksRoutes(routes);
+		const sessionKey = `muse-unauthorized-${crypto.randomUUID()}`;
+		const previousMode = authConfig.mode;
+		authConfig.mode = "team";
+		try {
+			const resp = await routes.request("/api/hooks/session-end", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					harness: "muse-code",
+					sessionKey,
+					agentId: "someone-else",
+					lastAssistantMessage: "forged assistant turn",
+				}),
+			});
+
+			expect(resp.status).toBe(403);
+			const row = getDbAccessor?.().withReadDb((db) =>
+				db.prepare("SELECT COUNT(*) AS count FROM session_transcripts WHERE session_key = ?").get(sessionKey),
+			);
+			expect(row).toEqual({ count: 0 });
+		} finally {
+			authConfig.mode = previousMode;
 			releaseSession?.(sessionKey);
 		}
 	});

@@ -5,7 +5,11 @@ import { join } from "node:path";
 import type { SignetSourceEntry } from "@signet/core";
 import { closeDbAccessor, getDbAccessor, initDbAccessor } from "./db-accessor";
 import { createDbOwnerClient } from "./db-owner-client";
-import { createDbOwnerMaintenance, registerDbOwnerMaintenance } from "./db-owner-maintenance";
+import {
+	closeRegisteredDbOwnerMaintenance,
+	createDbOwnerMaintenance,
+	registerDbOwnerMaintenance,
+} from "./db-owner-maintenance";
 import { setActiveTelemetry, type TelemetryCollector } from "./telemetry";
 import {
 	flushPendingSourceLifecycleTelemetry,
@@ -26,10 +30,10 @@ describe("source lifecycle telemetry contract", () => {
 
 	afterEach(async () => {
 		setActiveTelemetry(undefined);
-		registerDbOwnerMaintenance(null);
+		await closeRegisteredDbOwnerMaintenance();
 		await owner?.close();
 		owner = null;
-		closeDbAccessor();
+		await closeDbAccessor();
 		if (directory !== null) rmSync(directory, { recursive: true, force: true });
 		directory = null;
 	});
@@ -37,6 +41,7 @@ describe("source lifecycle telemetry contract", () => {
 	it("maps providers into a fixed taxonomy instead of forwarding provider input", () => {
 		expect(sourceClassForKind("obsidian")).toBe("note_vault");
 		expect(sourceClassForKind("github")).toBe("repository");
+		expect(sourceClassForKind("notion")).toBe("note_vault");
 		expect(sourceClassForKind("user-defined-provider-with-a-path-/Users/alice/vault")).toBe("other");
 	});
 

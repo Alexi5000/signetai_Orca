@@ -1,10 +1,22 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { dirname, join } from "node:path";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import {
+	existsSync,
+	readFileSync,
+	readdirSync,
+	writeFileSync,
+	mkdtempSync,
+	symlinkSync,
+	unlinkSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import {
 	getNativeTransformersBindings,
 	materializeEmbeddedAssetTree,
 	materializeEmbeddedNativeAddon,
+	materializeEmbeddedNativeLibrary,
 	materializeEmbeddedWasmAssets,
 	registerNativeAssets,
 	registerNativeTransformersBindings,
@@ -56,6 +68,29 @@ describe("native-runtime-assets", () => {
 		expect(wasmDir ? existsSync(`${wasmDir}/example.wasm`) : false).toBe(true);
 	});
 
+	test("materializes an embedded native library under its own file name and replaces stale versions", () => {
+		expect(materializeEmbeddedNativeLibrary("test-vec-library", "vec0.so")).toBeNull();
+
+		registerNativeAssets({
+			nativeAddons: [{ name: "test-vec-library", contentBase64: Buffer.from("vec-v1").toString("base64") }],
+		});
+		const first = materializeEmbeddedNativeLibrary("test-vec-library", "vec0.so");
+		expect(first?.endsWith("/vec0.so")).toBe(true);
+		expect(first ? readFileSync(first, "utf8") : "").toBe("vec-v1");
+		const before = first ? statSync(first) : null;
+		expect(materializeEmbeddedNativeLibrary("test-vec-library", "vec0.so")).toBe(first);
+		expect(first ? statSync(first).ino : null).toBe(before?.ino ?? null);
+		expect(first ? statSync(first).mtimeMs : null).toBe(before?.mtimeMs ?? null);
+
+		registerNativeAssets({
+			nativeAddons: [{ name: "test-vec-library", contentBase64: Buffer.from("vec-v2").toString("base64") }],
+		});
+		const second = materializeEmbeddedNativeLibrary("test-vec-library", "vec0.so");
+		expect(second).not.toBe(first);
+		expect(second ? readFileSync(second, "utf8") : "").toBe("vec-v2");
+		expect(first ? existsSync(first) : true).toBe(false);
+	});
+
 	test("materializes an embedded native addon to a real .node file, returning null when absent", async () => {
 		expect(materializeEmbeddedNativeAddon("napi-rs-keyring")).toBeNull();
 
@@ -67,17 +102,12 @@ describe("native-runtime-assets", () => {
 		expect(addonPath).toBeTruthy();
 		expect(addonPath?.endsWith(".node")).toBe(true);
 		expect(addonPath ? readFileSync(addonPath, "utf8") : "").toBe("fake-native-binding");
-
-		// Create every promise before awaiting so concurrent consumers enter the
-		// materializer in the same turn and converge on one published artifact.
 		const concurrentPaths = await Promise.all(
 			Array.from({ length: 16 }, () => Promise.resolve().then(() => materializeEmbeddedNativeAddon("napi-rs-keyring"))),
 		);
 		expect(new Set(concurrentPaths).size).toBe(1);
 		expect(concurrentPaths.every((path) => path && existsSync(path))).toBe(true);
 		expect(concurrentPaths[0] ? readFileSync(concurrentPaths[0], "utf8") : "").toBe("fake-native-binding");
-
-		// Inspect the directory the runtime actually materialized into.
 		const addonDir = dirname(concurrentPaths[0] ?? "");
 		const addonEntries = readdirSync(addonDir).filter((entry) => entry.startsWith("napi-rs-keyring-"));
 		expect(addonEntries).toHaveLength(1);
@@ -102,7 +132,6 @@ describe("native-runtime-assets", () => {
 		const dir = dirname(pathA ?? "");
 		const corrupt = join(dir, "fenced-addon-deadbeefdeadbeef.node");
 		const stray = join(dir, "fenced-addon-stray.tmp");
-		// Planted fixtures are owner-only, like the runtime's own files.
 		writeFileSync(corrupt, "torn", { mode: 0o600 });
 		writeFileSync(stray, "temp", { mode: 0o600 });
 		materializeEmbeddedNativeAddon("fenced-addon");
@@ -185,4 +214,29 @@ describe("native-runtime-assets", () => {
 		registerNativeTransformersBindings(bindings);
 		expect(getNativeTransformersBindings()).toBe(bindings);
 	});
+});
+
+test("native libraries reject escaped filenames and reject symlink destinations and publish privately", () => {
+	const dir = mkdtempSync(join(tmpdir(), "signet-library-test-"));
+	const target = join(dir, "outside");
+	const name = basename(dir);
+	writeFileSync(target, "unchanged");
+	registerNativeAssets({
+		nativeAddons: [{ name: name, contentBase64: Buffer.from("native").toString("base64") }],
+	});
+	try {
+		expect(() => materializeEmbeddedNativeLibrary(name, "../outside")).toThrow("Invalid native library filename");
+		const destination = materializeEmbeddedNativeLibrary(name, "library.so");
+		if (!destination) throw new Error("Missing library fixture");
+		unlinkSync(destination);
+		symlinkSync(target, destination);
+		expect(() => materializeEmbeddedNativeLibrary(name, "library.so")).toThrow();
+		unlinkSync(destination);
+		materializeEmbeddedNativeLibrary(name, "library.so");
+		expect(readFileSync(target, "utf8")).toBe("unchanged");
+		expect(readFileSync(destination, "utf8")).toBe("native");
+		if (process.platform !== "win32") expect(statSync(destination).mode & 0o777).toBe(0o600);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
