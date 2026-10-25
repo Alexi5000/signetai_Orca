@@ -432,9 +432,10 @@ async function applyRehearsalBoost(
 			const row = accessMap.get(s.id);
 			if (!row) continue;
 			if (rehearsalEnabled && row.access_count > 0) {
-				const daysSinceAccess = row.last_accessed
-					? (freshness.nowMs - new Date(row.last_accessed).getTime()) / 86_400_000
-					: search.rehearsal_half_life_days;
+				const accessedMs = row.last_accessed ? Date.parse(row.last_accessed) : Number.NaN;
+				const daysSinceAccess = Number.isNaN(accessedMs)
+					? search.rehearsal_half_life_days
+					: (freshness.nowMs - accessedMs) / 86_400_000;
 				const recencyFactor = 0.5 ** (daysSinceAccess / search.rehearsal_half_life_days);
 				const boost = search.rehearsal_weight * Math.log(row.access_count + 1) * recencyFactor;
 				s.score *= 1 + Math.min(boost, REHEARSAL_MAX_BOOST);
