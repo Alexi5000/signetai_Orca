@@ -1042,7 +1042,11 @@ describe("loadPipelineConfig", () => {
 			expect(
 				loadPipelineConfig({ memory: { pipelineV2: { enabled: true, worker: { maxLlmConcurrency: 99 } } } }).worker
 					.maxLlmConcurrency,
-			).toBe(16);
+			).toBe(99);
+			expect(
+				loadPipelineConfig({ memory: { pipelineV2: { enabled: true, worker: { maxLlmConcurrency: 999 } } } }).worker
+					.maxLlmConcurrency,
+			).toBe(256);
 			process.env.SIGNET_MAX_LLM_CONCURRENCY = "7";
 			expect(
 				loadPipelineConfig({ memory: { pipelineV2: { enabled: true, worker: { maxLlmConcurrency: 3 } } } }).worker

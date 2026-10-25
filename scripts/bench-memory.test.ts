@@ -131,7 +131,9 @@ describe("MemoryBench launcher", () => {
 		expect(config.memory.pipelineV2.worker.maxLlmConcurrency).toBe(8);
 		expect(config.inference.targets.background.executor).toBe("openai-compatible");
 		expect(benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "2" })).toBe(2);
-		expect(() => benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "0" })).toThrow("from 1 to 16");
+		expect(benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "128" })).toBe(128);
+		expect(() => benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "0" })).toThrow("from 1 to 256");
+		expect(() => benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "257" })).toThrow("from 1 to 256");
 	});
 
 	test("turns Dreaming codemode on only when the bench asks for it", async () => {

@@ -268,8 +268,8 @@ export function benchDreamingConcurrency(env: NodeJS.ProcessEnv = process.env): 
 	const raw = env.SIGNET_BENCH_DREAMING_CONCURRENCY;
 	if (raw === undefined || raw.trim() === "") return 6;
 	const parsed = Number(raw);
-	if (!Number.isInteger(parsed) || parsed < 1 || parsed > 16) {
-		throw new Error("SIGNET_BENCH_DREAMING_CONCURRENCY must be an integer from 1 to 16");
+	if (!Number.isInteger(parsed) || parsed < 1 || parsed > 256) {
+		throw new Error("SIGNET_BENCH_DREAMING_CONCURRENCY must be an integer from 1 to 256");
 	}
 	return parsed;
 }
@@ -281,7 +281,7 @@ export function setBenchDreamingConcurrency(agentsDir: string, passes: number): 
 	const dreaming = (memory.dreaming ?? {}) as Record<string, unknown>;
 	const pipeline = (memory.pipelineV2 ?? {}) as Record<string, unknown>;
 	const worker = (pipeline.worker ?? {}) as Record<string, unknown>;
-	const llmConcurrency = Math.min(16, passes + 2);
+	const llmConcurrency = Math.min(256, passes + 2);
 	if (dreaming.maxConcurrentPasses === passes && worker.maxLlmConcurrency === llmConcurrency) return;
 	config.memory = {
 		...memory,

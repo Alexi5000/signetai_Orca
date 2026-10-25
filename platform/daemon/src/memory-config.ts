@@ -21,6 +21,7 @@ import {
 } from "@signet/core";
 import { type AuthConfig, parseAuthConfig } from "./auth";
 import type { EmbeddingCostRates } from "./embedding-cost";
+import { MAX_LLM_CONCURRENCY } from "./llm-concurrency-limits";
 import { logger } from "./logger";
 
 export interface EmbeddingConfig {
@@ -467,9 +468,9 @@ function resolveMaxLlmConcurrency(rawValue: unknown, defaultValue: number): numb
 		logger.warn("pipeline", "SIGNET_MAX_LLM_CONCURRENCY is not a valid positive integer, using config/default", {
 			value: env,
 		});
-		return clampPositive(rawValue, 1, 16, defaultValue);
+		return clampPositive(rawValue, 1, MAX_LLM_CONCURRENCY, defaultValue);
 	}
-	return clampPositive(candidate, 1, 16, defaultValue);
+	return clampPositive(candidate, 1, MAX_LLM_CONCURRENCY, defaultValue);
 }
 function envBool(name: string): boolean | undefined {
 	const value = process.env[name];
@@ -988,7 +989,7 @@ export function loadDreamingConfig(yaml: Record<string, unknown>): DreamingConfi
 				? clampWarn("maxOutputTokens", raw.maxOutputTokens, 1_000, 1_000_000, 1_000)
 				: dd.maxOutputTokens,
 		maxConcurrentPasses: Math.floor(
-			clampWarn("maxConcurrentPasses", raw.maxConcurrentPasses, 1, 16, dd.maxConcurrentPasses),
+			clampWarn("maxConcurrentPasses", raw.maxConcurrentPasses, 1, MAX_LLM_CONCURRENCY, dd.maxConcurrentPasses),
 		),
 		codemode: typeof raw.codemode === "boolean" ? raw.codemode : dd.codemode,
 		backfillOnFirstRun: typeof raw.backfillOnFirstRun === "boolean" ? raw.backfillOnFirstRun : dd.backfillOnFirstRun,
