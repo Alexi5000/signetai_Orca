@@ -371,6 +371,31 @@ export function setBenchDreamingThinking(agentsDir: string, thinking: Record<str
 	writeFileSync(path, stringifyYaml(config));
 }
 
+export function benchDreamingContextWindow(env: NodeJS.ProcessEnv = process.env): number | undefined {
+	const raw = env.SIGNET_BENCH_DREAMING_CONTEXT_WINDOW?.trim();
+	if (raw === undefined || raw === "") return undefined;
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 8_192 || parsed > 2_000_000) {
+		throw new Error("SIGNET_BENCH_DREAMING_CONTEXT_WINDOW must be an integer from 8192 to 2000000");
+	}
+	return parsed;
+}
+
+export function setBenchDreamingContextWindow(agentsDir: string, contextWindow: number | undefined): void {
+	if (contextWindow === undefined) return;
+	const path = join(agentsDir, "agent.yaml");
+	const config = parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const inference = config.inference as Record<string, unknown> | undefined;
+	const targets = inference?.targets as Record<string, Record<string, unknown>> | undefined;
+	const target = inference?.defaultPolicy === "background" ? targets?.background : undefined;
+	const models = target?.models as Record<string, Record<string, unknown>> | undefined;
+	if (!models || Object.keys(models).length === 0) {
+		throw new Error("Signet setup did not write the expected background inference target");
+	}
+	for (const model of Object.values(models)) model.contextWindow = contextWindow;
+	writeFileSync(path, stringifyYaml(config));
+}
+
 export function pinnedBunMismatch(
 	packageManager: unknown,
 	version: string = Bun.version,
@@ -557,6 +582,7 @@ async function main(): Promise<void> {
 		setBenchDreamingCodemode(agentsDir, benchDreamingCodemode());
 		setBenchDreamingMaxOutputTokens(agentsDir, benchDreamingMaxOutputTokens());
 		setBenchDreamingThinking(agentsDir, benchDreamingThinking());
+		setBenchDreamingContextWindow(agentsDir, benchDreamingContextWindow());
 		mkdirSync(join(agentsDir, ".daemon", "logs"), { recursive: true });
 		daemon = spawn(process.execPath, ["platform/daemon/src/daemon.ts"], {
 			cwd: repoRoot,

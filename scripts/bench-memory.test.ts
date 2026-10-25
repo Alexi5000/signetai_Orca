@@ -9,6 +9,7 @@ import {
 	benchUsesSubscription,
 	benchDreamingCodemode,
 	benchDreamingConcurrency,
+	benchDreamingContextWindow,
 	benchDreamingMaxOutputTokens,
 	benchDreamingThinking,
 	buildSetupArgs,
@@ -18,6 +19,7 @@ import {
 	resolveBenchModel,
 	setBenchDreamingCodemode,
 	setBenchDreamingConcurrency,
+	setBenchDreamingContextWindow,
 	setBenchDreamingMaxOutputTokens,
 	setBenchDreamingThinking,
 } from "./bench-memory";
@@ -163,6 +165,22 @@ describe("MemoryBench launcher", () => {
 		expect(config.inference.targets.background.executor).toBe("openai-compatible");
 		expect(() => benchDreamingMaxOutputTokens({ SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS: "10" })).toThrow(
 			"from 1000 to 1000000",
+		);
+	});
+
+	test("sets the Dreaming model context window only when asked", async () => {
+		const dir = await workspace();
+		await writeFile(join(dir, "agent.yaml"), setupAgentYaml);
+		setBenchDreamingContextWindow(dir, benchDreamingContextWindow({}));
+		expect(
+			parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).inference.targets.background.models.default,
+		).toEqual({ model: "glm-5.3-flash" });
+		setBenchDreamingContextWindow(dir, benchDreamingContextWindow({ SIGNET_BENCH_DREAMING_CONTEXT_WINDOW: "262144" }));
+		expect(
+			parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).inference.targets.background.models.default,
+		).toEqual({ model: "glm-5.3-flash", contextWindow: 262144 });
+		expect(() => benchDreamingContextWindow({ SIGNET_BENCH_DREAMING_CONTEXT_WINDOW: "1000" })).toThrow(
+			"from 8192 to 2000000",
 		);
 	});
 
