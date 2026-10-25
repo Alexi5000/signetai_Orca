@@ -22,8 +22,13 @@ describe("Signet benchmark profiles", () => {
       if (path === "/api/hooks/transcript-capture/capture-1?agentId=memorybench-question-1-run") {
         return { status: "completed" } as T
       }
-      if (path.replace("&measure=1", "") === "/api/dream/status?agentId=memorybench-question-1-run") {
-        return { worker: { running: true }, episodicTokensPending: this.statusCalls >= 3 ? 0 : 1 } as T
+      if (
+        path.replace("&measure=1", "") === "/api/dream/status?agentId=memorybench-question-1-run"
+      ) {
+        return {
+          worker: { running: true },
+          episodicTokensPending: this.statusCalls >= 3 ? 0 : 1,
+        } as T
       }
       if (path === "/api/dream/trigger") {
         this.triggerCalls += 1
@@ -55,8 +60,9 @@ describe("Signet benchmark profiles", () => {
           episodicTokensPending: 0,
         } as T
       }
-      if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
-        throw new Error(`Unexpected path ${path}`)
+      if (path === "/api/embeddings/health")
+        return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+      throw new Error(`Unexpected path ${path}`)
     }
   }
 
@@ -132,7 +138,8 @@ describe("Signet benchmark profiles", () => {
           } as T
         }
         if (path === "/api/dream/trigger") return { passId: "pass-1" } as T
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
@@ -188,7 +195,7 @@ describe("Signet benchmark profiles", () => {
       protected override async request<T>(path: string, init: RequestInit): Promise<T> {
         this.calls.push({ path, init })
         if (path.startsWith("/api/agents")) return {} as T
-      if (path === "/api/hooks/session-end") {
+        if (path === "/api/hooks/session-end") {
           const body = JSON.parse(String(init.body)) as { agentId: string }
           return { transcriptCaptureJobId: `capture-${body.agentId}` } as T
         }
@@ -196,7 +203,8 @@ describe("Signet benchmark profiles", () => {
           return { status: "completed" } as T
         }
         if (path === "/api/memory/recall") return { results: [] } as T
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
@@ -218,7 +226,10 @@ describe("Signet benchmark profiles", () => {
       { containerTag: "scope-contract" }
     )
     await provider.awaitIndexing(result, "scope-contract")
-    await provider.search("What color is Harbor?", { containerTag: "scope-contract", agentId: "dreaming-gate-alpha" })
+    await provider.search("What color is Harbor?", {
+      containerTag: "scope-contract",
+      agentId: "dreaming-gate-alpha",
+    })
 
     expect(result.taskAgentIds).toEqual({
       "capture-dreaming-gate-alpha": "dreaming-gate-alpha",
@@ -273,7 +284,7 @@ describe("Signet benchmark profiles", () => {
       protected override async request<T>(path: string, init: RequestInit): Promise<T> {
         this.calls.push({ path, init })
         if (path.startsWith("/api/agents")) return {} as T
-      if (path === "/api/hooks/session-end") {
+        if (path === "/api/hooks/session-end") {
           const body = JSON.parse(String(init.body)) as { agentId: string }
           return { transcriptCaptureJobId: `capture-${body.agentId}` } as T
         }
@@ -291,7 +302,8 @@ describe("Signet benchmark profiles", () => {
             episodicTokensPending: 0,
           } as T
         }
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
@@ -323,9 +335,16 @@ describe("Signet benchmark profiles", () => {
 
     const triggers = provider.calls.filter((call) => call.path === "/api/dream/trigger")
     expect(triggers).toHaveLength(1)
-    expect(JSON.parse(String(triggers[0]?.init.body))).toMatchObject({ mode: "incremental", agentId: "memorybench" })
-    expect(provider.calls.map((call) => call.path)).toContain("/api/dream/status?agentId=dreaming-gate-alpha")
-    expect(provider.calls.map((call) => call.path)).toContain("/api/dream/status?agentId=dreaming-gate-beta")
+    expect(JSON.parse(String(triggers[0]?.init.body))).toMatchObject({
+      mode: "incremental",
+      agentId: "memorybench",
+    })
+    expect(provider.calls.map((call) => call.path)).toContain(
+      "/api/dream/status?agentId=dreaming-gate-alpha"
+    )
+    expect(provider.calls.map((call) => call.path)).toContain(
+      "/api/dream/status?agentId=dreaming-gate-beta"
+    )
   })
 
   it("joins a concurrent periodic Dreaming pass while draining the benchmark cursor", async () => {
@@ -338,7 +357,8 @@ describe("Signet benchmark profiles", () => {
         }
         if (path.replace("&measure=1", "") === "/api/dream/status?agentId=memorybench") {
           this.statusCalls += 1
-          if (this.statusCalls === 1) return { worker: { running: true }, episodicTokensPending: 2 } as T
+          if (this.statusCalls === 1)
+            return { worker: { running: true }, episodicTokensPending: 2 } as T
           if (this.statusCalls === 2) {
             return {
               worker: { running: true },
@@ -352,7 +372,8 @@ describe("Signet benchmark profiles", () => {
             episodicTokensPending: 0,
           } as T
         }
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
@@ -402,8 +423,9 @@ describe("Signet benchmark profiles", () => {
           episodicTokensPending: this.triggers >= this.drainedAfterPass ? 0 : null,
         } as T
       }
-      if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
-        throw new Error(`Unexpected path ${path}`)
+      if (path === "/api/embeddings/health")
+        return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+      throw new Error(`Unexpected path ${path}`)
     }
   }
 
@@ -437,7 +459,8 @@ describe("Signet benchmark profiles", () => {
           return { passId: "group-1" } as T
         }
         if (path.startsWith("/api/dream/status")) {
-          if (!this.triggered) return { worker: { running: true, activePasses: [] }, passes: [] } as T
+          if (!this.triggered)
+            return { worker: { running: true, activePasses: [] }, passes: [] } as T
           this.polls += 1
           const settled = this.polls > 2
           return {
@@ -449,14 +472,18 @@ describe("Signet benchmark profiles", () => {
             episodicTokensPending: settled ? 0 : 1,
           } as T
         }
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
     const provider = new ConcurrentRoundProvider()
     await finalizeWith(provider)
     expect(provider.calls.filter((path) => path === "/api/dream/trigger")).toHaveLength(1)
-    expect(Object.keys(provider.getIngestUsage().dreamingPasses ?? {}).sort()).toEqual(["group-1", "group-2"])
+    expect(Object.keys(provider.getIngestUsage().dreamingPasses ?? {}).sort()).toEqual([
+      "group-1",
+      "group-2",
+    ])
   })
 
   it("starts another pass as soon as a slot frees instead of waiting for the slowest pass", async () => {
@@ -470,13 +497,16 @@ describe("Signet benchmark profiles", () => {
           return { passId: `pass-${this.triggers.length}` } as T
         }
         if (path.startsWith("/api/dream/status")) {
-          if (this.triggers.length === 0) return { worker: { running: true, activePasses: [] }, passes: [] } as T
+          if (this.triggers.length === 0)
+            return { worker: { running: true, activePasses: [] }, passes: [] } as T
           this.polls += 1
           const slowDone = this.polls > 6
           const passes = [
             { id: "slow", status: slowDone ? "completed" : "running", mutationsApplied: 4 },
             { id: "fast", status: "completed", mutationsApplied: 2 },
-            ...(this.triggers.length > 1 ? [{ id: "next", status: "completed", mutationsApplied: 1 }] : []),
+            ...(this.triggers.length > 1
+              ? [{ id: "next", status: "completed", mutationsApplied: 1 }]
+              : []),
           ]
           return {
             worker: { running: true, activePasses: slowDone ? [] : [{ passId: "slow" }] },
@@ -485,7 +515,8 @@ describe("Signet benchmark profiles", () => {
             episodicTokensPending: slowDone ? 0 : 1,
           } as T
         }
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
@@ -506,7 +537,8 @@ describe("Signet benchmark profiles", () => {
           return { passId: `pass-${this.triggers}` } as T
         }
         if (path.startsWith("/api/dream/status")) {
-          if (this.triggers === 0) return { worker: { running: true, activePasses: [] }, passes: [] } as T
+          if (this.triggers === 0)
+            return { worker: { running: true, activePasses: [] }, passes: [] } as T
           this.polls += 1
           const longDone = this.polls > 12
           const empties = Array.from({ length: Math.max(0, this.triggers - 1) }, (_, index) => ({
@@ -518,13 +550,19 @@ describe("Signet benchmark profiles", () => {
             worker: { running: true, activePasses: longDone ? [] : [{ passId: "long" }] },
             config: { maxConcurrentPasses: 2 },
             passes: [
-              { id: "long", status: longDone ? "completed" : "running", mutationsApplied: 9, tokensInput: 5_000 },
+              {
+                id: "long",
+                status: longDone ? "completed" : "running",
+                mutationsApplied: 9,
+                tokensInput: 5_000,
+              },
               ...empties,
             ],
             episodicTokensPending: longDone ? 0 : 1,
           } as T
         }
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
@@ -561,7 +599,8 @@ describe("Signet benchmark profiles", () => {
             episodicTokensPending: this.triggers >= 2 ? 0 : 500,
           } as T
         }
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
@@ -595,13 +634,17 @@ describe("Signet benchmark profiles", () => {
         if (path.startsWith("/api/dream/status")) {
           return {
             worker: { running: true, activePasses: [] },
-            passes: this.triggered ? [{ id: "pass-1", status: "completed", mutationsApplied: 4 }] : [],
+            passes: this.triggered
+              ? [{ id: "pass-1", status: "completed", mutationsApplied: 4 }]
+              : [],
             episodicTokensPending: 0,
           } as T
         }
         if (path === "/api/embeddings/health") {
           this.health += 1
-          return { checks: [{ name: "coverage", detail: { unembedded: Math.max(0, 3 - this.health) } }] } as T
+          return {
+            checks: [{ name: "coverage", detail: { unembedded: Math.max(0, 3 - this.health) } }],
+          } as T
         }
         throw new Error(`Unexpected path ${path}`)
       }
@@ -619,13 +662,17 @@ describe("Signet benchmark profiles", () => {
 
   it("fails after three consecutive failed passes", async () => {
     const provider = new DrainingProvider(Number.POSITIVE_INFINITY, 5, new Set([1, 2, 3]))
-    await expect(finalizeWith(provider)).rejects.toThrow("Pi agent length (3 consecutive failed passes)")
+    await expect(finalizeWith(provider)).rejects.toThrow(
+      "Pi agent length (3 consecutive failed passes)"
+    )
     expect(provider.calls.filter((path) => path === "/api/dream/trigger")).toHaveLength(3)
   })
 
   it("fails instead of looping when passes stop applying mutations", async () => {
     const provider = new DrainingProvider(Number.POSITIVE_INFINITY, 0)
-    await expect(finalizeWith(provider)).rejects.toThrow("applied no mutations in 3 consecutive passes")
+    await expect(finalizeWith(provider)).rejects.toThrow(
+      "applied no mutations in 3 consecutive passes"
+    )
     expect(provider.calls.filter((path) => path === "/api/dream/trigger")).toHaveLength(3)
   })
 
@@ -638,7 +685,8 @@ describe("Signet benchmark profiles", () => {
         if (init.method === "PATCH") throw new Error(`${path} failed (404): Agent not found`)
         if (path === "/api/agents") return {} as T
         if (path === "/api/memory/recall") return { results: [] } as T
-        if (path === "/api/embeddings/health") return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
+        if (path === "/api/embeddings/health")
+          return { checks: [{ name: "coverage", detail: { unembedded: 0 } }] } as T
         throw new Error(`Unexpected path ${path}`)
       }
     }
@@ -653,6 +701,61 @@ describe("Signet benchmark profiles", () => {
       read_policy: "isolated",
     })
     expect(provider.calls.filter((call) => call.path.startsWith("/api/agents"))).toHaveLength(2)
+  })
+
+  it("creates a haystack agent once when its sessions ingest concurrently, and accepts a 409 race", async () => {
+    class RacingAgentProvider extends SignetDreamingProvider {
+      calls: string[] = []
+
+      protected override async request<T>(path: string, init: RequestInit): Promise<T> {
+        this.calls.push(`${init.method} ${path}`)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        if (init.method === "PATCH") throw new Error(`${path} failed (404): Agent not found`)
+        if (path === "/api/agents")
+          throw new Error(`${path} failed (409): Agent memorybench-q1-run already exists`)
+        if (path === "/api/memory/recall") return { results: [] } as T
+        throw new Error(`Unexpected path ${path}`)
+      }
+    }
+    const provider = new RacingAgentProvider()
+
+    await Promise.all(
+      Array.from({ length: 4 }, () => provider.search("question", { containerTag: "q1-run" }))
+    )
+
+    expect(provider.calls.filter((call) => call.includes("/api/agents"))).toEqual([
+      "PATCH /api/agents/memorybench-q1-run",
+      "POST /api/agents",
+    ])
+  })
+
+  it("retries Signet write pressure (503 + Retry-After) instead of failing the ingest", async () => {
+    let attempts = 0
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => {
+        attempts += 1
+        return attempts < 3
+          ? Response.json(
+              { error: "Write pressure", retryable: true },
+              { status: 503, headers: { "retry-after": "0.01" } }
+            )
+          : Response.json({ results: [] })
+      },
+    })
+    class LiveProvider extends SignetDreamingProvider {
+      async call(): Promise<unknown> {
+        ;(this as unknown as { baseUrl: string }).baseUrl = `http://127.0.0.1:${server.port}`
+        return this.request("/api/memory/recall", { method: "POST", body: "{}" })
+      }
+    }
+    try {
+      await expect(new LiveProvider().call()).resolves.toEqual({ results: [] })
+      expect(attempts).toBe(3)
+    } finally {
+      server.stop(true)
+    }
   })
 
   it("formats raw sessions like the Supermemory adapter for parity runs", () => {
@@ -692,13 +795,18 @@ describe("Signet benchmark profiles", () => {
   })
 
   it("resolves days ago and last weekday against the question date", () => {
-    expect(buildSignetRecallQuery("What kitchen appliance did I buy 10 days ago?", "2023/03/25 (Sat) 18:26")).toContain(
-      "10 days ago resolves near 15 March 2023"
-    )
-    expect(buildSignetRecallQuery("Who did I go with last Saturday?", "2023/04/22 (Sat) 08:01")).toContain(
-      "last Saturday resolves near 15 April 2023"
-    )
-    expect(buildSignetRecallQuery("What did I eat last Friday?", "2023/04/22 (Sat) 08:01")).toContain("2023-04-21")
+    expect(
+      buildSignetRecallQuery(
+        "What kitchen appliance did I buy 10 days ago?",
+        "2023/03/25 (Sat) 18:26"
+      )
+    ).toContain("10 days ago resolves near 15 March 2023")
+    expect(
+      buildSignetRecallQuery("Who did I go with last Saturday?", "2023/04/22 (Sat) 08:01")
+    ).toContain("last Saturday resolves near 15 April 2023")
+    expect(
+      buildSignetRecallQuery("What did I eat last Friday?", "2023/04/22 (Sat) 08:01")
+    ).toContain("2023-04-21")
   })
 })
 
