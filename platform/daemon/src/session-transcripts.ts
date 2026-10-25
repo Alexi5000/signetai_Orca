@@ -300,16 +300,24 @@ async function backfillDatabaseTranscripts(
 					Record<string, unknown>
 				>;
 				const hasUpdated = cols.some((col) => col.name === "updated_at");
+				const agentFilter = !agentId
+					? ""
+					: agentId === "default"
+						? "WHERE COALESCE(NULLIF(TRIM(agent_id), ''), 'default') = ?"
+						: "WHERE agent_id = ?";
 				const sql = hasUpdated
 					? `SELECT session_key, content, harness, project, agent_id, created_at, updated_at
 						FROM session_transcripts
+						${agentFilter}
 						ORDER BY agent_id, harness, session_key, rowid
 						LIMIT ? OFFSET ?`
 					: `SELECT session_key, content, harness, project, agent_id, created_at, NULL AS updated_at
 						FROM session_transcripts
+						${agentFilter}
 						ORDER BY agent_id, harness, session_key, rowid
 						LIMIT ? OFFSET ?`;
-				return db.prepare(sql).all(PAGE_SIZE, offset) as unknown as StoredTranscriptBackfillRow[];
+				const params = agentId ? [agentId, PAGE_SIZE, offset] : [PAGE_SIZE, offset];
+				return db.prepare(sql).all(...params) as unknown as StoredTranscriptBackfillRow[];
 			}, "session-transcripts.ts:298");
 			if (rows.length === 0) break;
 			for (const row of rows) {

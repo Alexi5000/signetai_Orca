@@ -1105,6 +1105,53 @@ describe("backfill replaces live-only sessions", () => {
 		expect(existsSync(join(root, "memory", ".canonical-transcript-backfill-v1.default"))).toBe(false);
 	});
 
+	test("backfills one agent's DB transcripts without paging through every other agent's rows", async () => {
+		const root = makeRoot("agent-scoped-db-backfill");
+		initTranscriptDb(root);
+		getDbAccessor().withWriteTx((db: import("./db-accessor").WriteDb) => {
+			const insert = db.prepare(
+				`INSERT INTO session_transcripts (session_key, content, harness, project, agent_id, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			);
+			for (let i = 0; i < 1_000; i++) {
+				insert.run(
+					`other-${i}`,
+					`User: other ${i}`,
+					"codex",
+					null,
+					`other-agent-${i % 10}`,
+					"2026-09-20",
+					"2026-09-20",
+				);
+			}
+			insert.run(
+				"mine",
+				"User: my question\nAssistant: my reply",
+				"codex",
+				null,
+				"agent-a",
+				"2026-09-20",
+				"2026-09-20",
+			);
+		});
+		const accessor = getDbAccessor();
+		const reads = spyOn(accessor, "withReadDb");
+		try {
+			await ensureCanonicalTranscriptHistory(root, "agent-a");
+			expect(reads.mock.calls.length).toBeLessThan(5);
+		} finally {
+			reads.mockRestore();
+		}
+		const records = readFileSync(canonicalTranscriptPath(root, "codex"), "utf8")
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line) as { agent_id: string; session_key: string; content: string });
+		expect(records.map((r) => [r.agent_id, r.session_key, r.content])).toEqual([
+			["agent-a", "mine", "my question"],
+			["agent-a", "mine", "my reply"],
+		]);
+	});
+
 	test("reports reordered completed DB turns without settling the backfill marker", async () => {
 		const root = makeRoot("diagnose-db-divergence");
 		initTranscriptDb(root);
