@@ -900,6 +900,10 @@ export class SignetProvider implements Provider {
       try {
         return await this.requestOnce<T>(path, init)
       } catch (error) {
+        if (isDroppedConnection(error) && attempt < MAX_DROPPED_CONNECTION_RETRIES) {
+          await new Promise((resolve) => setTimeout(resolve, 250 * attempt))
+          continue
+        }
         if (!(error instanceof RetryableSignetError) || attempt >= MAX_PRESSURE_RETRIES) throw error
         await new Promise((resolve) =>
           setTimeout(resolve, error.retryAfterMs * Math.min(attempt, 8))
@@ -945,6 +949,19 @@ export class SignetProvider implements Provider {
 }
 
 const MAX_PRESSURE_RETRIES = 30
+const MAX_DROPPED_CONNECTION_RETRIES = 4
+
+// A pooled keep-alive socket the daemon already closed fails before the request is read,
+// so resending is safe. Bun and Node word it differently.
+export function isDroppedConnection(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const code = (error as { code?: unknown }).code
+  return (
+    code === "ECONNRESET" ||
+    code === "ConnectionClosed" ||
+    /socket connection was closed unexpectedly|ECONNRESET|socket hang up/i.test(error.message)
+  )
+}
 
 class RetryableSignetError extends Error {
   constructor(

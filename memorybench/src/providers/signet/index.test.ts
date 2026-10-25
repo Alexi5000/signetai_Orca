@@ -3,6 +3,7 @@ import {
   buildSignetRecallQuery,
   formatSupermemoryParityContent,
   hasUsableMemoryContent,
+  isDroppedConnection,
   resolveSignetSearchLimit,
   SignetDreamingProvider,
   scopeStructuredBenchmarkParticipants,
@@ -727,6 +728,29 @@ describe("Signet benchmark profiles", () => {
       "PATCH /api/agents/memorybench-q1-run",
       "POST /api/agents",
     ])
+  })
+
+  it("resends a request once the daemon has dropped a pooled connection", async () => {
+    let attempts = 0
+    class DroppingProvider extends SignetDreamingProvider {
+      protected override async request<T>(path: string, init: RequestInit): Promise<T> {
+        return super.request<T>(path, init)
+      }
+    }
+    const provider = new DroppingProvider() as unknown as {
+      requestOnce: (path: string, init: RequestInit) => Promise<unknown>
+      request: (path: string, init: RequestInit) => Promise<unknown>
+    }
+    provider.requestOnce = async () => {
+      attempts += 1
+      if (attempts < 3) throw new Error("The socket connection was closed unexpectedly.")
+      return { results: [] }
+    }
+    await expect(provider.request("/api/memory/recall", { method: "POST" })).resolves.toEqual({
+      results: [],
+    })
+    expect(attempts).toBe(3)
+    expect(isDroppedConnection(new Error("boom"))).toBe(false)
   })
 
   it("retries Signet write pressure (503 + Retry-After) instead of failing the ingest", async () => {
