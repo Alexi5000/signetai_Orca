@@ -18,6 +18,9 @@ import { SIGNET_PROMPTS, SIGNET_SUPERMEMORY_PARITY_PROMPTS } from "./prompts"
 const DEFAULT_AGENT_ID = "memorybench"
 const DEFAULT_PROJECT = "memorybench"
 const DEFAULT_TIMEOUT_MS = 60_000
+// The daemon answers 503 + Retry-After while its capture backlog drains; at full
+// LongMemEval scale that backlog takes over an hour, so retry for as long as it says to.
+const DEFAULT_PRESSURE_RETRY_SECS = 3 * 60 * 60
 const DREAM_STATUS_CONCURRENCY = 4
 const STRICT_SEARCH_LIMIT = 10
 const SUPERMEMORY_PARITY_SEARCH_LIMIT = 30
@@ -341,6 +344,8 @@ export class SignetProvider implements Provider {
   private agentId = process.env.SIGNET_BENCH_AGENT_ID || DEFAULT_AGENT_ID
   private project = process.env.SIGNET_BENCH_PROJECT || DEFAULT_PROJECT
   private timeoutMs = readPositiveInt("SIGNET_BENCH_REQUEST_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)
+  private pressureRetryMs =
+    readPositiveInt("SIGNET_BENCH_PRESSURE_RETRY_SECS", DEFAULT_PRESSURE_RETRY_SECS) * 1000
   private profile: SignetBenchmarkProfile
   private readonly dreamingAgentIds = new Set<string>()
 
@@ -896,6 +901,7 @@ export class SignetProvider implements Provider {
   }
 
   protected async request<T>(path: string, init: RequestInit): Promise<T> {
+    const pressureDeadline = Date.now() + this.pressureRetryMs
     for (let attempt = 1; ; attempt++) {
       try {
         return await this.requestOnce<T>(path, init)
@@ -904,7 +910,7 @@ export class SignetProvider implements Provider {
           await new Promise((resolve) => setTimeout(resolve, 250 * attempt))
           continue
         }
-        if (!(error instanceof RetryableSignetError) || attempt >= MAX_PRESSURE_RETRIES) throw error
+        if (!(error instanceof RetryableSignetError) || Date.now() >= pressureDeadline) throw error
         await new Promise((resolve) =>
           setTimeout(resolve, error.retryAfterMs * Math.min(attempt, 8))
         )
@@ -948,7 +954,6 @@ export class SignetProvider implements Provider {
   }
 }
 
-const MAX_PRESSURE_RETRIES = 30
 const MAX_DROPPED_CONNECTION_RETRIES = 4
 
 // A pooled keep-alive socket the daemon already closed fails before the request is read,
