@@ -80,6 +80,7 @@ export interface PiModelProviderConfig {
 	readonly apiKey?: string;
 	readonly reasoning?: ThinkingLevel;
 	readonly contextWindow?: number;
+	readonly resolveContextWindow?: () => Promise<number | undefined>;
 	readonly maxTokens?: number;
 	readonly defaultTimeoutMs?: number;
 	readonly name?: string;
@@ -757,9 +758,17 @@ export function createPiModelProvider(
 			const create = options.persistentSessionKey
 				? leaseWorkerAgentSession.bind(null, options.persistentSessionKey, options.continuationPrompt)
 				: createWorkerAgentSession;
+			const discoveredWindow =
+				config.contextWindow === undefined && config.resolveContextWindow
+					? await config.resolveContextWindow()
+					: undefined;
 			return create(
 				{
-					model: options.maxTokens ? { ...piModel, maxTokens: options.maxTokens } : piModel,
+					model: {
+						...piModel,
+						...(discoveredWindow ? { contextWindow: discoveredWindow } : {}),
+						...(options.maxTokens ? { maxTokens: options.maxTokens } : {}),
+					},
 					apiKey: apiKey ?? KEYLESS_API_KEY,
 					systemPrompt:
 						options.systemPrompt ??

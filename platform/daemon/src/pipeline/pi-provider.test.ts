@@ -619,6 +619,32 @@ describe("local thinking control", () => {
 		}
 	});
 
+	test("agent sessions resolve a lazy context window; plain completions never ask for it", async () => {
+		const server = recordingServer();
+		let resolved = 0;
+		const provider = createPiModelProvider({
+			executor: "openai-compatible",
+			model: "lazy-window-test",
+			baseUrl: server.url,
+			resolveContextWindow: async () => {
+				resolved += 1;
+				return 262_144;
+			},
+		});
+		try {
+			await expect(provider.generate("plain")).resolves.toBe("done");
+			expect(resolved).toBe(0);
+			const session = await provider.createAgentSession([]);
+			try {
+				expect(resolved).toBe(1);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			server.stop();
+		}
+	});
+
 	test("targets without thinking config keep the keyless local defaults", async () => {
 		const server = recordingServer();
 		try {

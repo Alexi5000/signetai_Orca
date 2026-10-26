@@ -93,11 +93,7 @@ export async function createRoutingProvider(opts: CreateRoutingProviderOptions):
 	if (!piModel && !CUSTOM_PI_EXECUTORS.has(target.executor)) {
 		throw new Error(`Unknown pi-ai model "${model.model}" for provider "${providerFamily}"`);
 	}
-	const contextWindow =
-		model.contextWindow ??
-		(!piModel && LOCAL_SERVER_EXECUTORS.has(target.executor)
-			? await discoverLocalContextWindow(target.executor, target.endpoint, model.model, credential?.apiKey)
-			: undefined);
+	const discoverWindow = model.contextWindow === undefined && !piModel && LOCAL_SERVER_EXECUTORS.has(target.executor);
 
 	return {
 		...createPiModelProvider({
@@ -109,7 +105,13 @@ export async function createRoutingProvider(opts: CreateRoutingProviderOptions):
 			baseUrl: target.endpoint,
 			apiKey: credential?.apiKey,
 			reasoning: resolveProviderReasoning(target, model, piModel),
-			contextWindow,
+			contextWindow: model.contextWindow,
+			...(discoverWindow
+				? {
+						resolveContextWindow: () =>
+							discoverLocalContextWindow(target.executor, target.endpoint, model.model, credential?.apiKey),
+					}
+				: {}),
 			...(target.thinking ? { thinking: target.thinking } : {}),
 			name: `${target.executor}:${model.model}`,
 			defaultTimeoutMs: 60_000,
