@@ -221,6 +221,7 @@ export interface CreateDreamingCapabilitiesParams {
 	readonly passId?: string;
 	readonly evidenceDeliveryDeadline?: number;
 	readonly passDeadline?: number;
+	readonly evidenceTokenBudget?: number;
 	readonly now?: () => number;
 	readonly evidenceChars?: number;
 	readonly mode?: DreamingCapabilityMode;
@@ -491,12 +492,29 @@ export async function listDreamingAttention(
 			});
 }
 
+const EVIDENCE_CHARS_PER_TOKEN = 4;
+
+function deliveredEvidenceChars(items: readonly unknown[]): number {
+	let chars = 0;
+	for (const item of items) {
+		const content = (item as { content?: unknown } | null)?.content;
+		if (typeof content === "string") chars += content.length;
+	}
+	return chars;
+}
+
 export function createDreamingCapabilities(params: CreateDreamingCapabilitiesParams): readonly DreamingCapability[] {
 	const { accessor, agentId, actor } = params;
 	const now = params.now ?? Date.now;
 	let lastQueueDeliveryAt: number | undefined;
+	let deliveredQueueChars = 0;
 	const queueDeliveryClosed = (at: number): boolean => {
 		if (params.evidenceDeliveryDeadline !== undefined && at >= params.evidenceDeliveryDeadline) return true;
+		if (
+			params.evidenceTokenBudget !== undefined &&
+			deliveredQueueChars >= params.evidenceTokenBudget * EVIDENCE_CHARS_PER_TOKEN
+		)
+			return true;
 		if (params.passDeadline === undefined || lastQueueDeliveryAt === undefined) return false;
 		return at + 2 * (at - lastQueueDeliveryAt) >= params.passDeadline;
 	};
@@ -694,7 +712,7 @@ export function createDreamingCapabilities(params: CreateDreamingCapabilitiesPar
 						items: [],
 						hasMore: false,
 						deliveryClosed: true,
-						note: "This pass has used its time for new evidence. File what you have read, write the runbook, and finish; the rest of the queue is delivered to the next pass.",
+						note: "This pass has used its time or evidence budget for new evidence. File what you have read, write the runbook, and finish; the rest of the queue is delivered to the next pass.",
 					};
 				}
 				const input: DbOwnerDreamingEvidenceSearch = {
@@ -729,7 +747,10 @@ export function createDreamingCapabilities(params: CreateDreamingCapabilitiesPar
 					},
 					runInline: ({ read }) => read((db) => searchDreamingEvidenceInDb(db, input)),
 				});
-				if (drainsQueue && Array.isArray(result.items) && result.items.length > 0) lastQueueDeliveryAt = now();
+				if (drainsQueue && Array.isArray(result.items) && result.items.length > 0) {
+					lastQueueDeliveryAt = now();
+					deliveredQueueChars += deliveredEvidenceChars(result.items);
+				}
 				return result;
 			},
 		),

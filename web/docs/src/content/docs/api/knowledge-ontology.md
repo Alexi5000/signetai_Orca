@@ -928,7 +928,11 @@ that are not already in a running pass into up to `memory.dreaming.maxConcurrent
 groups (default 2), balanced by evidence backlog, and runs one pass per group.
 A group holds at most `memory.dreaming.maxPassTokens` of measured backlog
 (default 200,000 tokens, range 10,000-2,000,000); an agent whose backlog alone
-exceeds it gets a group to itself. Agents that do not fit wait for a later
+exceeds it gets a group to itself. The same budget caps the evidence one pass is
+delivered: once the delivery queue has served about `maxPassTokens` of evidence
+(estimated at four characters per token), it closes (`deliveryClosed: true`) and
+the rest waits for the next pass, so even one agent with a very large backlog
+works through it in passes that can finish. Agents that do not fit wait for a later
 trigger or sweep, so every pass stays small enough to finish and commit before
 its `timeout`. Scheduled content sweeps use the same budget for their one pass
 and leave out agents with no backlog.

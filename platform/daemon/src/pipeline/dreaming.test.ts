@@ -3856,6 +3856,53 @@ It is now Monday, 2026-10-05 18:42 America/Denver (GMT-06:00). Use this for what
 		expect(second.deliveryClosed).toBeUndefined();
 	});
 
+	it("closes delivery once a pass has been delivered its token budget, even for one large scope", async () => {
+		seedTranscript(db, "big-a", "Ines maintains the on-call rota. ".repeat(40));
+		seedTranscript(db, "big-b", "Briar owns the release process. ".repeat(40));
+		let first: Record<string, unknown> = {};
+		let second: Record<string, unknown> = {};
+		await runDreamingAgentPass(
+			accessor,
+			{
+				async run(input) {
+					first = await invokeDreamingTool(input, "search_evidence", { agentId: AGENT, limit: 1 });
+					second = await invokeDreamingTool(input, "search_evidence", { agentId: AGENT, limit: 1 });
+					return { summary: "Budgeted pass" };
+				},
+			},
+			defaultCfg({ timeout: 300_000, maxPassTokens: 100 }),
+			"/tmp",
+			AGENT,
+			[AGENT],
+			"incremental",
+		);
+		expect((first.items as unknown[]).length).toBe(1);
+		expect(second).toMatchObject({ ok: true, items: [], hasMore: false, deliveryClosed: true });
+	});
+
+	it("keeps delivering while the delivered evidence stays under the pass token budget", async () => {
+		seedTranscript(db, "small-a", "Ines maintains the on-call rota.");
+		seedTranscript(db, "small-b", "Briar owns the release process.");
+		let second: Record<string, unknown> = {};
+		await runDreamingAgentPass(
+			accessor,
+			{
+				async run(input) {
+					await invokeDreamingTool(input, "search_evidence", { agentId: AGENT, limit: 1 });
+					second = await invokeDreamingTool(input, "search_evidence", { agentId: AGENT, limit: 1 });
+					return { summary: "Small pass" };
+				},
+			},
+			defaultCfg({ timeout: 300_000, maxPassTokens: 200_000 }),
+			"/tmp",
+			AGENT,
+			[AGENT],
+			"incremental",
+		);
+		expect((second.items as unknown[]).length).toBe(1);
+		expect(second.deliveryClosed).toBeUndefined();
+	});
+
 	it("withholds only the sources a failed operation cited", async () => {
 		seedTranscript(db, "cited-source", "Briar owns the release process.");
 		seedTranscript(db, "uncited-source", "Corin owns the staging cluster.");

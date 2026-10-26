@@ -1876,6 +1876,7 @@ ${JSON.stringify(liveOptions.userRequest)}
 					}),
 			evidenceDeliveryDeadline: Date.now() + Math.floor(cfg.timeout / 2),
 			passDeadline: Date.now() + cfg.timeout,
+			...(cfg.maxPassTokens === undefined ? {} : { evidenceTokenBudget: cfg.maxPassTokens }),
 			evidenceChars: dreamingEvidencePageChars(cfg.maxInputTokens),
 			accessor,
 			agentId,
