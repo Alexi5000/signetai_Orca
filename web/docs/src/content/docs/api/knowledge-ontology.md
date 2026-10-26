@@ -516,6 +516,7 @@ an exact count when at most 50 sources are waiting, `null` when more are.
   },
   "config": {
     "tokenThreshold": 100000,
+    "maxPassTokens": 200000,
     "backfillOnFirstRun": true,
     "maxInputTokens": 128000,
     "maxOutputTokens": null,
@@ -925,6 +926,12 @@ no pass can start, 503 if the pipeline prevents worker startup, and 503 with
 An incremental trigger may start several passes. The daemon splits the agents
 that are not already in a running pass into up to `memory.dreaming.maxConcurrentPasses`
 groups (default 2), balanced by evidence backlog, and runs one pass per group.
+A group holds at most `memory.dreaming.maxPassTokens` of measured backlog
+(default 200,000 tokens, range 10,000-2,000,000); an agent whose backlog alone
+exceeds it gets a group to itself. Agents that do not fit wait for a later
+trigger or sweep, so every pass stays small enough to finish and commit before
+its `timeout`. Scheduled content sweeps use the same budget for their one pass
+and leave out agents with no backlog.
 It never starts more passes than `worker.maxLlmConcurrency` allows, because a
 pass waiting for a shared LLM permit would spend its own timeout waiting. The
 daemon allows that many Pi agent workers plus three for retained dashboard chats.

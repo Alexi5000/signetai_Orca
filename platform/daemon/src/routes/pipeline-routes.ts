@@ -727,6 +727,7 @@ export function registerPipelineRoutes(app: Hono): void {
 			episodicTokensPending,
 			config: {
 				tokenThreshold: cfg.dreaming.tokenThreshold,
+				maxPassTokens: cfg.dreaming.maxPassTokens,
 				backfillOnFirstRun: cfg.dreaming.backfillOnFirstRun,
 				maxInputTokens: cfg.dreaming.maxInputTokens,
 				maxOutputTokens: cfg.dreaming.maxOutputTokens,

@@ -659,6 +659,65 @@ describe("dreaming worker agent scope", () => {
 		}
 	});
 
+	it("bounds a scheduled content sweep to one pass budget of backlogged scopes and leaves out idle ones", async () => {
+		const now = new Date().toISOString();
+		for (const agent of ["hay-a", "hay-b", "hay-c"]) {
+			db.prepare(
+				`INSERT INTO agents (id, name, read_policy, created_at, updated_at) VALUES (?, ?, 'isolated', ?, ?)`,
+			).run(agent, agent, now, now);
+			db.prepare(
+				`INSERT INTO session_transcripts (session_key, agent_id, content, harness, created_at, updated_at, completed_at)
+				 VALUES (?, ?, ?, 'pi', datetime('now'), datetime('now'), datetime('now'))`,
+			).run(`s-${agent}`, agent, `${agent} owns ${"ledger ".repeat(400)}`);
+		}
+		const sweeps: string[][] = [];
+		const run = async (maxPassTokens: number) => {
+			const seen: string[] = [];
+			const worker = startDreamingWorker(
+				accessor,
+				defaultCfg({ tokenThreshold: 100, backfillOnFirstRun: true, maxPassTokens }),
+				agentsDir,
+				"default",
+				{
+					checkIntervalMs: 20,
+					executorFactory: () => ({
+						async run(input: { prompt: string }) {
+							seen.push(/<agent_scopes>\n([\s\S]*?)\n<\/agent_scopes>/.exec(input.prompt)?.[1] ?? "single");
+							return { summary: "fixture" };
+						},
+					}),
+				},
+			);
+			try {
+				await waitFor(() => seen.length > 0, 3_000);
+			} finally {
+				worker.stop();
+			}
+			const pass = db.prepare("SELECT scope_key FROM dreaming_passes ORDER BY rowid DESC LIMIT 1").get() as {
+				scope_key: string;
+			};
+			sweeps.push(pass.scope_key.split(","));
+		};
+
+		await run(200_000);
+		await run(500);
+
+		expect(sweeps[0]).toEqual(["hay-a", "hay-b", "hay-c"]);
+		expect(sweeps[1]).toHaveLength(1);
+		expect(sweeps.flat()).not.toContain("default");
+
+		db.prepare(
+			`INSERT INTO agents (id, name, read_policy, created_at, updated_at) VALUES ('aaa-review', 'aaa-review', 'isolated', ?, ?)`,
+		).run(now, now);
+		db.prepare(
+			`INSERT INTO dreaming_attention (id, agent_id, kind, subject_ref, details_json, priority)
+			 VALUES ('review-only', 'aaa-review', 'review_due', 'subject', '{}', 50)`,
+		).run();
+		await run(500);
+		expect(sweeps[2]).toContain("aaa-review");
+		expect(sweeps[2]?.filter((scope) => scope.startsWith("hay-"))).toHaveLength(1);
+	});
+
 	it("labels scheduled trigger logs with the decision reason and count semantics", () => {
 		const exact = { kind: "exact", tokens: 42, hasBacklog: true, sourcesScanned: 5 } as const;
 		const partial = { kind: "indeterminate", tokenLowerBound: 12, hasBacklog: true, sourcesScanned: 50 } as const;
