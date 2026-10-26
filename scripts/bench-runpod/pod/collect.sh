@@ -4,6 +4,7 @@ source /workspace/kit/pod/env.sh
 run=$1
 exec 8> /workspace/runs/$run.collect.lock
 flock -w 1800 8 || { echo "another collect of $run is still running"; exit 1; }
+[ -f /workspace/runs/$run.exit ] && kind=final || kind=partial
 E=/workspace/evidence/$run; rm -rf "$E"; mkdir -p "$E"
 fail=0
 cp /workspace/runs/$run.{log,meta,exit,url,qids,cmd.sh} "$E/" 2>/dev/null
@@ -39,7 +40,9 @@ python3 /workspace/kit/pod/tokens.py "$run" --json > "$E/tokens.json" 2>/dev/nul
 T=/workspace/evidence/$run.tgz
 tar czf "$T.tmp" -C /workspace/evidence "$run" && gzip -t "$T.tmp" || { echo "tar failed"; rm -f "$T.tmp"; exit 1; }
 sha256sum "$T.tmp" | cut -d' ' -f1 > "$T.sha256.tmp" && mv "$T.tmp" "$T" && mv "$T.sha256.tmp" "$T.sha256" || exit 1
+[ $fail = 0 ] || kind=partial
+echo $kind > /workspace/evidence/$run.kind
 [ $fail = 0 ] || { echo "collect incomplete (see above); not marking collected"; exit 1; }
-[ -f /workspace/runs/$run.exit ] && touch /workspace/runs/$run.collected
+[ $kind = final ] && touch /workspace/runs/$run.collected
 ls -la /workspace/evidence/$run.tgz
 cat "$E/tokens.txt"

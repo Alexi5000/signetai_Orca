@@ -33,8 +33,8 @@ curl -sf localhost:$PORT_SM_EXTRACT/_proxy_stats >/dev/null || { echo "proxies n
 rm -f /workspace/runs/$run.exit /workspace/runs/$run.collected /workspace/runs/$run.pulled
 date +%s > /workspace/kit/state/last_activity
 echo "{\"run\":\"$run\",\"system\":\"supermemory\",\"documents\":$docs,\"start\":$(date +%s),\"selection\":\"${sel[*]}\",\"sm_version\":\"$SM_VERSION\",\"cost_per_hr\":$COST_PER_HR,\"pod\":\"${RUNPOD_POD_ID:-}\"}" >> /workspace/runs/$run.meta
-touch /workspace/runs/$run.active
 cat > /workspace/runs/$run.cmd.sh <<EOF
+touch /workspace/runs/$run.active
 source /workspace/kit/pod/env.sh
 T=/workspace/runs/$run.timeline
 stamp() { echo "\$(date -u +%FT%TZ) \$*" >> \$T; }

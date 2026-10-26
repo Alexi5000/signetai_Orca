@@ -65,6 +65,26 @@ def scan_sse(buf, last):
     return buf, last
 
 
+def scrub_usage(data, keep_final_usage):
+    """Forward complete SSE lines, removing usage the client did not ask for."""
+    out = []
+    while b"\n" in data:
+        line, data = data.split(b"\n", 1)
+        if line.startswith(b"data:") and b'"usage"' in line:
+            try:
+                d = json.loads(line[5:].strip())
+            except Exception:
+                out.append(line + b"\n")
+                continue
+            if d.get("choices"):
+                d.pop("usage", None)
+                line = b"data: " + json.dumps(d).encode()
+            elif d.get("usage") is not None and not keep_final_usage:
+                continue
+        out.append(line + b"\n")
+    return b"".join(out), data
+
+
 async def handle(request):
     global session
     if session is None:
@@ -73,6 +93,7 @@ async def handle(request):
     counts[request.path] += 1
     track = request.method == "POST" and request.path.endswith(USAGE_PATHS) and body
     model, stream = None, False
+    keep_usage, keep_continuous = True, True
     if track:
         try:
             data = json.loads(body)
@@ -87,6 +108,8 @@ async def handle(request):
             stream = bool(data.get("stream"))
             if stream and args.inject_stream_usage:
                 so = dict(data.get("stream_options") or {})
+                keep_usage = bool(so.get("include_usage"))
+                keep_continuous = keep_usage and bool(so.get("continuous_usage_stats"))
                 so.setdefault("include_usage", True)
                 if so["include_usage"]:
                     so.setdefault("continuous_usage_stats", True)
@@ -110,18 +133,30 @@ async def handle(request):
             hop = ("content-length", "transfer-encoding", "content-encoding", "connection")
             resp = web.StreamResponse(status=up.status, headers={k: v for k, v in up.headers.items() if k.lower() not in hop})
             await resp.prepare(request)
-            buf, whole = b"", []
+            buf, whole, pending = b"", [], b""
+            scrub = track and stream and not keep_continuous
             async for chunk in up.content.iter_any():
                 if track:
                     if stream:
                         buf, usage = scan_sse(buf + chunk, usage)
                     else:
                         whole.append(chunk)
+                if scrub:
+                    out, pending = scrub_usage(pending + chunk, keep_usage)
+                else:
+                    out = chunk
                 try:
-                    await resp.write(chunk)
+                    if out:
+                        await resp.write(out)
                 except (ConnectionError, RuntimeError):
                     client_gone = True
                     break
+            if scrub and pending and not client_gone:
+                out, _ = scrub_usage(pending + b"\n", keep_usage)
+                try:
+                    await resp.write(out)
+                except (ConnectionError, RuntimeError):
+                    client_gone = True
             if track:
                 if stream:
                     buf, usage = scan_sse(buf + b"\n", usage)

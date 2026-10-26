@@ -123,7 +123,7 @@ cmd_supermemory() { local name=${1:?name} run=${2:?run-id}; shift 2; echo "bash 
 
 cmd_status() {
   local name=${1:?name} run=${2:-}
-  if [ -z "$run" ]; then echo 'ls -t /workspace/runs/*.meta 2>/dev/null | head -5 | xargs -n1 basename 2>/dev/null; cat /workspace/kit/state/watchdog.json 2>/dev/null' | on_pod "$name"; return; fi
+  if [ -z "$run" ]; then echo 'ls -t /workspace/runs/*.meta 2>/dev/null | head -5 | xargs -n1 basename 2>/dev/null; cat /workspace/kit/state/watchdog.json 2>/dev/null; true' | on_pod "$name"; return; fi
   echo "source /workspace/kit/pod/env.sh; python3 /workspace/kit/pod/status.py $run ${3:-}" | on_pod "$name" 300
 }
 
@@ -131,7 +131,7 @@ cmd_tokens() { local name=${1:?name} run=${2:?run}; shift 2; echo "source /works
 
 cmd_pull() {  # collect on the pod, copy evidence/<run>.tgz here in chunks over the PTY, verify sha256, mark pulled
   local name=${1:?name} run=${2:?run} dest="$EVIDENCE/$2"
-  echo "date +%s > /workspace/kit/state/last_activity; timeout 1800 bash /workspace/kit/pod/collect.sh $run > /workspace/logs/collect_$run.log 2>&1; stat -c %s /workspace/evidence/$run.tgz; cat /workspace/evidence/$run.tgz.sha256; [ -f /workspace/runs/$run.exit ] && echo final || echo partial" \
+  echo "date +%s > /workspace/kit/state/last_activity; timeout 1800 bash /workspace/kit/pod/collect.sh $run > /workspace/logs/collect_$run.log 2>&1; stat -c %s /workspace/evidence/$run.tgz; cat /workspace/evidence/$run.tgz.sha256; cat /workspace/evidence/$run.kind 2>/dev/null || echo partial" \
     | on_pod "$name" 1900 > "$LME_HOME/.pull_$run" || { echo "lme: collect failed: $(cat "$LME_HOME/.pull_$run")" >&2; return 1; }
   local size sha kind; size=$(sed -n 1p "$LME_HOME/.pull_$run"); sha=$(sed -n 2p "$LME_HOME/.pull_$run"); kind=$(sed -n 3p "$LME_HOME/.pull_$run")
   [[ "$size" =~ ^[0-9]+$ ]] || { echo "lme: collect failed: $(cat "$LME_HOME/.pull_$run")" >&2; return 1; }
@@ -168,7 +168,7 @@ cmd_hold() { echo 'touch /workspace/kit/state/no_autostop; echo autostop disable
 cmd_unhold() { echo 'rm -f /workspace/kit/state/no_autostop; echo autostop enabled' | on_pod "${1:?name}"; }
 cmd_stop() {  # archive container-disk workspaces and collect active runs before stopping (all resumable)
   local name=${1:?name} f; f=$(pod_file "$name")
-  echo 'source /workspace/kit/pod/env.sh; for w in $WS_ROOT/*-ws; do [ -d "$w" ] && timeout 3600 bash /workspace/kit/pod/archive_ws.sh "$(basename "$w" -ws)"; done; for a in /workspace/runs/*.active; do [ -e "$a" ] && timeout 1800 bash /workspace/kit/pod/collect.sh "$(basename "$a" .active)" > /dev/null 2>&1; done; echo pre-stop done' | on_pod "$name" 3700 || echo "pre-stop step failed (pod unreachable?); stopping anyway"
+  echo 'source /workspace/kit/pod/env.sh; for w in $WS_ROOT/*-ws; do [ -d "$w" ] && timeout 3600 bash /workspace/kit/pod/archive_ws.sh "$(basename "$w" -ws)"; done; true; for a in /workspace/runs/*.active; do [ -e "$a" ] && timeout 1800 bash /workspace/kit/pod/collect.sh "$(basename "$a" .active)" > /dev/null 2>&1; done; echo pre-stop done' | on_pod "$name" 7300 || echo "pre-stop step failed (pod unreachable?); stopping anyway"
   rpx stop "$(jget "$f" "['id']")"
 }
 cmd_start() {  # resume a stopped pod and bring the stack back; then: lme run NAME RUN --resume

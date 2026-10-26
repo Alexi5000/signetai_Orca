@@ -3,7 +3,7 @@ set -u
 source /workspace/kit/pod/env.sh
 run=$1; shift
 conc=$DREAM_CONC; sel=(); resume=0; hours=""
-case " $* " in *" --resume "*) ;; *) rm -f /workspace/runs/$run.qids ;; esac
+case " $* " in *" --resume "*) qids_keep=1 ;; *) qids_keep=0; rm -f /workspace/runs/$run.qids ;; esac
 while [ $# -gt 0 ]; do
   case $1 in
     --full) sel=(); shift ;;
@@ -12,15 +12,16 @@ while [ $# -gt 0 ]; do
     --shard)
       i=${2%/*}; n=${2#*/}
       [[ "$i" =~ ^[0-9]+$ && "$n" =~ ^[0-9]+$ ]] && [ "$i" -ge 1 ] && [ "$i" -le "$n" ] || { echo "bad shard $2 (want I/N with 1 <= I <= N)"; exit 2; }
-      awk -v i="$i" -v n="$n" 'NF && (NR-1) % n == i-1' /workspace/kit/state/qids_all.txt > /workspace/runs/$run.qids
+      [ $qids_keep = 1 ] || awk -v i="$i" -v n="$n" 'NF && (NR-1) % n == i-1' /workspace/kit/state/qids_all.txt > /workspace/runs/$run.qids
       sel=(--question-ids-file /workspace/runs/$run.qids); shift 2 ;;
-    --ids) cp "$2" /workspace/runs/$run.qids || exit 2; sel=(--question-ids-file /workspace/runs/$run.qids); shift 2 ;;
+    --ids) [ $qids_keep = 1 ] || cp "$2" /workspace/runs/$run.qids || exit 2; sel=(--question-ids-file /workspace/runs/$run.qids); shift 2 ;;
     --max-hours) hours=$2; shift 2 ;;
     --resume) resume=1; shift ;;
     --dream-conc) conc=$2; shift 2 ;;
     *) echo "unknown arg $1"; exit 2 ;;
   esac
 done
+if [ $resume = 1 ] && [ ${#sel[@]} -gt 0 ]; then echo "a resumed run keeps the questions it started with; drop the selection"; exit 2; fi
 if [ ${#sel[@]} -gt 0 ] && [ "${sel[0]}" = --question-ids-file ] && [ ! -s /workspace/runs/$run.qids ]; then echo "empty question id list; refusing (an empty filter could run all 500)"; exit 2; fi
 curl -sf localhost:$PORT_SIGNET_DREAM/v1/models >/dev/null || { echo "inference stack not serving; run serve first"; exit 1; }
 pgrep -f "runs/$run.cmd.sh" >/dev/null && { echo "run $run already active"; exit 1; }
@@ -42,11 +43,11 @@ nq=$( [ -f /workspace/runs/$run.qids ] && wc -l < /workspace/runs/$run.qids || {
 eval "cat $redir /workspace/runs/$run.meta" <<EOF
 {"run":"$run","system":"signet-dreaming","start":$(date +%s),"resume":$resume,"dream_conc":$conc,"selection":"${sel[*]}","questions_in_ids_file":"$nq","commit":"$(git -C $SIGNET_DIR rev-parse --short HEAD)","ref":"$SIGNET_REF","gpu":"$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)","cost_per_hr":$COST_PER_HR,"pod":"${RUNPOD_POD_ID:-}"}
 EOF
-touch /workspace/runs/$run.active
 date +%s > /workspace/kit/state/last_activity
-if [ -n "$hours" ]; then echo $(( $(date +%s) + $(python3 -c "print(int(float('$hours')*3600))") )) > /workspace/kit/state/deadline; echo "deadline: ${hours}h"
-else rm -f /workspace/kit/state/deadline; fi
+if [ -n "$hours" ]; then echo $(( $(date +%s) + $(python3 -c "print(int(float('$hours')*3600))") )) > /workspace/kit/state/deadline.$run; echo "deadline: ${hours}h"
+else rm -f /workspace/kit/state/deadline.$run; fi
 cat > /workspace/runs/$run.cmd.sh <<EOF
+touch /workspace/runs/$run.active
 source /workspace/kit/pod/env.sh
 cd $SIGNET_DIR
 export SIGNET_BENCH_DREAMING_MODEL=$SERVED_NAME
@@ -73,7 +74,7 @@ bun scripts/bench-memory.ts --workspace $WS_ROOT/$run-ws $(printf '%q ' "${args[
 rc=\$?
 echo "{\\"event\\":\\"exit\\",\\"t\\":\$(date +%s),\\"rc\\":\\"\$rc\\"}" >> /workspace/runs/$run.meta
 echo \$rc > /workspace/runs/$run.exit
-rm -f /workspace/runs/$run.active
+rm -f /workspace/runs/$run.active /workspace/kit/state/deadline.$run
 EOF
 setsid bash /workspace/runs/$run.cmd.sh >> /workspace/runs/$run.log 2>&1 < /dev/null &
 for i in $(seq 1 60); do
