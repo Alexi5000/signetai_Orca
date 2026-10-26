@@ -35,8 +35,8 @@ function fromModelsList(body: unknown, model: string): number | undefined {
 	const entry =
 		data.find((item) => (item as { id?: unknown })?.id === model) ?? (data.length === 1 ? data[0] : undefined);
 	if (!entry || typeof entry !== "object") return undefined;
-	const record = entry as { max_model_len?: unknown; meta?: { n_ctx?: unknown; n_ctx_train?: unknown } };
-	return positiveInt(record.max_model_len) ?? positiveInt(record.meta?.n_ctx) ?? positiveInt(record.meta?.n_ctx_train);
+	const record = entry as { max_model_len?: unknown; meta?: { n_ctx?: unknown } };
+	return positiveInt(record.max_model_len) ?? positiveInt(record.meta?.n_ctx);
 }
 
 function fromLlamaCppProps(body: unknown): number | undefined {
@@ -45,12 +45,10 @@ function fromLlamaCppProps(body: unknown): number | undefined {
 }
 
 function fromOllamaShow(body: unknown): number | undefined {
-	const info = (body as { model_info?: Record<string, unknown> })?.model_info;
-	if (!info) return undefined;
-	for (const [key, value] of Object.entries(info)) {
-		if (key.endsWith(".context_length")) return positiveInt(value);
-	}
-	return undefined;
+	const parameters = (body as { parameters?: unknown })?.parameters;
+	if (typeof parameters !== "string") return undefined;
+	const match = /^num_ctx\s+(\d+)\s*$/m.exec(parameters);
+	return match ? positiveInt(Number(match[1])) : undefined;
 }
 
 async function probe(
@@ -67,16 +65,17 @@ async function probe(
 			headers: { ...headers, "Content-Type": "application/json" },
 			body: JSON.stringify({ model }),
 		}).catch(() => undefined);
-		const fromShow = fromOllamaShow(shown);
-		if (fromShow) return fromShow;
+		return fromOllamaShow(shown);
+	}
+	const props = () => getJson(fetchImpl, `${rootOf(endpoint)}/props`, { headers }).catch(() => undefined);
+	if (executor === "llama-cpp") {
+		const fromProps = fromLlamaCppProps(await props());
+		if (fromProps) return fromProps;
 	}
 	const listed = await getJson(fetchImpl, `${versionedBase(endpoint)}/models`, { headers }).catch(() => undefined);
 	const fromList = fromModelsList(listed, model);
 	if (fromList) return fromList;
-	if (executor === "llama-cpp" || executor === "openai-compatible") {
-		const props = await getJson(fetchImpl, `${rootOf(endpoint)}/props`, { headers }).catch(() => undefined);
-		return fromLlamaCppProps(props);
-	}
+	if (executor === "openai-compatible") return fromLlamaCppProps(await props());
 	return undefined;
 }
 
