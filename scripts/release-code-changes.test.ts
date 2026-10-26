@@ -93,8 +93,39 @@ describe("release-code-changes", () => {
 		const repo = createRepo();
 		commit(repo, "platform/daemon/src/fix.ts", "fix: daemon");
 
-		expect(changes(repo, "--since-release", "HEAD").status).not.toBe(0);
+		expect(changes(repo, "--since-release", "missing-head").status).not.toBe(0);
 		expect(changes(repo, "v9.9.9", "HEAD").status).not.toBe(0);
+	});
+
+	test("reports initial code without inventing a first release tag", () => {
+		const repo = createRepo();
+		commit(repo, "platform/daemon/src/fix.ts", "fix: daemon");
+		git(repo, "tag", "bundle-latest");
+		const before = git(repo, "tag", "--list");
+		const result = changes(repo, "--since-release", "HEAD");
+		expect(result.status).toBe(0);
+		expect(result.stdout.trim()).toBe("platform/daemon/src/fix.ts");
+		expect(result.stderr).toContain("No reachable release tag");
+		expect(git(repo, "tag", "--list")).toBe(before);
+	});
+
+	test("does not release an initial tree containing only documentation", () => {
+		const repo = createRepo();
+		commit(repo, "platform/daemon/README.md", "docs: daemon");
+		const result = changes(repo, "--since-release", "HEAD");
+		expect(result.status).toBe(0);
+		expect(result.stdout).toBe("");
+	});
+
+	test("ignores a release tag that is not reachable from the requested head", () => {
+		const repo = createRepo();
+		commit(repo, "platform/daemon/src/fix.ts", "fix: daemon");
+		const head = git(repo, "rev-parse", "HEAD");
+		commit(repo, "package.json", "chore: release 0.1.0");
+		git(repo, "tag", "v0.1.0");
+		const result = changes(repo, "--since-release", head);
+		expect(result.status).toBe(0);
+		expect(result.stdout.trim()).toBe("platform/daemon/src/fix.ts");
 	});
 });
 
