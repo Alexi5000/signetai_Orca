@@ -2,17 +2,9 @@ import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
-// GitHub's dependency graph does not parse bun.lock, so Dependabot never
-// reports vulnerable versions locked for the MemoryBench UI. This test keeps
-// the lockfile from regressing below the first releases that fix the known
-// critical/high advisories (osv-scanner, 2026-10-26).
-
 const lockPath = join(import.meta.dir, "..", "ui", "bun.lock")
 
 type Floor = { major: number; min: string }
-
-// Per-major floors. A locked version whose major has no floor fails the test,
-// so a new major line has to be reviewed before it is accepted.
 const floors: Record<string, Floor[]> = {
 	next: [{ major: 15, min: "15.5.28" }],
 	"drizzle-orm": [{ major: 0, min: "0.45.2" }],
