@@ -944,7 +944,8 @@ most one running pass. The first pass starts immediately; the other groups start
 only after it completes a tool call, so an unavailable provider is not called once
 per group. The response's `passId` is the first pass. `worker.activePasses` in
 `GET /api/dream/status` lists every running pass that includes the requested
-agent, as `passId` and `mode` only (no other agent's id or scopes); the trigger is complete when it
+agent, as `passId` and `mode` only (no other agent's id or scopes), and
+`worker.activeAgentId` is the requested agent while it is dreaming, otherwise `null`; the trigger is complete when it
 is empty. Compact passes, directed passes, and scheduled content and hygiene
 passes run alone. `maxOutputTokens` is unset by default, so each reply may use
 the model's own output limit. `maxInputTokens` (default 128,000) sizes evidence

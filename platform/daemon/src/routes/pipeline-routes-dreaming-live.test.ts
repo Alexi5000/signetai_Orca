@@ -230,6 +230,24 @@ describe("Dreaming live routes", () => {
 		}
 	});
 
+	it("reports another agent's running pass without naming that agent", async () => {
+		const worker = {
+			running: true,
+			activeAgentId: "agent-other",
+			activePasses: [{ passId: "p-other", agentId: "agent-other", mode: "incremental", scopes: ["agent-other"] }],
+		} as unknown as DreamingWorkerHandle;
+		setDreamingWorker(worker);
+		try {
+			const body = (await (await createPipelineApp().request("/api/dream/status")).json()) as {
+				worker: { active: boolean; activeAgentId: string | null; activePasses: unknown[] };
+			};
+			expect(body.worker).toMatchObject({ active: false, activeAgentId: null, activePasses: [] });
+			expect(JSON.stringify(body.worker)).not.toContain("agent-other");
+		} finally {
+			setDreamingWorker(null);
+		}
+	});
+
 	it("reports running passes that cover the scoped agent without leaking other scopes", async () => {
 		const worker = {
 			running: true,

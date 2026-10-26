@@ -719,7 +719,7 @@ export function registerPipelineRoutes(app: Hono): void {
 			worker: {
 				running: worker !== null,
 				active: worker?.activeAgentId === agentId,
-				activeAgentId: worker?.activeAgentId ?? null,
+				activeAgentId: worker?.activeAgentId === agentId ? agentId : null,
 				activePasses,
 			},
 			scheduler: worker?.scheduler ?? null,
