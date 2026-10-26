@@ -246,10 +246,11 @@ describe("Dreaming live routes", () => {
 			expect(response.status).toBe(200);
 			const body = (await response.json()) as { worker: { activePasses: unknown[] } };
 			expect(body.worker.activePasses).toEqual([
-				{ passId: "p-own", agentId: "agent-a", mode: "incremental", scopeCount: 2 },
-				{ passId: "p-member", agentId: "agent-z", mode: "incremental", scopeCount: 2 },
+				{ passId: "p-own", mode: "incremental" },
+				{ passId: "p-member", mode: "incremental" },
 			]);
 			expect(JSON.stringify(body.worker)).not.toContain("agent-y");
+			expect(JSON.stringify(body.worker)).not.toContain("agent-z");
 		} finally {
 			setDreamingWorker(null);
 		}

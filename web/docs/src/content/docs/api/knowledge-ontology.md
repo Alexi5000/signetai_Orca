@@ -504,7 +504,7 @@ an exact count when at most 50 sources are waiting, `null` when more are.
     "active": false,
     "activeAgentId": null,
     "activePasses": [
-      { "passId": "pass-uuid", "agentId": "default", "mode": "incremental", "scopes": ["default", "noam"] }
+      { "passId": "pass-uuid", "mode": "incremental" }
     ]
   },
   "episodicTokensPending": 42000,
@@ -943,7 +943,8 @@ Each pass may read and write only its own group's agents, and an agent is in at
 most one running pass. The first pass starts immediately; the other groups start
 only after it completes a tool call, so an unavailable provider is not called once
 per group. The response's `passId` is the first pass. `worker.activePasses` in
-`GET /api/dream/status` lists every running pass; the trigger is complete when it
+`GET /api/dream/status` lists every running pass that includes the requested
+agent, as `passId` and `mode` only (no other agent's id or scopes); the trigger is complete when it
 is empty. Compact passes, directed passes, and scheduled content and hygiene
 passes run alone. `maxOutputTokens` is unset by default, so each reply may use
 the model's own output limit. `maxInputTokens` (default 128,000) sizes evidence
