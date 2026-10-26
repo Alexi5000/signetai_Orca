@@ -44,15 +44,22 @@ stop_pod() {
   if [ -f $S/no_autostop ]; then return; fi
   log "stopping pod: $1"
   if ! archive_all; then
-    unfinished=$(grep -L '^0$' /workspace/runs/*.exit 2>/dev/null | wc -l)
-    if [ "$unfinished" -gt 0 ]; then
-      log "STOP SKIPPED: a workspace archive failed and $unfinished run(s) are unfinished; stopping now would lose their container-disk workspace. Fix it, then: lme stop <name>"
+    unfinished=0
+    for w in $WS_ROOT/*-ws; do
+      [ -d "$w" ] || continue; r=$(basename "$w" -ws)
+      [ "$(cat /workspace/runs/$r.exit 2>/dev/null)" = 0 ] || unfinished=$((unfinished + 1))
+    done
+    skips=$(cat $S/stop_skips 2>/dev/null || echo 0)
+    if [ "$unfinished" -gt 0 ] && [ "$skips" -lt 3 ]; then
+      echo $((skips + 1)) > $S/stop_skips
+      log "STOP SKIPPED ($((skips + 1))/3): a workspace archive failed and $unfinished unfinished run(s) still have their workspace only on the container disk, which a stop erases. Fix it, then: lme stop <name>"
       date -u +%FT%TZ > $S/stop_failed
       sleep 600
       return
     fi
-    log "workspace archive failed, but every run finished; stopping anyway"
+    [ "$unfinished" -gt 0 ] && log "workspace archive still failing after 3 tries; stopping anyway to end the spend (unfinished runs will need a fresh start)"
   fi
+  rm -f $S/stop_skips
   if runpodctl pod stop "$RUNPOD_POD_ID" 2>&1 || runpodctl stop pod "$RUNPOD_POD_ID" 2>&1; then rm -f $S/stop_failed; else
     log "STOP FAILED: runpodctl could not stop this pod; it keeps billing. Stop it with: lme stop <name>"
     date -u +%FT%TZ > $S/stop_failed

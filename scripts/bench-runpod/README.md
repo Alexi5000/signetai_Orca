@@ -101,9 +101,9 @@ Pod died or hit `--max-hours`? Runs are resumable: `./lme start h1 && ./lme run 
 
 While a run is active:
 
-- `--max-hours H`, set per run (a run without it clears any old deadline), stops the runs at the deadline. They stay resumable, are collected, and then the rules above apply. The pilot gets a 6 h cap.
-- A stall, meaning no vLLM generation and no run-log growth for `STALL_MIN` (120), stops the Signet runs. They stay resumable with `--resume`.
-- On pods whose `/workspace` is a network filesystem, run workspaces (SQLite) live on the container disk. The watchdog archives them to `/workspace/evidence/<run>_ws.tgz` every hour and before any stop, and `--resume` restores from there. `lme stop` also archives and collects before it stops.
+- `--max-hours H` sets a deadline for that run only. At the deadline the watchdog stops just that run's processes; the run stays resumable, is collected, and then the rules above apply. The pilot gets a 6 h cap.
+- A stall stops the Signet runs, which stay resumable with `--resume`. A stall means that for `STALL_MIN` (120) there was no vLLM generation, no model call in flight on any proxy, and no write to the run log or the run's database. If telemetry itself is stale or failing, liveness counts as unknown and the stall check does not fire; only `--max-hours` bounds a hung run then, so set it on long runs.
+- On pods whose `/workspace` is a network filesystem, run workspaces (SQLite) live on the container disk. The watchdog archives them to `/workspace/evidence/<run>_ws.tgz` every hour and before any stop, and `--resume` restores from there. If an archive fails while unfinished runs still have their workspace only on the container disk, the watchdog skips the stop up to 3 times (10 minutes apart, `stop_failed: true` in `lme status`), then stops anyway to end the spend. `lme stop` also archives and collects before it stops.
 
 The pod stops itself with `runpodctl` and its own pod-scoped key, so no account key goes onto the pod. If that fails, `lme status NAME` shows `stop_failed: true`; stop it with `lme stop NAME`. `lme hold NAME` turns auto-stop off while you work interactively.
 

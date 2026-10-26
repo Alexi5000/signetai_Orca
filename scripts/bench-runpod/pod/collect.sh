@@ -43,6 +43,6 @@ sha256sum "$T.tmp" | cut -d' ' -f1 > "$T.sha256.tmp" && mv "$T.tmp" "$T" && mv "
 [ $fail = 0 ] || kind=partial
 echo $kind > /workspace/evidence/$run.kind
 [ $fail = 0 ] || { echo "collect incomplete (see above); not marking collected"; exit 1; }
-[ $kind = final ] && touch /workspace/runs/$run.collected
+[ $kind = final ] && [ -f /workspace/runs/$run.exit ] && [ ! -f /workspace/runs/$run.active ] && touch /workspace/runs/$run.collected
 ls -la /workspace/evidence/$run.tgz
 cat "$E/tokens.txt"
