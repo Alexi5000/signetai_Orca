@@ -21,6 +21,8 @@ import {
 	setBenchDreamingConcurrency,
 	setBenchDreamingContextWindow,
 	setBenchDreamingMaxOutputTokens,
+	setBenchDreamingTimeout,
+	benchDreamingTimeoutMs,
 	setBenchDreamingThinking,
 } from "./bench-memory";
 
@@ -165,6 +167,21 @@ describe("MemoryBench launcher", () => {
 		expect(config.inference.targets.background.executor).toBe("openai-compatible");
 		expect(() => benchDreamingMaxOutputTokens({ SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS: "10" })).toThrow(
 			"from 1000 to 1000000",
+		);
+	});
+
+	test("sets the Dreaming pass timeout only when asked", async () => {
+		const dir = await workspace();
+		await writeFile(join(dir, "agent.yaml"), setupAgentYaml);
+		setBenchDreamingTimeout(dir, benchDreamingTimeoutMs({}));
+		expect(parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).memory.dreaming).toEqual({ enabled: true });
+		setBenchDreamingTimeout(dir, benchDreamingTimeoutMs({ SIGNET_BENCH_DREAMING_TIMEOUT_MS: "1800000" }));
+		expect(parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).memory.dreaming).toEqual({
+			enabled: true,
+			timeout: 1_800_000,
+		});
+		expect(() => benchDreamingTimeoutMs({ SIGNET_BENCH_DREAMING_TIMEOUT_MS: "3600000" })).toThrow(
+			"from 30000 to 1800000",
 		);
 	});
 

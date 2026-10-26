@@ -341,6 +341,27 @@ export function setBenchDreamingMaxOutputTokens(agentsDir: string, maxOutputToke
 	writeFileSync(path, stringifyYaml(config));
 }
 
+export function benchDreamingTimeoutMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
+	const raw = env.SIGNET_BENCH_DREAMING_TIMEOUT_MS?.trim();
+	if (raw === undefined || raw === "") return undefined;
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 30_000 || parsed > 1_800_000) {
+		throw new Error("SIGNET_BENCH_DREAMING_TIMEOUT_MS must be an integer from 30000 to 1800000");
+	}
+	return parsed;
+}
+
+export function setBenchDreamingTimeout(agentsDir: string, timeout: number | undefined): void {
+	if (timeout === undefined) return;
+	const path = join(agentsDir, "agent.yaml");
+	const config = parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const memory = (config.memory ?? {}) as Record<string, unknown>;
+	const dreaming = (memory.dreaming ?? {}) as Record<string, unknown>;
+	if (dreaming.timeout === timeout) return;
+	config.memory = { ...memory, dreaming: { ...dreaming, timeout } };
+	writeFileSync(path, stringifyYaml(config));
+}
+
 export function benchDreamingThinking(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> | undefined {
 	const raw = env.SIGNET_BENCH_DREAMING_THINKING?.trim();
 	if (raw === undefined || raw === "") return undefined;
@@ -581,6 +602,7 @@ async function main(): Promise<void> {
 		setBenchDreamingConcurrency(agentsDir, benchDreamingConcurrency());
 		setBenchDreamingCodemode(agentsDir, benchDreamingCodemode());
 		setBenchDreamingMaxOutputTokens(agentsDir, benchDreamingMaxOutputTokens());
+		setBenchDreamingTimeout(agentsDir, benchDreamingTimeoutMs());
 		setBenchDreamingThinking(agentsDir, benchDreamingThinking());
 		setBenchDreamingContextWindow(agentsDir, benchDreamingContextWindow());
 		mkdirSync(join(agentsDir, ".daemon", "logs"), { recursive: true });
