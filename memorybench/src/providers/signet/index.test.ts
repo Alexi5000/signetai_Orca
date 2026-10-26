@@ -4,6 +4,7 @@ import {
   formatSupermemoryParityContent,
   hasUsableMemoryContent,
   isDroppedConnection,
+  parseRetryAfterMs,
   resolveSignetSearchLimit,
   SignetDreamingProvider,
   scopeStructuredBenchmarkParticipants,
@@ -790,6 +791,44 @@ describe("Signet benchmark profiles", () => {
     } finally {
       server.stop(true)
     }
+  })
+
+  it("never waits past the pressure-retry deadline, however large Retry-After is", async () => {
+    let attempts = 0
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => {
+        attempts += 1
+        return Response.json({ error: "Busy" }, { status: 429, headers: { "retry-after": "99999" } })
+      },
+    })
+    class LiveProvider extends SignetDreamingProvider {
+      async call(): Promise<unknown> {
+        ;(this as unknown as { baseUrl: string }).baseUrl = `http://127.0.0.1:${server.port}`
+        ;(this as unknown as { pressureRetryMs: number }).pressureRetryMs = 400
+        return this.request("/api/memory/recall", { method: "POST", body: "{}" })
+      }
+    }
+    try {
+      const started = Date.now()
+      await expect(new LiveProvider().call()).rejects.toThrow("/api/memory/recall failed (429)")
+      expect(Date.now() - started).toBeLessThan(3_000)
+      expect(attempts).toBe(2)
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  it("parses Retry-After as delay seconds or an HTTP date, falling back to one second", () => {
+    const now = Date.UTC(2026, 9, 26, 12, 0, 0)
+    expect(parseRetryAfterMs("120", now)).toBe(120_000)
+    expect(parseRetryAfterMs("0.5", now)).toBe(500)
+    expect(parseRetryAfterMs(new Date(now + 30_000).toUTCString(), now)).toBe(30_000)
+    expect(parseRetryAfterMs("120abc", now)).toBe(1_000)
+    expect(parseRetryAfterMs("0", now)).toBe(1_000)
+    expect(parseRetryAfterMs(null, now)).toBe(1_000)
+    expect(parseRetryAfterMs(new Date(now - 5_000).toUTCString(), now)).toBe(1_000)
   })
 
   it("formats raw sessions like the Supermemory adapter for parity runs", () => {

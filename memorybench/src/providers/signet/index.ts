@@ -19,6 +19,20 @@ const DEFAULT_AGENT_ID = "memorybench"
 const DEFAULT_PROJECT = "memorybench"
 const DEFAULT_TIMEOUT_MS = 60_000
 const DEFAULT_PRESSURE_RETRY_SECS = 3 * 60 * 60
+const MAX_PRESSURE_WAIT_MS = 5 * 60 * 1000
+const DEFAULT_RETRY_AFTER_MS = 1000
+
+export function parseRetryAfterMs(header: string | null, now: number = Date.now()): number {
+  const value = header?.trim() ?? ""
+  if (value === "") return DEFAULT_RETRY_AFTER_MS
+  if (/^\d+(\.\d+)?$/.test(value)) {
+    const ms = Number(value) * 1000
+    return ms > 0 ? ms : DEFAULT_RETRY_AFTER_MS
+  }
+  const at = Date.parse(value)
+  if (Number.isFinite(at) && at > now) return at - now
+  return DEFAULT_RETRY_AFTER_MS
+}
 const DREAM_STATUS_CONCURRENCY = 4
 const STRICT_SEARCH_LIMIT = 10
 const SUPERMEMORY_PARITY_SEARCH_LIMIT = 30
@@ -901,7 +915,8 @@ export class SignetProvider implements Provider {
   protected async request<T>(path: string, init: RequestInit): Promise<T> {
     const pressureDeadline = Date.now() + this.pressureRetryMs
     let droppedConnections = 0
-    for (let attempt = 1; ; attempt++) {
+    let pressureRetries = 0
+    for (;;) {
       try {
         return await this.requestOnce<T>(
           path,
@@ -920,10 +935,15 @@ export class SignetProvider implements Provider {
             `${init.method ?? "GET"} ${path}: connection dropped ${droppedConnections} times: ${(error as Error).message}`
           )
         }
-        if (!(error instanceof RetryableSignetError) || Date.now() >= pressureDeadline) throw error
-        await new Promise((resolve) =>
-          setTimeout(resolve, error.retryAfterMs * Math.min(attempt, 8))
+        const remainingMs = pressureDeadline - Date.now()
+        if (!(error instanceof RetryableSignetError) || remainingMs <= 0) throw error
+        pressureRetries++
+        const delayMs = Math.min(
+          error.retryAfterMs * Math.min(pressureRetries, 8),
+          MAX_PRESSURE_WAIT_MS,
+          remainingMs
         )
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
       }
     }
   }
@@ -949,10 +969,9 @@ export class SignetProvider implements Provider {
             : response.statusText
         const retryAfterHeader = response.headers.get("retry-after")
         if (response.status === 429 || (response.status === 503 && retryAfterHeader !== null)) {
-          const retryAfterSecs = Number.parseFloat(retryAfterHeader ?? "")
           throw new RetryableSignetError(
             `${path} failed (${response.status}): ${error}`,
-            Number.isFinite(retryAfterSecs) && retryAfterSecs > 0 ? retryAfterSecs * 1000 : 1000
+            parseRetryAfterMs(retryAfterHeader)
           )
         }
         throw new Error(`${path} failed (${response.status}): ${error}`)
