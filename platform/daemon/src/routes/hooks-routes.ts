@@ -106,6 +106,7 @@ import {
 	toRecord,
 	validateSessionAgentBinding,
 } from "./utils";
+import { WRITE_PRESSURE_RETRY_AFTER_SECONDS, isRetryableWritePressure } from "../write-pressure";
 
 export function stampHarness(harness: string | undefined): void {
 	if (harness) {
@@ -687,6 +688,13 @@ function registerSessionEnd(app: Hono): void {
 				throw e;
 			}
 		} catch (e) {
+			if (isRetryableWritePressure(e)) {
+				logger.warn("hooks", "Session end deferred by write pressure; caller should retry", {
+					error: e instanceof Error ? e.message : String(e),
+				});
+				c.header("Retry-After", String(WRITE_PRESSURE_RETRY_AFTER_SECONDS));
+				return c.json({ error: "Write pressure; retry the session end", retryable: true }, 503);
+			}
 			logger.error("hooks", "Session end hook failed", e as Error);
 			return c.json({ error: "Hook execution failed" }, 500);
 		}

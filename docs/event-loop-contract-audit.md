@@ -4,18 +4,18 @@ This report is generated from the deterministic migration ledger in `scripts/eve
 
 ## Current inventory
 
-- Exact ledger inventory: 810 sites
+- Exact ledger inventory: 813 sites
 - Synchronous `withWriteTx()` sites: 56
 - Synchronous `withReadDb()` sites: 88
 - Async-named DB sites: 168
 - Async-named ON-PARENT DB sites: 166
 - Async-named OFF-PARENT DB sites: 2
-- Synchronous filesystem/process sites: 498
+- Synchronous filesystem/process sites: 501
 - Compile-visible legacy DB sites remaining: 144
   - `withWriteTx`: 56
   - `withReadDb`: 88
 
-The 810-site inventory excludes test, benchmark, generated, and `__tests__` fixtures and includes every synchronous filesystem, process, and database call, including async-named DB callbacks. The 56 synchronous writes, 88 synchronous reads, and 168 async-named DB sites are the complete database-call inventory; 144 compatibility DB operations remain transitional callers for the later migration phase. The async-named DB counts above separate the 166 ON-PARENT callbacks from the 2 OFF-PARENT callbacks. Those compatibility calls are marked with `@ts-expect-error LEGACY_SYNC_DB_ACCESS`, so the compiler reports every remaining site without forcing this phase to migrate them.
+The 813-site inventory excludes test, benchmark, generated, and `__tests__` fixtures and includes every synchronous filesystem, process, and database call, including async-named DB callbacks. The 56 synchronous writes, 88 synchronous reads, and 168 async-named DB sites are the complete database-call inventory; 144 compatibility DB operations remain transitional callers for the later migration phase. The async-named DB counts above separate the 166 ON-PARENT callbacks from the 2 OFF-PARENT callbacks. Those compatibility calls are marked with `@ts-expect-error LEGACY_SYNC_DB_ACCESS`, so the compiler reports every remaining site without forcing this phase to migrate them.
 
 ## Execution-home inventory
 
@@ -280,11 +280,11 @@ The classifier follows execution home, not API spelling. A direct accessor callb
 - `session-checkpoints.ts:308` (withReadDb)
 - `session-checkpoints.ts:323` (withWriteTx)
 - `session-checkpoints.ts:338` (withWriteTxAsync)
-- `session-claims.ts:72` (withWriteTx)
-- `session-claims.ts:90` (withWriteTx)
-- `session-claims.ts:113` (withWriteTx)
-- `session-claims.ts:140` (withWriteTx)
-- `session-claims.ts:152` (withReadDb)
+- `session-claims.ts:74` (withWriteTx)
+- `session-claims.ts:92` (withWriteTx)
+- `session-claims.ts:115` (withWriteTx)
+- `session-claims.ts:142` (withWriteTx)
+- `session-claims.ts:154` (withReadDb)
 - `db:session-end.recovery.clear` (withWriteTxAsync)
 - `session-memories.ts:108` (withWriteTx)
 - `session-memories.ts:192` (withWriteTx)
@@ -295,17 +295,17 @@ The classifier follows execution home, not API spelling. A direct accessor callb
 - `session-transcripts.ts:145` (withReadDb)
 - `session-transcripts.ts:157` (withReadDb)
 - `session-transcripts.ts:298` (withReadDb)
-- `session-transcripts.ts:479` (withReadDb)
-- `session-transcripts.ts:533` (withWriteTx)
-- `session-transcripts.ts:615` (withWriteTxAsync)
-- `session-transcripts.ts:718` (withWriteTx)
-- `session-transcripts.ts:750` (withReadDb)
-- `session-transcripts.ts:847` (withReadDbAsync)
-- `session-transcripts.ts:866` (withReadDb)
-- `session-transcripts.ts:897` (withReadDb)
-- `session-transcripts.ts:952` (withReadDb)
-- `session-transcripts.ts:997` (withReadDb)
-- `session-transcripts.ts:1061` (withReadDb)
+- `session-transcripts.ts:487` (withReadDb)
+- `session-transcripts.ts:541` (withWriteTx)
+- `session-transcripts.ts:623` (withWriteTxAsync)
+- `session-transcripts.ts:726` (withWriteTx)
+- `session-transcripts.ts:758` (withReadDb)
+- `session-transcripts.ts:855` (withReadDbAsync)
+- `session-transcripts.ts:874` (withReadDb)
+- `session-transcripts.ts:905` (withReadDb)
+- `session-transcripts.ts:960` (withReadDb)
+- `session-transcripts.ts:1005` (withReadDb)
+- `session-transcripts.ts:1069` (withReadDb)
 - `session-ttl-finalizer.ts:56` (withReadDbAsync)
 - `session-ttl-finalizer.ts:71` (withWriteTxAsync)
 - `skill-invocations.ts:48` (withWriteTx)

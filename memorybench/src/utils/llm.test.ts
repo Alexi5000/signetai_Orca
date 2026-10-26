@@ -14,6 +14,8 @@ const saved = {
   zaiBaseUrl: config.zaiBaseUrl,
   openaiApiKey: config.openaiApiKey,
   openaiBaseUrl: config.openaiBaseUrl,
+  localApiKey: config.localApiKey,
+  localBaseUrl: config.localBaseUrl,
 }
 
 afterEach(() => {
@@ -155,6 +157,80 @@ describe("Z.ai GLM transport", () => {
     try {
       await generateWithModel(getModelConfig("gpt-4o"), "2 + 2?")
       expect(server.requests[0]!.body.max_output_tokens).toBe(1000)
+    } finally {
+      server.stop()
+    }
+  })
+})
+
+describe("local OpenAI-compatible transport", () => {
+  it("sends Chat Completions with server sampling and the reasoning effort as a template kwarg", async () => {
+    const server = serve(() => chatCompletion("Paris"))
+    config.localBaseUrl = server.url
+    config.localApiKey = "local"
+    try {
+      const modelConfig = getModelConfig("local:qwen3.8-27b", {
+        MEMORYBENCH_LOCAL_REASONING_EFFORT: "low",
+        MEMORYBENCH_LOCAL_MAX_TOKENS: "2048",
+      })
+      const result = await generateWithModel(modelConfig, "Capital of France?")
+
+      expect(result.text).toBe("Paris")
+      const request = server.requests[0]!
+      expect(request.path).toBe("/api/coding/paas/v4/chat/completions")
+      expect(request.body.model).toBe("qwen3.8-27b")
+      expect(request.body.chat_template_kwargs).toEqual({
+        enable_thinking: true,
+        reasoning_effort: "low",
+      })
+      expect(request.body.max_tokens).toBe(2048)
+      expect(request.body.temperature).toBeUndefined()
+      expect(request.body.thinking).toBeUndefined()
+      expect(result.usage.inputTokens).toBe(120)
+    } finally {
+      server.stop()
+    }
+  })
+
+  it("caps local reasoning with the vLLM thinking budget when configured", async () => {
+    const server = serve(() => chatCompletion("Paris"))
+    config.localBaseUrl = server.url
+    try {
+      await generateWithModel(
+        getModelConfig("local:qwen3.8-27b", {
+          MEMORYBENCH_LOCAL_REASONING_EFFORT: "low",
+          MEMORYBENCH_LOCAL_THINKING_BUDGET: "2000",
+        }),
+        "Capital of France?"
+      )
+      const body = server.requests[0]!.body
+      expect(body.thinking_token_budget).toBe(2000)
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: true, reasoning_effort: "low" })
+    } finally {
+      server.stop()
+    }
+  })
+
+  it("turns thinking off when the reasoning effort is off", async () => {
+    const server = serve(() => chatCompletion("Paris"))
+    config.localBaseUrl = server.url
+    try {
+      await generateWithModel(
+        getModelConfig("local:qwen3.8-27b", { MEMORYBENCH_LOCAL_REASONING_EFFORT: "off" }),
+        "Capital of France?"
+      )
+      expect(server.requests[0]!.body.chat_template_kwargs).toEqual({ enable_thinking: false })
+    } finally {
+      server.stop()
+    }
+  })
+
+  it("leaves the server's reasoning default alone when no effort is configured", async () => {
+    const server = serve(() => chatCompletion("Paris"))
+    config.localBaseUrl = server.url
+    try {
+      await generateWithModel(getModelConfig("local:qwen3.8-27b", {}), "Capital of France?")
+      expect(server.requests[0]!.body.chat_template_kwargs).toBeUndefined()
     } finally {
       server.stop()
     }

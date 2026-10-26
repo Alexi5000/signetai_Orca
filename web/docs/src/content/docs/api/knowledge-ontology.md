@@ -504,7 +504,7 @@ an exact count when at most 50 sources are waiting, `null` when more are.
     "active": false,
     "activeAgentId": null,
     "activePasses": [
-      { "passId": "pass-uuid", "agentId": "default", "mode": "incremental", "scopes": ["default", "noam"] }
+      { "passId": "pass-uuid", "mode": "incremental" }
     ]
   },
   "episodicTokensPending": 42000,
@@ -516,6 +516,7 @@ an exact count when at most 50 sources are waiting, `null` when more are.
   },
   "config": {
     "tokenThreshold": 100000,
+    "maxPassTokens": 200000,
     "backfillOnFirstRun": true,
     "maxInputTokens": 128000,
     "maxOutputTokens": null,
@@ -925,6 +926,16 @@ no pass can start, 503 if the pipeline prevents worker startup, and 503 with
 An incremental trigger may start several passes. The daemon splits the agents
 that are not already in a running pass into up to `memory.dreaming.maxConcurrentPasses`
 groups (default 2), balanced by evidence backlog, and runs one pass per group.
+A group holds at most `memory.dreaming.maxPassTokens` of measured backlog
+(default 200,000 tokens, range 10,000-2,000,000); an agent whose backlog alone
+exceeds it gets a group to itself. The same budget caps the evidence one pass is
+delivered: once the delivery queue has served about `maxPassTokens` of evidence
+(estimated at four characters per token), it closes (`deliveryClosed: true`) and
+the rest waits for the next pass, so even one agent with a very large backlog
+works through it in passes that can finish. Agents that do not fit wait for a later
+trigger or sweep, so every pass stays small enough to finish and commit before
+its `timeout`. Scheduled content sweeps use the same budget for their one pass
+and leave out agents with no backlog.
 It never starts more passes than `worker.maxLlmConcurrency` allows, because a
 pass waiting for a shared LLM permit would spend its own timeout waiting. The
 daemon allows that many Pi agent workers plus three for retained dashboard chats.
@@ -932,7 +943,9 @@ Each pass may read and write only its own group's agents, and an agent is in at
 most one running pass. The first pass starts immediately; the other groups start
 only after it completes a tool call, so an unavailable provider is not called once
 per group. The response's `passId` is the first pass. `worker.activePasses` in
-`GET /api/dream/status` lists every running pass; the trigger is complete when it
+`GET /api/dream/status` lists every running pass that includes the requested
+agent, as `passId` and `mode` only (no other agent's id or scopes), and
+`worker.activeAgentId` is the requested agent while it is dreaming, otherwise `null`; the trigger is complete when it
 is empty. Compact passes, directed passes, and scheduled content and hygiene
 passes run alone. `maxOutputTokens` is unset by default, so each reply may use
 the model's own output limit. `maxInputTokens` (default 128,000) sizes evidence

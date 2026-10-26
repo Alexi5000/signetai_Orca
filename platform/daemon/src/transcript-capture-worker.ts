@@ -100,6 +100,14 @@ export interface TranscriptCaptureJobReceipt {
 	readonly status: TranscriptCaptureJobStatus;
 	readonly error: string | null;
 }
+export class TranscriptCaptureBacklogFullError extends Error {
+	readonly code = "TRANSCRIPT_CAPTURE_BACKLOG_FULL" as const;
+	readonly retryable = true as const;
+	constructor(limitBytes: number) {
+		super(`inline transcript capture budget exceeded (${limitBytes} bytes)`);
+		this.name = "TranscriptCaptureBacklogFullError";
+	}
+}
 
 const DEFAULT_MAX_ATTEMPTS = 5;
 const MAX_INLINE_CAPTURE_BYTES = 4 * 1024 * 1024;
@@ -299,7 +307,7 @@ export async function enqueueTranscriptCaptureJob(
 					existingInlineBytes(db, existing?.id ? String(existing.id) : null) + payloadBytes >
 					MAX_INLINE_CAPTURE_TOTAL_BYTES
 				) {
-					throw new Error(`inline transcript capture budget exceeded (${MAX_INLINE_CAPTURE_TOTAL_BYTES} bytes)`);
+					throw new TranscriptCaptureBacklogFullError(MAX_INLINE_CAPTURE_TOTAL_BYTES);
 				}
 				const preservedCompletedAt = source ? scalarString(existing?.completed_at) : null;
 

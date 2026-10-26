@@ -580,6 +580,98 @@ describe("backfill OOM regression (#587)", () => {
 		expect(content).not.toContain('"content":"X"');
 	});
 
+	test("an append after a crash-torn record drops the torn tail instead of corrupting the new records", async () => {
+		const root = makeRoot("snapshot-append-torn-tail");
+		const jsonlPath = canonicalTranscriptPath(root, "memorybench");
+		await writeCanonicalTranscriptSnapshot({
+			basePath: root,
+			agentId: "agent-0",
+			harness: "memorybench",
+			sessionKey: "session-a",
+			sourceFormat: "normalized",
+			transcript: "User: first\nAssistant: reply",
+		});
+		const intact = readFileSync(jsonlPath, "utf8");
+		writeFileSync(jsonlPath, `${intact}{"session_key":"session-torn","seq":1,"ro`, "utf8");
+
+		const written = await writeCanonicalTranscriptSnapshot({
+			basePath: root,
+			agentId: "agent-0",
+			harness: "memorybench",
+			sessionKey: "session-b",
+			sourceFormat: "normalized",
+			transcript: "User: second\nAssistant: reply two",
+		});
+
+		expect(written).toBe(true);
+		const after = readFileSync(jsonlPath, "utf8");
+		expect(after.startsWith(intact)).toBe(true);
+		const lines = after.split("\n").filter((line) => line.trim().length > 0);
+		const parsed = lines.map((line) => JSON.parse(line) as { session_key: string });
+		expect(parsed.map((r) => r.session_key)).toEqual(["session-a", "session-a", "session-b", "session-b"]);
+		await expect(readCanonicalTranscriptSessionKeys({ basePath: root, harness: "memorybench" })).resolves.toBeDefined();
+	});
+
+	test("writeCanonicalTranscriptSnapshot appends a new session in place instead of rewriting the file", async () => {
+		const root = makeRoot("snapshot-append-new-session");
+		const jsonlPath = canonicalTranscriptPath(root, "memorybench");
+		for (let s = 0; s < 50; s++) {
+			await writeCanonicalTranscriptSnapshot({
+				basePath: root,
+				agentId: `agent-${s % 5}`,
+				harness: "memorybench",
+				sessionKey: `session-${s}`,
+				sourceFormat: "normalized",
+				transcript: `User: prompt ${s}\nAssistant: reply ${s}`,
+			});
+		}
+		const before = readFileSync(jsonlPath, "utf8");
+		const inodeBefore = statSync(jsonlPath).ino;
+
+		const written = await writeCanonicalTranscriptSnapshot({
+			basePath: root,
+			agentId: "agent-0",
+			harness: "memorybench",
+			sessionKey: "session-new",
+			sourceFormat: "normalized",
+			transcript: "User: new prompt\nAssistant: new reply",
+		});
+
+		expect(written).toBe(true);
+		expect(statSync(jsonlPath).ino).toBe(inodeBefore);
+		const after = readFileSync(jsonlPath, "utf8");
+		expect(after.startsWith(before)).toBe(true);
+		const added = after
+			.slice(before.length)
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line) as { session_key: string; seq: number; role: string; content: string });
+		expect(added.map((r) => [r.session_key, r.seq, r.role, r.content])).toEqual([
+			["session-new", 1, "user", "new prompt"],
+			["session-new", 2, "assistant", "new reply"],
+		]);
+
+		const replaced = await writeCanonicalTranscriptSnapshot({
+			basePath: root,
+			agentId: "agent-0",
+			harness: "memorybench",
+			sessionKey: "session-new",
+			sourceFormat: "normalized",
+			transcript: "User: new prompt\nAssistant: new reply\nUser: follow-up",
+		});
+		expect(replaced).toBe(true);
+		const records = readFileSync(jsonlPath, "utf8")
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line) as { session_key: string; content: string });
+		expect(records.filter((r) => r.session_key === "session-new").map((r) => r.content)).toEqual([
+			"new prompt",
+			"new reply",
+			"follow-up",
+		]);
+		expect(records).toHaveLength(103);
+	});
+
 	test("writeCanonicalTranscriptSnapshot handles large files without excessive memory (OOM guard)", async () => {
 		const root = makeRoot("snapshot-oom-guard");
 		const jsonlPath = canonicalTranscriptPath(root, "opencode");
@@ -1043,6 +1135,53 @@ describe("backfill replaces live-only sessions", () => {
 		await ensureCanonicalTranscriptHistory(root, "default");
 		expect(readFileSync(jsonlPath, "utf8")).toBe(original);
 		expect(existsSync(join(root, "memory", ".canonical-transcript-backfill-v1.default"))).toBe(false);
+	});
+
+	test("backfills one agent's DB transcripts without paging through every other agent's rows", async () => {
+		const root = makeRoot("agent-scoped-db-backfill");
+		initTranscriptDb(root);
+		getDbAccessor().withWriteTx((db: import("./db-accessor").WriteDb) => {
+			const insert = db.prepare(
+				`INSERT INTO session_transcripts (session_key, content, harness, project, agent_id, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			);
+			for (let i = 0; i < 1_000; i++) {
+				insert.run(
+					`other-${i}`,
+					`User: other ${i}`,
+					"codex",
+					null,
+					`other-agent-${i % 10}`,
+					"2026-09-20",
+					"2026-09-20",
+				);
+			}
+			insert.run(
+				"mine",
+				"User: my question\nAssistant: my reply",
+				"codex",
+				null,
+				"agent-a",
+				"2026-09-20",
+				"2026-09-20",
+			);
+		});
+		const accessor = getDbAccessor();
+		const reads = spyOn(accessor, "withReadDb");
+		try {
+			await ensureCanonicalTranscriptHistory(root, "agent-a");
+			expect(reads.mock.calls.length).toBeLessThan(5);
+		} finally {
+			reads.mockRestore();
+		}
+		const records = readFileSync(canonicalTranscriptPath(root, "codex"), "utf8")
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line) as { agent_id: string; session_key: string; content: string });
+		expect(records.map((r) => [r.agent_id, r.session_key, r.content])).toEqual([
+			["agent-a", "mine", "my question"],
+			["agent-a", "mine", "my reply"],
+		]);
 	});
 
 	test("reports reordered completed DB turns without settling the backfill marker", async () => {

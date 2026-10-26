@@ -93,6 +93,7 @@ import {
 	telemetryRef,
 } from "./state.js";
 import { STATUS_CACHE_TTL, cachedEmbeddingStatus, resolveScopedAgentId, statusCacheTime } from "./utils.js";
+import { WRITE_PRESSURE_RETRY_AFTER_SECONDS, isRetryableWritePressure } from "../write-pressure";
 
 interface PipelineQueueBlock {
 	readonly memory: QueueCounts;
@@ -576,7 +577,7 @@ export function registerPipelineRoutes(app: Hono): void {
 		const ownerRows = await withRegisteredDbOwnerMaintenance((maintenance) =>
 			ownerQueryAll<{ status: string; count: number }>(
 				maintenance.owner,
-				"routes/pipeline-routes.ts:579",
+				"routes/pipeline-routes.ts:580",
 				"SELECT status, COUNT(*) as count FROM memory_jobs GROUP BY status",
 			),
 		);
@@ -710,18 +711,23 @@ export function registerPipelineRoutes(app: Hono): void {
 		const reviewedEvidence = await getDreamingReviewedEvidence(accessor, agentId);
 		const attention = getDreamingAttention(accessor, agentId);
 		const worker = getDreamingWorker();
+		const activePasses = (worker?.activePasses ?? [])
+			.filter((pass) => pass.agentId === agentId || pass.scopes.includes(agentId))
+			.map((pass) => ({ passId: pass.passId, mode: pass.mode }));
 
 		return c.json({
 			worker: {
 				running: worker !== null,
 				active: worker?.activeAgentId === agentId,
-				activeAgentId: worker?.activeAgentId ?? null,
+				activeAgentId: worker?.activeAgentId === agentId ? agentId : null,
+				activePasses,
 			},
 			scheduler: worker?.scheduler ?? null,
 			state,
 			episodicTokensPending,
 			config: {
 				tokenThreshold: cfg.dreaming.tokenThreshold,
+				maxPassTokens: cfg.dreaming.maxPassTokens,
 				backfillOnFirstRun: cfg.dreaming.backfillOnFirstRun,
 				maxInputTokens: cfg.dreaming.maxInputTokens,
 				maxOutputTokens: cfg.dreaming.maxOutputTokens,
@@ -892,7 +898,7 @@ export function registerPipelineRoutes(app: Hono): void {
 				async (maintenance) =>
 					(await ownerQueryOne<{ present: number }>(
 						maintenance.owner,
-						"routes/pipeline-routes.ts:895",
+						"routes/pipeline-routes.ts:901",
 						"SELECT 1 AS present FROM dreaming_evidence_exclusions WHERE agent_id = ? AND source_kind = 'summary' AND source_id = ? AND resolved_at IS NULL",
 						[agentId, sourceId],
 					)) != null,
@@ -1062,6 +1068,10 @@ export function registerPipelineRoutes(app: Hono): void {
 		} catch (e) {
 			if (e instanceof AlreadyRunningError) return c.json({ error: e.message }, 409);
 			const msg = e instanceof Error ? e.message : String(e);
+			if (isRetryableWritePressure(e) || (e instanceof Error && e.name === "DbOwnerDeadlineError")) {
+				c.header("Retry-After", String(WRITE_PRESSURE_RETRY_AFTER_SECONDS));
+				return c.json({ error: msg, retryable: true }, 503);
+			}
 			return c.json({ error: msg }, 500);
 		}
 		return c.json({ accepted: true, passId, status: "running", mode, agentId }, 202);

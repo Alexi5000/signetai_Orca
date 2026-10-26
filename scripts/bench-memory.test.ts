@@ -9,12 +9,21 @@ import {
 	benchUsesSubscription,
 	benchDreamingCodemode,
 	benchDreamingConcurrency,
+	benchDreamingContextWindow,
+	benchDreamingMaxOutputTokens,
+	benchDreamingThinking,
 	buildSetupArgs,
+	isLocalEndpoint,
 	loadEnvFile,
 	pinnedBunMismatch,
 	resolveBenchModel,
 	setBenchDreamingCodemode,
 	setBenchDreamingConcurrency,
+	setBenchDreamingContextWindow,
+	setBenchDreamingMaxOutputTokens,
+	setBenchDreamingTimeout,
+	benchDreamingTimeoutMs,
+	setBenchDreamingThinking,
 } from "./bench-memory";
 
 const workspaces: string[] = [];
@@ -44,6 +53,14 @@ inference:
 `;
 
 describe("MemoryBench launcher", () => {
+	test("treats loopback inference endpoints as local so they need no API key", () => {
+		expect(isLocalEndpoint("http://127.0.0.1:8000/v1")).toBe(true);
+		expect(isLocalEndpoint("http://localhost:8000/v1")).toBe(true);
+		expect(isLocalEndpoint("http://[::1]:8000/v1")).toBe(true);
+		expect(isLocalEndpoint("https://open.bigmodel.cn/api/coding/paas/v4")).toBe(false);
+		expect(isLocalEndpoint("not a url")).toBe(false);
+	});
+
 	test("sets the workspace up through real Signet setup without letting setup start a daemon", () => {
 		const args = buildSetupArgs("/tmp/bench/agents", 47123, resolveBenchModel({}));
 
@@ -131,7 +148,73 @@ describe("MemoryBench launcher", () => {
 		expect(config.memory.pipelineV2.worker.maxLlmConcurrency).toBe(8);
 		expect(config.inference.targets.background.executor).toBe("openai-compatible");
 		expect(benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "2" })).toBe(2);
-		expect(() => benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "0" })).toThrow("from 1 to 16");
+		expect(benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "128" })).toBe(128);
+		expect(() => benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "0" })).toThrow("from 1 to 256");
+		expect(() => benchDreamingConcurrency({ SIGNET_BENCH_DREAMING_CONCURRENCY: "257" })).toThrow("from 1 to 256");
+	});
+
+	test("raises the Dreaming per-turn output budget only when the bench asks for it", async () => {
+		const dir = await workspace();
+		await writeFile(join(dir, "agent.yaml"), setupAgentYaml);
+		setBenchDreamingMaxOutputTokens(dir, benchDreamingMaxOutputTokens({}));
+		expect(parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).memory.dreaming).toEqual({ enabled: true });
+		setBenchDreamingMaxOutputTokens(
+			dir,
+			benchDreamingMaxOutputTokens({ SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS: "16384" }),
+		);
+		const config = parseYaml(await readFile(join(dir, "agent.yaml"), "utf8"));
+		expect(config.memory.dreaming).toEqual({ enabled: true, maxOutputTokens: 16384 });
+		expect(config.inference.targets.background.executor).toBe("openai-compatible");
+		expect(() => benchDreamingMaxOutputTokens({ SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS: "10" })).toThrow(
+			"from 1000 to 1000000",
+		);
+	});
+
+	test("sets the Dreaming pass timeout only when asked", async () => {
+		const dir = await workspace();
+		await writeFile(join(dir, "agent.yaml"), setupAgentYaml);
+		setBenchDreamingTimeout(dir, benchDreamingTimeoutMs({}));
+		expect(parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).memory.dreaming).toEqual({ enabled: true });
+		setBenchDreamingTimeout(dir, benchDreamingTimeoutMs({ SIGNET_BENCH_DREAMING_TIMEOUT_MS: "1800000" }));
+		expect(parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).memory.dreaming).toEqual({
+			enabled: true,
+			timeout: 1_800_000,
+		});
+		expect(() => benchDreamingTimeoutMs({ SIGNET_BENCH_DREAMING_TIMEOUT_MS: "3600000" })).toThrow(
+			"from 30000 to 1800000",
+		);
+	});
+
+	test("sets the Dreaming model context window only when asked", async () => {
+		const dir = await workspace();
+		await writeFile(join(dir, "agent.yaml"), setupAgentYaml);
+		setBenchDreamingContextWindow(dir, benchDreamingContextWindow({}));
+		expect(
+			parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).inference.targets.background.models.default,
+		).toEqual({ model: "glm-5.3-flash" });
+		setBenchDreamingContextWindow(dir, benchDreamingContextWindow({ SIGNET_BENCH_DREAMING_CONTEXT_WINDOW: "262144" }));
+		expect(
+			parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).inference.targets.background.models.default,
+		).toEqual({ model: "glm-5.3-flash", contextWindow: 262144 });
+		expect(() => benchDreamingContextWindow({ SIGNET_BENCH_DREAMING_CONTEXT_WINDOW: "1000" })).toThrow(
+			"from 8192 to 2000000",
+		);
+	});
+
+	test("writes local thinking control onto the background target only when asked", async () => {
+		const dir = await workspace();
+		await writeFile(join(dir, "agent.yaml"), setupAgentYaml);
+		setBenchDreamingThinking(dir, benchDreamingThinking({}));
+		expect(parseYaml(await readFile(join(dir, "agent.yaml"), "utf8")).inference.targets.background.thinking).toBe(
+			undefined,
+		);
+		const thinking = { format: "chat-template", budgetTokens: 2000 };
+		setBenchDreamingThinking(dir, benchDreamingThinking({ SIGNET_BENCH_DREAMING_THINKING: JSON.stringify(thinking) }));
+		const config = parseYaml(await readFile(join(dir, "agent.yaml"), "utf8"));
+		expect(config.inference.targets.background.thinking).toEqual(thinking);
+		expect(config.inference.targets.background.executor).toBe("openai-compatible");
+		expect(() => benchDreamingThinking({ SIGNET_BENCH_DREAMING_THINKING: "nope" })).toThrow("JSON object");
+		expect(() => benchDreamingThinking({ SIGNET_BENCH_DREAMING_THINKING: "{}" })).toThrow("needs a format");
 	});
 
 	test("turns Dreaming codemode on only when the bench asks for it", async () => {

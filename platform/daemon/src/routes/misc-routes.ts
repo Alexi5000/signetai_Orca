@@ -30,6 +30,7 @@ import {
 import { loadDashboardIdentity } from "./dashboard-identity.js";
 import { AGENTS_DIR, authConfig } from "./state.js";
 import { parseOptionalString, toRecord } from "./utils.js";
+import { WRITE_PRESSURE_RETRY_AFTER_SECONDS, isRetryableWritePressure } from "../write-pressure";
 
 const GUARDED_CONFIG_FILES_CI = new Set(["agent.yaml", "config.yaml"]);
 
@@ -265,15 +266,26 @@ export function registerMiscRoutes(app: Hono): void {
 		const readPolicy = resolved.readPolicy;
 		const group = resolved.policyGroup;
 		const now = new Date().toISOString();
-		await dbOwnerQuery(
-			{
-				sql: `INSERT INTO agents (id, name, read_policy, policy_group, created_at, updated_at)
+		try {
+			await dbOwnerQuery(
+				{
+					sql: `INSERT INTO agents (id, name, read_policy, policy_group, created_at, updated_at)
 				 VALUES (?, ?, ?, ?, ?, ?)`,
-				params: [name, name, readPolicy, group, now, now],
-				result: "run",
-			},
-			{ operation: "agents.create", lane: "write", deadlineMs: 5_000 },
-		);
+					params: [name, name, readPolicy, group, now, now],
+					result: "run",
+				},
+				{ operation: "agents.create", lane: "write", deadlineMs: 5_000 },
+			);
+		} catch (error) {
+			if (error instanceof Error && /UNIQUE constraint failed/i.test(error.message)) {
+				return c.json({ error: `Agent ${name} already exists` }, 409);
+			}
+			if (isRetryableWritePressure(error)) {
+				c.header("Retry-After", String(WRITE_PRESSURE_RETRY_AFTER_SECONDS));
+				return c.json({ error: "Write pressure; retry agent creation", retryable: true }, 503);
+			}
+			throw error;
+		}
 		invalidateAgentScopeCache(name);
 		const created = await dbOwnerQuery<AgentRow | undefined>(
 			{

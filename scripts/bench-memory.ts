@@ -234,6 +234,16 @@ export function buildSetupArgs(agentsDir: string, port: number, model: BenchMode
 	];
 }
 
+export function isLocalEndpoint(value: string): boolean {
+	let hostname: string;
+	try {
+		hostname = new URL(value).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+}
+
 const SUBSCRIPTION_PROVIDER_FAMILIES: ReadonlySet<string> = new Set(["openai-codex"]);
 
 export function benchUsesSubscription(providerFamily: string): boolean {
@@ -268,8 +278,8 @@ export function benchDreamingConcurrency(env: NodeJS.ProcessEnv = process.env): 
 	const raw = env.SIGNET_BENCH_DREAMING_CONCURRENCY;
 	if (raw === undefined || raw.trim() === "") return 6;
 	const parsed = Number(raw);
-	if (!Number.isInteger(parsed) || parsed < 1 || parsed > 16) {
-		throw new Error("SIGNET_BENCH_DREAMING_CONCURRENCY must be an integer from 1 to 16");
+	if (!Number.isInteger(parsed) || parsed < 1 || parsed > 256) {
+		throw new Error("SIGNET_BENCH_DREAMING_CONCURRENCY must be an integer from 1 to 256");
 	}
 	return parsed;
 }
@@ -281,7 +291,7 @@ export function setBenchDreamingConcurrency(agentsDir: string, passes: number): 
 	const dreaming = (memory.dreaming ?? {}) as Record<string, unknown>;
 	const pipeline = (memory.pipelineV2 ?? {}) as Record<string, unknown>;
 	const worker = (pipeline.worker ?? {}) as Record<string, unknown>;
-	const llmConcurrency = Math.min(16, passes + 2);
+	const llmConcurrency = Math.min(256, passes + 2);
 	if (dreaming.maxConcurrentPasses === passes && worker.maxLlmConcurrency === llmConcurrency) return;
 	config.memory = {
 		...memory,
@@ -307,6 +317,103 @@ export function setBenchDreamingCodemode(agentsDir: string, enabled: boolean | u
 	const dreaming = (memory.dreaming ?? {}) as Record<string, unknown>;
 	if (dreaming.codemode === enabled) return;
 	config.memory = { ...memory, dreaming: { ...dreaming, codemode: enabled } };
+	writeFileSync(path, stringifyYaml(config));
+}
+
+export function benchDreamingMaxOutputTokens(env: NodeJS.ProcessEnv = process.env): number | undefined {
+	const raw = env.SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS?.trim();
+	if (raw === undefined || raw === "") return undefined;
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 1_000 || parsed > 1_000_000) {
+		throw new Error("SIGNET_BENCH_DREAMING_MAX_OUTPUT_TOKENS must be an integer from 1000 to 1000000");
+	}
+	return parsed;
+}
+
+export function setBenchDreamingMaxOutputTokens(agentsDir: string, maxOutputTokens: number | undefined): void {
+	if (maxOutputTokens === undefined) return;
+	const path = join(agentsDir, "agent.yaml");
+	const config = parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const memory = (config.memory ?? {}) as Record<string, unknown>;
+	const dreaming = (memory.dreaming ?? {}) as Record<string, unknown>;
+	if (dreaming.maxOutputTokens === maxOutputTokens) return;
+	config.memory = { ...memory, dreaming: { ...dreaming, maxOutputTokens } };
+	writeFileSync(path, stringifyYaml(config));
+}
+
+export function benchDreamingTimeoutMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
+	const raw = env.SIGNET_BENCH_DREAMING_TIMEOUT_MS?.trim();
+	if (raw === undefined || raw === "") return undefined;
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 30_000 || parsed > 1_800_000) {
+		throw new Error("SIGNET_BENCH_DREAMING_TIMEOUT_MS must be an integer from 30000 to 1800000");
+	}
+	return parsed;
+}
+
+export function setBenchDreamingTimeout(agentsDir: string, timeout: number | undefined): void {
+	if (timeout === undefined) return;
+	const path = join(agentsDir, "agent.yaml");
+	const config = parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const memory = (config.memory ?? {}) as Record<string, unknown>;
+	const dreaming = (memory.dreaming ?? {}) as Record<string, unknown>;
+	if (dreaming.timeout === timeout) return;
+	config.memory = { ...memory, dreaming: { ...dreaming, timeout } };
+	writeFileSync(path, stringifyYaml(config));
+}
+
+export function benchDreamingThinking(env: NodeJS.ProcessEnv = process.env): Record<string, unknown> | undefined {
+	const raw = env.SIGNET_BENCH_DREAMING_THINKING?.trim();
+	if (raw === undefined || raw === "") return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new Error("SIGNET_BENCH_DREAMING_THINKING must be a JSON object");
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("SIGNET_BENCH_DREAMING_THINKING must be a JSON object");
+	}
+	if (typeof (parsed as { format?: unknown }).format !== "string") {
+		throw new Error("SIGNET_BENCH_DREAMING_THINKING needs a format");
+	}
+	return parsed as Record<string, unknown>;
+}
+
+export function setBenchDreamingThinking(agentsDir: string, thinking: Record<string, unknown> | undefined): void {
+	if (thinking === undefined) return;
+	const path = join(agentsDir, "agent.yaml");
+	const config = parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const inference = config.inference as Record<string, unknown> | undefined;
+	const targets = inference?.targets as Record<string, Record<string, unknown>> | undefined;
+	const target = inference?.defaultPolicy === "background" ? targets?.background : undefined;
+	if (!target) throw new Error("Signet setup did not write the expected background inference target");
+	target.thinking = thinking;
+	writeFileSync(path, stringifyYaml(config));
+}
+
+export function benchDreamingContextWindow(env: NodeJS.ProcessEnv = process.env): number | undefined {
+	const raw = env.SIGNET_BENCH_DREAMING_CONTEXT_WINDOW?.trim();
+	if (raw === undefined || raw === "") return undefined;
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 8_192 || parsed > 2_000_000) {
+		throw new Error("SIGNET_BENCH_DREAMING_CONTEXT_WINDOW must be an integer from 8192 to 2000000");
+	}
+	return parsed;
+}
+
+export function setBenchDreamingContextWindow(agentsDir: string, contextWindow: number | undefined): void {
+	if (contextWindow === undefined) return;
+	const path = join(agentsDir, "agent.yaml");
+	const config = parseYaml(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const inference = config.inference as Record<string, unknown> | undefined;
+	const targets = inference?.targets as Record<string, Record<string, unknown>> | undefined;
+	const target = inference?.defaultPolicy === "background" ? targets?.background : undefined;
+	const models = target?.models as Record<string, Record<string, unknown>> | undefined;
+	if (!models || Object.keys(models).length === 0) {
+		throw new Error("Signet setup did not write the expected background inference target");
+	}
+	for (const model of Object.values(models)) model.contextWindow = contextWindow;
 	writeFileSync(path, stringifyYaml(config));
 }
 
@@ -494,6 +601,10 @@ async function main(): Promise<void> {
 
 		setBenchDreamingConcurrency(agentsDir, benchDreamingConcurrency());
 		setBenchDreamingCodemode(agentsDir, benchDreamingCodemode());
+		setBenchDreamingMaxOutputTokens(agentsDir, benchDreamingMaxOutputTokens());
+		setBenchDreamingTimeout(agentsDir, benchDreamingTimeoutMs());
+		setBenchDreamingThinking(agentsDir, benchDreamingThinking());
+		setBenchDreamingContextWindow(agentsDir, benchDreamingContextWindow());
 		mkdirSync(join(agentsDir, ".daemon", "logs"), { recursive: true });
 		daemon = spawn(process.execPath, ["platform/daemon/src/daemon.ts"], {
 			cwd: repoRoot,
