@@ -55,6 +55,9 @@ import { nativeRerank } from "./native-rerank";
 import { FTS_STOP } from "./pipeline/stop-words";
 import {
 	type EvidenceCandidateInput,
+	HINT_ONLY_SCORE_CAP,
+	hasDirectEvidence,
+	hintQueryCoverage,
 	shapeByFacetCoverage,
 	shapeStructuredEvidence,
 } from "./pipeline/structured-evidence";
@@ -64,6 +67,7 @@ import {
 	findStructuredPathCandidatesViaOwner,
 	scoreStructuredPathEvidenceViaOwner,
 } from "./pipeline/structured-path-evidence";
+import { rankPositions, reciprocalRankScore, selectPrimaryCandidates } from "./recall-rank-fusion";
 import { type RecallDedupeMeta, applyRecallDedupe } from "./session-recall-dedupe";
 import { recordFirstSourceRecall } from "./source-lifecycle-telemetry";
 import { escapeLike } from "./sql-utils";
@@ -392,6 +396,7 @@ function normalizeExpansionToken(raw: string): string {
 	if (cleaned.endsWith("s") && cleaned.length > 3) return cleaned.slice(0, -1);
 	return cleaned;
 }
+const REHEARSAL_MAX_BOOST = 0.25;
 async function applyRehearsalBoost(
 	scored: Array<{ id: string; score: number; source: string }>,
 	search: MemorySearchConfig,
@@ -428,12 +433,13 @@ async function applyRehearsalBoost(
 			const row = accessMap.get(s.id);
 			if (!row) continue;
 			if (rehearsalEnabled && row.access_count > 0) {
-				const daysSinceAccess = row.last_accessed
-					? (freshness.nowMs - new Date(row.last_accessed).getTime()) / 86_400_000
-					: search.rehearsal_half_life_days;
+				const accessedMs = row.last_accessed ? Date.parse(row.last_accessed) : Number.NaN;
+				const daysSinceAccess = Number.isNaN(accessedMs)
+					? search.rehearsal_half_life_days
+					: (freshness.nowMs - accessedMs) / 86_400_000;
 				const recencyFactor = 0.5 ** (daysSinceAccess / search.rehearsal_half_life_days);
 				const boost = search.rehearsal_weight * Math.log(row.access_count + 1) * recencyFactor;
-				s.score *= 1 + boost;
+				s.score *= 1 + Math.min(boost, REHEARSAL_MAX_BOOST);
 			}
 			if (freshnessEnabled) {
 				const createdAtMs = Date.parse(row.created_at);
@@ -1683,7 +1689,6 @@ function describeRecallGraphError(error: unknown): {
 function isRecallGraphDeadlineError(error: { readonly code: string | number | null }): boolean {
 	return error.code === "DB_OWNER_DEADLINE" || error.code === "DB_OWNER_CANCELLED";
 }
-const HINT_ONLY_SCORE_CAP = 0.75;
 const TEMPORAL_TOPIC_SCORE_CAP = 0.85;
 
 function temporalTopicTokens(raw: string): string[] {
@@ -1709,7 +1714,6 @@ export async function hybridRecall(
 	checkRecallCancellation(execution);
 	let query = params.query;
 	const limit = normalizeRecallLimit(params.limit);
-	const alpha = cfg.search.alpha;
 	const minScore = cfg.search.min_score;
 	const filter = buildFilterClause(params);
 	const needsPostFilter = params.scope !== undefined || !!params.project || !!params.agentId;
@@ -2059,7 +2063,7 @@ export async function hybridRecall(
 		try {
 			await timings.timeAsync("hints_fts", async () => {
 				if (keywordQuery.length === 0) return;
-				const sql = `SELECT h.memory_id AS id, bm25(memory_hints_fts) AS raw_score
+				const sql = `SELECT h.memory_id AS id, h.hint AS hint, bm25(memory_hints_fts) AS raw_score
 				   FROM memory_hints_fts
 				   CROSS JOIN memory_hints h ON memory_hints_fts.rowid = h.rowid
 				   CROSS JOIN memories m ON m.id = h.memory_id
@@ -2069,7 +2073,7 @@ export async function hybridRecall(
 				     ${filter.sql}
 				   ORDER BY raw_score LIMIT ?`;
 
-				const rows = await ownerReadAll<{ id: string; raw_score: number }>(
+				const rows = await ownerReadAll<{ id: string; hint: string; raw_score: number }>(
 					await getDbOwner(getDbAccessorPath()),
 					sql,
 					[keywordQuery, ...filter.args, cfg.search.top_k],
@@ -2085,7 +2089,8 @@ export async function hybridRecall(
 				const maxRaw = rawScores.length > 0 ? Math.max(...rawScores) : 1;
 				const normalizer = maxRaw > 0 ? maxRaw : 1;
 				for (const row of rows) {
-					const hint = Math.abs(row.raw_score) / normalizer;
+					const hint = (Math.abs(row.raw_score) / normalizer) * hintQueryCoverage(keywordQuery, row.hint);
+					if (hint <= 0) continue;
 					hintMap.set(row.id, Math.max(hintMap.get(row.id) ?? 0, hint));
 				}
 			});
@@ -2179,6 +2184,8 @@ export async function hybridRecall(
 		...temporalCandidateMap.keys(),
 	]);
 	const flatScored: Array<{ id: string; score: number; source: string }> = [];
+	const lexicalRank = rankPositions(bm25Map, minScore);
+	const semanticRank = rankPositions(vectorMap, minScore);
 
 	timings.time("flat_score_merge", () => {
 		for (const id of allIds) {
@@ -2189,18 +2196,20 @@ export async function hybridRecall(
 			const temporalCandidate = temporalCandidateMap.get(id) ?? 0;
 			const topicEvidence = bm25 > 0 || hint > 0 || vec > 0 || structured > 0;
 			const temporalScore = temporalCandidateSet.has(id) && topicEvidence ? 0.85 : 0;
+			const lexicalPosition = lexicalRank.get(id);
+			const semanticPosition = semanticRank.get(id);
+			const ranked = lexicalPosition !== undefined || semanticPosition !== undefined;
 			let score: number;
 			let source: string;
 
-			if (bm25 > 0 && vec > 0) {
-				score = alpha * vec + (1 - alpha) * bm25;
-				source = "hybrid";
-			} else if (vec > 0) {
-				score = vec;
-				source = "vector";
-			} else if (bm25 > 0) {
-				score = bm25;
-				source = "keyword";
+			if (ranked) {
+				score = reciprocalRankScore([lexicalPosition, semanticPosition]);
+				source =
+					lexicalPosition !== undefined && semanticPosition !== undefined
+						? "hybrid"
+						: semanticPosition !== undefined
+							? "vector"
+							: "keyword";
 			} else if (temporalScore > 0) {
 				score = temporalScore;
 				source = "temporal";
@@ -2225,7 +2234,7 @@ export async function hybridRecall(
 				source = bm25 > 0 || vec > 0 || hint > 0 || structured > 0 ? "temporal_hybrid" : "temporal";
 			}
 
-			if (score >= minScore) flatScored.push({ id, score, source });
+			if (ranked || score >= minScore) flatScored.push({ id, score, source });
 		}
 
 		flatScored.sort((a, b) => b.score - a.score);
@@ -2330,22 +2339,15 @@ export async function hybridRecall(
 			const candidateBudget = Math.max(limit, Math.min(cfg.search.top_k, limit * 4));
 			const flatIds = new Set(flatScored.map((row) => row.id));
 			const minFlat = Math.ceil(candidateBudget * 0.4);
+			const reservedSemantic = Math.ceil(candidateBudget * 0.25);
 			const byId = new Map<string, { id: string; score: number; source: string }>();
 			for (const row of flatScored) mergeCandidate(byId, row);
 			for (const row of traversalScored) mergeCandidate(byId, row);
 			const fused = [...byId.values()].sort((a, b) => b.score - a.score);
-			const selected: Array<{ id: string; score: number; source: string }> = [];
-			let flatCount = 0;
-			for (const row of fused) {
-				if (selected.length >= candidateBudget) break;
-				const isFlat = flatIds.has(row.id);
-				const remaining = candidateBudget - selected.length;
-				const neededFlat = Math.max(0, Math.min(minFlat, flatScored.length) - flatCount);
-				if (!isFlat && neededFlat >= remaining) continue;
-				selected.push(row);
-				if (isFlat) flatCount++;
-			}
-			scored = selected;
+			const reservedIds = new Set(
+				[...semanticRank].filter(([, position]) => position <= reservedSemantic).map(([id]) => id),
+			);
+			scored = selectPrimaryCandidates(fused, candidateBudget, flatIds, minFlat, reservedIds);
 		});
 	} else {
 		scored = flatScored;
@@ -2821,11 +2823,14 @@ export async function hybridRecall(
 			});
 		}
 		for (const row of scored) {
-			const hasDirectEvidence =
-				(bm25Map.get(row.id) ?? 0) > 0 ||
-				(vectorMap.get(row.id) ?? 0) > 0 ||
-				(structuredEvidenceMap.get(row.id) ?? 0) > 0;
-			if (row.source === "hint" && !hasDirectEvidence) row.score = Math.min(row.score, HINT_ONLY_SCORE_CAP);
+			const direct = hasDirectEvidence({
+				lexical: Math.max(bm25Map.get(row.id) ?? 0, temporalTopicEvidenceMap.get(row.id) ?? 0),
+				semantic: semanticEvidenceMap.get(row.id),
+				structured: structuredEvidenceMap.get(row.id),
+			});
+			if ((hintMap.get(row.id) ?? 0) > 0 && !direct) {
+				row.score = Math.min(row.score, HINT_ONLY_SCORE_CAP);
+			}
 		}
 		const observedScores = await loadObservedScores(
 			scored.map((row) => row.id),
