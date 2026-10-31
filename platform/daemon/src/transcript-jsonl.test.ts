@@ -1,5 +1,17 @@
 import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	closeSync,
+	existsSync,
+	fstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -36,6 +48,15 @@ afterEach(async () => {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+function readWithInode(path: string): [string, number] {
+	const fd = openSync(path, "r");
+	try {
+		return [readFileSync(fd, "utf8"), fstatSync(fd).ino];
+	} finally {
+		closeSync(fd);
+	}
+}
 
 describe("canonical transcript JSONL", () => {
 	test("preserves multiline and whitespace-sensitive content in completed snapshots", async () => {
@@ -626,8 +647,7 @@ describe("backfill OOM regression (#587)", () => {
 				transcript: `User: prompt ${s}\nAssistant: reply ${s}`,
 			});
 		}
-		const before = readFileSync(jsonlPath, "utf8");
-		const inodeBefore = statSync(jsonlPath).ino;
+		const [before, inodeBefore] = readWithInode(jsonlPath);
 
 		const written = await writeCanonicalTranscriptSnapshot({
 			basePath: root,
@@ -639,8 +659,8 @@ describe("backfill OOM regression (#587)", () => {
 		});
 
 		expect(written).toBe(true);
-		expect(statSync(jsonlPath).ino).toBe(inodeBefore);
-		const after = readFileSync(jsonlPath, "utf8");
+		const [after, inodeAfter] = readWithInode(jsonlPath);
+		expect(inodeAfter).toBe(inodeBefore);
 		expect(after.startsWith(before)).toBe(true);
 		const added = after
 			.slice(before.length)

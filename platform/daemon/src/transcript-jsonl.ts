@@ -261,11 +261,16 @@ function isCompleteJsonLine(line: Buffer): boolean {
 }
 
 function dropTornTail(path: string): void {
-	if (!existsSync(path)) return;
-	const size = statSync(path).size;
-	if (size === 0) return;
-	const fd = openSync(path, "r+");
+	let fd: number;
 	try {
+		fd = openSync(path, "r+");
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+		throw error;
+	}
+	try {
+		const size = fstatSync(fd).size;
+		if (size === 0) return;
 		const last = Buffer.alloc(1);
 		readSync(fd, last, 0, 1, size - 1);
 		if (last[0] === 0x0a) return;

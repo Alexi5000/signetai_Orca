@@ -10,6 +10,7 @@ usage: usage_proxy.py --port 8091 --tag signet-dream [--upstream http://127.0.0.
 --think-budget / --force-model only fill fields the client did not set; use them for
 clients that cannot send a thinking budget themselves (Supermemory).
 Stats: GET /_proxy_stats -> per-path request counts plus usage totals.
+Only the OpenAI-compatible endpoints in FORWARD_PATHS are forwarded upstream.
 """
 import argparse, collections, json, os, time
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
@@ -31,6 +32,10 @@ totals = collections.Counter()
 inflight = 0
 session = None
 USAGE_PATHS = ("/chat/completions", "/completions")
+FORWARD_PATHS = {
+    p: p
+    for p in ("/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/embeddings", "/health")
+}
 
 
 def record(path, model, stream, status, t0, usage, client_gone=False):
@@ -89,6 +94,9 @@ async def handle(request):
     global session
     if session is None:
         session = ClientSession(timeout=ClientTimeout(total=4 * 3600), connector=TCPConnector(limit=0))
+    forward_path = FORWARD_PATHS.get(request.path)
+    if forward_path is None:
+        return web.Response(status=404, text="usage_proxy: path not forwarded")
     body = await request.read()
     counts[request.path] += 1
     track = request.method == "POST" and request.path.endswith(USAGE_PATHS) and body
@@ -128,7 +136,7 @@ async def handle(request):
     global inflight
     inflight += 1
     try:
-        async with session.request(request.method, args.upstream + request.rel_url.path_qs, data=body, headers=headers) as up:
+        async with session.request(request.method, args.upstream + forward_path, params=request.rel_url.query, data=body, headers=headers) as up:
             status = up.status
             hop = ("content-length", "transfer-encoding", "content-encoding", "connection")
             resp = web.StreamResponse(status=up.status, headers={k: v for k, v in up.headers.items() if k.lower() not in hop})
@@ -173,7 +181,8 @@ async def handle(request):
             return resp
     except Exception as e:
         status = 599
-        raise web.HTTPBadGateway(text=f"usage_proxy upstream error: {e}")
+        print(f"usage_proxy upstream error on {request.path}: {type(e).__name__}: {e}", flush=True)
+        raise web.HTTPBadGateway(text="usage_proxy upstream error")
     finally:
         inflight -= 1
         if track:
