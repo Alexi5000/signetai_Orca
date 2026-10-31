@@ -5083,182 +5083,168 @@
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 264,
-      "api": "existsSync",
-      "source": "if (!existsSync(path)) return;",
-      "category": "hot-path"
-    },
-    {
-      "path": "transcript-jsonl.ts",
-      "line": 265,
-      "api": "statSync",
-      "source": "const size = statSync(path).size;",
-      "category": "hot-path"
-    },
-    {
-      "path": "transcript-jsonl.ts",
-      "line": 288,
+      "line": 293,
       "api": "mkdirSync",
       "source": "mkdirSync(dirname(path), { recursive: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 290,
+      "line": 295,
       "api": "appendFileSync",
       "source": "appendFileSync(",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 315,
+      "line": 320,
       "api": "readFileSync",
       "source": "const parsed = JSON.parse(readFileSync(join(path, \"owner.json\"), \"utf8\")) as { readonly pid?: unknown };",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 324,
+      "line": 329,
       "api": "readFileSync",
       "source": "const parsed = JSON.parse(readFileSync(join(path, \"owner.json\"), \"utf8\")) as { readonly token?: unknown };",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 344,
+      "line": 349,
       "api": "statSync",
       "source": "return now - statSync(path).mtimeMs > LOCK_DEAD_OWNER_STALE_MS;",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 355,
+      "line": 360,
       "api": "mkdirSync",
       "source": "mkdirSync(lockPath);",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 356,
+      "line": 361,
       "api": "writeFileExclusiveSync",
       "source": "writeFileExclusiveSync(",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 368,
+      "line": 373,
       "api": "rmSync",
       "source": "rmSync(lockPath, { recursive: true, force: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 378,
+      "line": 383,
       "api": "readFileSync",
       "source": "const parsed = JSON.parse(readFileSync(join(lockPath, \"owner.json\"), \"utf8\")) as { readonly token?: unknown };",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 383,
+      "line": 388,
       "api": "rmSync",
       "source": "rmSync(lockPath, { recursive: true, force: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 387,
+      "line": 392,
       "api": "mkdirSync",
       "source": "mkdirSync(dirname(path), { recursive: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 435,
+      "line": 440,
       "api": "existsSync",
       "source": "if (!existsSync(path)) return null;",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 436,
+      "line": 441,
       "api": "statSync",
       "source": "const stat = statSync(path);",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 533,
+      "line": 538,
       "api": "existsSync",
       "source": "if (!existsSync(path)) return { canonicalKeys, liveOnlyKeys, completedDigests: new Map() };",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 599,
+      "line": 604,
       "api": "mkdirSync",
       "source": "mkdirSync(dirname(path), { recursive: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 601,
+      "line": 606,
       "api": "writeFileExclusiveSync",
       "source": "if (writeFileExclusiveSync(path, `${body}\\n`, { fsync: true })) {",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 610,
+      "line": 615,
       "api": "rmSync",
       "source": "rmSync(tmpPath, { force: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 664,
+      "line": 669,
       "api": "rmSync",
       "source": "rmSync(tmpPath, { force: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 678,
+      "line": 683,
       "api": "rmSync",
       "source": "rmSync(tmpPath, { force: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 688,
+      "line": 693,
       "api": "renameSync",
       "source": "renameSync(tmpPath, path);",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 694,
+      "line": 699,
       "api": "rmSync",
       "source": "rmSync(tmpPath, { force: true });",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 745,
+      "line": 750,
       "api": "existsSync",
       "source": "if (replacements.size === 0 || !existsSync(jsonlPath)) return Promise.resolve(0);",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 830,
+      "line": 835,
       "api": "renameSync",
       "source": "renameSync(tmpPath, jsonlPath);",
       "category": "hot-path"
     },
     {
       "path": "transcript-jsonl.ts",
-      "line": 835,
+      "line": 840,
       "api": "rmSync",
       "source": "rmSync(tmpPath, { force: true });",
       "category": "hot-path"
