@@ -33,7 +33,7 @@ port.on("message", (message: CountRequest) => {
 	const counts: Array<{ readonly key: string; readonly count: number }> = [];
 	let total = 0;
 	for (const entry of message.entries) {
-		const count = tokenizer.encode(entry.text).length;
+		const count = tokenizer.encode(entry.text, [], []).length;
 		counts.push({ key: entry.key, count });
 		total += count;
 		if (message.stopAt !== undefined && total >= message.stopAt) break;

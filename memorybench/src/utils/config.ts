@@ -12,6 +12,8 @@ export interface Config {
   googleApiKey: string
   zaiApiKey: string
   zaiBaseUrl: string
+  localBaseUrl: string
+  localApiKey: string
 }
 
 export const ZAI_CODING_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
@@ -28,6 +30,8 @@ export const config: Config = {
   googleApiKey: process.env.GOOGLE_API_KEY || "",
   zaiApiKey: process.env.ZAI_API_KEY || "",
   zaiBaseUrl: process.env.ZAI_BASE_URL || ZAI_CODING_BASE_URL,
+  localBaseUrl: process.env.LOCAL_LLM_BASE_URL || "http://127.0.0.1:8000/v1",
+  localApiKey: process.env.LOCAL_LLM_API_KEY || "local",
 }
 
 function openRouterHeaders(baseUrl: string): Record<string, string> | undefined {

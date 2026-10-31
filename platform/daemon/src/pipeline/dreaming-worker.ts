@@ -90,6 +90,7 @@ export function partitionDreamingScopes(
 		readonly oldestAttentionAt?: string | null;
 	}>,
 	slots: number,
+	maxTokensPerPass = Number.POSITIVE_INFINITY,
 ): string[][] {
 	const withBacklog = backlogs
 		.filter((item) => item.tokens > 0)
@@ -107,6 +108,7 @@ export function partitionDreamingScopes(
 	}));
 	for (const item of withBacklog) {
 		const target = groups.reduce((smallest, group) => (group.tokens < smallest.tokens ? group : smallest));
+		if (target.scopes.length > 0 && target.tokens + item.tokens > maxTokensPerPass) continue;
 		target.scopes.push(item.scope);
 		target.tokens += item.tokens;
 	}
@@ -176,6 +178,8 @@ export interface DreamingWorkerOptions {
 
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const INFERENCE_RECHECK_MS = 30 * 1000;
+const PASS_SETTLED_CHECK_DELAY_MS = 1_000;
+const DEFAULT_MAX_PASS_TOKENS = 200_000;
 const AGENT_SCOPE_SNAPSHOT_REFRESH_MS = 30 * 60 * 1000;
 export async function shouldDeferDreamingSweep(
 	accessor: DbAccessor,
@@ -336,6 +340,7 @@ export function startDreamingWorker(
 	caps?: GraphHygieneCaps,
 ): DreamingWorkerHandle {
 	let timer: ReturnType<typeof setTimeout> | null = null;
+	let checkRequested = false;
 	let stopped = false;
 	let admission: Promise<void> | null = null;
 	let activeWork: Promise<void> | null = null;
@@ -547,13 +552,20 @@ export function startDreamingWorker(
 			() => resolveToolCall(true),
 			() => resolveToolCall(false),
 		);
+		let madeProgress = false;
 		void result
-			.catch(() => undefined)
+			.then(
+				(outcome) => {
+					madeProgress = outcome.applied > 0;
+				},
+				() => undefined,
+			)
 			.then(async () => compactHistoryAfterPass(runAgentId, await passId, scopes, live))
 			.catch(() => undefined)
 			.finally(() => {
 				runningPasses.delete(entry);
 				release();
+				if (madeProgress) checkSoon();
 			});
 		return { passId, result, firstToolCall };
 	}
@@ -590,11 +602,34 @@ export function startDreamingWorker(
 		);
 	}
 
+	function passTokenBudget(): number {
+		return cfg.maxPassTokens ?? DEFAULT_MAX_PASS_TOKENS;
+	}
+
+	async function contentSweepScopes(scopes: readonly string[], triggeredScope: string): Promise<string[]> {
+		const measured = await measureScopeWork(scopes);
+		const trigger = measured.find((item) => item.scope === triggeredScope);
+		if (!trigger || (trigger.tokens <= 0 && !trigger.attention)) return [];
+		let remaining = passTokenBudget() - trigger.tokens;
+		const group = [triggeredScope];
+		const candidates = measured
+			.filter((item) => item.scope !== triggeredScope && item.tokens > 0)
+			.sort((a, b) => b.tokens - a.tokens || a.scope.localeCompare(b.scope));
+		for (const item of candidates) {
+			if (item.tokens > remaining) continue;
+			group.push(item.scope);
+			remaining -= item.tokens;
+		}
+		return group.sort();
+	}
+
 	async function startIncrementalPasses(runAgentId: string, scopes: readonly string[]): Promise<StartedDreamingPass> {
 		const slots = maxPasses() - usedSlots();
 		if (scopes.length === 0 || slots <= 0) throw new AlreadyRunningError();
 		const measured =
-			scopes.length === 1 ? [[...scopes]] : partitionDreamingScopes(await measureScopeWork(scopes), slots);
+			scopes.length === 1
+				? [[...scopes]]
+				: partitionDreamingScopes(await measureScopeWork(scopes), slots, passTokenBudget());
 		const groups = measured.length > 0 ? measured : [[...scopes]];
 		const [firstGroup, ...rest] = groups;
 		const first = startPass(runAgentId, "incremental", firstGroup ?? [...scopes], false);
@@ -681,7 +716,7 @@ export function startDreamingWorker(
 				budget: evidenceRetry.hourlyBudget,
 			});
 		}
-		let triggered = false;
+		let triggeredScope: string | null = null;
 		for (const scopeId of scopes) {
 			if (stopped) return;
 			if (await isDreamingHaltActive(accessor, scopeId)) continue;
@@ -696,7 +731,7 @@ export function startDreamingWorker(
 				);
 				const decision = await evaluateDreamingTrigger(accessor, cfg, scopeId, probe, Date.now());
 				if (!decision.trigger) continue;
-				triggered = true;
+				triggeredScope = scopeId;
 				logger.info(
 					"dreaming-worker",
 					"Starting scheduled dreaming pass",
@@ -711,15 +746,22 @@ export function startDreamingWorker(
 				});
 			}
 		}
-		if (!triggered) return;
+		if (triggeredScope === null) return;
 		const mode = await selectDreamingCheckMode(accessor, scopes, nextScheduledFocus, options.ownerMaintenance);
 		if (mode !== "incremental" && runningPasses.size > 0) return;
+		const sweepScopes = mode === "incremental-content" ? await contentSweepScopes(scopes, triggeredScope) : scopes;
+		if (sweepScopes.length === 0) {
+			logger.info("dreaming-worker", "Scheduled content sweep found no scope with measurable work", {
+				triggeredScope,
+			});
+			return;
+		}
 		nextScheduledFocus = dreamingFocusOfMode(mode) ?? nextScheduledFocus;
 		try {
 			const started = await admit(async () =>
 				mode === "incremental"
 					? await startIncrementalPasses(defaultAgentId, scopes)
-					: startPass(defaultAgentId, mode, scopes, true),
+					: startPass(defaultAgentId, mode, sweepScopes, true),
 			);
 			await started.passId;
 		} catch (e) {
@@ -735,6 +777,8 @@ export function startDreamingWorker(
 
 	function schedule(): void {
 		if (stopped) return;
+		const delay = checkRequested ? PASS_SETTLED_CHECK_DELAY_MS : nextCheckDelay();
+		checkRequested = false;
 		timer = setTimeout(async () => {
 			timer = null;
 			try {
@@ -748,7 +792,14 @@ export function startDreamingWorker(
 				);
 			}
 			schedule();
-		}, nextCheckDelay());
+		}, delay);
+	}
+	function checkSoon(): void {
+		checkRequested = true;
+		if (stopped || timer === null) return;
+		clearTimeout(timer);
+		timer = null;
+		schedule();
 	}
 	function nextCheckDelay(): number {
 		const interval = options.checkIntervalMs ?? CHECK_INTERVAL_MS;

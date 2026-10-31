@@ -7,6 +7,7 @@ import {
 	type Model,
 	type OpenAICompletionsCompat,
 	type ProviderHeaders,
+	type ThinkingBudgets,
 	type ThinkingLevel,
 	type Usage,
 } from "@earendil-works/pi-ai";
@@ -17,6 +18,7 @@ import type {
 	LlmGenerateResult,
 	LlmProvider,
 	LlmUsage,
+	RoutingLocalThinkingConfig,
 } from "@signet/core";
 import { logger } from "../logger";
 import {
@@ -43,6 +45,31 @@ const LOCAL_COMPAT: OpenAICompletionsCompat = {
 	maxTokensField: "max_tokens",
 };
 
+const DEFAULT_THINKING_CHAT_TEMPLATE_KWARGS: NonNullable<OpenAICompletionsCompat["chatTemplateKwargs"]> = {
+	enable_thinking: { $var: "thinking.enabled" },
+};
+
+export function localThinkingCompat(thinking: RoutingLocalThinkingConfig | undefined): OpenAICompletionsCompat {
+	if (!thinking) return LOCAL_COMPAT;
+	return {
+		...LOCAL_COMPAT,
+		thinkingFormat: thinking.format,
+		...(thinking.format === "chat-template"
+			? {
+					chatTemplateKwargs:
+						(thinking.chatTemplateKwargs as OpenAICompletionsCompat["chatTemplateKwargs"]) ??
+						DEFAULT_THINKING_CHAT_TEMPLATE_KWARGS,
+				}
+			: {}),
+		...(thinking.budgetTokens ? { thinkingTokenBudgetField: thinking.budgetField ?? "thinking_token_budget" } : {}),
+	};
+}
+
+export function localThinkingBudgets(thinking: RoutingLocalThinkingConfig | undefined): ThinkingBudgets | undefined {
+	const budget = thinking?.budgetTokens;
+	return budget ? { minimal: budget, low: budget, medium: budget, high: budget } : undefined;
+}
+
 export interface PiModelProviderConfig {
 	readonly executor: PiExecutorKind;
 	readonly providerFamily?: string;
@@ -53,9 +80,11 @@ export interface PiModelProviderConfig {
 	readonly apiKey?: string;
 	readonly reasoning?: ThinkingLevel;
 	readonly contextWindow?: number;
+	readonly resolveContextWindow?: () => Promise<number | undefined>;
 	readonly maxTokens?: number;
 	readonly defaultTimeoutMs?: number;
 	readonly name?: string;
+	readonly thinking?: RoutingLocalThinkingConfig;
 }
 export class PiProviderDeadlineError extends Error {
 	readonly timeoutMs: number;
@@ -320,7 +349,7 @@ export function resolvePiModel(config: PiModelProviderConfig): ResolvedModel {
 				contextWindow: config.contextWindow ?? 128_000,
 				maxTokens: config.maxTokens ?? 4096,
 				headers: {},
-				compat: LOCAL_COMPAT,
+				compat: localThinkingCompat(config.thinking),
 			};
 			return {
 				piModel,
@@ -525,6 +554,7 @@ export function createPiModelProvider(
 	const accountingProvenance = accountingProvenanceForConfig(config, piModel);
 	const defaultTimeoutMs = config.defaultTimeoutMs ?? 60_000;
 	const reasoning = config.reasoning;
+	const thinkingBudgets = localThinkingBudgets(config.thinking);
 	const modelRuntime = ModelRuntime.create({
 		credentials: new InMemoryCredentialStore(),
 		modelsPath: null,
@@ -556,6 +586,7 @@ export function createPiModelProvider(
 		maxTokens?: number;
 		temperature?: number;
 		reasoning?: ThinkingLevel;
+		thinkingBudgets?: ThinkingBudgets;
 	} {
 		const effectiveReasoning: ThinkingLevel | undefined =
 			opts?.reasoning === false ? undefined : (opts?.reasoning ?? reasoning);
@@ -571,6 +602,7 @@ export function createPiModelProvider(
 			...(opts?.maxTokens ? { maxTokens: opts.maxTokens } : {}),
 			...(typeof opts?.temperature === "number" ? { temperature: opts.temperature } : {}),
 			...(effectiveReasoning !== undefined ? { reasoning: effectiveReasoning } : {}),
+			...(effectiveReasoning !== undefined && thinkingBudgets ? { thinkingBudgets } : {}),
 		};
 	}
 
@@ -726,9 +758,17 @@ export function createPiModelProvider(
 			const create = options.persistentSessionKey
 				? leaseWorkerAgentSession.bind(null, options.persistentSessionKey, options.continuationPrompt)
 				: createWorkerAgentSession;
+			const discoveredWindow =
+				config.contextWindow === undefined && config.resolveContextWindow
+					? await config.resolveContextWindow()
+					: undefined;
 			return create(
 				{
-					model: options.maxTokens ? { ...piModel, maxTokens: options.maxTokens } : piModel,
+					model: {
+						...piModel,
+						...(discoveredWindow ? { contextWindow: discoveredWindow } : {}),
+						...(options.maxTokens ? { maxTokens: options.maxTokens } : {}),
+					},
 					apiKey: apiKey ?? KEYLESS_API_KEY,
 					systemPrompt:
 						options.systemPrompt ??
@@ -741,6 +781,8 @@ export function createPiModelProvider(
 						...(exposure ? { exposure } : {}),
 					})),
 					...(options.retry ? { retry: options.retry } : {}),
+					...(config.thinking && reasoning !== undefined ? { thinkingLevel: reasoning } : {}),
+					...(config.thinking && reasoning !== undefined && thinkingBudgets ? { thinkingBudgets } : {}),
 				},
 				tools,
 				options.signal,

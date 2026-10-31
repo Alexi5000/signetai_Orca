@@ -28,7 +28,10 @@ runtime.registerProvider(input.model.provider, {
 	apiKey: input.apiKey,
 	models: [{ ...input.model }],
 });
-const settingsManager = SettingsManager.inMemory(input.retry ? { retry: { enabled: true, ...input.retry } } : {});
+const settingsManager = SettingsManager.inMemory({
+	...(input.retry ? { retry: { enabled: true, ...input.retry } } : {}),
+	...(input.thinkingBudgets ? { thinkingBudgets: input.thinkingBudgets } : {}),
+});
 const codemode = input.tools.some((tool) => tool.exposure === "codemode");
 const resourceLoader = new DefaultResourceLoader({
 	cwd: process.cwd(),
@@ -74,6 +77,7 @@ const customTools: ToolDefinition[] = input.tools.map((tool) => ({
 }));
 const { session } = await createAgentSession({
 	model: input.model,
+	...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
 	modelRuntime: runtime,
 	sessionManager: SessionManager.inMemory(),
 	settingsManager,

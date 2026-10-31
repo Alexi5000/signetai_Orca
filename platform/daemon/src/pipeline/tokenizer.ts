@@ -34,11 +34,11 @@ export function resetTokenizerStats(): void {
 export function countTokens(text: string): number {
 	tokenizerStats.encodeCalls += 1;
 	tokenizerStats.encodeChars += text.length;
-	return tok.encode(text).length;
+	return tok.encode(text, [], []).length;
 }
 export function truncateToTokens(text: string, limit: number): string {
 	if (limit < 1) return "";
-	const tokens = tok.encode(text);
+	const tokens = tok.encode(text, [], []);
 	if (tokens.length <= limit) return text;
 	let tokenCount = Math.min(limit, tokens.length);
 	while (tokenCount > 0) {

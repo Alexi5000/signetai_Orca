@@ -99,6 +99,45 @@ describe("inference provider factory", () => {
 		}
 	});
 
+	test("does not probe a local server's context window for plain completions", async () => {
+		const parsed = parseRoutingConfig({
+			inference: {
+				targets: {
+					local: {
+						executor: "openai-compatible",
+						endpoint: "http://127.0.0.1:65530/v1",
+						models: { default: { model: "local-model" } },
+					},
+				},
+			},
+		});
+		if (!parsed.ok) throw new Error(parsed.error.message);
+		const originalFetch = globalThis.fetch;
+		const requests: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+			requests.push(`${init?.method ?? "GET"} ${new URL(String(input)).pathname}`);
+			return new Response(
+				`data: ${JSON.stringify({ choices: [{ delta: { content: "done" } }] })}\n\ndata: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}) as unknown as typeof fetch;
+		try {
+			const provider = await createRoutingProvider({
+				config: parsed.value,
+				targetId: "local",
+				modelId: "default",
+				async resolveCredential() {
+					return {};
+				},
+			});
+			expect(requests).toEqual([]);
+			await expect(provider.generate("test")).resolves.toBe("done");
+			expect(requests).toEqual(["POST /v1/chat/completions"]);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	test("fails clearly when Kimi is configured as a direct executor", async () => {
 		const parsed = parseRoutingConfig({
 			inference: {

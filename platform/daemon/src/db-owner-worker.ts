@@ -292,7 +292,7 @@ export function runDbOwnerWorker(): void {
 		if (resultBytes > maxResultBytes) {
 			throw resultLimitError(
 				"DB_OWNER_RESULT_TOO_LARGE",
-				`DB owner result is ${resultBytes} bytes, above the ${maxResultBytes}-byte limit; page the query or reduce its columns`,
+				`DB owner result is ${resultBytes} bytes, above the ${maxResultBytes}-byte limit; page the query or reduce its columns (${statement.sql.replace(/\s+/g, " ").trim().slice(0, 160)})`,
 			);
 		}
 		return value;

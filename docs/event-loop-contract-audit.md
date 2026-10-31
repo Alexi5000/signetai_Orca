@@ -4,18 +4,18 @@ This report is generated from the deterministic migration ledger in `scripts/eve
 
 ## Current inventory
 
-- Exact ledger inventory: 786 sites
+- Exact ledger inventory: 787 sites
 - Synchronous `withWriteTx()` sites: 56
 - Synchronous `withReadDb()` sites: 85
 - Async-named DB sites: 164
 - Async-named ON-PARENT DB sites: 162
 - Async-named OFF-PARENT DB sites: 2
-- Synchronous filesystem/process sites: 481
+- Synchronous filesystem/process sites: 482
 - Compile-visible legacy DB sites remaining: 141
   - `withWriteTx`: 56
   - `withReadDb`: 85
 
-The 786-site inventory excludes test, benchmark, generated, and `__tests__` fixtures and includes every synchronous filesystem, process, and database call, including async-named DB callbacks. The 56 synchronous writes, 85 synchronous reads, and 164 async-named DB sites are the complete database-call inventory; 141 compatibility DB operations remain transitional callers for the later migration phase. The async-named DB counts above separate the 162 ON-PARENT callbacks from the 2 OFF-PARENT callbacks. Those compatibility calls are marked with `@ts-expect-error LEGACY_SYNC_DB_ACCESS`, so the compiler reports every remaining site without forcing this phase to migrate them.
+The 787-site inventory excludes test, benchmark, generated, and `__tests__` fixtures and includes every synchronous filesystem, process, and database call, including async-named DB callbacks. The 56 synchronous writes, 85 synchronous reads, and 164 async-named DB sites are the complete database-call inventory; 141 compatibility DB operations remain transitional callers for the later migration phase. The async-named DB counts above separate the 162 ON-PARENT callbacks from the 2 OFF-PARENT callbacks. Those compatibility calls are marked with `@ts-expect-error LEGACY_SYNC_DB_ACCESS`, so the compiler reports every remaining site without forcing this phase to migrate them.
 
 ## Execution-home inventory
 
@@ -274,11 +274,11 @@ The classifier follows execution home, not API spelling. A direct accessor callb
 - `session-checkpoints.ts:308` (withReadDb)
 - `session-checkpoints.ts:323` (withWriteTx)
 - `session-checkpoints.ts:338` (withWriteTxAsync)
-- `session-claims.ts:72` (withWriteTx)
-- `session-claims.ts:90` (withWriteTx)
-- `session-claims.ts:113` (withWriteTx)
-- `session-claims.ts:140` (withWriteTx)
-- `session-claims.ts:152` (withReadDb)
+- `session-claims.ts:74` (withWriteTx)
+- `session-claims.ts:92` (withWriteTx)
+- `session-claims.ts:115` (withWriteTx)
+- `session-claims.ts:142` (withWriteTx)
+- `session-claims.ts:154` (withReadDb)
 - `db:session-end.recovery.clear` (withWriteTxAsync)
 - `session-memories.ts:108` (withWriteTx)
 - `session-memories.ts:192` (withWriteTx)

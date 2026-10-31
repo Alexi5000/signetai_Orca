@@ -7,6 +7,7 @@ import {
 	fchmodSync,
 	fstatSync,
 	fsyncSync,
+	ftruncateSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -250,9 +251,47 @@ function writeRecords(path: string, records: readonly CanonicalTranscriptRecord[
 	writeFileAtomicSync(path, body.length > 0 ? `${body}\n` : "", { fsync: false });
 }
 
+function isCompleteJsonLine(line: Buffer): boolean {
+	try {
+		JSON.parse(line.toString("utf8"));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function dropTornTail(path: string): void {
+	let fd: number;
+	try {
+		fd = openSync(path, "r+");
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+		throw error;
+	}
+	try {
+		const size = fstatSync(fd).size;
+		if (size === 0) return;
+		const last = Buffer.alloc(1);
+		readSync(fd, last, 0, 1, size - 1);
+		if (last[0] === 0x0a) return;
+		const start = Math.max(0, size - TAIL_SCAN_BYTES);
+		const tail = Buffer.alloc(size - start);
+		readSync(fd, tail, 0, tail.length, start);
+		const newline = tail.lastIndexOf(0x0a);
+		if ((newline === -1 && start > 0) || isCompleteJsonLine(tail.subarray(newline + 1))) {
+			writeSync(fd, "\n", size);
+			return;
+		}
+		ftruncateSync(fd, newline === -1 ? 0 : start + newline + 1);
+	} finally {
+		closeSync(fd);
+	}
+}
+
 function appendRecords(path: string, records: readonly CanonicalTranscriptRecord[]): void {
 	if (records.length === 0) return;
 	mkdirSync(dirname(path), { recursive: true });
+	dropTornTail(path);
 	appendFileSync(
 		path,
 		records
@@ -571,6 +610,19 @@ export function writeCanonicalTranscriptSnapshot(
 		}
 
 		const tmpPath = `${path}.snapshot-tmp`;
+		const entries = await loadSessionSeqIndex(path);
+		if (lastSessionSeq(entries, input) === 0) {
+			rmSync(tmpPath, { force: true });
+			appendIndexedRecords(path, entries, next);
+			const appended = openSync(path, "r");
+			try {
+				fsyncSync(appended);
+			} finally {
+				closeSync(appended);
+			}
+			return true;
+		}
+
 		let fd: number | null = null;
 		try {
 			fd = openRewriteTemp(tmpPath);
