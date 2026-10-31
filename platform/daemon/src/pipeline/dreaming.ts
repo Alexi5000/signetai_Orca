@@ -1671,6 +1671,10 @@ async function readDreamingEvidenceSource(
 	});
 }
 
+export function isPiCompactionStart(event: unknown): event is { type: "compaction_start"; reason?: string } {
+	return typeof event === "object" && event !== null && (event as { type?: unknown }).type === "compaction_start";
+}
+
 export async function runDreamingAgentPass(
 	accessor: DbAccessor,
 	executor: DreamingAgentExecutor,
@@ -1871,6 +1875,8 @@ ${JSON.stringify(liveOptions.userRequest)}
 						),
 					}),
 			evidenceDeliveryDeadline: Date.now() + Math.floor(cfg.timeout / 2),
+			passDeadline: Date.now() + cfg.timeout,
+			...(cfg.maxPassTokens === undefined ? {} : { evidenceTokenBudget: cfg.maxPassTokens }),
 			evidenceChars: dreamingEvidencePageChars(cfg.maxInputTokens),
 			accessor,
 			agentId,
@@ -1974,7 +1980,15 @@ ${JSON.stringify(liveOptions.userRequest)}
 			tools,
 			timeoutMs: cfg.timeout,
 			maxTokens: cfg.maxOutputTokens ?? undefined,
-			onEvent: (event) => publishDreamingAgentEvent(passId, event, live),
+			onEvent: (event) => {
+				if (isPiCompactionStart(event)) {
+					logger.warn("dreaming", "Pi auto-compaction fired inside a Dreaming pass", {
+						passId,
+						reason: event.reason ?? null,
+					});
+				}
+				publishDreamingAgentEvent(passId, event, live);
+			},
 			onSessionInfo: (info) => publishDreamingSessionInfo(passId, info, live),
 		});
 		if (mode === "incremental-content" && memoryHeadCommitInput === null) {

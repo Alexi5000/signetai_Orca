@@ -1,7 +1,7 @@
 import { createAnthropic } from "@ai-sdk/anthropic"
 import { createGoogleGenerativeAI } from "@ai-sdk/google"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
-import { generateText, type LanguageModel, type LanguageModelUsage } from "ai"
+import { generateText, type JSONValue, type LanguageModel, type LanguageModelUsage } from "ai"
 import { config, createConfiguredOpenAI } from "./config"
 import type { ModelConfig, ModelProvider } from "./models"
 
@@ -29,6 +29,7 @@ const CREDENTIAL_ENV: Record<ModelProvider, string> = {
   anthropic: "ANTHROPIC_API_KEY",
   google: "GOOGLE_API_KEY",
   zai: "ZAI_API_KEY",
+  local: "LOCAL_LLM_API_KEY",
 }
 
 export function emptyUsage(): ModelUsage {
@@ -75,6 +76,8 @@ function credential(provider: ModelProvider): string {
       return config.googleApiKey
     case "zai":
       return config.zaiApiKey
+    case "local":
+      return config.localApiKey
   }
 }
 
@@ -100,7 +103,38 @@ export function getLanguageModel(modelConfig: ModelConfig): LanguageModel {
         apiKey: config.zaiApiKey,
         baseURL: config.zaiBaseUrl,
       }).chatModel(modelConfig.id)
+    case "local":
+      return createOpenAICompatible({
+        name: "local",
+        apiKey: config.localApiKey,
+        baseURL: config.localBaseUrl,
+        includeUsage: true,
+      }).chatModel(modelConfig.id)
   }
+}
+
+export function providerOptionsFor(
+  modelConfig: ModelConfig
+): Record<string, Record<string, JSONValue>> | undefined {
+  if (modelConfig.provider === "local") {
+    const effort = modelConfig.reasoningEffort
+    const budget = modelConfig.thinkingBudgetTokens
+    const off = effort === "off" || effort === "none"
+    const options: Record<string, JSONValue> = {
+      ...(effort
+        ? {
+            chat_template_kwargs: off
+              ? { enable_thinking: false }
+              : { enable_thinking: true, reasoning_effort: effort },
+          }
+        : {}),
+      ...(budget && !off ? { thinking_token_budget: budget } : {}),
+    }
+    return Object.keys(options).length > 0 ? { local: options } : undefined
+  }
+  return modelConfig.thinking
+    ? { [modelConfig.provider]: { thinking: { type: modelConfig.thinking } } }
+    : undefined
 }
 
 export async function generateWithModel(
@@ -108,17 +142,14 @@ export async function generateWithModel(
   prompt: string,
   options: GenerateOptions = {}
 ): Promise<GenerateResult> {
+  const providerOptions = providerOptionsFor(modelConfig)
   const result = await generateText({
     model: getLanguageModel(modelConfig),
     prompt,
     ...(options.system ? { system: options.system } : {}),
     maxOutputTokens: options.maxOutputTokens ?? modelConfig.defaultMaxTokens,
     ...(modelConfig.supportsTemperature ? { temperature: modelConfig.defaultTemperature } : {}),
-    ...(modelConfig.thinking
-      ? {
-          providerOptions: { [modelConfig.provider]: { thinking: { type: modelConfig.thinking } } },
-        }
-      : {}),
+    ...(providerOptions ? { providerOptions } : {}),
   })
   return { text: result.text, usage: usageFromSdk(result.usage) }
 }

@@ -452,6 +452,7 @@ export interface DreamingSurprisalConfig {
 export interface DreamingConfig {
 	readonly enabled: boolean;
 	readonly tokenThreshold: number;
+	readonly maxPassTokens?: number;
 	readonly maxInterval: number;
 	readonly timeout: number;
 	readonly maxInputTokens: number;

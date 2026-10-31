@@ -17,6 +17,7 @@ import {
 	resolveLaunchdExecutable,
 	resolveWorkspaceLayout,
 } from "@signet/core";
+import { MAX_LLM_CONCURRENCY } from "../llm-concurrency-limits";
 import { logger } from "../logger";
 import { getActiveTelemetry } from "../telemetry";
 import { which } from "../which";
@@ -179,7 +180,9 @@ export function getLlmConcurrencyLimit(): number {
 }
 
 export function configureLlmConcurrency(limit: number): void {
-	const normalized = Number.isSafeInteger(limit) ? Math.min(16, Math.max(1, limit)) : DEFAULT_MAX_LLM_CONCURRENCY;
+	const normalized = Number.isSafeInteger(limit)
+		? Math.min(MAX_LLM_CONCURRENCY, Math.max(1, limit))
+		: DEFAULT_MAX_LLM_CONCURRENCY;
 	llmSemaphore.setLimit(normalized);
 }
 

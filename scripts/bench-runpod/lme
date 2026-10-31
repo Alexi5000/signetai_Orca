@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# lme: run LongMemEval on Signet Dreaming with a local model on RunPod, end to end.
+# See README.md. Every command takes a pod NAME (local alias); state lives in $LME_HOME (default ~/.local/share/signet-lme).
+set -euo pipefail
+KIT=$(builtin cd "$(dirname "$(readlink -f "$0")")" && pwd)
+while IFS= read -r line; do  # config.env gives defaults; values already in the environment win
+  line=${line%%#*}; [[ $line =~ ^([A-Z_]+)=(.*)$ ]] || continue
+  k=${BASH_REMATCH[1]}; v=$(printf '%s' "${BASH_REMATCH[2]}" | sed 's/[[:space:]]*$//'); v=${v%\"}; v=${v#\"}
+  [ -z "${!k+x}" ] && export "$k=$v"
+  export "${k?}"
+done < "$KIT/config.env"
+LME_HOME=${LME_HOME:-$HOME/.local/share/signet-lme}
+STATE=$LME_HOME/pods; EVIDENCE=$LME_HOME/evidence; mkdir -p "$STATE" "$EVIDENCE"
+if [ -z "${SIGNET_REF:-}" ]; then  # build the exact commit this checkout is on; the pod fetches it from origin
+  SIGNET_REF=$(git -C "$KIT" rev-parse HEAD 2>/dev/null || echo main)
+  if [ "$SIGNET_REF" != main ] && [ -z "$(git -C "$KIT" branch -r --contains "$SIGNET_REF" 2>/dev/null)" ]; then
+    echo "lme: warning: HEAD $SIGNET_REF is not on any remote branch; push it or set SIGNET_REF, or the pod cannot fetch it" >&2
+  fi
+  export SIGNET_REF
+fi
+die() { echo "lme: $*" >&2; exit 1; }
+rpx() { "$KIT/rpx.sh" "$@"; }
+jget() { python3 -c "import json,sys;d=json.load(open('$1'));print(d$2)"; }
+pod_file() { [ -f "$STATE/$1.json" ] || die "no pod named $1 (lme ls)"; echo "$STATE/$1.json"; }
+on_pod() {  # on_pod NAME [timeout] < script
+  local f; f=$(pod_file "$1")
+  POD_HOST=$(jget "$f" "['host']") POD_TIMEOUT=${2:-600} "$KIT/pod.sh" - \
+    | awk '/^__END_M[0-9]+_rc=/{sub(/.*_rc=/,""); rc=$0; seen=1; next} {print} END{exit seen ? rc+0 : 255}' 
+}
+
+cmd_balance() {
+  rpx me | python3 -c "
+import json,sys;d=json.load(sys.stdin)
+print(f\"balance \${d['clientBalance']:.2f}  spending \${d['currentSpendPerHr']:.3f}/h\")
+for p in d['pods']: print(f\"  {p['id']} {p['name']:24s} {p['desiredStatus']:8s} \${p['costPerHr']}/h {(p.get('machine') or {}).get('gpuDisplayName')}\")"
+}
+
+cmd_gpus() { rpx gpus; }
+
+boot_wait() {  # boot_wait NAME ID -> 0 once the container runs (runtime reported), 1 after BOOT_MIN
+  local name=$1 id=$2 t0; t0=$(date +%s)
+  while [ $(( $(date +%s) - t0 )) -lt $(( ${BOOT_MIN:-10} * 60 )) ]; do
+    if rpx pod "$id" 2>/dev/null | tail -1 | python3 -c "
+import json,sys;p=json.loads(sys.stdin.read());m=p.get('machine') or {}
+assert m.get('podHostId') and (p.get('runtime') or {}).get('uptimeInSeconds') is not None
+d=json.load(open('$STATE/$name.json'));d.update(host=m['podHostId'],gpu=m.get('gpuDisplayName'),location=m.get('location'));json.dump(d,open('$STATE/$name.json','w'),indent=1)" 2>/dev/null; then return 0; fi
+    sleep 15
+  done
+  return 1
+}
+
+cmd_up() {  # lme up NAME: first GPU type x cloud x datacenter that has capacity and actually boots
+  local name=${1:?name}; [ -f "$STATE/$name.json" ] && die "$name exists (lme start $name to resume it)"
+  local out gpu cloud dc booted=0
+  IFS='|' read -ra gpus <<< "$GPU_TYPE"; IFS='|' read -ra clouds <<< "$CLOUD"
+  for gpu in "${gpus[@]}"; do for cloud in "${clouds[@]}"; do for dc in $DATACENTERS; do
+    GPU_ONE=$gpu CLOUD_ONE=$cloud python3 -c "
+import json,os
+s={'cloudType':os.environ['CLOUD_ONE'],'gpuCount':1,'gpuTypeId':os.environ['GPU_ONE'],'name':'signet-lme-$name','imageName':os.environ['IMAGE'],
+   'containerDiskInGb':int(os.environ['CONTAINER_GB']),'volumeInGb':int(os.environ['VOLUME_GB']),'volumeMountPath':'/workspace',
+   'ports':'22/tcp,8000/http','startSsh':True}
+if os.environ.get('CUDA_VERSIONS','').split(): s['allowedCudaVersions']=os.environ['CUDA_VERSIONS'].split()
+if '$dc'!='any': s['dataCenterId']='$dc'
+json.dump(s,open('$LME_HOME/spec-$name.json','w'))"
+    out=$(rpx create "$LME_HOME/spec-$name.json" || true)
+    if ! printf '%s' "$out" | grep -q '"id"'; then echo "  $gpu $cloud $dc: $(printf '%s' "$out" | tail -1 | cut -c1-100)"; continue; fi
+    printf '%s' "$out" | tail -1 | python3 -c "
+import json,sys,time;p=json.loads(sys.stdin.read()); m=p.get('machine') or {}
+json.dump({'name':'$name','id':p['id'],'host':m.get('podHostId'),'gpu':m.get('gpuDisplayName'),'location':m.get('location'),
+           'cost_per_hr':p['costPerHr'],'created':int(time.time())},open('$STATE/$name.json','w'),indent=1)
+print(f\"created {p['id']} {m.get('gpuDisplayName')} \${p['costPerHr']}/h ($cloud $dc); waiting for boot\")"
+    local id; id=$(jget "$STATE/$name.json" "['id']")
+    if boot_wait "$name" "$id"; then booted=1; break 3; fi
+    echo "  $id did not boot in ${BOOT_MIN:-10} min (image/driver mismatch or slow host); terminating, trying next"
+    rpx terminate "$id" >/dev/null || true; rm -f "$STATE/$name.json"
+  done; done; done
+  [ $booted = 1 ] || die "no bootable capacity for: $GPU_TYPE ($CLOUD) in $DATACENTERS"
+  echo "booted; waiting for ssh..."
+  for i in $(seq 1 60); do
+    if echo 'echo up' | on_pod "$name" 30 2>/dev/null | grep -q '^up$'; then break; fi; sleep 10
+  done
+  cmd_push "$name"
+  echo 'setsid bash /workspace/kit/pod/bootstrap.sh < /dev/null > /dev/null 2>&1 & echo bootstrap started' | on_pod "$name"
+  echo "next: lme ready $name   (model download + vLLM install + Signet build, ~20-30 min)"
+}
+
+cmd_push() {  # copy kit/pod and the effective config onto the pod
+  local name=${1:?name} f cost; f=$(pod_file "$name"); cost=$(jget "$f" "['cost_per_hr']")
+  local cfg; cfg=$(for v in SIGNET_REF MODEL_REPO MAX_LEN DREAM_CONC DREAM_THINK QA_THINK DREAM_TIMEOUT_MS GRACE_MIN HOLD_AFTER_PULL_MIN IDLE_MAX_MIN SM_VERSION; do printf '%s=%q\n' "$v" "${!v}"; done; echo "COST_PER_HR=$cost")
+  local tgz; tgz=$(tar czf - -C "$KIT" pod | base64 -w 0)
+  { echo "mkdir -p /workspace/kit/state && cd /workspace/kit && echo '$tgz' | base64 -d | tar xzf - && chmod +x pod/*.sh pod/*.py"
+    echo "cat > /workspace/kit/state/config.env <<'__CFG__'"; echo "$cfg"; echo "__CFG__"
+    echo "echo pushed kit: \$(ls /workspace/kit/pod | wc -l) files"; } | on_pod "$name" 120
+}
+
+cmd_ready() { echo 'ls /workspace/.ready 2>/dev/null | tr "\n" " "; echo; grep -a "READY\|FAILED\|INCOMPLETE\|dataset ok" /workspace/logs/bootstrap.log | tail -8; tail -c 300 /workspace/logs/bootstrap_model.log 2>/dev/null | tr "\r" "\n" | tail -1' | on_pod "${1:?name}"; }
+
+cmd_serve() {  # serve.sh runs detached on the pod (survives ssh drops); poll its log
+  local name=${1:?name}
+  echo 'rm -f /workspace/logs/serve.log; setsid bash /workspace/kit/pod/serve.sh > /workspace/logs/serve.log 2>&1 < /dev/null & echo serve started' | on_pod "$name"
+  for i in $(seq 1 60); do
+    sleep 30
+    local out; out=$(echo 'cat /workspace/logs/serve.log 2>/dev/null' | on_pod "$name" 60 || true)
+    if printf '%s' "$out" | grep -q 'SMOKE_OK\|SMOKE_FAILED\|VLLM_FAILED\|PROXY_FAILED\|bootstrap not finished'; then
+      printf '%s\n' "$out"; printf '%s' "$out" | grep -q SMOKE_OK; return
+    fi
+  done
+  die "serve did not finish in 30 min; check /workspace/logs/serve.log"
+}
+
+cmd_run() {  # lme run NAME RUN selection... [--dream-conc N] [--max-hours H]
+  local name=${1:?name} run=${2:?run-id}; shift 2
+  echo "bash /workspace/kit/pod/start_run.sh $(printf '%q ' "$run" "$@")" | on_pod "$name" 300
+}
+
+cmd_pilot() {  # 12 questions (2 per type), then print the projection for 500
+  local name=${1:?name}
+  cmd_run "$name" pilot12 --sample 2 --max-hours 6
+  echo "pilot launched. When it ends (lme status $name pilot12), lme tokens $name pilot12 prints the 500-question projection."
+}
+
+cmd_supermemory() { local name=${1:?name} run=${2:?run-id}; shift 2; echo "bash /workspace/kit/pod/supermemory.sh $(printf '%q ' "$run" "$@")" | on_pod "$name" 300; }
+
+cmd_status() {
+  local name=${1:?name} run=${2:-}
+  if [ -z "$run" ]; then echo 'ls -t /workspace/runs/*.meta 2>/dev/null | head -5 | xargs -n1 basename 2>/dev/null; cat /workspace/kit/state/watchdog.json 2>/dev/null; true' | on_pod "$name"; return; fi
+  echo "source /workspace/kit/pod/env.sh; python3 /workspace/kit/pod/status.py $run ${3:-}" | on_pod "$name" 300
+}
+
+cmd_tokens() { local name=${1:?name} run=${2:?run}; shift 2; echo "source /workspace/kit/pod/env.sh; python3 /workspace/kit/pod/tokens.py $run $*" | on_pod "$name" 300; }
+
+cmd_pull() {  # collect on the pod, copy evidence/<run>.tgz here in chunks over the PTY, verify sha256, mark pulled
+  local name=${1:?name} run=${2:?run} dest="$EVIDENCE/$2"
+  echo "date +%s > /workspace/kit/state/last_activity; timeout 1800 bash /workspace/kit/pod/collect.sh $run > /workspace/logs/collect_$run.log 2>&1; stat -c %s /workspace/evidence/$run.tgz; cat /workspace/evidence/$run.tgz.sha256; cat /workspace/evidence/$run.kind 2>/dev/null || echo partial" \
+    | on_pod "$name" 1900 > "$LME_HOME/.pull_$run" || { echo "lme: collect failed: $(cat "$LME_HOME/.pull_$run")" >&2; return 1; }
+  local size sha kind; size=$(sed -n 1p "$LME_HOME/.pull_$run"); sha=$(sed -n 2p "$LME_HOME/.pull_$run"); kind=$(sed -n 3p "$LME_HOME/.pull_$run")
+  [[ "$size" =~ ^[0-9]+$ ]] || { echo "lme: collect failed: $(cat "$LME_HOME/.pull_$run")" >&2; return 1; }
+  mkdir -p "$dest"; : > "$dest/$run.tgz.part"
+  local chunk=$((8 * 1024 * 1024)) n=$(( (size + 8*1024*1024 - 1) / (8*1024*1024) ))
+  for i in $(seq 0 $((n - 1))); do
+    echo "date +%s > /workspace/kit/state/last_activity; dd if=/workspace/evidence/$run.tgz bs=$chunk skip=$i count=1 status=none | base64 -w 0; echo" | on_pod "$name" 600 \
+      | awk '/^[A-Za-z0-9+\/=]{8,}$/' | base64 -d >> "$dest/$run.tgz.part" || { echo "lme: chunk $i failed" >&2; return 1; }
+    printf '\r  %d/%d chunks' $((i + 1)) "$n"
+  done; echo
+  [ "$(sha256sum "$dest/$run.tgz.part" | cut -d' ' -f1)" = "$sha" ] || { echo "lme: checksum mismatch; rerun lme pull $name $run" >&2; return 1; }
+  mv "$dest/$run.tgz.part" "$dest/$run.tgz" && tar xzf "$dest/$run.tgz" -C "$dest" || return 1
+  if [ "$kind" = final ]; then echo "[ -f /workspace/runs/$run.exit ] && touch /workspace/runs/$run.pulled" | on_pod "$name" >/dev/null || true
+  else echo "note: $run is still running; this is a partial snapshot and the run is not marked pulled"; fi
+  echo "pulled $(du -sh "$dest" | cut -f1) to $dest ($kind)"
+  [ -f "$dest/$run/tokens.txt" ] && cat "$dest/$run/tokens.txt"
+  return 0
+}
+
+cmd_watch() {  # foreground loop: pull every finished run, exit when the pod stops (watchdog stops it)
+  local name=${1:?name} f id; f=$(pod_file "$name"); id=$(jget "$f" "['id']")
+  local down=0
+  while true; do
+    local st; st=$(rpx pod "$id" 2>/dev/null | tail -1 | python3 -c "import json,sys;print(json.load(sys.stdin)['desiredStatus'])" 2>/dev/null || echo unknown)
+    if [ "$st" = "RUNNING" ]; then down=0; else down=$((down + 1)); echo "$(date +%T) pod status $st ($down/3)"; [ $down -ge 3 ] && { echo "watch done"; break; }; sleep 60; continue; fi
+    for r in $(echo 'for c in /workspace/runs/*.collected; do [ -e "$c" ] || continue; r=$(basename "$c" .collected); [ -f /workspace/runs/$r.pulled ] || echo $r; done' | on_pod "$name" 60 || true); do
+      echo "$(date +%T) pulling $r"; ( cmd_pull "$name" "$r" ) || echo "pull $r failed; retrying next round"
+    done
+    sleep 300
+  done
+}
+
+cmd_hold() { echo 'touch /workspace/kit/state/no_autostop; echo autostop disabled' | on_pod "${1:?name}"; }
+cmd_unhold() { echo 'rm -f /workspace/kit/state/no_autostop; echo autostop enabled' | on_pod "${1:?name}"; }
+cmd_stop() {  # archive container-disk workspaces and collect active runs before stopping (all resumable)
+  local name=${1:?name} f; f=$(pod_file "$name")
+  echo 'source /workspace/kit/pod/env.sh; for w in $WS_ROOT/*-ws; do [ -d "$w" ] && timeout 3600 bash /workspace/kit/pod/archive_ws.sh "$(basename "$w" -ws)"; done; true; for a in /workspace/runs/*.active; do [ -e "$a" ] && timeout 1800 bash /workspace/kit/pod/collect.sh "$(basename "$a" .active)" > /dev/null 2>&1; done; echo pre-stop done' | on_pod "$name" 7300 || echo "pre-stop step failed (pod unreachable?); stopping anyway"
+  rpx stop "$(jget "$f" "['id']")"
+}
+cmd_start() {  # resume a stopped pod and bring the stack back; then: lme run NAME RUN --resume
+  local name=${1:?name} f; f=$(pod_file "$name")
+  rpx start "$(jget "$f" "['id']")"
+  boot_wait "$name" "$(jget "$f" "['id']")" || die "pod did not come back (GPU may be rented out: retry later, or create a new pod)"
+  for i in $(seq 1 60); do echo 'echo up' | on_pod "$name" 30 2>/dev/null | grep -q '^up$' && break; sleep 10; done
+  cmd_push "$name"; cmd_serve "$name"
+}
+cmd_rm() {
+  local name=${1:?name} f; f=$(pod_file "$name")
+  read -r -p "terminate $name ($(jget "$f" "['id']")) and delete its volume? type the name: " ok; [ "$ok" = "$name" ] || die "aborted"
+  rpx terminate "$(jget "$f" "['id']")" && mv "$f" "$STATE/$name.terminated.json"
+}
+cmd_ls() { for f in "$STATE"/*.json; do [ -e "$f" ] && [[ "$f" != *.terminated.json ]] && python3 -c "import json;d=json.load(open('$f'));print(f\"{d['name']:12s} {d['id']} {d['gpu']} \${d['cost_per_hr']}/h host {d['host']}\")"; done; true; }
+cmd_exec() { local name=${1:?name}; shift; if [ $# -gt 0 ]; then cat "$1" | on_pod "$name" 1800; else on_pod "$name" 1800; fi; }
+cmd_config() { for v in SIGNET_REF GPU_TYPE CLOUD DATACENTERS IMAGE CUDA_VERSIONS BOOT_MIN VOLUME_GB CONTAINER_GB MODEL_REPO MAX_LEN DREAM_CONC DREAM_THINK QA_THINK DREAM_TIMEOUT_MS GRACE_MIN HOLD_AFTER_PULL_MIN IDLE_MAX_MIN SM_VERSION; do printf '%-20s %s\n' "$v" "${!v}"; done; }
+cmd_merge() { LME_HOME=$LME_HOME python3 "$KIT/merge_reports.py" "$@"; }
+
+case ${1:-help} in
+  config|balance|gpus|up|push|ready|serve|run|pilot|supermemory|status|tokens|pull|watch|hold|unhold|stop|start|rm|ls|exec|merge) c=$1; shift; "cmd_$c" "$@" ;;
+  *) sed -n '/^## Commands/,/^## /p' "$KIT/README.md" | head -40 ;;
+esac

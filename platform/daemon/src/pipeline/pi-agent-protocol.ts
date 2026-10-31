@@ -1,4 +1,4 @@
-import type { Model, Api, Usage } from "@earendil-works/pi-ai";
+import type { Model, Api, ThinkingBudgets, ThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent, SessionStats, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 export interface PiAgentTool
@@ -22,6 +22,8 @@ export interface PiAgentWorkerInput {
 	readonly systemPrompt: string;
 	readonly tools: ReadonlyArray<Pick<ToolDefinition, "name" | "label" | "description" | "parameters" | "exposure">>;
 	readonly retry?: PiAgentRetryPolicy;
+	readonly thinkingLevel?: ThinkingLevel;
+	readonly thinkingBudgets?: ThinkingBudgets;
 }
 
 export type PiAgentWorkerRequest =

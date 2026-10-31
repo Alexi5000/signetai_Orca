@@ -555,3 +555,109 @@ describe("pi provider catalog models", () => {
 		}
 	});
 });
+
+describe("local thinking control", () => {
+	function recordingServer(): { url: string; bodies: Record<string, unknown>[]; stop: () => void } {
+		const bodies: Record<string, unknown>[] = [];
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: async (request) => {
+				if (request.method === "POST") bodies.push((await request.json()) as Record<string, unknown>);
+				return new Response(
+					`data: ${JSON.stringify({ choices: [{ delta: { content: "done" } }] })}\n\ndata: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				);
+			},
+		});
+		return { url: `http://127.0.0.1:${server.port}/v1`, bodies, stop: () => server.stop(true) };
+	}
+
+	const thinking = {
+		format: "chat-template",
+		budgetTokens: 2000,
+		chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" }, preserve_thinking: false },
+	} as const;
+
+	test("routed calls send the chat-template kwargs and the vLLM thinking budget", async () => {
+		const server = recordingServer();
+		try {
+			const provider = createPiModelProvider({
+				executor: "openai-compatible",
+				model: "qwen-thinking-test",
+				baseUrl: server.url,
+				reasoning: "medium",
+				maxTokens: 16_384,
+				thinking,
+			});
+			await expect(provider.generate("think briefly", { maxTokens: 16_384 })).resolves.toBe("done");
+			expect(server.bodies[0]?.chat_template_kwargs).toEqual({ enable_thinking: true, preserve_thinking: false });
+			expect(server.bodies[0]?.thinking_token_budget).toBe(2000);
+		} finally {
+			server.stop();
+		}
+	});
+
+	test("agent sessions carry the thinking level and budget into the worker", async () => {
+		const server = recordingServer();
+		const provider = createPiModelProvider({
+			executor: "openai-compatible",
+			model: "qwen-thinking-agent-test",
+			baseUrl: server.url,
+			reasoning: "medium",
+			maxTokens: 16_384,
+			thinking,
+		});
+		const session = await provider.createAgentSession([], { maxTokens: 16_384 });
+		try {
+			await session.prompt("finish without tools");
+			expect(server.bodies[0]?.chat_template_kwargs).toEqual({ enable_thinking: true, preserve_thinking: false });
+			expect(server.bodies[0]?.thinking_token_budget).toBe(2000);
+		} finally {
+			await session.dispose();
+			server.stop();
+		}
+	});
+
+	test("agent sessions resolve a lazy context window; plain completions never ask for it", async () => {
+		const server = recordingServer();
+		let resolved = 0;
+		const provider = createPiModelProvider({
+			executor: "openai-compatible",
+			model: "lazy-window-test",
+			baseUrl: server.url,
+			resolveContextWindow: async () => {
+				resolved += 1;
+				return 262_144;
+			},
+		});
+		try {
+			await expect(provider.generate("plain")).resolves.toBe("done");
+			expect(resolved).toBe(0);
+			const session = await provider.createAgentSession([]);
+			try {
+				expect(resolved).toBe(1);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			server.stop();
+		}
+	});
+
+	test("targets without thinking config keep the keyless local defaults", async () => {
+		const server = recordingServer();
+		try {
+			const provider = createPiModelProvider({
+				executor: "openai-compatible",
+				model: "plain-local-test",
+				baseUrl: server.url,
+			});
+			await expect(provider.generate("plain")).resolves.toBe("done");
+			expect(server.bodies[0]?.chat_template_kwargs).toBeUndefined();
+			expect(server.bodies[0]?.thinking_token_budget).toBeUndefined();
+		} finally {
+			server.stop();
+		}
+	});
+});

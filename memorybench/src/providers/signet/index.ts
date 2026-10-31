@@ -18,6 +18,21 @@ import { SIGNET_PROMPTS, SIGNET_SUPERMEMORY_PARITY_PROMPTS } from "./prompts"
 const DEFAULT_AGENT_ID = "memorybench"
 const DEFAULT_PROJECT = "memorybench"
 const DEFAULT_TIMEOUT_MS = 60_000
+const DEFAULT_PRESSURE_RETRY_SECS = 3 * 60 * 60
+const MAX_PRESSURE_WAIT_MS = 5 * 60 * 1000
+const DEFAULT_RETRY_AFTER_MS = 1000
+
+export function parseRetryAfterMs(header: string | null, now: number = Date.now()): number {
+  const value = header?.trim() ?? ""
+  if (value === "") return DEFAULT_RETRY_AFTER_MS
+  if (/^\d+(\.\d+)?$/.test(value)) {
+    const ms = Number(value) * 1000
+    return ms > 0 ? ms : DEFAULT_RETRY_AFTER_MS
+  }
+  const at = Date.parse(value)
+  if (Number.isFinite(at) && at > now) return at - now
+  return DEFAULT_RETRY_AFTER_MS
+}
 const DREAM_STATUS_CONCURRENCY = 4
 const STRICT_SEARCH_LIMIT = 10
 const SUPERMEMORY_PARITY_SEARCH_LIMIT = 30
@@ -116,7 +131,11 @@ export function observeDreamingPasses(
 }
 
 function passHadNothingToDo(pass: DreamingStatusPass): boolean {
-  return pass.status === "completed" && (pass.mutationsApplied ?? 0) === 0 && !((pass.tokensInput ?? 0) > 0)
+  return (
+    pass.status === "completed" &&
+    (pass.mutationsApplied ?? 0) === 0 &&
+    !((pass.tokensInput ?? 0) > 0)
+  )
 }
 
 const MAX_IDLE_DREAMING_PASSES = 3
@@ -125,8 +144,7 @@ const MAX_FAILED_DREAMING_PASSES = 3
 const RAW_EVIDENCE_ID_PREFIXES = ["source-chunk:", "native-artifact:", "transcript:"] as const
 
 export function classifySignetRecallResult(result: unknown): RecallEvidenceKind {
-  const id =
-    typeof result === "object" && result !== null && "id" in result ? result.id : undefined
+  const id = typeof result === "object" && result !== null && "id" in result ? result.id : undefined
   return typeof id === "string" && RAW_EVIDENCE_ID_PREFIXES.some((prefix) => id.startsWith(prefix))
     ? "raw-evidence"
     : "derived"
@@ -210,7 +228,9 @@ export function buildSignetRecallQuery(query: string, questionDate?: string): st
     }
   }
 
-  const dayMatch = query.match(/\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\s+ago\b/i)
+  const dayMatch = query.match(
+    /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\s+ago\b/i
+  )
   if (dayMatch) {
     const raw = (dayMatch[1] ?? "").toLowerCase()
     const days = wordNumbers[raw] ?? Number.parseInt(raw, 10)
@@ -221,7 +241,9 @@ export function buildSignetRecallQuery(query: string, questionDate?: string): st
     }
   }
 
-  const weekdayMatch = query.match(/\blast\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i)
+  const weekdayMatch = query.match(
+    /\blast\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i
+  )
   if (weekdayMatch) {
     const target = WEEKDAY_NAMES.indexOf((weekdayMatch[1] ?? "").toLowerCase())
     const date = new Date(anchor)
@@ -330,9 +352,12 @@ export class SignetProvider implements Provider {
   private readonly extractionUsage = emptyUsage()
   private readonly dreamingPasses: Record<string, DreamingPassUsage> = {}
   private readonly isolatedAgents = new Set<string>()
+  private readonly isolatingAgents = new Map<string, Promise<void>>()
   private agentId = process.env.SIGNET_BENCH_AGENT_ID || DEFAULT_AGENT_ID
   private project = process.env.SIGNET_BENCH_PROJECT || DEFAULT_PROJECT
   private timeoutMs = readPositiveInt("SIGNET_BENCH_REQUEST_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)
+  private pressureRetryMs =
+    readPositiveInt("SIGNET_BENCH_PRESSURE_RETRY_SECS", DEFAULT_PRESSURE_RETRY_SECS) * 1000
   private profile: SignetBenchmarkProfile
   private readonly dreamingAgentIds = new Set<string>()
 
@@ -393,22 +418,38 @@ export class SignetProvider implements Provider {
 
   private async ensureIsolatedAgent(agentId: string): Promise<void> {
     if (this.isolatedAgents.has(agentId)) return
+    const inflight = this.isolatingAgents.get(agentId)
+    if (inflight) return inflight
+    const pending = this.isolateAgent(agentId).finally(() => this.isolatingAgents.delete(agentId))
+    this.isolatingAgents.set(agentId, pending)
+    return pending
+  }
+
+  private async isolateAgent(agentId: string): Promise<void> {
     try {
       await this.request(`/api/agents/${encodeURIComponent(agentId)}`, {
         method: "PATCH",
         body: JSON.stringify({ read_policy: "isolated" }),
       })
     } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes("failed (404)")) throw error
-      await this.request("/api/agents", {
-        method: "POST",
-        body: JSON.stringify({ name: agentId, read_policy: "isolated" }),
-      })
+      if (!(error instanceof Error && error.message.includes("failed (404)"))) throw error
+      try {
+        await this.request("/api/agents", {
+          method: "POST",
+          body: JSON.stringify({ name: agentId, read_policy: "isolated" }),
+        })
+      } catch (createError) {
+        if (!(createError instanceof Error && createError.message.includes("failed (409)")))
+          throw createError
+      }
     }
     this.isolatedAgents.add(agentId)
   }
 
-  private async readDreamStatuses(scopes: readonly string[], measure = false): Promise<DreamingStatusResponse[]> {
+  private async readDreamStatuses(
+    scopes: readonly string[],
+    measure = false
+  ): Promise<DreamingStatusResponse[]> {
     const statuses: DreamingStatusResponse[] = new Array(scopes.length)
     let next = 0
     const worker = async (): Promise<void> => {
@@ -417,7 +458,9 @@ export class SignetProvider implements Provider {
         statuses[index] = await this.readDreamStatus(scopes[index]!, measure)
       }
     }
-    await Promise.all(Array.from({ length: Math.min(DREAM_STATUS_CONCURRENCY, scopes.length) }, worker))
+    await Promise.all(
+      Array.from({ length: Math.min(DREAM_STATUS_CONCURRENCY, scopes.length) }, worker)
+    )
     return statuses
   }
 
@@ -431,7 +474,6 @@ export class SignetProvider implements Provider {
   }
 
   async ingest(sessions: UnifiedSession[], options: IngestOptions): Promise<IngestResult> {
-
     const ids: string[] = []
     const pending: string[] = []
     const taskAgentIds: Record<string, string> = {}
@@ -625,7 +667,9 @@ export class SignetProvider implements Provider {
           if (failedPasses >= MAX_FAILED_DREAMING_PASSES * slots) {
             throw new Error(`${failure} (${failedPasses} consecutive failed passes)`)
           }
-          logger.warn(`${failure}; retrying (${failedPasses}/${MAX_FAILED_DREAMING_PASSES * slots})`)
+          logger.warn(
+            `${failure}; retrying (${failedPasses}/${MAX_FAILED_DREAMING_PASSES * slots})`
+          )
           continue
         }
         failedPasses = 0
@@ -648,7 +692,9 @@ export class SignetProvider implements Provider {
           }
         } else {
           if (idlePasses >= MAX_IDLE_DREAMING_PASSES * slots) {
-            const backlog = statuses.map((status) => status.episodicTokensPending ?? "unmeasured").join(", ")
+            const backlog = statuses
+              .map((status) => status.episodicTokensPending ?? "unmeasured")
+              .join(", ")
             throw new Error(
               `Dreaming applied no mutations in ${idlePasses} consecutive passes while the backlog was not drained (${backlog})`
             )
@@ -659,7 +705,9 @@ export class SignetProvider implements Provider {
             if (active === 0 && (onlyEmpty || (!started && finished.length === 0))) {
               emptyTriggers++
               if (emptyTriggers >= MAX_IDLE_DREAMING_PASSES) {
-                throw new Error(`Dreaming started no new passes in ${emptyTriggers} consecutive triggers`)
+                throw new Error(
+                  `Dreaming started no new passes in ${emptyTriggers} consecutive triggers`
+                )
               }
             } else {
               emptyTriggers = 0
@@ -678,10 +726,12 @@ export class SignetProvider implements Provider {
         method: "POST",
         body: JSON.stringify({ mode: "incremental", agentId: this.agentId }),
       })
-      if (!accepted.passId) throw new Error(`Dreaming trigger failed: ${accepted.error || "missing pass id"}`)
+      if (!accepted.passId)
+        throw new Error(`Dreaming trigger failed: ${accepted.error || "missing pass id"}`)
       return true
     } catch (error) {
-      if (error instanceof Error && error.message.includes("/api/dream/trigger failed (409)")) return false
+      if (error instanceof Error && error.message.includes("/api/dream/trigger failed (409)"))
+        return false
       throw error
     }
   }
@@ -692,7 +742,9 @@ export class SignetProvider implements Provider {
     let best = Number.POSITIVE_INFINITY
     let progressAt = Date.now()
     while (Date.now() < deadline) {
-      const health = await this.request<EmbeddingHealthResponse>("/api/embeddings/health", { method: "GET" })
+      const health = await this.request<EmbeddingHealthResponse>("/api/embeddings/health", {
+        method: "GET",
+      })
       const coverage = health.checks?.find((check) => check.name === "coverage")?.detail
       const unembedded = typeof coverage?.unembedded === "number" ? coverage.unembedded : null
       if (unembedded === null) {
@@ -704,7 +756,9 @@ export class SignetProvider implements Provider {
         best = unembedded
         progressAt = Date.now()
       } else if (Date.now() - progressAt > stallMs) {
-        logger.warn(`${unembedded} Signet memories are still unembedded and embedding has stalled; searching anyway`)
+        logger.warn(
+          `${unembedded} Signet memories are still unembedded and embedding has stalled; searching anyway`
+        )
         return
       }
       await new Promise((resolve) => setTimeout(resolve, Math.max(pollMs, 5_000)))
@@ -859,6 +913,42 @@ export class SignetProvider implements Provider {
   }
 
   protected async request<T>(path: string, init: RequestInit): Promise<T> {
+    const pressureDeadline = Date.now() + this.pressureRetryMs
+    let droppedConnections = 0
+    let pressureRetries = 0
+    for (;;) {
+      try {
+        return await this.requestOnce<T>(
+          path,
+          droppedConnections > 0 ? { ...init, keepalive: false } : init
+        )
+      } catch (error) {
+        if (isDroppedConnection(error)) {
+          droppedConnections++
+          if (droppedConnections <= MAX_DROPPED_CONNECTION_RETRIES) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, Math.min(250 * droppedConnections, 2_000))
+            )
+            continue
+          }
+          throw new Error(
+            `${init.method ?? "GET"} ${path}: connection dropped ${droppedConnections} times: ${(error as Error).message}`
+          )
+        }
+        const remainingMs = pressureDeadline - Date.now()
+        if (!(error instanceof RetryableSignetError) || remainingMs <= 0) throw error
+        pressureRetries++
+        const delayMs = Math.min(
+          error.retryAfterMs * Math.min(pressureRetries, 8),
+          MAX_PRESSURE_WAIT_MS,
+          remainingMs
+        )
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
+      }
+    }
+  }
+
+  private async requestOnce<T>(path: string, init: RequestInit): Promise<T> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs)
 
@@ -877,12 +967,40 @@ export class SignetProvider implements Provider {
           data && typeof data === "object" && "error" in data
             ? String((data as { error?: unknown }).error)
             : response.statusText
+        const retryAfterHeader = response.headers.get("retry-after")
+        if (response.status === 429 || (response.status === 503 && retryAfterHeader !== null)) {
+          throw new RetryableSignetError(
+            `${path} failed (${response.status}): ${error}`,
+            parseRetryAfterMs(retryAfterHeader)
+          )
+        }
         throw new Error(`${path} failed (${response.status}): ${error}`)
       }
       return data
     } finally {
       clearTimeout(timeout)
     }
+  }
+}
+
+const MAX_DROPPED_CONNECTION_RETRIES = 8
+export function isDroppedConnection(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const code = (error as { code?: unknown }).code
+  return (
+    code === "ECONNRESET" ||
+    code === "ConnectionClosed" ||
+    /socket connection was closed unexpectedly|ECONNRESET|socket hang up/i.test(error.message)
+  )
+}
+
+class RetryableSignetError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs: number
+  ) {
+    super(message)
+    this.name = "RetryableSignetError"
   }
 }
 

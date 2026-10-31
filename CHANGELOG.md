@@ -6,6 +6,12 @@ All notable changes to Signet are documented here.
 
 Surface summary of the most recent release dates. See the release ledger below for exact version-by-version history.
 
+### 2026-10-26
+- Features: set the Dreaming pass timeout for slower local models; cap local answering and judging reasoning with a thinking budget; override the Dreaming model context window; cap thinking on local OpenAI-compatible targets; send enable_thinking with the local reasoning effort; set the Dreaming per-turn output budget for local reasoning models; run answering and judging on local OpenAI-compatible models; raise LLM and Dreaming concurrency ceilings to 256.
+- Bug fixes: discover the window only for agents; bound archive retries and clean temp files; report activeAgentId only for that agent; harden the RunPod kit from review; cap waits at the retry deadline; scope dream status to the agent; repair a torn tail on append; read the served context window; cap evidence delivered per pass; bound scheduled content sweeps and size passes by maxPassTokens; size passes so they finish and commit instead of livelocking; treat a DB owner deadline on trigger as retryable; count special-token literals in user text instead of throwing; return a retryable 503 when a trigger hits DB owner pressure; resend dropped requests on a fresh connection and name the failed path; keep every question when resuming an unrestricted run; page session-claim restore so a busy daemon can restart; keep honoring Retry-After while the capture backlog drains; treat a full transcript-capture backlog as retryable write pressure; resend requests the daemon dropped on a pooled connection; take local targets' context window from the server; create each haystack agent once and retry Signet write pressure; surface write pressure as retryable 503s instead of 500s and dropped captures; report running passes in /api/dream/status; restore the loopback endpoint check for local Dreaming models.
+- Performance: scope the per-agent canonical backfill query to that agent; append a new session's snapshot instead of rewriting the canonical JSONL.
+- Docs: record the Qwen3.8-27B vLLM recipe for one Blackwell GPU.
+
 ### 2026-10-25
 - Bug fixes: return primary candidates in fused rank order; score the best fused recall hit 1; reserve candidate slots for the best vector hits; rank keyword and vector hits by position in hybrid recall; keep rehearsal boost finite for unparseable access times; measure hint coverage against the sanitized FTS query; count traversal cosine as direct evidence at final rank; measure hint coverage with a unicode tokenizer; cap hint-only rows by evidence, not source label; bound hint and rehearsal contributions to recall scores; publish head over unrecorded revisions.
 - Refactoring: retire search.alpha.
@@ -29,11 +35,60 @@ Surface summary of the most recent release dates. See the release ledger below f
 - Performance: bound import attention drain check.
 - Docs: name migration 169 as latest.
 
-### 2026-10-08
-- Bug fixes: stop orphaning nightly releases; read failure and pass times as UTC; keep supported carried entries; revalidate carried head entries; bind head fence and carry entries; stop content passes staling their head; count every purged mention; bind memory-head commits to the running pass; keep aliases and assertions on merge; reconcile contradictions on skill uninstall; stop reconciling contradictions on read; bound native embedding input; defer incomplete transcript backfill; stop blocking input on prompt-submit; keep transcript seq monotonic per key; keep identity in portable import; record ontology claim actor; cascade and audit agent removal; stop retention from deleting entities; check pid hints and relative paths; scope daemon stop to its workspace; keep opt-in for existing workspaces; list memory setup under Needs attention; show the pipeline on when unset; wait for a provider instead of pausing.
-- Docs: address review on docs template; add screenshots for docs template PR; add page template and rewrite core pages; refresh for 1.0 and post-1.0 direction; note native updater cap in 1.0 post.
-
 ## Release Ledger
+
+## [0.238.0] - 2026-10-26
+
+Release summary: 8 features, 25 bug fixes, 2 performance improvements, and 1 docs update.
+Tag range: `v0.237.21..v0.238.0`.
+
+### Features
+
+- **bench**: set the Dreaming pass timeout for slower local models
+- **memorybench**: cap local answering and judging reasoning with a thinking budget
+- **bench**: override the Dreaming model context window
+- **inference**: cap thinking on local OpenAI-compatible targets
+- **memorybench**: send enable_thinking with the local reasoning effort
+- **bench**: set the Dreaming per-turn output budget for local reasoning models
+- **memorybench**: run answering and judging on local OpenAI-compatible models
+- **daemon**: raise LLM and Dreaming concurrency ceilings to 256
+
+### Bug Fixes
+
+- **inference**: discover the window only for agents
+- **bench**: bound archive retries and clean temp files
+- **dreaming**: report activeAgentId only for that agent
+- **bench**: harden the RunPod kit from review
+- **memorybench**: cap waits at the retry deadline
+- **dreaming**: scope dream status to the agent
+- **transcripts**: repair a torn tail on append
+- **inference**: read the served context window
+- **dreaming**: cap evidence delivered per pass
+- **dreaming**: bound scheduled content sweeps and size passes by maxPassTokens
+- **dreaming**: size passes so they finish and commit instead of livelocking
+- **dreaming**: treat a DB owner deadline on trigger as retryable
+- **pipeline**: count special-token literals in user text instead of throwing
+- **dreaming**: return a retryable 503 when a trigger hits DB owner pressure
+- **memorybench**: resend dropped requests on a fresh connection and name the failed path
+- **memorybench**: keep every question when resuming an unrestricted run
+- **daemon**: page session-claim restore so a busy daemon can restart
+- **memorybench**: keep honoring Retry-After while the capture backlog drains
+- **daemon**: treat a full transcript-capture backlog as retryable write pressure
+- **memorybench**: resend requests the daemon dropped on a pooled connection
+- **inference**: take local targets' context window from the server
+- **memorybench**: create each haystack agent once and retry Signet write pressure
+- **daemon**: surface write pressure as retryable 503s instead of 500s and dropped captures
+- **dreaming**: report running passes in /api/dream/status
+- **bench**: restore the loopback endpoint check for local Dreaming models
+
+### Performance
+
+- **transcripts**: scope the per-agent canonical backfill query to that agent
+- **transcripts**: append a new session's snapshot instead of rewriting the canonical JSONL
+
+### Docs
+
+- record the Qwen3.8-27B vLLM recipe for one Blackwell GPU
 
 ## [0.237.21] - 2026-10-25
 

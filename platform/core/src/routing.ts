@@ -100,6 +100,21 @@ export interface RoutingOpenRouterConfig {
 	readonly reasoning?: RoutingOpenRouterReasoningConfig;
 }
 
+export const ROUTING_LOCAL_THINKING_FORMATS = ["qwen-chat-template", "chat-template", "qwen"] as const;
+export type RoutingLocalThinkingFormat = (typeof ROUTING_LOCAL_THINKING_FORMATS)[number];
+export const ROUTING_THINKING_BUDGET_FIELDS = [
+	"thinking_token_budget",
+	"thinking_budget",
+	"thinking_budget_tokens",
+] as const;
+export type RoutingThinkingBudgetField = (typeof ROUTING_THINKING_BUDGET_FIELDS)[number];
+export interface RoutingLocalThinkingConfig {
+	readonly format: RoutingLocalThinkingFormat;
+	readonly budgetTokens?: number;
+	readonly budgetField?: RoutingThinkingBudgetField;
+	readonly chatTemplateKwargs?: Readonly<Record<string, unknown>>;
+}
+
 export type RoutingAcpxPermissionMode = "inherit" | "deny-all" | "approve-reads" | "approve-all";
 export type RoutingAcpxHooksMode = "inherit" | "disabled" | "enabled";
 export type RoutingAcpxTerminalMode = "inherit" | "disabled" | "enabled";
@@ -141,6 +156,7 @@ export interface RoutingTargetConfig {
 	readonly command?: PipelineCommandConfig;
 	readonly acpx?: RoutingAcpxConfig;
 	readonly openrouter?: RoutingOpenRouterConfig;
+	readonly thinking?: RoutingLocalThinkingConfig;
 	readonly privacy?: RoutingPrivacyTier;
 	readonly models: Readonly<Record<string, RoutingModelConfig>>;
 }
@@ -657,6 +673,27 @@ function parseOpenRouterConfig(raw: unknown): RoutingOpenRouterConfig | undefine
 	return Object.keys(reasoning).length > 0 ? { reasoning } : undefined;
 }
 
+const LOCAL_THINKING_EXECUTORS: ReadonlySet<string> = new Set(["openai-compatible", "llama-cpp", "ollama"]);
+
+export function parseLocalThinkingConfig(raw: unknown): RoutingLocalThinkingConfig | undefined {
+	if (!isRecord(raw)) return undefined;
+	const format = asString(raw.format);
+	if (!format || !(ROUTING_LOCAL_THINKING_FORMATS as readonly string[]).includes(format)) return undefined;
+	const budgetTokens = asPositiveInt(raw.budgetTokens ?? raw.budget_tokens);
+	const budgetFieldRaw = asString(raw.budgetField ?? raw.budget_field);
+	const budgetField =
+		budgetFieldRaw && (ROUTING_THINKING_BUDGET_FIELDS as readonly string[]).includes(budgetFieldRaw)
+			? (budgetFieldRaw as RoutingThinkingBudgetField)
+			: undefined;
+	const kwargsRaw = raw.chatTemplateKwargs ?? raw.chat_template_kwargs;
+	return {
+		format: format as RoutingLocalThinkingFormat,
+		...(budgetTokens !== undefined ? { budgetTokens } : {}),
+		...(budgetField ? { budgetField } : {}),
+		...(isRecord(kwargsRaw) ? { chatTemplateKwargs: { ...kwargsRaw } } : {}),
+	};
+}
+
 function parseTargetConfig(raw: unknown): RoutingTargetConfig | null {
 	if (!isRecord(raw)) return null;
 	const executor = asString(raw.executor);
@@ -672,6 +709,7 @@ function parseTargetConfig(raw: unknown): RoutingTargetConfig | null {
 	const acpx = executor === "acpx" ? parseAcpxConfig(raw) : undefined;
 	if (executor === "acpx" && !acpx) return null;
 	const openrouter = executor === "openrouter" ? parseOpenRouterConfig(raw) : undefined;
+	const thinking = LOCAL_THINKING_EXECUTORS.has(executor) ? parseLocalThinkingConfig(raw.thinking) : undefined;
 	const endpoint = asString(raw.endpoint ?? raw.baseUrl ?? raw.base_url);
 	return {
 		kind: (() => {
@@ -687,6 +725,7 @@ function parseTargetConfig(raw: unknown): RoutingTargetConfig | null {
 		command: parseCommandConfig(raw.command),
 		acpx,
 		openrouter,
+		...(thinking ? { thinking } : {}),
 		privacy: asRoutingPrivacyTier(raw.privacy, inferTargetPrivacy(executor, endpoint)),
 		models,
 	};

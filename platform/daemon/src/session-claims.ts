@@ -39,6 +39,8 @@ interface SessionClaimRow {
 	readonly end_marker: string | null;
 }
 
+const SESSION_CLAIM_RESTORE_PAGE_ROWS = 1000;
+
 function persistedClaimsFromRows(rows: readonly SessionClaimRow[]): readonly PersistedSessionClaim[] {
 	return rows.map((row) => ({
 		sessionKey: row.session_key,
@@ -83,7 +85,7 @@ export function createSessionClaimStore(accessor: DbAccessor): SessionClaimStore
 						ended_at = NULL,
 						end_marker = NULL`,
 				).run(claim.sessionKey, claim.agentId, claim.runtimePath, claim.harness, claim.claimedAt, claim.expiresAt);
-			}, "session-claims.ts:72");
+			}, "session-claims.ts:74");
 		},
 		markExpired(sessionKey, agentId): void {
 			// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withWriteTx migration site
@@ -93,7 +95,7 @@ export function createSessionClaimStore(accessor: DbAccessor): SessionClaimStore
 					 SET state = 'expired'
 					 WHERE session_key = ? AND agent_id = ? AND state = 'active'`,
 				).run(sessionKey, agentId);
-			}, "session-claims.ts:90");
+			}, "session-claims.ts:92");
 		},
 		async markExpiredAsync(sessionKey, agentId): Promise<void> {
 			await dbOwnerBatch(
@@ -133,13 +135,13 @@ export function createSessionClaimStore(accessor: DbAccessor): SessionClaimStore
 					claim.endedAt,
 					claim.endMarker,
 				);
-			}, "session-claims.ts:113");
+			}, "session-claims.ts:115");
 		},
 		remove(sessionKey, agentId): void {
 			// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withWriteTx migration site
 			accessor.withWriteTx((db: import("./db-accessor").WriteDb) => {
 				db.prepare("DELETE FROM session_claims WHERE session_key = ? AND agent_id = ?").run(sessionKey, agentId);
-			}, "session-claims.ts:140");
+			}, "session-claims.ts:142");
 		},
 		async removeAsync(sessionKey, agentId): Promise<void> {
 			await dbOwnerBatch(
@@ -149,20 +151,31 @@ export function createSessionClaimStore(accessor: DbAccessor): SessionClaimStore
 		},
 		list(): readonly PersistedSessionClaim[] {
 			// @ts-expect-error LEGACY_SYNC_DB_ACCESS: withReadDb migration site
-			return accessor.withReadDb(readClaims, "session-claims.ts:152");
+			return accessor.withReadDb(readClaims, "session-claims.ts:154");
 		},
 		async listAsync(): Promise<readonly PersistedSessionClaim[]> {
-			const rows = await dbOwnerQuery<readonly SessionClaimRow[]>(
-				ownerStatement(
-					`SELECT session_key, agent_id, runtime_path, harness, claimed_at, expires_at,
-							state, ended_at, end_marker
-					 FROM session_claims
-					 ORDER BY claimed_at ASC`,
-					[],
-					"all",
-				),
-				{ operation: "session-claims.restore", lane: "read" },
-			);
+			const rows: SessionClaimRow[] = [];
+			let cursor: SessionClaimRow | undefined;
+			for (;;) {
+				const page = await dbOwnerQuery<readonly SessionClaimRow[]>(
+					ownerStatement(
+						`SELECT session_key, agent_id, runtime_path, harness, claimed_at, expires_at,
+								state, ended_at, end_marker
+						 FROM session_claims
+						 ${cursor ? "WHERE (claimed_at, agent_id, session_key) > (?, ?, ?)" : ""}
+						 ORDER BY claimed_at ASC, agent_id ASC, session_key ASC
+						 LIMIT ?`,
+						cursor
+							? [cursor.claimed_at, cursor.agent_id, cursor.session_key, SESSION_CLAIM_RESTORE_PAGE_ROWS]
+							: [SESSION_CLAIM_RESTORE_PAGE_ROWS],
+						"all",
+					),
+					{ operation: "session-claims.restore", lane: "read" },
+				);
+				rows.push(...page);
+				cursor = page[page.length - 1];
+				if (page.length < SESSION_CLAIM_RESTORE_PAGE_ROWS) break;
+			}
 			return persistedClaimsFromRows(rows);
 		},
 	};

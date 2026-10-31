@@ -13,6 +13,7 @@ import {
 	markSessionEnded,
 	resetSessions,
 	restorePersistedSessions,
+	restorePersistedSessionsAsync,
 	runStaleCleanup,
 	setSessionClaimStore,
 	setSessionEvictionHandler,
@@ -53,6 +54,30 @@ describe("durable session lifecycle claims (#1228)", () => {
 		await closeDbAccessor();
 		rmSync(agentsDir, { recursive: true, force: true });
 	});
+
+	it("restores more claims than fit in one DB owner result", async () => {
+		const endedAt = new Date().toISOString();
+		const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+		const total = 6_000;
+		getDbAccessor().withWriteTx((db) => {
+			const insert = db.prepare(
+				`INSERT INTO session_claims
+				 (session_key, agent_id, runtime_path, harness, claimed_at, expires_at, state, ended_at, end_marker)
+				 VALUES (?, ?, 'plugin', 'memorybench', ?, ?, 'ended', ?, 'session-end')`,
+			);
+			for (let i = 0; i < total; i++) {
+				const key = `memorybench:haystack-${String(i).padStart(5, "0")}-run:session-${"x".repeat(160)}`;
+				insert.run(key, `memorybench-h${i % 500}`, endedAt, expiresAt, endedAt);
+			}
+		});
+
+		const restored = await restorePersistedSessionsAsync();
+
+		expect(restored).toEqual({ active: 0, expired: 0, ended: total });
+		expect(
+			getEndedSession(`memorybench:haystack-05999-run:session-${"x".repeat(160)}`, "memorybench-h499"),
+		).toBeDefined();
+	}, 60_000);
 
 	it("rehydrates an active claim after the tracker process state is cleared", () => {
 		expect(claimSession("restart-active", "plugin", "agent-a", "hermes").ok).toBe(true);

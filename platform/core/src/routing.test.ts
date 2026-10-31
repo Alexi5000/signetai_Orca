@@ -699,6 +699,48 @@ describe("inference config + decision engine", () => {
 		});
 	});
 
+	it("parses thinking controls on local OpenAI-compatible targets only", () => {
+		const parsed = parseRoutingConfig({
+			inference: {
+				targets: {
+					local: {
+						executor: "openai-compatible",
+						endpoint: "http://127.0.0.1:8000/v1",
+						thinking: {
+							format: "chat-template",
+							budget_tokens: 2000,
+							budgetField: "thinking_token_budget",
+							chat_template_kwargs: { enable_thinking: { $var: "thinking.enabled" }, preserve_thinking: false },
+						},
+						models: { default: { model: "qwen3.8-27b" } },
+					},
+					badFormat: {
+						executor: "llama-cpp",
+						thinking: { format: "telepathy", budgetTokens: 10 },
+						models: { default: { model: "x" } },
+					},
+					remote: {
+						executor: "openrouter",
+						account: "openrouter-api",
+						thinking: { format: "qwen", budgetTokens: 10 },
+						models: { default: { model: "inception/mercury-2" } },
+					},
+				},
+			},
+		});
+
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) return;
+		expect(parsed.value.targets.local?.thinking).toEqual({
+			format: "chat-template",
+			budgetTokens: 2000,
+			budgetField: "thinking_token_budget",
+			chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" }, preserve_thinking: false },
+		});
+		expect(parsed.value.targets.badFormat?.thinking).toBeUndefined();
+		expect(parsed.value.targets.remote?.thinking).toBeUndefined();
+	});
+
 	it("accepts pi-ai provider ids without duplicating its dynamic catalog", () => {
 		const parsed = parseRoutingConfig({
 			inference: {

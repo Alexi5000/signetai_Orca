@@ -42,6 +42,13 @@ describe("loadDreamingConfig", () => {
 		);
 	});
 
+	it("defaults and bounds the per-pass backlog budget", () => {
+		expect(loadDreamingConfig({}).maxPassTokens).toBe(200_000);
+		expect(loadDreamingConfig({ memory: { dreaming: { maxPassTokens: 120_000 } } }).maxPassTokens).toBe(120_000);
+		expect(loadDreamingConfig({ memory: { dreaming: { maxPassTokens: 5 } } }).maxPassTokens).toBe(10_000);
+		expect(loadDreamingConfig({ memory: { dreaming: { maxPassTokens: 9_000_000 } } }).maxPassTokens).toBe(2_000_000);
+	});
+
 	it("leaves the Dreaming output cap to the model unless one is configured", () => {
 		expect(loadDreamingConfig({}).maxOutputTokens).toBeNull();
 		expect(loadDreamingConfig({ memory: { dreaming: { enabled: true } } }).maxOutputTokens).toBeNull();
@@ -1042,7 +1049,11 @@ describe("loadPipelineConfig", () => {
 			expect(
 				loadPipelineConfig({ memory: { pipelineV2: { enabled: true, worker: { maxLlmConcurrency: 99 } } } }).worker
 					.maxLlmConcurrency,
-			).toBe(16);
+			).toBe(99);
+			expect(
+				loadPipelineConfig({ memory: { pipelineV2: { enabled: true, worker: { maxLlmConcurrency: 999 } } } }).worker
+					.maxLlmConcurrency,
+			).toBe(256);
 			process.env.SIGNET_MAX_LLM_CONCURRENCY = "7";
 			expect(
 				loadPipelineConfig({ memory: { pipelineV2: { enabled: true, worker: { maxLlmConcurrency: 3 } } } }).worker

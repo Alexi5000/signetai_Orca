@@ -513,7 +513,7 @@ printf 'never reached\\n'
 			let hangChatRequests = false;
 			globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
 				const url = String(input);
-				if (url.endsWith("/models")) return new Response("not found", { status: 404 });
+				if (url.endsWith("/models") || url.endsWith("/props")) return new Response("not found", { status: 404 });
 				chatRequests++;
 				if (hangChatRequests) {
 					const signal = input instanceof Request ? input.signal : init?.signal;
@@ -687,7 +687,8 @@ printf 'never reached\\n'
 		let workerServer: ReturnType<typeof Bun.serve> | undefined;
 		let chatRequests = 0;
 		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
-			if (String(input).endsWith("/models")) return new Response("not found", { status: 404 });
+			if (String(input).endsWith("/models") || String(input).endsWith("/props"))
+				return new Response("not found", { status: 404 });
 			chatRequests++;
 			return openAiSseResponse("agent completed", { prompt_tokens: 3, completion_tokens: 1 });
 		}) as unknown as typeof fetch;

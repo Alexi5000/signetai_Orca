@@ -12,6 +12,21 @@ import {
 } from "./pipeline/tokenizer";
 
 describe("tokenizer", () => {
+	it("counts and truncates text that contains special-token literals as plain text", () => {
+		const text = "user pasted <|endoftext|> and <|im_start|> into the chat";
+		expect(countTokens(text)).toBeGreaterThan(10);
+		expect(truncateToTokens(text, 4).length).toBeGreaterThan(0);
+	});
+
+	it("counts special-token literals in the Dreaming backlog token worker", async () => {
+		const { countDreamingBacklogTokenEntries } = await import("./pipeline/dreaming-token-cache");
+		const result = await countDreamingBacklogTokenEntries("special-token-agent", [
+			{ key: "s1", revision: "r1", text: "transcript with <|endoftext|> inside" },
+		]);
+		expect(result.tokens).toBeGreaterThan(5);
+		expect(result.entriesCounted).toBe(1);
+	});
+
 	it("resolves the WASM file used by the Bun loader", () => {
 		expect(existsSync(tokenizerWasmPath)).toBe(true);
 	});
